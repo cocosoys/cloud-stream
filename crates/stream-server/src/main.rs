@@ -55,6 +55,14 @@ fn init_logger(cfg: &config::Config) -> anyhow::Result<Option<hbb_common::flexi_
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // #65: Windows' default timer granularity (~15.6 ms) makes the beat's
+    // `sleep` overshoot, which capped the loop at ~57 Hz even with a 5.8 ms beat.
+    // One-millisecond resolution puts the settle sleep on target. Since Windows 10
+    // the request is scoped to this process.
+    #[cfg(windows)]
+    unsafe {
+        windows_sys::Win32::Media::timeBeginPeriod(1);
+    }
     let cfg = Arc::new(config::Config::parse(std::env::args().skip(1).collect()));
     // #60: VMware SVGA 3D has no HDR desktop; `--no-hdr` skips the guaranteed
     // DuplicateOutput1 probe and its per-start warning.
@@ -77,12 +85,16 @@ async fn main() -> anyhow::Result<()> {
         cfg.bitrate_kbps,
     );
     log::info!(
-        "log_file={} | spf={:.3}ms",
+        "log_file={} | spf={:.3}ms | upload_dir={}",
         cfg.log_file
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "stderr".to_owned()),
         cfg.spf().as_secs_f64() * 1000.0,
+        cfg.upload_dir
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "disabled".to_owned()),
     );
 
     // #36 starts the capture loop after Connected notices are sent; the WS

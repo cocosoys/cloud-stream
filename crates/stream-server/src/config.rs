@@ -42,6 +42,18 @@ pub struct Config {
     /// this directory as BMP files, so a smear/glitch can be attributed to the
     /// capturer, the scaler or the encoder instead of guessing.
     pub dump_frame: Option<PathBuf>,
+    /// #64/#66: emit one static-screen repeat frame every N WouldBlock beats.
+    /// 1 = hold the full target cadence on an idle desktop; 2 halves the repeat
+    /// rate for a browser whose software VP8 decoder cannot keep up (measured
+    /// 3.6 % dropped frames at ~54 repeats/s on this host).
+    pub repeat_every: u32,
+    /// #67: file-transfer root. When set, `/api/files/{rel}` lists/downloads
+    /// files under this directory and `/api/upload` writes into it; `None`
+    /// disables both endpoints (403), matching the retired Python service's
+    /// `file_manager_path` behavior. Every path component is validated against
+    /// traversal, drive letters and reserved characters before touching the
+    /// filesystem (RustDesk `fs::join_validated_path` style).
+    pub upload_dir: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -62,6 +74,8 @@ impl Default for Config {
             log_file: Some(PathBuf::from(r"logs\stream-server.log")),
             no_hdr: false,
             dump_frame: None,
+            repeat_every: 2,
+            upload_dir: None,
         }
     }
 }
@@ -144,7 +158,23 @@ impl Config {
                         }
                     }
                 }
+                "--repeat-every" => {
+                    if let Some(v) = iter.next() {
+                        if let Ok(n) = v.parse::<u32>() {
+                            cfg.repeat_every = n.clamp(1, 10);
+                        }
+                    }
+                }
                 "--no-hdr" => cfg.no_hdr = true,
+                "--upload-dir" => {
+                    if let Some(v) = iter.next() {
+                        if v.is_empty() {
+                            cfg.upload_dir = None;
+                        } else {
+                            cfg.upload_dir = Some(PathBuf::from(v));
+                        }
+                    }
+                }
                 "--dump-frame" => {
                     if let Some(v) = iter.next() {
                         if !v.is_empty() {
