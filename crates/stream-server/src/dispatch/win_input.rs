@@ -7,7 +7,10 @@
 //! Wire contract (input.js, verified):
 //! * `m,<x>,<y>,<mask>,<mag>,<seq>`    absolute pointer; x/y are **stream frame
 //!   pixels** (0..frame_w, 0..frame_h), not the 0-1000 normalisation that older
-//!   selkies docs claimed — see `frame_to_screen`
+//!   selkies docs claimed — see `frame_to_screen`. #68: "frame" here means the
+//!   frame the browser decoded (`videoWidth/videoHeight`), i.e.
+//!   `StreamSettings::output()`, which after the #66 clamp can be *smaller* than
+//!   the resolution the client requested.
 //! * `m2,<dx>,<dy>,<mask>,<mag>,<seq>` relative pointer (server px); scroll
 //!   pulses ride mask bits 3(down)/4(up)/6(left)/7(right) with `mag` notches
 //! * `kd,<keysym>` / `ku,<keysym>`      key down / up (X11 keysym decimal)
@@ -119,10 +122,31 @@ struct InputState {
 /// Win32 call, and the internal state is behind one `Mutex`.
 pub struct WinInputSink {
     state: Mutex<InputState>,
-    /// #62: live stream frame size. The frontend sends `m,x,y` in frame pixels,
-    /// so the server must scale frame space -> screen space itself; 0 means
-    /// "unknown" and the coordinates pass through unchanged.
+    /// #62/#68: live stream settings, used purely as the *coordinate space* the
+    /// frontend is talking in.
+    ///
+    /// READ THIS BEFORE CHANGING ANY COORDINATE MATH HERE:
+    /// * The webclient sends `m,x,y` in **decoded frame pixels**. Its
+    ///   `_applySinkCoordinates()` multiplies the element-relative position by
+    ///   `sinkW / boxW`, where `sinkW = video.videoWidth` — i.e. the size of the
+    ///   frames the server actually encoded.
+    /// * Therefore the divisor below MUST be the *transmitted* size, which is
+    ///   `StreamSettings::output()` (published by the capture loop) — never
+    ///   `width()/height()`, which hold the raw client request. Since #66 the
+    ///   pipeline clamps an over-large request to the native display, so the two
+    ///   differ (3840x2160 requested vs. 1718x926 sent). Using the request makes
+    ///   every click land at `actual/request` of the intended position — the
+    ///   #68 "cursor offset" regression: the pointer moved only ~45 % as far as
+    ///   the click, and the error grew toward the right/bottom edge.
+    /// * `output()` is (0, 0) only until the capture loop opens its encoder;
+    ///   falling back to the request for that one window is intentional.
     frame: StreamSettings,
+    /// #68: log the mapping once per session (frame size vs. screen size).
+    /// A "clicks land in the wrong place" report is otherwise impossible to
+    /// diagnose from the server log: the only evidence needed is whether the
+    /// divisor equals the transmitted frame and whether `GetSystemMetrics`
+    /// agrees with the captured desktop.
+    mapping_logged: std::sync::atomic::AtomicBool,
 }
 
 impl Default for WinInputSink {
@@ -139,6 +163,28 @@ impl WinInputSink {
         Self {
             state: Mutex::new(InputState::default()),
             frame,
+            mapping_logged: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// #68: one INFO line per session showing both sides of the pointer mapping.
+    fn log_mapping_once(&self, fw: u32, fh: u32, sw: i32, sh: i32) {
+        use std::sync::atomic::Ordering as O;
+        if self.mapping_logged.swap(true, O::SeqCst) {
+            return;
+        }
+        let (rw, rh) = (self.frame.width(), self.frame.height());
+        log::info!(
+            "input mapping: frame {fw}x{fh} -> screen {sw}x{sh} \
+             (client requested {rw}x{rh}, transmitted size is authoritative)"
+        );
+        if (fw as i32, fh as i32) != (sw, sh) {
+            log::info!(
+                "input mapping is scaled by {:.3}x / {:.3}x — expected only when the \
+                 stream is resized",
+                sw as f32 / fw.max(1) as f32,
+                sh as f32 / fh.max(1) as f32
+            );
         }
     }
 }
@@ -148,6 +194,21 @@ fn screen_size() -> (i32, i32) {
         unsafe { GetSystemMetrics(SM_CXSCREEN) },
         unsafe { GetSystemMetrics(SM_CYSCREEN) },
     )
+}
+
+/// #68: map one axis value from transmitted-frame pixels onto physical screen
+/// pixels. Endpoint-to-endpoint (`0 -> 0`, `frame-1 -> screen-1`) so a 1:1
+/// stream is an exact identity.
+///
+/// `frame` MUST be the size the browser decoded (`StreamSettings::output()`).
+/// Passing the client's *requested* resolution here is the #68 bug: with a
+/// 3840x2160 request clamped to a 1718x926 wire, every click would be scaled by
+/// 1718/3840 ≈ 0.447 and the pointer would stop at ~45 % of the way to the
+/// click point (error growing linearly toward the edges).
+fn map_axis(v: i32, frame: u32, screen: i32) -> i32 {
+    let last_screen = screen.max(2) as i64 - 1;
+    let last_frame = frame.max(2) as i64 - 1;
+    (v as i64 * last_screen / last_frame).clamp(0, last_screen) as i32
 }
 
 /// Convert a 0-1000 normalized coordinate into screen pixels.
@@ -369,24 +430,42 @@ impl WinInputSink {
     /// most (1280,720): the right/bottom quarter of the screen was unreachable.
     /// Scale by the live frame size; when it is unknown the values pass through
     /// unchanged.
+    ///
+    /// #68: "live frame size" means the size the browser is *decoding*
+    /// (`StreamSettings::output()`), not the size the client requested. See the
+    /// field doc on `frame` for why this distinction is load-bearing.
+    fn transmitted_frame(&self) -> (u32, u32) {
+        let (ow, oh) = self.frame.output();
+        if ow > 0 && oh > 0 {
+            return (ow, oh);
+        }
+        (self.frame.width(), self.frame.height())
+    }
+
     fn frame_to_screen(&self, x: i32, y: i32) -> (i32, i32) {
-        let (fw, fh) = (self.frame.width(), self.frame.height());
+        let (fw, fh) = self.transmitted_frame();
         let (sw, sh) = screen_size();
         if fw == 0 || fh == 0 {
             return (x, y);
         }
-        let map = |v: i32, frame: u32, screen: i32| -> i32 {
-            let last = screen.max(1) as i64 - 1;
-            ((v as i64 * screen.max(1) as i64) / frame.max(1) as i64).clamp(0, last) as i32
-        };
-        (map(x, fw, sw), map(y, fh, sh))
+        // Endpoint-to-endpoint mapping (frame pixel 0 -> screen pixel 0, last
+        // frame pixel -> last screen pixel) so a 1:1 stream is an exact
+        // identity and no sub-pixel bias accumulates toward the far edge.
+        self.log_mapping_once(fw, fh, sw, sh);
+        (map_axis(x, fw, sw), map_axis(y, fh, sh))
     }
 
     /// #62: the same frame -> screen ratio for relative deltas (`m2`, pointer
     /// lock). Unscaled deltas make a locked pointer move only frame/screen of
     /// the real distance, which reads as sluggish mouse sensitivity.
+    ///
+    /// #68 caveat: pointer-lock deltas are `MouseEvent.movementX/Y`, i.e. CSS
+    /// pixels of the *element*, not frame pixels, so this factor is an
+    /// approximation (exact only while the element is drawn at ~1:1). It is kept
+    /// on the transmitted-frame ratio because that is the closest information
+    /// the server has; do not "simplify" it away (an unscaled delta is far worse).
     fn frame_to_screen_delta(&self, dx: i32, dy: i32) -> (i32, i32) {
-        let (fw, fh) = (self.frame.width(), self.frame.height());
+        let (fw, fh) = self.transmitted_frame();
         let (sw, sh) = screen_size();
         if fw == 0 || fh == 0 {
             return (dx, dy);
@@ -418,6 +497,8 @@ impl WinInputSink {
                 // physical screen before injecting (a 1:1 pass-through left the
                 // right/bottom of the desktop unreachable whenever the stream
                 // was scaled down).
+                // #68: frame pixels = the *transmitted* size (see
+                // `transmitted_frame`), never the client's requested resolution.
                 let (sx, sy) = self.frame_to_screen(x, y);
                 mouse_move_abs(sx, sy);
                 if let Ok(mut st) = self.state.lock() {
@@ -580,4 +661,42 @@ pub type WinInputSinkRef = std::sync::Arc<dyn InputSink>;
 #[allow(dead_code)]
 fn _assert_c_int() -> c_int {
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 1:1 stream (the #66 default path: no client request, no scaling) must
+    /// be a pixel-exact identity, including the last pixel.
+    #[test]
+    fn map_axis_is_identity_for_unscaled_stream() {
+        assert_eq!(map_axis(0, 1718, 1718), 0);
+        assert_eq!(map_axis(900, 1718, 1718), 900);
+        assert_eq!(map_axis(1717, 1718, 1718), 1717);
+    }
+
+    /// A downscaled stream must still reach the far screen edge, and an
+    /// out-of-range frame coordinate must clamp instead of overshooting.
+    #[test]
+    fn map_axis_reaches_far_edge_for_downscaled_stream() {
+        assert_eq!(map_axis(0, 1280, 1718), 0);
+        assert_eq!(map_axis(1279, 1280, 1718), 1717);
+        assert_eq!(map_axis(4096, 1280, 1718), 1717);
+    }
+
+    /// #68 regression guard: pointer mapping must divide by the *transmitted*
+    /// geometry. If someone reverts `transmitted_frame()` to `width()/height()`
+    /// this fails — that revert is exactly what put every click at ~45 % of the
+    /// intended position when a 3840x2160 request was clamped to 1718x926.
+    #[test]
+    fn transmitted_frame_prefers_output_over_request() {
+        let s = StreamSettings::from_config(&crate::config::Config::default());
+        s.set_resolution(3840, 2160);
+        let sink = WinInputSink::new(s.clone());
+        // Before the capture loop reports, the request is the only value known.
+        assert_eq!(sink.transmitted_frame(), (3840, 2160));
+        s.set_output(1718, 926);
+        assert_eq!(sink.transmitted_frame(), (1718, 926));
+    }
 }

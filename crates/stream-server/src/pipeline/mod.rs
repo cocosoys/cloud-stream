@@ -493,6 +493,16 @@ fn run_blocking_loop(
                  {enc_w}x{enc_h} (no upscale)"
             );
         }
+        // #68 — MANDATORY SIDE EFFECT OF THE CLAMP ABOVE.
+        // The clamp changes what the browser actually receives, so it must be
+        // published as the *transmitted* geometry. `WinInputSink` converts the
+        // frontend's frame-pixel pointer coordinates (`m,x,y`, which the
+        // webclient derives from `videoWidth/videoHeight`) into screen pixels by
+        // dividing by this size. If it is missing, the sink falls back to the
+        // un-clamped request (3840x2160) and every click lands at
+        // 1718/3840 = 44.7 % of the intended position — the #68 cursor offset.
+        // Never delete this call without giving input mapping another source.
+        settings.set_output(enc_w, enc_h);
         let mut encoder = match VideoEncoder::new(enc_w, enc_h, cfg.bitrate_kbps) {
             Ok(encoder) => encoder,
             Err(err) => {
@@ -636,6 +646,11 @@ fn run_inner_beat(
         settings.width().min(src_w.max(1)).max(1),
         settings.height().min(src_h.max(1)).max(1),
     );
+    // #68: republish on every (re)entry of the beat loop. The outer scheduler
+    // already does it, but a rebuild after a desktop resize changes `src_w/h`
+    // and therefore the clamp; keeping it here means the pointer mapping and the
+    // encoder can never disagree (see the long note in `run_blocking_loop`).
+    settings.set_output(enc_w, enc_h);
     // The fps the cadence was last aligned to; a change re-bases the deadline.
     let mut last_fps = settings.fps();
     let mut spf = settings.spf();
