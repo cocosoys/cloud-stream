@@ -20,6 +20,22 @@
 //! loop simply sends nothing, which leaves the reference chain intact (a
 //! missing frame is invisible, a mismatched one is corruption).
 //!
+//! #70 pointer lock (server-composited cursor): in gaming mode the frontend
+//! hides its own pointer and asks the server to draw the OS one
+//! (`SET_NATIVE_CURSOR_RENDERING,1` -> `cursor_inject`). Desktop Duplication
+//! only reports a frame when the *desktop* changes and its pixels never contain
+//! the cursor, so a locked pointer on a still screen is a `WouldBlock` beat —
+//! which used to re-encode the previous YUV and leave the composited pointer
+//! frozen where it was last painted. The repeat path therefore repaints from a
+//! cursor-free copy of the last frame (`pristine_bgra`) whenever the OS pointer
+//! moved, changed shape, or vanished. That copy is kept on every new frame,
+//! even while the frontend is still drawing its own pointer, because gaming
+//! mode is entered on an idle screen as often as not and an idle screen never
+//! produces the frame a lazy snapshot would wait for. The repaint also ignores
+//! the `--repeat-every` throttle: a pointer moving on a still picture is new
+//! information, and its residual against an almost identical reference is the
+//! cheapest frame the encoder ever produces.
+//!
 //! #42-1 recovery chain (aligned with RustDesk `video_service.rs`):
 //! * DXGI errors (`ConnectionReset` / `InvalidData` / other while on DXGI) get
 //!   a finite rebuild budget: `DXGI_RECOVERY_LIMIT = 3` attempts inside
@@ -601,6 +617,22 @@ fn run_inner_beat(
     // change) + the last emitted id so hide transitions fire once.
     let mut cursor_cache: Option<CursorData> = None;
     let mut last_cursor_id: Option<u64> = None;
+    // #70 pointer-lock cursor sync. `pristine_bgra` is the last frame *without*
+    // the cursor painted on it, in target geometry, refreshed on **every** new
+    // frame whatever `cursor_inject` currently says (see the snapshot note in
+    // the new-frame branch). `cursor_buf` is the scratch a WouldBlock beat
+    // repaints into; `last_paint` is what the last sent frame drew (top-left +
+    // cursor handle), so a repaint happens only when the OS pointer really
+    // moved, changed shape, or vanished. Without the pristine copy a repaint
+    // would composite the pointer over the previous pointer and leave a trail.
+    let mut pristine_bgra: Vec<u8> = Vec::new();
+    let mut cursor_buf: Vec<u8> = Vec::new();
+    let mut last_paint: Option<(i32, i32, u64)> = None;
+    // #70: last handover state, for a once-per-transition log line, and the
+    // number of pointer-driven repaints in the current stats window (the
+    // acceptance signal that the locked pointer is actually being redrawn).
+    let mut cursor_was_on = false;
+    let mut cursor_repaints: u64 = 0;
     // R2 (#62): the YUV of the last *encoded* frame. A WouldBlock re-encodes it
     // (a real repeat frame) so the VP8 reference chain stays valid; the two
     // buffers are swapped instead of copied, so this costs nothing per frame.
@@ -702,7 +734,7 @@ fn run_inner_beat(
             log::info!(
                 "pipeline {:.1}s: loop={:.1}Hz new={} repeat={} skip={} wb={} inv={} cap_err={} \
                  enc_ok={} enc_no_out={} enc_err={} ws_err={} cap_wait={:.2}ms poll={:.2}ms conv={:.2}ms \
-                 enc_avg={:.1}ms pipe_avg={:.1}ms scale={} carry={}",
+                 enc_avg={:.1}ms pipe_avg={:.1}ms scale={} carry={} paint={}",
                 since_log.as_secs_f64(),
                 beats as f64 / since_log.as_secs_f64(),
                 d(c.new_frames, prev_counters.new_frames),
@@ -721,7 +753,8 @@ fn run_inner_beat(
                 enc_ms,
                 pipe_ms,
                 last_scale,
-                last_copy
+                last_copy,
+                cursor_repaints
             );
             prev_counters = c;
             beats = 0;
@@ -729,6 +762,9 @@ fn run_inner_beat(
             cap_wait_n = 0;
             conv_sum = 0.0;
             conv_n = 0;
+            // #70: per-window, like the counters above; `paint` must climb while
+            // a locked pointer moves and stay at 0 otherwise.
+            cursor_repaints = 0;
             last_stats_log = Instant::now();
         }
         // #53: PLI/FIR from the browser -> force the next encode to a keyframe
@@ -876,11 +912,118 @@ fn run_inner_beat(
             }
         }
 
+        // #70: resolve the OS cursor once per beat, *before* knowing whether a
+        // frame arrived, because the WouldBlock branch below must repaint it
+        // too. Pointer lock lives on a static desktop most of the time (the
+        // page cursor is hidden, the host is not otherwise changing), and that
+        // is exactly the case DXGI reports as "no new frame". `update_cursor`
+        // is cheap: one `GetCursorInfo`; bitmap work happens only when the
+        // cursor identity changes.
+        let cursor = update_cursor(&mut cursor_cache, &mut last_cursor_id, &handle);
+        let cursor_on = handle.cursor_inject_on();
+        if cursor_on != cursor_was_on {
+            // #70: one line per handover, so a "the pointer will not move"
+            // report can be settled from the log alone: OFF here means the
+            // frontend never sent `SET_NATIVE_CURSOR_RENDERING,1` (a client
+            // problem), ON means the server owns the pointer and the `paint=`
+            // field of the stats line below has to climb while it moves.
+            cursor_was_on = cursor_on;
+            log::info!(
+                "#70 pointer handover: server-composited cursor {}",
+                if cursor_on {
+                    "ON (repainting on WouldBlock beats)"
+                } else {
+                    "OFF (frontend draws it)"
+                }
+            );
+        }
+        if !cursor_on {
+            // #70: frames sent while the server is *not* compositing carry no
+            // pointer. Forget what the last painted frame looked like, so the
+            // first repaint after pointer lock is re-entered is always emitted
+            // — otherwise an unchanged position + unchanged shape would compare
+            // equal to the pre-lock state and be skipped, leaving a pointer-less
+            // frame on screen until the user happened to move.
+            last_paint = None;
+        }
+
         let Some(mut captured) = taken else {
             // No new frame this beat: an idle desktop WouldBlocks forever — DXGI
             // intentionally yields nothing while the screen is static (an MC main
             // menu can sit still for many seconds). That is normal, not a fault.
             bump(&stats, |s| s.counters.would_block += 1);
+            // #70 — THE POINTER-LOCK CASE, do not delete.
+            // In gaming mode the frontend hides its own pointer and asks the
+            // server to composite the OS one (`SET_NATIVE_CURSOR_RENDERING,1`).
+            // Desktop Duplication reports a frame only when the *desktop*
+            // changes and never contains the cursor, so a locked pointer on a
+            // still screen lands here on every beat. Repainting only on new
+            // frames (the pre-#70 behaviour) left the composited pointer frozen
+            // while the injected `m2` moves did move the real OS cursor — the
+            // "pointer locked, the pointer will not move" report. Repaint from
+            // the cursor-free copy whenever the pointer moved, changed shape or
+            // vanished, and send that as this beat's frame.
+            if cursor_on && !pristine_bgra.is_empty() {
+                let want = cursor.as_ref().map(|c| {
+                    let (x, y) = cursor_draw_pos(tw, th, src_w, src_h, c);
+                    (x, y, c.id)
+                });
+                if want != last_paint {
+                    // `resize` both grows and shrinks, so the geometry change of
+                    // a resolution handover needs no special case.
+                    cursor_buf.resize(pristine_bgra.len(), 0);
+                    cursor_buf.copy_from_slice(&pristine_bgra);
+                    if let (Some((px, py, _)), Some(cur)) = (want, cursor.as_ref()) {
+                        draw_cursor(
+                            &mut cursor_buf,
+                            tw as usize * 4,
+                            tw as i32,
+                            th as i32,
+                            px,
+                            py,
+                            cur,
+                        );
+                    }
+                    let mut yuv_target = yuvfmt.clone();
+                    yuv_target.w = tw as usize;
+                    yuv_target.h = th as usize;
+                    let pb = PixelBuffer::with_BGRA(&cursor_buf, tw as usize, th as usize);
+                    match convert_to_yuv(&pb, yuv_target, &mut yuv, &mut mid_data) {
+                        Ok(()) => {
+                            // Same invariant as the new-frame path: `last_yuv`
+                            // holds what was encoded last, `yuv` is scratch.
+                            std::mem::swap(&mut yuv, &mut last_yuv);
+                            let pts = start.elapsed().as_millis() as i64;
+                            match encoder.encode(EncodeInput::YUV(&last_yuv), pts) {
+                                Ok(Some(encoded)) => {
+                                    bump(&stats, |s| {
+                                        s.counters.repeat_ok += 1;
+                                        s.counters.repeat_frames += 1;
+                                    });
+                                    forward_chunks(&tx, encoded, &stats, &handle);
+                                    last_paint = want;
+                                    cursor_repaints += 1;
+                                }
+                                Ok(None) => bump(&stats, |s| s.counters.repeat_skipped += 1),
+                                Err(err) => {
+                                    log::warn!("cursor repaint encode failed: {err:#}");
+                                    bump(&stats, |s| s.counters.encode_err += 1);
+                                }
+                            }
+                            settle_beat(&mut next_deadline, spf);
+                            continue;
+                        }
+                        Err(err) => {
+                            // Fall through to the ordinary repeat path: sending
+                            // the previous YUV keeps the cadence and the
+                            // reference chain intact.
+                            log::warn!("cursor repaint conversion failed: {err:#}");
+                            bump(&stats, |s| s.counters.encode_err += 1);
+                        }
+                    }
+                }
+            }
+
             // R2 (#62): re-encode the cached YUV of the last frame. Sending
             // the previous *payload* again would double-apply its residual
             // against the decoder's reference frame (colour smear on any
@@ -933,20 +1076,20 @@ fn run_inner_beat(
         repeat_beat_skip = 0;
         let _ = captured.seq;
 
-        // #50+#51+#63: convert to YUV. A mutable native-resolution BGRA copy is
-        // only required when the OS cursor must be composited (C1, pointer-lock
-        // mode) or the #60 dump is armed; in the default path the frontend draws
-        // its own cursor, so the scale/convert runs **directly on the captured
-        // buffer**. That removes a 6.4 MB memcpy from every frame, which was a
-        // measurable slice of the 60 fps beat budget on this VM.
-        let cursor = update_cursor(&mut cursor_cache, &mut last_cursor_id, &handle);
+        // #50+#51+#63: convert to YUV. The scale/convert reads straight off the
+        // captured buffer (no native-resolution staging copy) — the 6.4 MB copy
+        // now happens once, on the capture thread (#65), instead of here.
+        // #70 adds exactly one more copy, of the **target-size** result, and it
+        // is unconditional: that copy is the cursor-free snapshot the repeat
+        // path repaints onto while the desktop is static. See the note on
+        // `pristine_bgra`; it is the whole fix for the frozen locked pointer.
+        // `cursor` / `cursor_on` were resolved above, before the WouldBlock
+        // branch, so both paths composite the same pointer.
         let native_len = (src_w * src_h * 4) as usize;
         let scale_needed = (src_w, src_h) != (tw, th);
-        let cursor_on = handle.cursor_inject_on();
-        // #65: the published frame is ours (owned bytes), so no extra native copy
-        // is needed at all — the cursor is composited in place and the scale /
-        // convert read straight from it. The 6.4 MB copy now happens once, on the
-        // capture thread, instead of on this beat.
+        // Informational only (the `carry=` field of the stats line): whether a
+        // native-size staging copy was needed for the cursor composite or the
+        // #60 dump. The target-size snapshot above is not reported here.
         let need_native_copy = cursor_on || dump_frame.is_some();
         last_scale = scale_needed;
         last_copy = need_native_copy;
@@ -996,18 +1139,38 @@ fn run_inner_beat(
             // #57: composite only when the frontend handed pointer rendering
             // over (pointer lock); otherwise it draws its native cursor and a
             // second composited pointer would appear.
+            // #70: the cursor-free snapshot is taken on **every** new frame,
+            // even while `cursor_on` is false — see the note on
+            // `pristine_bgra` above. Cost is one target-size memcpy (≈0.6 ms at
+            // 1718x926 on this VM), already accounted for in the `conv=`
+            // figure of the pipeline log line. Do not "optimise" it back
+            // behind `cursor_on`: that reintroduces the frozen pointer.
+            keep_pristine(&mut pristine_bgra, &scaled_buf);
             if cursor_on {
-                if let Some(cur) = &cursor {
-                    paint_cursor(&mut scaled_buf, tw, th, src_w, src_h, cur);
-                }
+                last_paint = paint_cursor_state(
+                    &mut scaled_buf,
+                    tw,
+                    th,
+                    src_w,
+                    src_h,
+                    cursor.as_ref(),
+                );
             }
             let scaled_pb = PixelBuffer::with_BGRA(&scaled_buf, tw as usize, th as usize);
             convert_to_yuv(&scaled_pb, yuv_target, &mut yuv, &mut mid_data)
         } else {
+            // Same as the scaled branch: snapshot first, then paint the copy we
+            // actually encode (see #70 note above).
+            keep_pristine(&mut pristine_bgra, &captured.data);
             if cursor_on {
-                if let Some(cur) = &cursor {
-                    paint_cursor(&mut captured.data, src_w, src_h, src_w, src_h, cur);
-                }
+                last_paint = paint_cursor_state(
+                    &mut captured.data,
+                    src_w,
+                    src_h,
+                    src_w,
+                    src_h,
+                    cursor.as_ref(),
+                );
             }
             let pb_view =
                 PixelBuffer::with_BGRA(&captured.data, src_w as usize, src_h as usize);
@@ -1237,8 +1400,28 @@ fn update_cursor(
     }
 }
 
+/// C1: where the OS cursor's top-left lands in the final (possibly scaled)
+/// frame — the live screen position minus the cursor hotspot.
+///
+/// Split out of `paint_cursor` so the repeat path (#70) can tell whether a
+/// repaint is due (`cursor_draw_pos` changed) without painting into anything.
+fn cursor_draw_pos(
+    dst_w: u32,
+    dst_h: u32,
+    src_w: u32,
+    src_h: u32,
+    cur: &CursorData,
+) -> (i32, i32) {
+    let (ox, oy) = virtual_origin();
+    let (csx, csy) = cursor_pos();
+    let hx = ((csx - ox) as i64 * dst_w as i64 / src_w.max(1) as i64) as i32;
+    let hy = ((csy - oy) as i64 * dst_h as i64 / src_h.max(1) as i64) as i32;
+    (hx - cur.hotx, hy - cur.hoty)
+}
+
 /// C1: paint the OS cursor at its hotspot position, translated from screen
-/// coordinates into the final (possibly scaled) frame coordinates.
+/// coordinates into the final (possibly scaled) frame coordinates. Returns the
+/// top-left it drew at, which the repeat path remembers to detect movement.
 fn paint_cursor(
     buf: &mut [u8],
     dst_w: u32,
@@ -1246,20 +1429,44 @@ fn paint_cursor(
     src_w: u32,
     src_h: u32,
     cur: &CursorData,
-) {
-    let (ox, oy) = virtual_origin();
-    let (csx, csy) = cursor_pos();
-    let hx = ((csx - ox) as i64 * dst_w as i64 / src_w as i64) as i32;
-    let hy = ((csy - oy) as i64 * dst_h as i64 / src_h as i64) as i32;
+) -> (i32, i32) {
+    let (x, y) = cursor_draw_pos(dst_w, dst_h, src_w, src_h, cur);
     draw_cursor(
         buf,
         dst_w as usize * 4,
         dst_w as i32,
         dst_h as i32,
-        hx - cur.hotx,
-        hy - cur.hoty,
+        x,
+        y,
         cur,
     );
+    (x, y)
+}
+
+/// #70: `paint_cursor` plus the identity a later beat compares against.
+/// `None` means "this frame carries no cursor" (hidden or not yet captured),
+/// which is itself a state worth repainting *away* when it changes.
+fn paint_cursor_state(
+    buf: &mut [u8],
+    dst_w: u32,
+    dst_h: u32,
+    src_w: u32,
+    src_h: u32,
+    cur: Option<&CursorData>,
+) -> Option<(i32, i32, u64)> {
+    let cur = cur?;
+    let (x, y) = paint_cursor(buf, dst_w, dst_h, src_w, src_h, cur);
+    Some((x, y, cur.id))
+}
+
+/// #70: snapshot a frame *before* the cursor goes onto it, so a repeat beat can
+/// repaint on clean pixels. Painting over an already-painted frame would leave
+/// a trail of every previous pointer position behind the moving one.
+fn keep_pristine(dst: &mut Vec<u8>, src: &[u8]) {
+    if dst.len() != src.len() {
+        dst.resize(src.len(), 0);
+    }
+    dst.copy_from_slice(src);
 }
 
 fn settle_beat(next_deadline: &mut Instant, spf: Duration) {
