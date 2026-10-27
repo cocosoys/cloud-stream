@@ -1,0 +1,23 @@
+[workspace]
+members = [
+  "vendor/hbb_common",
+  "vendor/base",
+  "vendor/scrap",
+  "crates/bench-capture",
+  "crates/stream-server",
+]
+# 0d smoke crate 是独立工程，不并入本 workspace
+exclude = ["crates/shell"]
+resolver = "2"
+
+[profile.dev]
+# 2 vCPU / 8 GB build host: 限并行代码生成块，压低首次全量编译内存峰值
+codegen-units = 2
+
+# Stage1: webrtc fork patch 提升到 workspace 根（hbb_common 内部重复声明已删除）。
+# Keep the rev in lockstep with rustdesk's root Cargo.toml. webrtc >=0.14 pulls sdp 0.10 /
+# webrtc-util 0.12 which use usize::is_multiple_of (rustc >=1.87); pinned to 0.13 for Rust 1.75.
+[patch.crates-io]
+webrtc = { git = "https://github.com/rustdesk-org/webrtc", rev = "49c89bd8d30e6e62e4c1a96cee38fdc11f79ef63" }
+webrtc-util = { git = "https://github.com/rustdesk-org/webrtc", rev = "49c89bd8d30e6e62e4c1a96cee38fdc11f79ef63" }
+webrtc-sctp = { git = "https://github.com/rustdesk-org/webrtc", rev = "49c89bd8d30e6e62e4c1a96cee38fdc11f79ef63" }

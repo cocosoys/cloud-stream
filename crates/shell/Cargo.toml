@@ -1,0 +1,17 @@
+[package]
+name = "cloud-shell"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Stage 0 smoke crate: verify Rust toolchain + MSVC linker + crates mirror before any scrap/hbb_common code."
+
+# 0d 不引入 scrap / hbb_common / webrtc / 任何 git fork；
+# serde + serde_json 仅用于验证 crates.io 镜像下载与编译链路通畅。
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.dev]
+# 8GB/2vCPU：dev 期 codegen-units=2 平衡编译速度与内存；
+# 主仓 release 的 lto=true / codegen-units=1 在阶段 0 不启用（会爆内存）。
+codegen-units = 2

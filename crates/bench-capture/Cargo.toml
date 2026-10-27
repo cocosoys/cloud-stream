@@ -1,0 +1,11 @@
+[package]
+name = "bench-capture"
+version = "0.1.0"
+edition = "2018"
+rust-version = "1.75"
+
+# 0e-2: workspace 链接验收。只枚举显示器，不实例化 Capturer、不建编码器；
+# 采集 + VP8 编码帧率/CPU 基线在 0e-3 接入。
+
+[dependencies]
+scrap = { path = "../../vendor/scrap" }

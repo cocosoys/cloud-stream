@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>阶段0 · Rust 编译环境安装清单（云游戏路线 A）</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='4' fill='%231a2230'/%3E%3Cpath d='M7 15l3.5-6 3 3.5L17 8v8H7z' fill='%231f5fbf'/%3E%3C/svg%3E">
+<style>
+:root{
+  --ink:#1a2230; --ink-2:#46536a; --muted:#7a8699; --line:#dbe2ec; --bg:#f5f7fa;
+  --panel:#ffffff; --code:#0f1b2d; --code-ink:#dbe7f6; --blue:#1f5fbf; --blue-bg:#eaf1fc;
+  --red:#c8323a; --red-bg:#fdeeee; --green:#1f8a52; --green-bg:#eaf6ef; --amber:#9a6a12; --amber-bg:#fdf5e6;
+}
+*{box-sizing:border-box;}
+html,body{margin:0;padding:0;background:var(--bg);color:var(--ink);font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif;font-size:14.5px;line-height:1.65;}
+.wrap{max-width:1180px;margin:0 auto;padding:28px 20px 80px;}
+header.top{border-bottom:2px solid var(--ink);padding-bottom:18px;margin-bottom:24px;}
+header.top .kicker{font-family:Consolas,monospace;font-size:12px;color:var(--blue);letter-spacing:.12em;}
+header.top h1{font-size:26px;margin:8px 0 6px;font-weight:700;}
+header.top .sub{color:var(--ink-2);font-size:14px;}
+.badges{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px;}
+.badge{font-family:Consolas,monospace;font-size:12px;padding:3px 10px;border:1px solid var(--line);border-radius:3px;background:var(--panel);color:var(--ink-2);}
+.badge.done{border-color:var(--green);color:var(--green);background:var(--green-bg);}
+.badge.now{border-color:var(--blue);color:var(--blue);background:var(--blue-bg);}
+section{margin:30px 0;}
+h2{font-size:19px;font-weight:700;border-left:4px solid var(--ink);padding-left:10px;margin:0 0 14px;}
+h3{font-size:15.5px;font-weight:600;margin:18px 0 8px;}
+table{width:100%;border-collapse:collapse;background:var(--panel);font-size:13.5px;table-layout:fixed;}
+th,td{border:1px solid var(--line);padding:8px 10px;vertical-align:top;text-align:left;word-break:break-word;}
+th{background:#eef2f7;font-weight:600;}
+code.inline{font-family:Consolas,monospace;background:#eef2f7;padding:1px 6px;border-radius:3px;font-size:12.8px;color:var(--blue);}
+.step{background:var(--panel);border:1px solid var(--line);border-radius:6px;margin:16px 0;overflow:hidden;}
+.step-h{display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--line);}
+.step-no{font-family:Consolas,monospace;font-weight:700;color:var(--panel);background:var(--ink);width:26px;height:26px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-size:13px;flex:none;}
+.step-h .t{font-weight:600;font-size:15px;}
+.step-b{padding:14px 16px;}
+pre{background:var(--code);color:var(--code-ink);font-family:Consolas,monospace;font-size:12.8px;padding:12px 14px;border-radius:5px;overflow-x:auto;line-height:1.55;margin:8px 0;}
+pre .c{color:#7f93ad;} pre .r{color:#ff9a9e;} pre .g{color:#93e2b6;} pre .b{color:#9ec7ff;}
+.note{border-left:3px solid var(--red);background:var(--red-bg);padding:10px 14px;margin:10px 0;border-radius:0 4px 4px 0;font-size:13.5px;}
+.note .lab{font-weight:700;color:var(--red);font-family:Consolas,monospace;font-size:12px;letter-spacing:.08em;}
+.ok{border-left:3px solid var(--green);background:var(--green-bg);padding:10px 14px;margin:10px 0;border-radius:0 4px 4px 0;font-size:13.5px;}
+.ok .lab{font-weight:700;color:var(--green);font-family:Consolas,monospace;font-size:12px;letter-spacing:.08em;}
+.warn{border-left:3px solid var(--amber);background:var(--amber-bg);padding:10px 14px;margin:10px 0;border-radius:0 4px 4px 0;font-size:13.5px;}
+.warn .lab{font-weight:700;color:var(--amber);font-family:Consolas,monospace;font-size:12px;letter-spacing:.08em;}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px;}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:14px 16px;}
+.card h4{margin:0 0 8px;font-size:14px;}
+ul.tight{margin:6px 0;padding-left:20px;}
+ul.tight li{margin:4px 0;}
+.mono{font-family:Consolas,monospace;font-size:12.5px;}
+.small{font-size:12.5px;color:var(--muted);}
+.gate{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:4px 16px 14px;}
+.gate li{margin:7px 0;}
+.legend{display:flex;flex-wrap:wrap;gap:16px;font-size:12.5px;color:var(--ink-2);margin:8px 0 0;}
+.legend span{display:inline-flex;align-items:center;gap:6px;}
+.dot{width:9px;height:9px;border-radius:50%;display:inline-block;}
+@media (max-width:760px){.grid2{grid-template-columns:1fr;} .wrap{padding:18px 12px;} table{font-size:12.5px;}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="top">
+  <div class="kicker">CLOUD-GAME STAGE 0 · ROUTE A · RUSTDESK BACKEND FORK</div>
+  <h1>阶段 0 · Rust 编译环境安装清单与裁剪清单</h1>
+  <div class="sub">主控 SERVER001（192.168.59.142，本机 Win11 Pro 26200 x64，2 vCPU / 8 GB）；目标：工具链跑通 → 空壳 crate 构建 → 采集基线。被控 CLIENT001（192.168.59.143）仅在 0e 阶段接收编译产物。</div>
+  <div class="badges">
+    <span class="badge done">0a 现状探查 已完成</span>
+    <span class="badge now">0b 本清单 进行中</span>
+    <span class="badge">0c 工具链安装</span>
+    <span class="badge">0d 空壳构建</span>
+    <span class="badge">0e 采集基线</span>
+  </div>
+  <div class="legend">
+    <span><i class="dot" style="background:var(--red)"></i>红针：必须照做的风险点/硬约束</span>
+    <span><i class="dot" style="background:var(--green)"></i>验收通过判据</span>
+    <span><i class="dot" style="background:var(--amber)"></i>待权衡取舍</span>
+  </div>
+</header>
+
+<section>
+  <h2>1. 本机现状快照（2026-10-22 实测）</h2>
+  <table>
+    <colgroup><col style="width:26%"><col style="width:34%"><col style="width:40%"></colgroup>
+    <thead><tr><th>项</th><th>实测结果</th><th>处置</th></tr></thead>
+    <tbody>
+      <tr><td>操作系统</td><td>Windows 11 Pro build 26200，x64</td><td>符合 MSVC host 要求</td></tr>
+      <tr><td>CPU / 内存 / 磁盘</td><td>2 vCPU；RAM 8.0 GB；C: 余约 113 GB</td><td>编译并发限制 2；工程与 vcpkg 一律落 C:</td></tr>
+      <tr><td>cargo / rustc / rustup</td><td>已就位：<span class="mono">rustc 1.75.0</span>、<span class="mono">cargo 1.75.0</span>、<span class="mono">rustup 1.29.2</span>，toolchain <span class="mono">1.75-x86_64-pc-windows-msvc</span> minimal default，目录 <span class="mono">%USERPROFILE%\.cargo\bin</span></td><td>rsproxy sparse 索引 + git-fetch-with-cli，已固化进 cargo config</td></tr>
+      <tr><td>vcpkg / cl / cmake / ninja / nasm / clang</td><td>已就位：vcpkg 2026-09-26 预编译（<span class="mono">C:\dev\vcpkg</span>）；MSVC 14.44.35207 + SDK 10.0.22621（vswhere 未注册实例，须 vcvars64.bat 前置初始化 PATH/INCLUDE/LIB）；CMake 4.4.3、Ninja 1.13.2、pwsh 7.6.6、Python 3.14.7 预置 PATH；LLVM 21.1.8 便携解压 <span class="mono">C:\dev\llvm</span>（bindgen libclang.dll）；NASM 3.01 由 vcpkg 自动获取</td><td>所有 cargo / vcpkg 命令沿用 build-shell.cmd / install-vcpkg-libs.cmd 的 vcvars 前置包装</td></tr>
+      <tr><td>git</td><td><span class="mono">C:\dev\git\cmd\git.exe</span> 可用</td><td>直接复用；cargo 配置 git-fetch-with-cli</td></tr>
+      <tr><td>winget</td><td>可用（<span class="mono">WindowsApps\winget.exe</span>）</td><td>Step 1 用 winget 装 Build Tools</td></tr>
+      <tr><td>RustDesk 源码副本</td><td><span class="mono">C:\Users\user\Desktop\rustdesk</span>（1.5.1，含 libs/hbb_common 子模块）</td><td>仅作源码参考与 path 依赖来源，不在主仓上直接 build</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section>
+  <h2>2. 版本锁定（依据 RustDesk 1.5.1 源码）</h2>
+  <table>
+    <colgroup><col style="width:22%"><col style="width:34%"><col style="width:44%"></colgroup>
+    <thead><tr><th>组件</th><th>锁定版本 / 参数</th><th>依据（本地副本路径 · 行号）</th></tr></thead>
+    <tbody>
+      <tr><td>Rust 工具链</td><td><span class="mono">1.75-x86_64-pc-windows-msvc</span>，default 固定；不装 latest stable</td><td><span class="mono">rustdesk\Cargo.toml:9</span> <span class="mono">rust-version = "1.75"</span>；<span class="mono">libs\hbb_common\Cargo.toml:70-73</span> 注释：webrtc 0.13 栈钉在 rustc 1.75，升级会撞 <span class="mono">is_multiple_of</span> 1.87 门槛</td></tr>
+      <tr><td>MSVC 工具集</td><td>v143（VS2022 17.x），x86_64 Windows 静态 CRT</td><td>winapi 0.3 + windows 0.61 Windows 依赖（Cargo.toml:113-155）；scrap/build.rs:244-245 设置 crt-static</td></tr>
+      <tr><td>vcpkg triplet</td><td><span class="mono">x64-windows-static</span>（不可用 dynamic）</td><td><span class="mono">libs\scrap\build.rs:49-50</span> Windows 固定拼接 <span class="mono">{arch}-windows-static</span>，27-75 静态库链接</td></tr>
+      <tr><td>libvpx</td><td>1.15.2，启用 <span class="mono">realtime</span> feature；不启用 highbitdepth</td><td><span class="mono">res\vcpkg\libvpx\vcpkg.json:2-16</span>；portfile:72-74 <span class="mono">--enable-realtime-only</span></td></tr>
+      <tr><td>libyuv</td><td>1974；GitHub SSH mirror <span class="mono">lemenkov/libyuv</span> HEAD <span class="mono">47ba8e21…</span>；第一版 MSVC 直编、禁用 JPEG（<span class="mono">LIBYUV_DISABLE_JPEG=ON</span>），无 libjpeg-turbo 依赖；clang-cl 提速留到阶段 3 按基线数据再定</td><td>overlay 端口 <span class="mono">cloud-stream\vcpkg-ports\libyuv\portfile.cmake</span>；googlesource 与官方 GitHub 仓库在本网络不可达，旧 RustDesk 1857 overlay 已作废</td></tr>
+      <tr><td>编码器（阶段 0e 起）</td><td>先 VP8；VP9 / AV1 / 硬编全部关闭</td><td>已拍板：先 VP8，阶段 3 再评估 VP9；无 GPU 直通，hwcodec/vram/mediacodec/drm 关闭</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section>
+  <h2>3. 安装步骤（按顺序执行，每步附验收命令）</h2>
+
+  <div class="step">
+    <div class="step-h"><span class="step-no">1</span><span class="t">安装 VS2022 Build Tools（MSVC + Windows SDK + CMake/Ninja + LLVM）</span></div>
+    <div class="step-b">
+      <div class="small">只装 VCTools 工作负载，不带 .NET、不带桌面/UI  workload。LLVM 组件是 libyuv overlay portfile 的硬性前置（clang-cl）。</div>
+<pre><span class="c"># 管理员或普通用户均可；winget 走微软 CDN，国内可达</span>
+winget install --id Microsoft.VisualStudio.2022.BuildTools -e `
+  --override "--wait --quiet --norestart `
+  --add Microsoft.VisualStudio.Workload.VCTools `
+  --add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+  --add Microsoft.VisualStudio.Component.Windows11SDK.22621 `
+  --add Microsoft.VisualStudio.Component.VC.CMake.Project `
+  --add Microsoft.VisualStudio.Component.Ninja `
+  --add Microsoft.VisualStudio.Component.LLVM.Compiler `
+  --includeRecommended"</pre>
+      <div class="ok"><span class="lab">验收</span> 新开 PowerShell 执行：<span class="mono">&amp; "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath</span>，应输出非空实例路径；VC\Tools\MSVC 下存在 v143 目录；Windows Kits\10\Include 存在 10.0.22621 SDK。</div>
+      <div class="note"><span class="lab">红针</span> 安装结束必须<b>关闭并重开终端</b>，否则 PATH 与 vswhere 探测不到新实例；预留磁盘 8–12 GB；不要装 Visual Studio IDE 全量版本。</div>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-h"><span class="step-no">2</span><span class="t">安装 rustup 并固定 1.75 MSVC 工具链</span></div>
+    <div class="step-b">
+<pre><span class="c"># 先设镜像环境变量（当前会话），再下载 rustup-init；实测 rsproxy 可用，tuna rustup 404、中科大 403</span>
+$env:RUSTUP_DIST_SERVER = "https://rsproxy.cn/rustup"
+$env:RUSTUP_UPDATE_ROOT = "https://rsproxy.cn/rustup/rustup"
+
+Invoke-WebRequest -Uri "https://rsproxy.cn/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe" `
+  -OutFile "$env:TEMP\rustup-init.exe"
+
+<span class="c"># -y 自动确认；minimal profile 只装 rustc/cargo/rustup，不含文档与源码</span>
+& "$env:TEMP\rustup-init.exe" -y --default-toolchain 1.75-x86_64-pc-windows-msvc --profile minimal
+
+<span class="c"># 重开终端后固定 default 并验证</span>
+rustup default 1.75-x86_64-pc-windows-msvc
+rustc --version
+cargo --version
+rustup show</pre>
+      <div class="ok"><span class="lab">验收</span> <span class="mono">rustc --version</span> 显示 <span class="mono">rustc 1.75.x (… x86_64-pc-windows-msvc)</span>；<span class="mono">rustup show</span> host 行 = <span class="mono">x86_64-pc-windows-msvc</span>；<span class="mono">cargo --version</span> 同步为 1.75.x。</div>
+      <div class="note"><span class="lab">红针</span> 禁止执行 <span class="mono">rustup update stable</span> 或让工具链飘到 1.76+；<span class="mono">hbb_common</span> 与 webrtc 0.13 fork 按 1.75 ABI 钉版，升级是阶段 3 之后的独立决策。</div>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-h"><span class="step-no">3</span><span class="t">配置 cargo 国内镜像与 git 镜像</span></div>
+    <div class="step-b">
+      <div class="small">模板已生成：<span class="mono">cloud-stream\toolchain\config.toml</span>。复制为 cargo 用户配置：</div>
+<pre><span class="c"># 复制 cargo 镜像配置</span>
+New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.cargo" | Out-Null
+Copy-Item "C:\Users\user\Desktop\cloud-stream\toolchain\config.toml" "$env:USERPROFILE\.cargo\config.toml" -Force
+
+<span class="c"># 查看生效配置</span>
+Get-Content "$env:USERPROFILE\.cargo\config.toml"</pre>
+      <div class="small">配置内容（rsproxy sparse 索引 + 系统 git 拉取 git 依赖）：</div>
+<pre><span class="c"># config.toml</span>
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+[net]
+git-fetch-with-cli = true</pre>
+      <div class="warn"><span class="lab">待办 · 0e 前置</span> git fork 镜像表（rustdesk-org 各 fork）在 0d 空壳阶段<b>不需要</b>；进入 0e 引用 scrap/hbb_common 前，把 <span class="mono">toolchain\gitconfig-mirror.txt</span> 的 insteadOf 写入 <span class="mono">%USERPROFILE%\.gitconfig</span>，rustdesk-org 条目排在普通 github 条目前面。</div>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-h"><span class="step-no">4</span><span class="t">部署 vcpkg 到 C:\dev\vcpkg 并固化环境变量</span></div>
+    <div class="step-b">
+<pre><span class="c"># GitHub 直连失败时在 URL 前加 https://ghfast.top/ 前缀（已验证可用通道）</span>
+git clone https://github.com/microsoft/vcpkg.git C:\dev\vcpkg
+cd C:\dev\vcpkg
+.\bootstrap-vcpkg.bat -disableMetrics
+
+<span class="c"># 固化 VCPKG_ROOT、并发上限 2、PATH（用户级，幂等）</span>
+powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Users\user\Desktop\cloud-stream\toolchain\env-setup.ps1"</pre>
+      <div class="ok"><span class="lab">验收</span> 重开终端执行 <span class="mono">vcpkg version</span> 输出版本号；<span class="mono">$env:VCPKG_ROOT</span> = <span class="mono">C:\dev\vcpkg</span>；<span class="mono">$env:VCPKG_MAX_CONCURRENCY</span> = <span class="mono">2</span>。</div>
+      <div class="note"><span class="lab">红针</span> vcpkg 必须放在 <span class="mono">C:\dev\vcpkg</span> 固定路径——<span class="mono">scrap/build.rs:58-63</span> 从 <span class="mono">VCPKG_ROOT/installed/x64-windows-static</span> 拼库路径，路径漂移会导致链接期找不到 vpx.lib / yuv.lib。</div>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-h"><span class="step-no">5</span><span class="t">安装 C 静态库：libvpx[realtime] + libyuv（overlay 定制端口）</span></div>
+    <div class="step-b">
+      <div class="small">overlay 端口在 <span class="mono">cloud-stream\vcpkg-ports\</span>：libvpx 保留补丁 0003/0004 并把源码下载走 ghfast 代理；libyuv 为新写端口（GitHub SSH mirror、MSVC 直编、禁用 JPEG），用 <span class="mono">--overlay-ports</span> 覆盖 vcpkg 内置端口。</div>
+<pre>cmd /c "C:\Users\user\Desktop\cloud-stream\toolchain\install-vcpkg-libs.cmd" "libvpx[realtime]"
+cmd /c "C:\Users\user\Desktop\cloud-stream\toolchain\install-vcpkg-libs.cmd" libyuv
+
+<span class="c"># 验收：仅见 libvpx[realtime] / libyuv 及 vcpkg 框架传递依赖，无 aom/opus/ffmpeg</span>
+vcpkg list</pre>
+      <div class="ok"><span class="lab">验收 · 0c 实测已通过</span> <span class="mono">installed\x64-windows-static\lib</span> 下存在 <span class="mono">vpx.lib</span>（14,065,862 字节）、<span class="mono">yuv.lib</span>（3,574,066 字节）；<span class="mono">include\vpx</span> 11 个头文件、<span class="mono">include\libyuv</span> 24 个头文件就位；bin 与 debug/bin 残留 DLL/工具已清理。build.rs 链接约定按目录找库（去 <span class="mono">lib</span> 前缀得 <span class="mono">vpx</span>/<span class="mono">yuv</span>），不读 CMake config。</div>
+      <div class="note"><span class="lab">红针 · 裁剪范围</span> 本阶段<b>不装</b>：aom、opus、ffmpeg、mfx-dispatch、libsodium。理由见第 4 节裁剪清单；8 GB 内存下 aom 参考编码器全量静态编译峰值不可控。</div>
+      <div class="warn"><span class="lab">权衡分支 · aom</span> scrap 主仓 <span class="mono">build.rs:249</span> 无条件链接 aom，<span class="mono">common\mod.rs:54</span> 与 <span class="mono">codec.rs</span> 多处引用 AomEncoder/Decoder。<b>推荐分支（0e 执行）</b>：把 scrap 复制为独立裁剪副本，将 aom 模块与引用条件编译移除，避免编译 aom；<b>备选分支</b>：若裁剪引用点过多，再在 vcpkg 补装 aom:x64-windows-static，编译前关闭 MC/浏览器并把并发压到 1。两条分支在 0e 开工时按引用清点结果定，本清单不预装。</div>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-h"><span class="step-no">6</span><span class="t">环境变量复核与终端重开</span></div>
+    <div class="step-b">
+<pre><span class="c"># env-setup.ps1 已在 Step 4 固化用户级变量；本步只复核</span>
+[Environment]::GetEnvironmentVariable('VCPKG_ROOT','User')
+[Environment]::GetEnvironmentVariable('VCPKG_MAX_CONCURRENCY','User')
+[Environment]::GetEnvironmentVariable('Path','User')</pre>
+      <div class="note"><span class="lab">红针</span> setx 只对<b>新开终端</b>生效；后续所有 cargo / vcpkg 命令必须在 Step 1 之后新开的终端里执行，旧终端不继承新 PATH。</div>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-h"><span class="step-no">7</span><span class="t">阶段 0c 自检脚本（一键全量复核）</span></div>
+    <div class="step-b">
+<pre>powershell -NoProfile -ExecutionPolicy Bypass-File `
+  "C:\Users\user\Desktop\cloud-stream\toolchain\stage0-verify.ps1"</pre>
+      <div class="ok"><span class="lab">验收</span> 脚本输出 rustc / cargo / rustup / vcpkg / git 全 <span class="mono">[ OK ]</span>，vswhere 探测到 VS 实例与 MSVC 工具集、SDK；末行打印「自检通过：可以进入 0d 空壳构建」。任一项 <span class="mono">[FAIL]</span> 先回对应步骤修复，不进入 0d。</div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>4. 裁剪清单（阶段 0 → 阶段 1 不引入的代码与依赖）</h2>
+
+  <div class="grid2">
+    <div class="card">
+      <h4>4.1 工程形态</h4>
+      <ul class="tight">
+        <li>独立 crate <span class="mono">cloud-shell</span>（<span class="mono">crates\shell</span>）作为 0d 空壳；后续适配层在 <span class="mono">cloud-stream</span> 工程内增长。</li>
+        <li><b>不在 rustdesk 主仓上直接 cargo build</b>：主仓捆绑 Sciter UI、Flutter bridge、服务进程、托盘、剪贴板、终端、外设与平台服务，依赖面与 2 vCPU / 8 GB 不匹配。</li>
+        <li>path 依赖只取需要的子模块：libs\scrap（采集+VP8 编码）、libs\enigo（输入注入）。<span class="mono">hbb_common</span> 与 <span class="mono">base</span> 是 scrap 的硬 path 依赖（scrap\Cargo.toml:33-34），0e 即随 scrap 引入；hbb_common 的 <span class="mono">webrtc</span> feature 关闭（:11/:74 optional），第一版不链 webrtc-rs。</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>4.2 scrap features 关闭项</h4>
+      <ul class="tight">
+        <li><span class="mono">wayland</span>：Linux gstreamer/dbus/zbus 链，Windows 不生效（scrap\Cargo.toml:13）。</li>
+        <li><span class="mono">drm</span> / <span class="mono">mediacodec</span>：Linux/Android 后端（:23-24）。</li>
+        <li><span class="mono">hwcodec</span> / <span class="mono">vram</span>：无 GPU 直通，硬编路径全关（:26-27）。</li>
+        <li><span class="mono">linux-pkg-config</span>：关闭（:25）。</li>
+        <li>保留：Windows DXGI 采集、vpxcodec VP8、convert（libyuv）。</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>4.2.1 scrap 副本 aom 裁剪点（0e 实测行号，Windows 第一版不编 AV1）</h4>
+      <table>
+        <colgroup><col style="width:34%"><col style="width:18%"><col style="width:48%"></colgroup>
+        <thead><tr><th>文件</th><th>行号</th><th>处置</th></tr></thead>
+        <tbody>
+          <tr><td>libs\scrap\build.rs</td><td>:249</td><td>删除 <span class="mono">gen_vcpkg_package("aom", …)</span>：不链 aom.lib、不为 aom 生成 bindgen、不读 aom 头文件</td></tr>
+          <tr><td>src\common\mod.rs</td><td>:54</td><td>删除 <span class="mono">pub mod aom;</span>；:293/:304/:315/:328/:341/:353 的 <span class="mono">CodecFormat::AV1</span> 枚举变体与字符串映射保留（proto 消息仍携带，不产生原生链接）</td></tr>
+          <tr><td>src\common\codec.rs</td><td>:15</td><td>删除 <span class="mono">aom::{self, AomDecoder, AomEncoder, AomEncoderConfig}</span> use 句</td></tr>
+          <tr><td>src\common\codec.rs</td><td>:53</td><td>删除枚举变体 <span class="mono">AOM(AomEncoderConfig)</span></td></tr>
+          <tr><td>src\common\codec.rs</td><td>:106</td><td>删除 <span class="mono">av1: Option&lt;AomDecoder&gt;</span> 字段；:602 构造字面量同步删除 <span class="mono">av1,</span></td></tr>
+          <tr><td>src\common\codec.rs</td><td>:140-142</td><td>删除 <span class="mono">EncoderCfg::AOM(_)</span> 编码臂（VPX 臂保留）</td></tr>
+          <tr><td>src\common\codec.rs</td><td>:367 / :413</td><td>删除 <span class="mono">set_fallback</span> 与 <span class="mono">use_i444</span> 中的 AOM match 臂</td></tr>
+          <tr><td>src\common\codec.rs</td><td>:503 / :531-537</td><td>三元组去掉 <span class="mono">av1</span>；删除 <span class="mono">CodecFormat::AV1</span> decoder 创建分支</td></tr>
+          <tr><td>src\common\codec.rs</td><td>:654-660</td><td>删除 <span class="mono">video_frame::Union::Av1s</span> 分派分支</td></tr>
+          <tr><td>src\common\codec.rs</td><td>:739-760</td><td>删除私有函数 <span class="mono">handle_av1s_video_frame</span></td></tr>
+          <tr><td>src\common\codec.rs</td><td>:1039 起至文件尾</td><td>整段删除 <span class="mono">pub fn test_av1()</span>（内部唯一新建 AomEncoder 的演示函数）</td></tr>
+          <tr><td>src\common\codec.rs</td><td>:1033-1037</td><td><b>保留</b> <span class="mono">disable_av1()</span>：只判指针宽度，不引用 aom 原生符号；:196/:335/:436 三处调用同步保留</td></tr>
+          <tr><td>src\common\aom.rs</td><td>整文件</td><td>裁剪副本中删除，不参与编译</td></tr>
+        </tbody>
+      </table>
+      <div class="small">已核实：hwcodec/mediacodec/vram/wayland/drm 引用在原文均已被 <span class="mono">#[cfg(feature = …)]</span> 门控（codec.rs:8-13/:54-57/:107-118，mod.rs:43-49/:13-22），第一版不激活即不进编译图，无需逐行删除。</div>
+    </div>
+    <div class="card">
+      <h4>4.2.2 录屏 / 摄像头模块整体移除（0e-2 实测，非门控）</h4>
+      <ul class="tight">
+        <li><span class="mono">scrap\Cargo.toml</span>：删除 <span class="mono">webm</span>（rust-webm git）与 <span class="mono">nokhwa</span> 两个 git 依赖。rust-webm 子模块 <span class="mono">src\sys\libwebm</span> 指向 <span class="mono">chromium.googlesource.com</span>，该域 443 不通；cargo 生成 lockfile 阶段会克隆所有 target 平台声明的 git 仓库，target cfg 关不掉 fetch，故整条移除而非保留 cfg 门控。</li>
+        <li><span class="mono">src\common\record.rs</span>（录屏 webm mux）、<span class="mono">src\common\camera.rs</span>（nokhwa 摄像头）物理移出到 <span class="mono">toolchain\vendor-backup\scrap-removed-modules\</span>；<span class="mono">mod.rs</span> 删除两条模块声明。</li>
+        <li>需要 Linux / 录屏形态时，从原始副本 <span class="mono">C:\Users\user\Desktop\rustdesk\libs\scrap</span> 恢复对应文件。</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>4.2.3 Cargo.lock 锁版本与 0e-2 编译排障记录</h4>
+      <ul class="tight">
+        <li><b>锁版本复用主仓 lockfile</b>：主仓 <span class="mono">rustdesk\Cargo.lock</span> 复制为 workspace <span class="mono">cloud-stream\Cargo.lock</span>，锁内 <span class="mono">time 0.3.36 / 0.1.45</span>。初次生成 lockfile 时传递依赖上浮到 <span class="mono">time v0.3.55</span>（要求 edition2024，Rust 1.75 不支持）；复用主仓 lockfile 规避，首次 build 后按实际依赖闭包自动裁剪。</li>
+        <li><b>AV1 空臂补丁</b>：<span class="mono">codec.rs:504</span> 首编 <span class="mono">E0004 non-exhaustive patterns: CodecFormat::AV1 not covered</span>（Decoder::new 穷举 match 漏 AV1 臂）；已在 Unknown 臂前补 <span class="mono">CodecFormat::AV1 =&gt; { log::warn!("AV1 decoder disabled in this build"); }</span>，<span class="mono">valid</span> 保持 false。</li>
+        <li><b>良性 warning</b>：<span class="mono">vpxcodec.rs:181 unreachable pattern</span> 是删 AOM 后外层 <span class="mono">_</span> 兜底不可达，非阻塞。</li>
+        <li><b>webrtc patch 提升点（阶段 1 待办）</b>：hbb_common 内部 <span class="mono">[patch.crates-io]</span> 的 webrtc / webrtc-util / webrtc-sctp 三件套在成员 crate 内被忽略（<span class="mono">patch for the non root package will be ignored</span>）；阶段 0 未启用 webrtc optional feature 不影响编译，阶段 1 启用 webrtc 适配层时必须把这三条 patch 提升到 workspace 根 <span class="mono">Cargo.toml</span>。</li>
+        <li><b>fork SSH 拉取</b>：confy、sysinfo、tokio-socks、default_net、machine-uid、webrtc、hwcodec 七个 fork；<span class="mono">~/.gitconfig</span> 以 <span class="mono">[url "git@github.com:"] insteadOf</span> 将 HTTPS 改写 SSH，cargo 配置 <span class="mono">net.git-fetch-with-cli=true</span>。</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3>4.3 主仓依赖排除表（不编译、不下载）</h3>
+  <table>
+    <colgroup><col style="width:18%"><col style="width:52%"><col style="width:30%"></colgroup>
+    <thead><tr><th>分组</th><th>排除依赖（rustdesk\Cargo.toml 出处）</th><th>阶段处置</th></tr></thead>
+    <tbody>
+      <tr><td>UI / 窗口</td><td>sciter-rs（:100）、flutter_rust_bridge（:78）、tao（:173）、tray-icon（:172）、tiny-skia、softbuffer、fontdb、ttf-parser、image（:174）、arboard（:106）</td><td>阶段 1–2 浏览器页面即 UI，不建桌面窗口，全部不引入</td></tr>
+      <tr><td>服务 / 进程 / 外设</td><td>virtual_display、remote_printer（:151-152）、impersonate_system（:153）、windows-service（:150）、portable-pty（:108）、ctrlc（:104）、system_shutdown（:110）、qrcode-generator（:111）、wallpaper（:180）、clipboard-master（:107）、tauri-winrt-notification（:155）、shared_memory（:154）</td><td>阶段 4 服务化时按需要最小化回补，阶段 0–2 不编译</td></tr>
+      <tr><td>音频</td><td>cpal（:95）、ringbuf（:96）、magnum-opus（:68）、use_samplerate / use_rubato / use_dasp（:25-27，默认 use_dasp 需关闭）、opus vcpkg 包</td><td>阶段 3 音频链路开工再评估；0d/0e cargo 工程不挂音频 feature</td></tr>
+      <tr><td>网络中继 / 信令旧链</td><td>kcp-sys（:90）、stunclient（:89）、wol-rs（:77）、sys-locale（:101）、hbb_common webrtc feature（主仓 :55）</td><td>路线 A 由 Rust 内建 WS 信令 + 自建标准 PC 取代；kcp/中继/打洞第一版不接</td></tr>
+      <tr><td>平台无关但第一版不用</td><td>rdev（:80，enigo 内部依赖，随 enigo 引入，不单独在主仓引用）、repg、xxhash-rust、zstd（hbb_common 内部按需）</td><td>以子模块自身 Cargo.toml 为准，适配层不直接声明</td></tr>
+    </tbody>
+  </table>
+
+  <h3>4.4 vcpkg 包排除表（对照 vcpkg.json 原清单）</h3>
+  <table>
+    <colgroup><col style="width:24%"><col style="width:38%"><col style="width:38%"></colgroup>
+    <thead><tr><th>包</th><th>原清单出处</th><th>阶段 0–2 处置</th></tr></thead>
+    <tbody>
+      <tr><td>aom / aom(host)</td><td>vcpkg.json:3-11</td><td>不装；0e 裁剪 scrap 副本移除 aom 链接（见 5 节权衡分支）</td></tr>
+      <tr><td>opus / opus(host)</td><td>:29-35</td><td>阶段 3 音频再装</td></tr>
+      <tr><td>ffmpeg（amf/nvcodec/qsv）</td><td>:63-85</td><td>不装；hwcodec 关闭，无 GPU 直通</td></tr>
+      <tr><td>mfx-dispatch</td><td>:53-61</td><td>不装；同上</td></tr>
+      <tr><td>libsodium</td><td>:24-27（仅 windows arm64）</td><td>x64 无需</td></tr>
+      <tr><td>libjpeg-turbo</td><td>:16-22（旧 RustDesk overlay）</td><td>不拉入；改造版 libyuv 端口 <span class="mono">LIBYUV_DISABLE_JPEG=ON</span>（overlay 新 portfile）</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section>
+  <h2>5. 8 GB / 2 vCPU 内存防护条款（强制）</h2>
+  <table>
+    <colgroup><col style="width:30%"><col style="width:34%"><col style="width:36%"></colgroup>
+    <thead><tr><th>条款</th><th>设置</th><th>依据 / 原因</th></tr></thead>
+    <tbody>
+      <tr><td>vcpkg 并发</td><td><span class="mono">VCPKG_MAX_CONCURRENCY=2</span>（env-setup.ps1 已固化）；编译单个包峰值超限时临时改 1</td><td>libvpx/libyuv 静态多文件并行编译内存峰值与并发数成正比</td></tr>
+      <tr><td>cargo 并发</td><td><span class="mono">cargo build -j 2</span>；dev profile <span class="mono">codegen-units=2</span>（shell\Cargo.toml 已写）</td><td>2 vCPU 物理上限；避免编译期 OOM 杀进程</td></tr>
+      <tr><td>Release LTO 暂不启用</td><td>不沿用主仓 <span class="mono">Cargo.toml:285-289</span> 的 <span class="mono">lto=true / codegen-units=1</span>；阶段 3 性能调优期再开</td><td>LTO + 单 codegen unit 在 8 GB 上链接阶段即 OOM</td></tr>
+      <tr><td>aom 不参与编译</td><td>见 4.4 与 Step 5 权衡分支</td><td>aom 参考编码器 SIMD 源文件数量大，全量静态编译内存峰值超 16 GB 的历史记录常见</td></tr>
+      <tr><td>编译期进程隔离</td><td>vcpkg / cargo 编译期间关闭 MC 客户端、浏览器多余标签页；旧 Python 串流服务在 0c 前停止</td><td>被控 143 侧旧 python.exe PID 7532 空转仍在跑，0e 基线前清理</td></tr>
+      <tr><td>页面文件</td><td>保持系统托管，不手动禁用虚拟内存</td><td>8 GB 物理内存下编译峰值依赖页面文件兜底</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section>
+  <h2>6. 风险与回退表</h2>
+  <table>
+    <colgroup><col style="width:20%"><col style="width:32%"><col style="width:48%"></colgroup>
+    <thead><tr><th>风险点</th><th>现象</th><th>处置（按顺序）</th></tr></thead>
+    <tbody>
+      <tr><td>VS Build Tools 下载慢 / 超时</td><td>winget 卡在下载进度</td><td>改用官方离线引导 <span class="mono">vs_BuildTools.exe</span>，<span class="mono">--add</span> 参数与 Step 1 一致；仍失败则只保留 VCTools + Windows11SDK 两个组件，CMake/Ninja/LLVM 后置到 Step 5 前补装</td></tr>
+      <tr><td>rustup 镜像拉取超时</td><td>rustup-init 下载 403 / 连接重置</td><td>dist server 换官方直连 <span class="mono">https://static.rust-lang.org/rustup</span>（本机实测 200）；固定下载 <span class="mono">1.75.0</span> toolchain 包；不换 stable 版本号</td></tr>
+      <tr><td>crates.io 索引超时</td><td>cargo 拉包 403 / index 超时</td><td>config.toml 换中科大 sparse：<span class="mono">sparse+https://mirrors.ustc.edu.cn/crates.io-index/</span>；确认 <span class="mono">net.git-fetch-with-cli=true</span></td></tr>
+      <tr><td>git fork 克隆失败</td><td>cargo build 卡在 git clone，403/超时</td><td>0d 不引 fork；0e 先写 gitconfig insteadOf（ghfast 前缀）；仍失败按单点仓库换镜像直链</td></tr>
+      <tr><td>libvpx 编译 OOM / 中断</td><td>vcpkg 进程被终止、buildtrees 残留</td><td>并发压到 1；关闭其余进程；删除 <span class="mono">C:\dev\vcpkg\buildtrees\libvpx</span> 后重装；仅构建 release triplet</td></tr>
+      <tr><td>libyuv 找不到 clang</td><td>portfile 报 <span class="mono">Clang is required</span> FATAL_ERROR</td><td>复核 VS LLVM.Compiler 组件；或让 vcpkg 自行 acquire clang（删除环境中手动 CLANG 路径，由 vcpkg 下载官方 LLVM）</td></tr>
+      <tr><td>link.exe 未被 cargo 发现</td><td>cargo 报 <span class="mono">linker link.exe not found</span> / LINK 1181</td><td>新开终端；仍失败则在 VS 开发者命令行环境内执行 cargo；回装 VCTools 组件</td></tr>
+      <tr><td>静态库名不匹配</td><td>链接期 <span class="mono">LIB vpx.lib 未找到</span></td><td>核对 <span class="mono">VCPKG_ROOT\installed\x64-windows-static\lib</span> 目录；确认 triplet 未被改成 dynamic</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section>
+  <h2>7. 阶段 0 验收门</h2>
+  <div class="grid2">
+    <div class="gate card">
+      <h3>7.1 0d · 空壳构建通过条件</h3>
+      <ul class="tight">
+        <li><span class="mono">stage0-verify.ps1</span> 全部 <span class="mono">[ OK ]</span>，末行自检通过。</li>
+        <li><span class="mono">cd C:\Users\user\Desktop\cloud-stream\crates\shell</span> 后 <span class="mono">cargo build</span> 退出码 0；未拉取任何 scrap/hbb_common/webrtc/git fork。</li>
+        <li><span class="mono">cargo run</span> 输出 serde_json 序列化 JSON（arch= x86_64、os=windows、env=msvc）与 <span class="mono">[cloud-shell] build &amp; link OK</span>。</li>
+        <li>产物 <span class="mono">target\debug\cloud-shell.exe</span> 存在且可独立运行。</li>
+      </ul>
+    </div>
+    <div class="gate card">
+      <h3>7.2 0e · 采集基线通过条件</h3>
+      <ul class="tight">
+        <li>scrap 裁剪副本在本机编译通过；仅 VP8 + DXGI + libyuv，无 aom/hwcodec/音频模块进入编译图。</li>
+        <li>本机基线：100 帧采集 + VP8 编码，记录物理分辨率、采集 fps、单帧编码耗时、整机 CPU%、内存占用。</li>
+        <li>交叉编译/同构 x64 exe 推送到 143，SSH 远程运行同一套采样脚本，产出对照基线表。</li>
+        <li>旧 Python 串流服务在 0e 采样前停止，避免 CPU 基线被污染。</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>附录 · 源码依据索引（阶段 0 事实可回溯）</h2>
+  <table>
+    <colgroup><col style="width:34%"><col style="width:66%"></colgroup>
+    <thead><tr><th>本地路径</th><th>关键行号与结论</th></tr></thead>
+    <tbody>
+      <tr><td>rustdesk\Cargo.toml</td><td>:9 rust-version 1.75；:23-48 features 定义；:54 scrap path + wayland；:55 hbb_common webrtc；:78 flutter_rust_bridge optional；:90 kcp-sys fork；:100 sciter-rs；:102 enigo；:113-155 windows 依赖；:217 workspace members；:285-289 release LTO / codegen-units=1</td></tr>
+      <tr><td>rustdesk\vcpkg.json</td><td>:3-11 aom；:16-22 libjpeg-turbo；:24-27 libsodium；:29-35 opus；:37-43 libvpx；:45-51 libyuv；:53-61 mfx-dispatch；:63-85 ffmpeg；:87-97 overlay ports 与 baseline</td></tr>
+      <tr><td>libs\scrap\Cargo.toml</td><td>:13 wayland；:23 drm；:24 mediacodec；:25 linux-pkg-config；:26 hwcodec；:27 vram；:35 webm git；:77-78 nokhwa git</td></tr>
+      <tr><td>libs\scrap\build.rs</td><td>:27-75 link_vcpkg 静态库拼接（去 lib 前缀：libvpx→vpx、libyuv→yuv，按 installed/x64-windows-static/{lib,include} 目录约定找库，不读 CMake config）；:49-50 Windows = x64-windows-static；:247 libyuv find_package；:248 libvpx gen_vcpkg_package；:249 aom（0e 删除）；:250 libyuv bindgen；:244-245 强制 crt-static</td></tr>
+      <tr><td>libs\scrap\src\common\codec.rs</td><td>:15 aom use（0e 删）；:51-58 EncoderCfg 枚举；:103-123 Decoder 字段；:133-169 Encoder::new match；:361-401 set_fallback；:403-420 use_i444；:501-619 Decoder::new 构造；:640-660 帧类型分派；:711-736 handle_vpxs；:739-760 handle_av1s（0e 删）；:1033-1037 disable_av1（保留）；:1039+ test_av1（0e 整段删）</td></tr>
+      <tr><td>libs\scrap\src\common\mod.rs</td><td>:30-32 Windows dxgi 后端；:41-49 codec/convert/vpxcodec 模块与 hwcodec/mediacodec/vram feature 门控；:54 pub mod aom（0e 删）；:132-147 TraitCapturer trait；:178-207 Frame 与 Frame::to；:209-214 EncodeInput</td></tr>
+      <tr><td>libs\scrap\src\common\dxgi.rs</td><td>:12-41 Capturer 结构与 width/height；:19 Capturer::new(Display)；:43-59 TraitCapturer::frame/is_gdi/set_gdi；:121-179 Display（:124 primary 未实现，:129 Display::all() 枚举主用）</td></tr>
+      <tr><td>libs\hbb_common\Cargo.toml</td><td>:11 webrtc feature 开关；:33 confy fork；:37 tokio-socks fork；:44 sysinfo fork；:70-73 webrtc 0.13 / rustc 1.75 钉版注释；:74 webrtc optional；:77-80 default_net/machine-uid fork；:96-99 webrtc 三段 patch fork rev 锁定</td></tr>
+      <tr><td>res\vcpkg\libvpx\portfile.cmake</td><td>:1 static-only；:70 默认选项；:72-74 realtime；:76-78 highbitdepth；:82-103 MSYS/perl/NASM/MSBuild 链（已复制到 cloud-stream\vcpkg-ports\libvpx 并加 ghfast GITHUB_HOST）</td></tr>
+      <tr><td>res\vcpkg\libyuv\portfile.cmake</td><td><b>已作废</b>：旧 1857 版本强制 clang-cl 且依赖 libjpeg-turbo，1974 新版 OBJECT-library 结构不兼容 patch；0e 起以 cloud-stream\vcpkg-ports\libyuv 新端口为准（SSH mirror lemenkov/libyuv 47ba8e21…、MSVC 直编、LIBYUV_DISABLE_JPEG=ON）</td></tr>
+      <tr><td>README.md</td><td>:53-55 官方 Windows vcpkg 清单（libvpx/libyuv/opus/aom，本阶段裁剪后两包）</td></tr>
+    </tbody>
+  </table>
+  <p class="small">生成时间：2026-10-22 · 主控 SERVER001 · 路线 A 阶段 0 · 清单与脚本均位于 <span class="mono">C:\Users\user\Desktop\cloud-stream\</span></p>
+</section>
+
+</div>
+</body>
+</html>

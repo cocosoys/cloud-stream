@@ -1,0 +1,103 @@
+{
+  "src": "C:\\Users\\user\\Desktop\\cloud-stream\\docs\\stage1-design.html",
+  "url": "file:///C:/Users/user/Desktop/cloud-stream/docs/stage1-design.html",
+  "outdir": "C:\\Users\\user\\Desktop\\cloud-stream\\docs\\_shots",
+  "include": [
+    "lint",
+    "screenshots",
+    "structure"
+  ],
+  "shots": {
+    "desktop": {
+      "slices": [
+        "C:\\Users\\user\\Desktop\\cloud-stream\\docs\\_shots\\stage1-design_desktop_p1of6.jpg",
+        "C:\\Users\\user\\Desktop\\cloud-stream\\docs\\_shots\\stage1-design_desktop_p2of6.jpg",
+        "C:\\Users\\user\\Desktop\\cloud-stream\\docs\\_shots\\stage1-design_desktop_p3of6.jpg",
+        "C:\\Users\\user\\Desktop\\cloud-stream\\docs\\_shots\\stage1-design_desktop_p4of6.jpg",
+        "C:\\Users\\user\\Desktop\\cloud-stream\\docs\\_shots\\stage1-design_desktop_p5of6.jpg",
+        "C:\\Users\\user\\Desktop\\cloud-stream\\docs\\_shots\\stage1-design_desktop_p6of6.jpg"
+      ],
+      "sliceHint": "按顺序 Read slices 里的各分片。",
+      "truncated": false,
+      "structure": {
+        "title": "阶段1 · 媒体面最小闭环设计稿（云游戏路线 A）",
+        "firstH1": "阶段 1 · 媒体面最小闭环设计稿（模块划分 · 信令协议复刻 · WebRTC Patch 方案）",
+        "viewport": {
+          "w": 1416,
+          "h": 761
+        },
+        "fullpage": {
+          "w": 1416,
+          "h": 26338
+        },
+        "counts": {
+          "section": 11,
+          "h1": 1,
+          "h2": 11,
+          "img": 0,
+          "canvas": 0,
+          "svg": 0,
+          "links": 0,
+          "buttons": 0
+        }
+      },
+      "consoleErrors": [],
+      "consoleWarnings": [],
+      "horizontalOverflow": [],
+      "resourceErrors": [],
+      "reportSource": "cdp"
+    }
+  },
+  "engine": "chrome_cli",
+  "chromiumExec": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+  "engineDegraded": true,
+  "engineDegradedReason": "playwright 未装",
+  "elapsedSec": 13.46,
+  "schemaVersion": 2,
+  "status": "pass",
+  "engineInfo": {
+    "name": "chrome_cli",
+    "degraded": true,
+    "degradedReasons": [
+      "playwright 未装"
+    ]
+  },
+  "input": {
+    "original": "C:\\Users\\user\\Desktop\\cloud-stream\\docs\\stage1-design.html",
+    "resolvedPath": "C:\\Users\\user\\Desktop\\cloud-stream\\docs\\stage1-design.html",
+    "baseUrl": "file:///C:/Users/user/Desktop/cloud-stream/docs/stage1-design.html",
+    "protocol": "file",
+    "cwd": "C:\\Users\\user\\Desktop",
+    "mediaMode": {
+      "reducedMotion": true
+    }
+  },
+  "artifacts": {
+    "screenshots": [
+      {
+        "viewport": "desktop",
+        "tiles": [
+          "C:\\Users\\user\\Desktop\\cloud-stream\\docs\\_shots\\stage1-design_desktop_p1of6.jpg",
+          "C:\\Users\\user\\Desktop\\cloud-stream\\docs\\_shots\\stage1-design_desktop_p2of6.jpg",
+          "C:\\Users\\user\\Desktop\\cloud-stream\\docs\\_shots\\stage1-design_desktop_p3of6.jpg",
+          "C:\\Users\\user\\Desktop\\cloud-stream\\docs\\_shots\\stage1-design_desktop_p4of6.jpg",
+          "C:\\Users\\user\\Desktop\\cloud-stream\\docs\\_shots\\stage1-design_desktop_p5of6.jpg",
+          "C:\\Users\\user\\Desktop\\cloud-stream\\docs\\_shots\\stage1-design_desktop_p6of6.jpg"
+        ],
+        "visualCoverage": {
+          "complete": true,
+          "reason": null
+        }
+      }
+    ]
+  },
+  "summary": {
+    "blocker": 0,
+    "error": 0,
+    "warning": 0,
+    "info": 0
+  },
+  "findings": [],
+  "prioritizedActions": [],
+  "reportPath": "C:\\Users\\user\\Desktop\\cloud-stream\\docs\\_shots\\report.json"
+}

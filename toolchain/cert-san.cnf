@@ -1,0 +1,11 @@
+[req]
+distinguished_name=dn
+x509_extensions=ext
+prompt=no
+[dn]
+CN=192.168.59.148
+[ext]
+subjectAltName=IP:192.168.59.148,IP:192.168.59.143
+basicConstraints=CA:FALSE
+keyUsage=digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth

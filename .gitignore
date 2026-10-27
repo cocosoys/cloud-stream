@@ -1,0 +1,50 @@
+# ============================================================
+# cloud-stream .gitignore
+# 口径：只纳入「可重建」之外的源码/脚本/文档；构建产物、部署副本、
+# 诊断原始数据、私钥一律不入库（体积大或敏感，可随时重新生成）。
+# ============================================================
+
+# ---- Rust 构建产物（含 crates/shell 这种独立子工程自己的 target/）----
+target/
+**/target/
+**/*.pdb
+**/*.rlib
+**/*.rmeta
+**/*.d
+**/*.o
+
+# ---- 日志（构建 / 运行 / 探针输出）----
+/logs/
+/build-*.log
+/toolchain/*.log
+/toolchain/*.txt
+
+# ---- 部署与打包副本（由 dist / 部署流程生成）----
+/toolchain/dist-test/
+/toolchain/deploy143/
+/toolchain/vendor-backup/
+
+# ---- 大数据文件（JDK 压缩包等，本地自备）----
+/toolchain/*.zip
+/toolchain/*.7z
+/toolchain/*.jar
+
+# ---- 证书私钥（敏感，仅本地保留）----
+# 注意：只忽略 toolchain/ 下的自签证书；vendor/hbb_common/tests/data/*.pem
+# 是 RustDesk 上游的测试固件，被 include_bytes! 引用，必须入库。
+/toolchain/*.pem
+/toolchain/*.key
+/toolchain/*.pfx
+*.p12
+
+# ---- 采集/编码诊断原始数据（--dump-frame 可重生成）----
+/dump-triage/*.bmp
+/dump-triage/*.ivf
+
+# ---- 编辑器 / 系统 ----
+Thumbs.db
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/

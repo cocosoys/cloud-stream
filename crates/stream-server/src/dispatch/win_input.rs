@@ -1,0 +1,583 @@
+//! #54 real Windows input injection (`WinInputSink`).
+//!
+//! Replaces the stage1 `NullInputSink` stub: parses the selkies-webclient
+//! wire input messages and injects them with Win32 `SendInput` /
+//! `SetCursorPos`, matching RustDesk's native client interaction latency.
+//!
+//! Wire contract (input.js, verified):
+//! * `m,<x>,<y>,<mask>,<mag>,<seq>`    absolute pointer; x/y are **stream frame
+//!   pixels** (0..frame_w, 0..frame_h), not the 0-1000 normalisation that older
+//!   selkies docs claimed — see `frame_to_screen`
+//! * `m2,<dx>,<dy>,<mask>,<mag>,<seq>` relative pointer (server px); scroll
+//!   pulses ride mask bits 3(down)/4(up)/6(left)/7(right) with `mag` notches
+//! * `kd,<keysym>` / `ku,<keysym>`      key down / up (X11 keysym decimal)
+//! * `kh,<k1>,<k2>,...`                 held-key heartbeat (ensure pressed)
+//! * `kr`                               release all keys
+//! * `p,0|1`                            pointer-lock state (informational)
+//! * `SET_NATIVE_CURSOR_RENDERING,0|1`  cursor mode switch (informational)
+//! * `sf,<dx>,<dy>` / `sfe`             smooth-wheel fallback
+//! * `js,...`                           joystick (ignored)
+//!
+//! Button mask bits: 0=left, 1=middle, 2=right; 3/4 vertical wheel rising
+//! edge, 6/7 horizontal wheel rising edge.
+
+use std::os::raw::c_int;
+use std::sync::Mutex;
+
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, MapVirtualKeyW,
+    MOUSEINPUT, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
+    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
+    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, SendInput, VkKeyScanW, INPUT,
+    INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+
+use crate::pipeline::StreamSettings;
+
+use super::input_stub::InputSink;
+
+/// One press / release produced from a keysym.
+#[derive(Debug, Clone, Copy)]
+struct VkAction {
+    vk: u16,
+    /// Set when the key must ride on a modifier (shift for `!`, `@`, ...).
+    needs_shift: bool,
+}
+
+/// Translate an X11 keysym into a Windows VK (plus a shift hint for
+/// printable characters whose layout position requires Shift).
+fn keysym_to_vk(keysym: u32) -> Option<VkAction> {
+    // Printable ASCII: let Windows resolve the layout (US/ISO) — VkKeyScanW
+    // returns LOWORD=VK, HIWORD shift-state bits (1=shift, 2=ctrl, 4=alt).
+    if (0x20..=0x7e).contains(&keysym) {
+        let ch = keysym as u16;
+        let res = unsafe { VkKeyScanW(ch) };
+        if res == -1 {
+            return None;
+        }
+        let vk = (res as u16) & 0xff;
+        let needs_shift = ((res as u16) >> 8) & 1 != 0;
+        return Some(VkAction { vk, needs_shift });
+    }
+
+    // X11 function-key block (0xff00-0xffff), incl. XK_* named constants.
+    let vk = match keysym {
+        0xff08 => 0x08u16,            // BackSpace
+        0xff09 => 0x09,               // Tab
+        0xff0b => 0x0c,               // Clear
+        0xff0d => 0x0d,               // Return
+        0xff13 => 0x13,               // Pause
+        0xff14 => 0x91,               // Scroll_Lock
+        0xff1b => 0x1b,               // Escape
+        0xff50 => 0x24,               // Home
+        0xff51 => 0x25,               // Left
+        0xff52 => 0x26,               // Up
+        0xff53 => 0x27,               // Right
+        0xff54 => 0x28,               // Down
+        0xff55 => 0x21,               // Prior (PageUp)
+        0xff56 => 0x22,               // Next (PageDown)
+        0xff57 => 0x23,               // End
+        0xff61 => 0x2c,               // Print
+        0xff63 => 0x2d,               // Insert
+        0xff67 => 0x5d,               // Menu
+        0xff7f => 0x90,               // Num_Lock
+        0xffff => 0x2e,               // Delete
+        0xffe1 => 0xa0,               // Shift_L
+        0xffe2 => 0xa1,               // Shift_R
+        0xffe3 => 0xa2,               // Control_L
+        0xffe4 => 0xa3,               // Control_R
+        0xffe5 => 0x14,               // Caps_Lock
+        0xffe7 | 0xffeb => 0x5b,      // Meta_L / Super_L -> LWin
+        0xffe8 | 0xffec => 0x5c,      // Meta_R / Super_R -> RWin
+        0xffe9 => 0xa4,               // Alt_L
+        0xffea => 0xa5,               // Alt_R
+        0xffbe..=0xffd5 => 0x70u16 + (keysym - 0xffbe) as u16, // F1..F24 -> VK_F1..VK_F24
+        0xffb0..=0xffb9 => 0x60u16 + (keysym - 0xffb0) as u16, // KP_0..KP_9
+        0xff80 => 0x60,               // KP_Space (treated as numpad 0) — best effort
+        0xffaa => 0x6a,               // KP_Multiply
+        0xffab => 0x6b,               // KP_Add
+        0xffad => 0x6d,               // KP_Subtract
+        0xffae => 0x6e,               // KP_Decimal
+        0xffaf => 0x6f,               // KP_Divide
+        0xffbd => 0x6c,               // KP_Equal (separator-ish)
+        _ => return None,
+    };
+    Some(VkAction { vk, needs_shift: false })
+}
+
+/// Pointer state kept across messages so we can emit button / wheel
+/// transitions instead of absolute "current state" events.
+#[derive(Default)]
+struct InputState {
+    buttons_held: u32,
+    scroll_bits_prev: u32,
+    held_keys: Vec<u32>,
+}
+
+/// The real injection sink. All methods are `&self` and cheap: heavy work is a
+/// Win32 call, and the internal state is behind one `Mutex`.
+pub struct WinInputSink {
+    state: Mutex<InputState>,
+    /// #62: live stream frame size. The frontend sends `m,x,y` in frame pixels,
+    /// so the server must scale frame space -> screen space itself; 0 means
+    /// "unknown" and the coordinates pass through unchanged.
+    frame: StreamSettings,
+}
+
+impl Default for WinInputSink {
+    fn default() -> Self {
+        Self::new(StreamSettings::default())
+    }
+}
+
+impl WinInputSink {
+    /// Build a sink that maps frame-space pointer input onto the real screen
+    /// using the live `StreamSettings` (which the pipeline re-seeds to the
+    /// native display size and the client may override).
+    pub fn new(frame: StreamSettings) -> Self {
+        Self {
+            state: Mutex::new(InputState::default()),
+            frame,
+        }
+    }
+}
+
+fn screen_size() -> (i32, i32) {
+    (
+        unsafe { GetSystemMetrics(SM_CXSCREEN) },
+        unsafe { GetSystemMetrics(SM_CYSCREEN) },
+    )
+}
+
+/// Convert a 0-1000 normalized coordinate into screen pixels.
+fn normalized_to_px(v: f64, span: i32) -> i32 {
+    let span = span.max(1);
+    ((v.clamp(0.0, 1000.0) / 1000.0) * (span as f64 - 1.0)).round() as i32
+}
+
+/// Screen pixel -> the 0..65535 absolute range `SendInput` expects. Without
+/// `MOUSEEVENTF_VIRTUALDESK` this is the primary monitor, matching
+/// `GetSystemMetrics(SM_CXSCREEN/SM_CYSCREEN)`.
+fn absolute_norm(v: i32, span: i32) -> i32 {
+    let last = span.max(2) - 1;
+    ((v.clamp(0, last) as i64 * 65535) / last as i64) as i32
+}
+
+fn send_inputs(inputs: &mut [INPUT]) {
+    if inputs.is_empty() {
+        return;
+    }
+    let n = unsafe {
+        SendInput(
+            inputs.len() as u32,
+            inputs.as_mut_ptr(),
+            std::mem::size_of::<INPUT>() as i32,
+        )
+    };
+    if n != inputs.len() as u32 {
+        log::warn!("SendInput injected {n}/{} events", inputs.len());
+    }
+}
+
+fn key_input(vk: u16, down: bool) -> INPUT {
+    let mut scan = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) };
+    let mut flags: u32 = 0;
+    // Extended-key virtual codes need the extended flag so the injected scan
+    // code matches the physical key (RHS Ctrl/Alt, arrows, Insert/Delete...).
+    let extended = matches!(vk, 0xa1 | 0xa3 | 0xa5 | 0x25 | 0x26 | 0x27 | 0x28 | 0x2d | 0x2e | 0x6f);
+    if extended {
+        flags |= KEYEVENTF_EXTENDEDKEY;
+        scan = 0;
+    }
+    if !down {
+        flags |= KEYEVENTF_KEYUP;
+    }
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: vk,
+                wScan: scan as u16,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
+/// Absolute pointer move. #62: `SendInput` with
+/// `MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE` instead of `SetCursorPos`:
+/// `SetCursorPos` only moves the cursor, it produces no `WM_INPUT`, so any
+/// raw-input consumer (pointer-locked games, several Unity/UE titles) saw
+/// nothing at all. This path generates a real input event.
+fn mouse_move_abs(x: i32, y: i32) {
+    let (w, h) = screen_size();
+    send_inputs(&mut [INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: absolute_norm(x, w),
+                dy: absolute_norm(y, h),
+                mouseData: 0,
+                dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }]);
+}
+
+fn mouse_move_rel(dx: i32, dy: i32) {
+    if dx == 0 && dy == 0 {
+        return;
+    }
+    send_inputs(&mut [INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx,
+                dy,
+                mouseData: 0,
+                dwFlags: MOUSEEVENTF_MOVE,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }]);
+}
+
+fn mouse_button_event(flag_down: u32, flag_up: u32, down: bool) -> INPUT {
+    INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: 0,
+                dy: 0,
+                mouseData: 0,
+                dwFlags: if down { flag_down } else { flag_up },
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
+fn mouse_wheel_event(vertical: bool, notches: i32) -> INPUT {
+    // WHEEL_DELTA is a macro in winuser.h (120); windows-sys 0.52 does not
+    // re-export it, so the literal stands.
+    let delta = 120i32.saturating_mul(notches);
+    INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: 0,
+                dy: 0,
+                mouseData: delta as u32,
+                dwFlags: if vertical { MOUSEEVENTF_WHEEL } else { MOUSEEVENTF_HWHEEL },
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
+/// Diff the incoming button mask against the held state and emit the
+/// transitions (bit0 left, bit1 middle, bit2 right).
+fn sync_buttons(state: &mut InputState, mask: u32) {
+    let held = state.buttons_held & 0x7;
+    let next = mask & 0x7;
+    if held == next {
+        return;
+    }
+    let mut inputs = Vec::with_capacity(2);
+    for (bit, down_flag, up_flag) in [
+        (0u32, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
+        (1, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
+        (2, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
+    ] {
+        let was = held & (1 << bit) != 0;
+        let is = next & (1 << bit) != 0;
+        if was && !is {
+            inputs.push(mouse_button_event(down_flag, up_flag, false));
+        } else if !was && is {
+            inputs.push(mouse_button_event(down_flag, up_flag, true));
+        }
+    }
+    state.buttons_held = next;
+    if !inputs.is_empty() {
+        send_inputs(&mut inputs);
+    }
+}
+
+/// Diff the scroll bits (3/4 vertical, 6/7 horizontal) against the previous
+/// mask; each 0->1 rising edge emits one wheel pulse of `mag` notches.
+fn sync_scroll(state: &mut InputState, mask: u32, mag: i32) {
+    const SCROLL_BITS: u32 = 0b1100_1000;
+    let changed = (state.scroll_bits_prev ^ mask) & SCROLL_BITS;
+    let rising = changed & mask;
+    if rising == 0 {
+        state.scroll_bits_prev = mask & SCROLL_BITS;
+        return;
+    }
+    let mut inputs = Vec::with_capacity(4);
+    for (bit, vertical) in [
+        (3u32, true),
+        (4, true),
+        (6, false),
+        (7, false),
+    ] {
+        if rising & (1 << bit) != 0 {
+            // bit3/6 = down/left (negative delta), bit4/7 = up/right (positive).
+            let dir = if bit == 3 || bit == 6 { -1 } else { 1 };
+            inputs.push(mouse_wheel_event(vertical, dir * mag.max(1)));
+        }
+    }
+    state.scroll_bits_prev = mask & SCROLL_BITS;
+    if !inputs.is_empty() {
+        send_inputs(&mut inputs);
+    }
+}
+
+/// Press or release one key. A printable char that needs Shift emits a
+/// Shift-down first (and Shift-up after release) unless Shift is already held.
+fn inject_key(state: &InputState, keysym: u32, down: bool) {
+    let Some(action) = keysym_to_vk(keysym) else {
+        log::debug!("keysym 0x{keysym:x} not mapped; dropped");
+        return;
+    };
+    let shift_held = state
+        .held_keys
+        .iter()
+        .any(|&k| matches!(k, 0xffe1 | 0xffe2));
+    let mut inputs = Vec::with_capacity(3);
+    if down && action.needs_shift && !shift_held {
+        inputs.push(key_input(0x10, true)); // VK_SHIFT
+    }
+    inputs.push(key_input(action.vk, down));
+    if !down && action.needs_shift && !shift_held {
+        inputs.push(key_input(0x10, false));
+    }
+    send_inputs(&mut inputs);
+}
+
+impl WinInputSink {
+    /// #62: frame space -> screen space. The frontend's `m,x,y` are pixels in
+    /// the **streamed frame** (`_clientToServerX` = element-relative *
+    /// frame/element ratio), so a 1280x720 stream on a 1718x926 desktop sends at
+    /// most (1280,720): the right/bottom quarter of the screen was unreachable.
+    /// Scale by the live frame size; when it is unknown the values pass through
+    /// unchanged.
+    fn frame_to_screen(&self, x: i32, y: i32) -> (i32, i32) {
+        let (fw, fh) = (self.frame.width(), self.frame.height());
+        let (sw, sh) = screen_size();
+        if fw == 0 || fh == 0 {
+            return (x, y);
+        }
+        let map = |v: i32, frame: u32, screen: i32| -> i32 {
+            let last = screen.max(1) as i64 - 1;
+            ((v as i64 * screen.max(1) as i64) / frame.max(1) as i64).clamp(0, last) as i32
+        };
+        (map(x, fw, sw), map(y, fh, sh))
+    }
+
+    /// #62: the same frame -> screen ratio for relative deltas (`m2`, pointer
+    /// lock). Unscaled deltas make a locked pointer move only frame/screen of
+    /// the real distance, which reads as sluggish mouse sensitivity.
+    fn frame_to_screen_delta(&self, dx: i32, dy: i32) -> (i32, i32) {
+        let (fw, fh) = (self.frame.width(), self.frame.height());
+        let (sw, sh) = screen_size();
+        if fw == 0 || fh == 0 {
+            return (dx, dy);
+        }
+        let sx = (dx as f64 * sw as f64 / fw as f64).round() as i32;
+        let sy = (dy as f64 * sh as f64 / fh as f64).round() as i32;
+        (sx, sy)
+    }
+
+    /// Full wire-message parser. Called by the session for every C-group
+    /// line; unrecognized shapes are debug-logged and dropped.
+    fn handle(&self, line: &str) {
+        let (head, rest) = match line.split_once(',') {
+            Some((h, r)) => (h, r),
+            None => (line, ""),
+        };
+        match head {
+            "m" => {
+                let f: Vec<&str> = rest.splitn(5, ',').collect();
+                if f.len() < 4 {
+                    log::debug!("malformed m: {line}");
+                    return;
+                }
+                let Ok(x) = f[0].parse::<i32>() else { return };
+                let Ok(y) = f[1].parse::<i32>() else { return };
+                let Ok(mask) = f[2].parse::<u32>() else { return };
+                let Ok(mag) = f[3].parse::<f64>() else { return };
+                // #62: `m` carries stream-frame pixels; map them onto the
+                // physical screen before injecting (a 1:1 pass-through left the
+                // right/bottom of the desktop unreachable whenever the stream
+                // was scaled down).
+                let (sx, sy) = self.frame_to_screen(x, y);
+                mouse_move_abs(sx, sy);
+                if let Ok(mut st) = self.state.lock() {
+                    sync_buttons(&mut st, mask);
+                    let _ = mag;
+                }
+            }
+            "m2" => {
+                let f: Vec<&str> = rest.splitn(5, ',').collect();
+                if f.len() < 4 {
+                    log::debug!("malformed m2: {line}");
+                    return;
+                }
+                let Ok(dx) = f[0].parse::<i32>() else { return };
+                let Ok(dy) = f[1].parse::<i32>() else { return };
+                let Ok(mask) = f[2].parse::<u32>() else { return };
+                let Ok(mag) = f[3].parse::<i32>() else { return };
+                // #62: relative deltas are frame-space too; scale them so a
+                // locked pointer keeps a 1:1 feel on a scaled-down stream.
+                let (sdx, sdy) = self.frame_to_screen_delta(dx, dy);
+                mouse_move_rel(sdx, sdy);
+                if let Ok(mut st) = self.state.lock() {
+                    sync_buttons(&mut st, mask);
+                    sync_scroll(&mut st, mask, mag);
+                }
+            }
+            "kd" | "ku" => {
+                let Ok(keysym) = rest.parse::<u32>() else {
+                    log::debug!("malformed {head}: {line}");
+                    return;
+                };
+                let down = head == "kd";
+                let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                inject_key(&st, keysym, down);
+                if down {
+                    if !st.held_keys.contains(&keysym) {
+                        st.held_keys.push(keysym);
+                    }
+                } else {
+                    st.held_keys.retain(|&k| k != keysym);
+                }
+            }
+            "kh" => {
+                // Held-key heartbeat: make sure every listed keysym is down.
+                let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                for ks in rest.split(',') {
+                    let Ok(keysym) = ks.parse::<u32>() else { continue };
+                    if !st.held_keys.contains(&keysym) {
+                        inject_key(&st, keysym, true);
+                        st.held_keys.push(keysym);
+                    }
+                }
+            }
+            "kr" => {
+                let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                for &ks in &st.held_keys.clone() {
+                    inject_key(&st, ks, false);
+                }
+                st.held_keys.clear();
+            }
+            // Informational / no-op on the injection side.
+            "p" | "SET_NATIVE_CURSOR_RENDERING" | "js" | "sf" | "sfe" | "pointer" => {
+                log::debug!("[input] informational line: {line}");
+            }
+            _ => {
+                log::debug!("[input] unhandled line: {line}");
+            }
+        }
+    }
+}
+
+impl InputSink for WinInputSink {
+    fn mouse_absolute(&self, x: f64, y: f64, mask: u32, _magnitude: f64) {
+        let (w, h) = screen_size();
+        mouse_move_abs(normalized_to_px(x, w), normalized_to_px(y, h));
+        if let Ok(mut st) = self.state.lock() {
+            sync_buttons(&mut st, mask);
+        }
+    }
+
+    fn mouse_relative(&self, dx: f64, dy: f64, mask: u32, magnitude: f64) {
+        mouse_move_rel(dx as i32, dy as i32);
+        if let Ok(mut st) = self.state.lock() {
+            sync_buttons(&mut st, mask);
+            sync_scroll(&mut st, mask, magnitude as i32);
+        }
+    }
+
+    fn mouse_button(&self, pressed: bool, mask: u32) {
+        if let Ok(mut st) = self.state.lock() {
+            let next = if pressed { st.buttons_held | mask } else { st.buttons_held & !mask };
+            sync_buttons(&mut st, next);
+        }
+    }
+
+    fn mouse_wheel(&self, _dx: f64, dy: f64, _mask: u32) {
+        let notches = dy.round() as i32;
+        if notches != 0 {
+            send_inputs(&mut [mouse_wheel_event(true, notches)]);
+        }
+    }
+
+    fn key_down(&self, keysym: u32) {
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if !st.held_keys.contains(&keysym) {
+            inject_key(&st, keysym, true);
+            st.held_keys.push(keysym);
+        }
+    }
+
+    fn key_up(&self, keysym: u32) {
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        inject_key(&st, keysym, false);
+        st.held_keys.retain(|&k| k != keysym);
+    }
+
+    fn keys_sync(&self, held: Vec<u32>) {
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        for ks in held {
+            if !st.held_keys.contains(&ks) {
+                inject_key(&st, ks, true);
+                st.held_keys.push(ks);
+            }
+        }
+    }
+
+    fn keys_release_all(&self) {
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        for &ks in &st.held_keys.clone() {
+            inject_key(&st, ks, false);
+        }
+        st.held_keys.clear();
+    }
+
+    fn reset(&self) {
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        for &ks in &st.held_keys.clone() {
+            inject_key(&st, ks, false);
+        }
+        st.held_keys.clear();
+        // #62: a held mouse button must be released too, otherwise the host
+        // app keeps receiving a "pressed" state after the tab goes away.
+        sync_buttons(&mut st, 0);
+        st.scroll_bits_prev = 0;
+        log::info!("input state reset: held keys / buttons released");
+    }
+
+    fn note_stub(&self, line: &str) {
+        log::debug!("[input] note_stub (should not happen with WinInputSink): {line}");
+    }
+
+    fn handle_line(&self, line: &str) {
+        self.handle(line);
+    }
+}
+
+/// Re-export for wiring; keeps the alias stable for the session.
+pub type WinInputSinkRef = std::sync::Arc<dyn InputSink>;
+
+#[allow(dead_code)]
+fn _assert_c_int() -> c_int {
+    0
+}
