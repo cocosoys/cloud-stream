@@ -21,7 +21,7 @@
 | 4.3 节拍与错误阈值 | 采集错误连续 ≥3 次终止循环；无效帧不计入编码分组；新帧 `frame.to()` 失败记 `encode_err` 后不 sleep 继续下一拍 | `pipeline\mod.rs:206–241` |
 | 5.4 流水线统计 | `Timing`（sum/min/max/n）、`FrameCounters`（new/repeat/would_block/invalid/capture_err/encoded_ok/encode_no_output/encode_err/repeat_ok/repeat_skipped/write_sample_err）；`snapshot(window)` 出 `PipelineSnapshot`；`reset_window()` 清零 | `pipeline\stats.rs:16–122` |
 | 5.4 统计口径 | `encoded_fps=(new_frames+repeat_ok)/wall`（total 口径，对齐 bench v2 `fps(total)`）；`encode_ms` 仅新帧分组（Ok/VpxNoOutput/Err 同 bench `new_encode`），repeat 帧只计数不带计时；`pipeline_ms` 仅成功新帧端到端 | `pipeline\stats.rs:95–106`、`pipeline\mod.rs:244–279` |
-| 9.2 #3 主机采样器 | `cpu_percent`=本进程 `cpu_usage()`（单核口径）；`mem_used/mem_total`=主机口径；`refresh()` 只刷主机内存与本进程条目，不遍历全进程表；经 hbb_common re-export 的 sysinfo fork 0.29.10，不引第二份 | `platform\sysinfo.rs:27–63` |
+| 9.2 #3 主机采样器 | `cpu_percent`=**整机** CPU（全逻辑核平均，0–100，`sysinfo` 的 `global_cpu_info().cpu_usage()`；Windows 上即 PDH `\Processor(_Total)\% Idle Time` 取反）；`process_cpu_percent`=本进程单核口径（仅诊断）；`mem_used/mem_total`=主机口径；`refresh()` 刷整机 CPU + 主机内存 + 本进程条目，不遍历全进程表；经 hbb_common re-export 的 sysinfo fork 0.29.10，不引第二份。**口径变更（2026-10-27，用户要求）**：原为「本进程单核占比」，面板 4 vCPU 上「占满 1 核」与「整机满载」都显示 100%，无法反映设备健康度，故改为整机；不要改回 `process().cpu_usage()` | `platform\sysinfo.rs:1–120` |
 | 5.4 统计上链 | 1s 周期任务取 `PipelineStats::snapshot(1s)` 后 `reset_window()`；`StreamStats::from_host(host).with_pipeline(&snapshot)` 合并三字段再发 `stream_stats` | `signaling\websession.rs:334–365`、`dispatch\output.rs:56–73` |
 | 4.3 循环接线 | PC `Connected` 首次装配 `spawn_loop`（`loop_started` 防重入）；`START_VIDEO`/`STOP_VIDEO` 翻闸门；会话退出 `pipeline.stop_loop()` 停线程与闸门 | `signaling\websession.rs:316–319`、`133` |
 
@@ -212,7 +212,7 @@ video.write_sample(chunk.data, cfg.spf()).await?;
 
 | `stream_stats.data` 字段 | 本任务来源 | 前端面板位置 |
 | --- | --- | --- |
-| `cpu_percent` | `Sampler.sample().cpu_percent`（本进程单核口径） | 状态栏 CPU 行 |
+| `cpu_percent` | `Sampler.sample().cpu_percent`（**整机**口径 0–100，面板 CPU 条直接当占用率用） | 状态栏 CPU 行 / 仪表盘 CPU 表 |
 | `mem_used` / `mem_total` | 主机口径 `used_memory` / `total_memory` | 状态栏内存行 |
 | `encoded_fps` | `PipelineSnapshot.encoded_fps`（new+repeat 窗口均摊） | 面板 fps 服务端口 |
 | `encode_ms` | `PipelineSnapshot.encode_ms`（新帧分组均值，repeat 帧不计入） | 面板编码耗时行 |

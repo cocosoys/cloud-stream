@@ -55,7 +55,7 @@
 | --- | --- | --- | --- |
 | `pipeline` | `msg.data.status` 写入状态条（:736–737） | `pipeline(status)` → `{"type":"pipeline","data":{"status":…}}`（:67–69） | 一致 |
 | `stream_info` | `onstreaminfo(msg.data)` 整体上送 `streamStats.setInfo`（:738–741；core :3306） | `stream_info(info)` 含 backend/capture/zero_copy/zero_copy_available/capture_reason/encoder/hardware/gpu_present/hardware_expected/encoder_reason/codec/fullcolor/bit_depth/striped/gpu/driver/encode_node（:73–97） | 字段名与 `lib/stream-stats.js:46–71` typedef 逐项对齐；renderer 组为 wayland 可选字段，Windows 省略 |
-| `stream_stats` | `onstreamstats(msg.data)`（:742–745；core :3307）；服务端新鲜度阈值 3000ms | `stream_stats(s)` 含 cpu_percent/mem_used/mem_total/encoded_fps/encode_ms/pipeline_ms/throttled（:100–117）；gpu 组与 rtt_ms 有意省略 | 一致；#36 前 pipeline 指标为零值占位 |
+| `stream_stats` | `onstreamstats(msg.data)`（:742–745；core :3307）；服务端新鲜度阈值 3000ms | `stream_stats(s)` 含 cpu_percent（整机 0–100）/process_cpu_percent（本进程单核）/mem_used/mem_total/encoded_fps/encode_ms/pipeline_ms/throttled（:124–146）；gpu 组与 rtt_ms 有意省略 | 一致；#36 前 pipeline 指标为零值占位 |
 | `connection` | `onconnection(!!(msg.data && msg.data.poor))`（:746–749） | `connection(poor)` → `{"type":"connection","data":{"poor":…}}`（:120–122） | 一致；阶段 1 固定 `false` |
 | 其余 type | 未识别会报 `Unhandled message received`（:802–804） | 白名单外类型阶段 1 一律不发送 | 边界已记入第 6 节 |
 
@@ -139,7 +139,8 @@ ctx.pipeline.is_on();   // 采集循环每拍先读此闸门，关闭时不抓�
 // 主机口径采样器（platform::Sampler）：refresh() 后 sample() 出 HostSample
 let mut sampler = platform::Sampler::new().unwrap_or_default();
 sampler.refresh();
-let host: platform::HostSample = sampler.sample();   // cpu_percent=进程自身 CPU；
+let host: platform::HostSample = sampler.sample();   // cpu_percent=整机 CPU（0–100）；
+                                                    // process_cpu_percent=本进程单核；
                                                     // mem_used/mem_total=主机口径
 let stats = dispatch::StreamStats::from_host(host);
 // #36 再把 pipeline 聚合器的 encoded_fps / encode_ms / pipeline_ms / throttled 填入 stats
@@ -158,8 +159,10 @@ media.video().write_sample(bytes, cfg.spf()).await?;
 - 当前 stats 任务每 1s 在 `stats_on=true` 时构造 `StreamStats::from_host(host)`，pipeline 三字段为
   `Default` 零值；#36 接入 `PipelineStats::snapshot(window)` 后，把 `encoded_fps / encode_ms /
   pipeline_ms / throttled` 合并进同一 `StreamStats` 再发 `stream_stats`。
-- `cpu_percent` 口径为进程自身 CPU；`mem_used / mem_total` 为主机口径，与 0e bench 对齐
-  （设计稿 9.2 #3 用户拍板口径，不得回退为整机电 CPU 或进程内存）。
+- `cpu_percent` 口径为**整机** CPU（全逻辑核平均，0–100）；`mem_used / mem_total` 为主机口径。
+  2026-10-27 用户明确要求由「本进程单核占比」改为整机口径，理由是面板要让用户看设备健康度；
+  旧口径保留在 `process_cpu_percent`（后端 JSON 有，前端只作悬停说明）。`mem_used/mem_total`
+  仍为主机口径，不得回退为进程内存。
 
 ### 5.4 通道边界（不可串）
 

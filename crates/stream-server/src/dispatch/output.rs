@@ -51,7 +51,13 @@ impl StreamInfo {
 /// be forged here.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StreamStats {
+    /// Host-wide CPU utilisation, percent of all logical cores (0..=100). The
+    /// panel's `CPU` meter reads this: see `platform::sysinfo` for why it is not
+    /// this process's per-core figure.
     pub cpu_percent: f32,
+    /// This process alone, percent of one core. Diagnostics ("is the stream
+    /// server the one eating the CPU"), not the meter.
+    pub process_cpu_percent: f32,
     pub mem_used: u64,
     pub mem_total: u64,
     /// fps(total): new frames plus repeat frames over the stat window.
@@ -70,6 +76,7 @@ impl StreamStats {
     pub fn from_host(host: HostSample) -> Self {
         Self {
             cpu_percent: host.cpu_percent,
+            process_cpu_percent: host.process_cpu_percent,
             mem_used: host.mem_used,
             mem_total: host.mem_total,
             throttled: false,
@@ -126,7 +133,11 @@ pub fn stream_stats(s: &StreamStats) -> String {
     let v = json!({
         "type": "stream_stats",
         "data": {
+            // Whole-machine share, the figure the panel's CPU meter shows.
             "cpu_percent": s.cpu_percent,
+            // Per-core figure for this process; the panel keeps it for the
+            // tooltip/diagnostics and never draws it as a share of the host.
+            "process_cpu_percent": s.process_cpu_percent,
             "mem_used": s.mem_used,
             "mem_total": s.mem_total,
             "encoded_fps": s.encoded_fps,

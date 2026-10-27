@@ -441,6 +441,10 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
                 }
             };
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            // One line per session at the first sample: it settles "is the host
+            // loaded or is this process" without needing the browser, and it
+            // proves the whole-machine counter opened (it reads 0 if PDH failed).
+            let mut announced = false;
             loop {
                 tick.tick().await;
                 if !stats_flag.load(Ordering::SeqCst) {
@@ -448,6 +452,17 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
                 }
                 sampler.refresh();
                 let host: HostSample = sampler.sample();
+                if !announced {
+                    announced = true;
+                    log::info!(
+                        "host sample: cpu {:.1}% of {} logical cores (this process {:.1}% of one core), mem {:.0}/{:.0} MiB",
+                        host.cpu_percent,
+                        host.cpu_cores,
+                        host.process_cpu_percent,
+                        host.mem_used as f64 / 1048576.0,
+                        host.mem_total as f64 / 1048576.0,
+                    );
+                }
                 let stats_arc = stats_pipeline.stats();
                 // #62: snapshot + window reset must share one lock. Taken
                 // separately, counters accumulated between the two acquisitions
