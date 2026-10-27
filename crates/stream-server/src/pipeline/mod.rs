@@ -46,7 +46,7 @@ pub mod scale;
 pub mod settings;
 pub mod stats;
 
-pub use stats::{PipelineSnapshot, PipelineStats};
+pub use stats::{FrameCounters, PipelineSnapshot, PipelineStats};
 pub use capture::CaptureSource;
 pub use cursor::{cursor_data, cursor_info, cursor_png_b64, cursor_pos, draw_cursor, virtual_origin, CursorData};
 pub use encoder::VideoEncoder;
@@ -69,24 +69,38 @@ use tokio::sync::mpsc;
 use crate::config::Config;
 use crate::webrtc::VideoTrack;
 
-/// Fraction of spf the capturer is allowed to wait for a new frame; the rest
-/// of the beat is budget for the repeat encode and the settle sleep, so a
-/// WouldBlock + repeat still lands inside one spf (spf 33.3 ms -> ~13 ms).
-const CAPTURE_TIMEOUT_FRACTION: u64 = 40;
+/// #63: capture wait as a percentage of the beat (spf). Measured on the
+/// 1718x926 VM: a WouldBlock beat spent ~11 ms inside `AcquireNextFrame`, which
+/// on its own nearly fills the 16.7 ms a 60 fps beat has. The wait is pure loss
+/// when the desktop is static (DXGI yields nothing until something changes), so
+/// the poll is now short and the repeat path holds the cadence instead; the only
+/// cost is up to one beat of extra latency for brand-new content.
+const CAPTURE_TIMEOUT_FRACTION: u64 = 15;
 /// DXGI rebuild attempts allowed inside one recovery window (video_service.rs).
 const DXGI_RECOVERY_LIMIT: u32 = 3;
 /// Sliding window for the DXGI rebuild counter.
 const DXGI_RECOVERY_WINDOW: Duration = Duration::from_secs(10);
 /// #62: consecutive repeat (WouldBlock) frames that may be re-encoded before
-/// the loop stops sending and waits for a real frame. At 30 fps this is ~0.27 s
-/// of held picture, which is invisible; it bounds idle CPU on the 4vCPU host.
-const REPEAT_ENCODE_MAX: u32 = 8;
+/// the loop stops sending and waits for a real frame. #63 raised this from 8 to
+/// 600 after measuring: DXGI yields a real frame only when the desktop changes
+/// (an idle desktop produced ~2 new frames/s), so the repeat path *is* what
+/// holds the output cadence. With the cap at 8 the browser's fps counter
+/// collapsed to 10-16 on a static screen. A repeat re-encode costs ~4 ms at
+/// 720p, i.e. ~25% of one core at 60 fps — affordable on this host, and 600
+/// keeps a hard bound (10 s at 60 fps) instead of an unbounded loop.
+const REPEAT_ENCODE_MAX: u32 = 600;
 /// #62: minimum spacing between forced keyframes. The browser sends a PLI for
 /// every lost frame, and a keyframe is much larger than a P-frame, so an
 /// unthrottled response re-creates the loss that triggered it (PLI storm ->
 /// "clear / blurry" oscillation). One keyframe per 500 ms is the RustDesk /
 /// Chromium order of magnitude.
 const KEYFRAME_MIN_INTERVAL: Duration = Duration::from_millis(500);
+/// #63: how often the worker prints its own throughput counters. The 1 s
+/// `stream_stats` message only exists while the browser has subscribed, and it
+/// is invisible in the server log — without this line a low fps report has no
+/// server-side evidence at all (is the loop starving, is the capture dry, or is
+/// the encoder slow?).
+const STATS_LOG_INTERVAL: Duration = Duration::from_secs(5);
 /// #62: encode -> `write_sample` hand-off depth, in encoded frames (the sample
 /// map yields exactly one chunk per VP8 frame). Bounded on purpose: the
 /// forwarder stalls when the transport stalls, and an unbounded queue turns a
@@ -558,6 +572,18 @@ fn run_inner_beat(
     // #62: last forced keyframe, for the PLI debounce below.
     let mut last_keyframe: Option<Instant> = None;
     let mut gdi_err: u64 = 0;
+    // #63: loop-rate / frame-count probe (see `STATS_LOG_INTERVAL`).
+    let mut beats: u64 = 0;
+    let mut prev_counters = FrameCounters::default();
+    let mut last_stats_log = Instant::now();
+    // #63: per-window cost split — capture block vs. BGRA->YUV+scale.
+    let mut cap_wait_sum: f64 = 0.0;
+    let mut cap_wait_n: u64 = 0;
+    let mut conv_sum: f64 = 0.0;
+    let mut conv_n: u64 = 0;
+    // Last beat's conversion path, reported by the next stats line.
+    let mut last_scale = false;
+    let mut last_copy = false;
     let mut recovery = DxgiRecoveryState::new();
     // #59: last beat a DXGI restore was attempted while parked on GDI.
     let mut last_gdi_retry: Option<Instant> = None;
@@ -595,6 +621,64 @@ fn run_inner_beat(
         if handle.stopped.load(Ordering::SeqCst) {
             log::info!("pipeline loop stopped by session cleanup");
             return InnerOutcome::NormalStop;
+        }
+        // #63: periodic self-report so a "fps is low" report has server-side
+        // evidence (loop rate vs. capture rate vs. encode cost). Counters are
+        // differenced against the previous window; the session's 1 s stats tick
+        // keeps owning `reset_window`, so nothing is cleared here.
+        beats += 1;
+        let since_log = last_stats_log.elapsed();
+        if since_log >= STATS_LOG_INTERVAL {
+            let (c, enc_ms, pipe_ms) = {
+                let guard = stats.lock().unwrap_or_else(|p| p.into_inner());
+                (
+                    guard.counters,
+                    guard.encode_timing.avg_ms(),
+                    guard.pipeline_timing.avg_ms(),
+                )
+            };
+            let d = |now: u64, before: u64| now.saturating_sub(before);
+            let cap_avg = if cap_wait_n > 0 {
+                cap_wait_sum / cap_wait_n as f64
+            } else {
+                0.0
+            };
+            let conv_avg = if conv_n > 0 {
+                conv_sum / conv_n as f64
+            } else {
+                0.0
+            };
+            log::info!(
+                "pipeline {:.1}s: loop={:.1}Hz new={} repeat={} skip={} wb={} inv={} cap_err={} \
+                 enc_ok={} enc_no_out={} enc_err={} ws_err={} cap_wait={:.2}ms to={:.2}ms conv={:.2}ms \
+                 enc_avg={:.1}ms pipe_avg={:.1}ms scale={} carry={}",
+                since_log.as_secs_f64(),
+                beats as f64 / since_log.as_secs_f64(),
+                d(c.new_frames, prev_counters.new_frames),
+                d(c.repeat_ok, prev_counters.repeat_ok),
+                d(c.repeat_skipped, prev_counters.repeat_skipped),
+                d(c.would_block, prev_counters.would_block),
+                d(c.invalid, prev_counters.invalid),
+                d(c.capture_err, prev_counters.capture_err),
+                d(c.encoded_ok, prev_counters.encoded_ok),
+                d(c.encode_no_output, prev_counters.encode_no_output),
+                d(c.encode_err, prev_counters.encode_err),
+                d(c.write_sample_err, prev_counters.write_sample_err),
+                cap_avg,
+                capture_timeout_for(spf).as_secs_f64() * 1000.0,
+                conv_avg,
+                enc_ms,
+                pipe_ms,
+                last_scale,
+                last_copy
+            );
+            prev_counters = c;
+            beats = 0;
+            cap_wait_sum = 0.0;
+            cap_wait_n = 0;
+            conv_sum = 0.0;
+            conv_n = 0;
+            last_stats_log = Instant::now();
         }
         // #53: PLI/FIR from the browser -> force the next encode to a keyframe
         // so the receiver re-anchors its reference chain after packet loss.
@@ -682,7 +766,14 @@ fn run_inner_beat(
             }
         }
 
-        let frame = match source.frame(capture_timeout) {
+        let cap_start = Instant::now();
+        let frame_res = source.frame(capture_timeout);
+        // #63: how long the capturer actually blocked this beat, sampled on every
+        // beat (including WouldBlock). If it stays near zero, the capture poll is
+        // not the cost and the per-frame conversion/encode is.
+        cap_wait_sum += cap_start.elapsed().as_secs_f64() * 1000.0;
+        cap_wait_n += 1;
+        let frame = match frame_res {
             Ok(frame) => frame,
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
                 // #59: an idle desktop WouldBlocks on nearly every beat — DXGI
@@ -699,10 +790,10 @@ fn run_inner_beat(
                 // the previous *payload* again would double-apply its residual
                 // against the decoder's reference frame (colour smear on any
                 // moving content); a fresh encode of identical input yields a
-                // near-empty residual and keeps the chain exact. Past
-                // `REPEAT_ENCODE_MAX` consecutive beats the loop stops sending
-                // instead — a missing frame is invisible, a mismatched one is
-                // corruption.
+                // near-empty residual and keeps the chain exact.
+                // #63: the budget is large (600) because this path is what keeps
+                // the frame cadence alive on a static desktop — see
+                // `REPEAT_ENCODE_MAX`.
                 if repeat_budget > 0 && !last_yuv.is_empty() {
                     repeat_budget -= 1;
                     let pts = start.elapsed().as_millis() as i64;
@@ -778,98 +869,124 @@ fn run_inner_beat(
             continue;
         }
 
+        // #63: how long the capturer actually blocked this beat. If this stays
+        // near zero on WouldBlock beats, the capture poll is not the cost and the
+        // per-frame conversion is.
+        cap_wait_sum += cap_start.elapsed().as_secs_f64() * 1000.0;
+        cap_wait_n += 1;
+
         // New frame resets the repeat / fatal counters.
         gdi_err = 0;
         repeat_budget = REPEAT_ENCODE_MAX;
 
-        // #50+#51: convert to YUV. The native BGRA frame is always copied into
-        // `scratch_bgra` (PixelBuffer data is a read-only borrow), scaled to the
-        // client target when it differs, then the OS cursor is alpha-composited
-        // (C1) on the *final* resolution buffer so the cursor never distorts.
-        // `update_cursor` also emits the C2 cursor message on identity change.
+        // #50+#51+#63: convert to YUV. A mutable native-resolution BGRA copy is
+        // only required when the OS cursor must be composited (C1, pointer-lock
+        // mode) or the #60 dump is armed; in the default path the frontend draws
+        // its own cursor, so the scale/convert runs **directly on the captured
+        // buffer**. That removes a 6.4 MB memcpy from every frame, which was a
+        // measurable slice of the 60 fps beat budget on this VM.
         let cursor = update_cursor(&mut cursor_cache, &mut last_cursor_id, &handle);
         let native_len = (src_w * src_h * 4) as usize;
-        scratch_bgra.resize(native_len, 0);
-        match &frame {
-            Frame::PixelBuffer(pb) => {
-                // #62: the buffer length is the only cheap invariant here, and
-                // `copy_from_slice` panics on a mismatch — which used to kill
-                // the blocking worker silently (frozen picture, live stats).
-                // A desktop resize lands here before the outer scheduler knows
-                // about it, so treat it as a rebuild trigger instead.
-                if pb.width() != src_w as usize
-                    || pb.height() != src_h as usize
-                    || pb.data().len() < native_len
-                {
-                    log::warn!(
-                        "frame geometry changed ({}x{}, {} bytes) vs {}x{} ({} bytes): rebuilding",
-                        pb.width(),
-                        pb.height(),
-                        pb.data().len(),
-                        src_w,
-                        src_h,
-                        native_len
-                    );
-                    bump(&stats, |s| s.counters.invalid += 1);
-                    return InnerOutcome::Rebuild { from_gdi: on_gdi };
-                }
-                scratch_bgra.copy_from_slice(&pb.data()[..native_len]);
-            }
-            _ => {
-                log::warn!("frame conversion requires a pixel buffer frame");
-                bump(&stats, |s| s.counters.encode_err += 1);
-                settle_beat(&mut next_deadline, spf);
-                continue;
-            }
+        let scale_needed = (src_w, src_h) != (tw, th);
+        let cursor_on = handle.cursor_inject_on();
+        let need_native_copy = cursor_on || dump_frame.is_some();
+        last_scale = scale_needed;
+        last_copy = need_native_copy;
+
+        let Frame::PixelBuffer(pb) = &frame else {
+            log::warn!("frame conversion requires a pixel buffer frame");
+            bump(&stats, |s| s.counters.encode_err += 1);
+            settle_beat(&mut next_deadline, spf);
+            continue;
+        };
+        // #62: the buffer length is the only cheap invariant here, and
+        // `copy_from_slice` panics on a mismatch — which used to kill the
+        // blocking worker silently (frozen picture, live stats). A desktop resize
+        // lands here before the outer scheduler knows about it, so treat it as a
+        // rebuild trigger instead.
+        if pb.width() != src_w as usize
+            || pb.height() != src_h as usize
+            || pb.data().len() < native_len
+        {
+            log::warn!(
+                "frame geometry changed ({}x{}, {} bytes) vs {}x{} ({} bytes): rebuilding",
+                pb.width(),
+                pb.height(),
+                pb.data().len(),
+                src_w,
+                src_h,
+                native_len
+            );
+            bump(&stats, |s| s.counters.invalid += 1);
+            return InnerOutcome::Rebuild { from_gdi: on_gdi };
         }
-        let input = if (src_w, src_h) != (tw, th) {
+
+        let conv_start = Instant::now();
+        // #57 fix: the conversion target must match the *encoded* frame (tw, th),
+        // not whatever encoder the loop opened with; deriving it from the encoder
+        // can lag a resolution handover and trips scrap's `src rect > dst rect`
+        // guard (1920x1080 > 1718x926).
+        let mut yuv_target = yuvfmt.clone();
+        yuv_target.w = tw as usize;
+        yuv_target.h = th as usize;
+
+        let conv_result = if need_native_copy {
+            scratch_bgra.resize(native_len, 0);
+            scratch_bgra.copy_from_slice(&pb.data()[..native_len]);
+            if scale_needed {
+                scaled_buf.resize((tw * th * 4) as usize, 0);
+                bgra_scale(
+                    &scratch_bgra,
+                    src_w as usize,
+                    src_h as usize,
+                    &mut scaled_buf,
+                    tw as usize,
+                    th as usize,
+                );
+                // #57: composite only when the frontend handed pointer rendering
+                // over (pointer lock); otherwise it draws its native cursor and a
+                // second composited pointer would appear.
+                if cursor_on {
+                    if let Some(cur) = &cursor {
+                        paint_cursor(&mut scaled_buf, tw, th, src_w, src_h, cur);
+                    }
+                }
+                let scaled_pb = PixelBuffer::with_BGRA(&scaled_buf, tw as usize, th as usize);
+                convert_to_yuv(&scaled_pb, yuv_target, &mut yuv, &mut mid_data)
+            } else {
+                if cursor_on {
+                    if let Some(cur) = &cursor {
+                        paint_cursor(&mut scratch_bgra, src_w, src_h, src_w, src_h, cur);
+                    }
+                }
+                let pb_view = PixelBuffer::with_BGRA(&scratch_bgra, src_w as usize, src_h as usize);
+                convert_to_yuv(&pb_view, yuv_target, &mut yuv, &mut mid_data)
+            }
+        } else if scale_needed {
             scaled_buf.resize((tw * th * 4) as usize, 0);
             bgra_scale(
-                &scratch_bgra,
+                &pb.data()[..native_len],
                 src_w as usize,
                 src_h as usize,
                 &mut scaled_buf,
                 tw as usize,
                 th as usize,
             );
-            // #57: composite only when the frontend handed pointer rendering
-            // over (pointer lock); otherwise it draws its native cursor and a
-            // second composited pointer would appear.
-            if handle.cursor_inject_on() {
-                if let Some(cur) = &cursor {
-                    paint_cursor(&mut scaled_buf, tw, th, src_w, src_h, cur);
-                }
-            }
             let scaled_pb = PixelBuffer::with_BGRA(&scaled_buf, tw as usize, th as usize);
-            // #57 fix: the conversion target must match the *scaled* frame
-            // (tw, th), not whatever encoder the loop opened with. Deriving the
-            // format from the encoder can lag a resolution handover and trips
-            // scrap's `src rect > dst rect` guard (1920x1080 > 1718x926).
-            let mut yuvfmt_target = yuvfmt.clone();
-            yuvfmt_target.w = tw as usize;
-            yuvfmt_target.h = th as usize;
-            if let Err(err) = convert_to_yuv(&scaled_pb, yuvfmt_target, &mut yuv, &mut mid_data) {
-                log::warn!("scaled frame YUV conversion failed: {err:#}");
-                bump(&stats, |s| s.counters.encode_err += 1);
-                settle_beat(&mut next_deadline, spf);
-                continue;
-            }
-            EncodeInput::YUV(&yuv)
+            convert_to_yuv(&scaled_pb, yuv_target, &mut yuv, &mut mid_data)
         } else {
-            if handle.cursor_inject_on() {
-                if let Some(cur) = &cursor {
-                    paint_cursor(&mut scratch_bgra, src_w, src_h, src_w, src_h, cur);
-                }
-            }
-            let pb = PixelBuffer::with_BGRA(&scratch_bgra, src_w as usize, src_h as usize);
-            if let Err(err) = convert_to_yuv(&pb, yuvfmt.clone(), &mut yuv, &mut mid_data) {
-                log::warn!("frame YUV conversion failed: {err:#}");
-                bump(&stats, |s| s.counters.encode_err += 1);
-                settle_beat(&mut next_deadline, spf);
-                continue;
-            }
-            EncodeInput::YUV(&yuv)
+            let pb_view = PixelBuffer::with_BGRA(&pb.data()[..native_len], src_w as usize, src_h as usize);
+            convert_to_yuv(&pb_view, yuv_target, &mut yuv, &mut mid_data)
         };
+        conv_sum += conv_start.elapsed().as_secs_f64() * 1000.0;
+        conv_n += 1;
+        if let Err(err) = conv_result {
+            log::warn!("frame YUV conversion failed: {err:#}");
+            bump(&stats, |s| s.counters.encode_err += 1);
+            settle_beat(&mut next_deadline, spf);
+            continue;
+        }
+        let input = EncodeInput::YUV(&yuv);
         // `input` borrows `frame`/`yuv` through the encode call below; the live
         // backend this beat already equals the `on_gdi` snapshot taken before
         // `frame()`, so query the capturer again only after encoding completes.
