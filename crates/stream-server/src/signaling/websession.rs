@@ -518,6 +518,7 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
             // loaded or is this process" without needing the browser, and it
             // proves the whole-machine counter opened (it reads 0 if PDH failed).
             let mut announced = false;
+            let mut stats_announced = false;
             loop {
                 tick.tick().await;
                 if !stats_flag.load(Ordering::SeqCst) {
@@ -552,6 +553,24 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
                 let stats = StreamStats::from_host(host)
                     .with_pipeline(&snapshot)
                     .with_rtt(stats_latency.rtt_ms());
+                // #78: one line when a subscriber arrives. `stream_stats` is
+                // otherwise invisible in the log (it only exists while `_stats,1`
+                // is active), so "the panel is empty" had no server-side answer:
+                // this separates "we never sent" from "the browser drew nothing".
+                if !stats_announced {
+                    stats_announced = true;
+                    log::info!(
+                        "stream_stats: first sample sent (video {:.2}/{:.2} Mbps, peak {:.2}, send {:.1} ms, rtt {})",
+                        stats.video_mbps,
+                        stats.target_mbps,
+                        stats.peak_mbps,
+                        stats.send_ms,
+                        match stats.rtt_ms {
+                            Some(rtt) => format!("{rtt:.1} ms"),
+                            None => String::from("not measured yet"),
+                        }
+                    );
+                }
                 if let Err(err) = stats_media
                     .lock()
                     .await
