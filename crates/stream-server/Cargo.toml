@@ -53,3 +53,25 @@ windows-sys = { version = "0.52", features = [
 flate2 = "1.0"
 # #55: clipboard uplink chunks arrive base64-encoded (clipboard-worker-bridge).
 base64 = "0.22"
+# #77 audio: Opus encoder for the game-sound downlink and decoder for the mic
+# uplink. Links the locally built static libopus (`C:\dev\opus-static`, built
+# from xiph/opus v1.5.2 because vcpkg refuses this machine's BuildTools-only
+# VS install). See docs/stage3-audio-design.md section 3.2.
+audiopus = "0.2"
+# #77 audio capture: WASAPI loopback. `windows-sys` 0.52 ships the Media::Audio
+# constants but no COM interface methods, and the `wasapi` wrapper needs
+# edition2024 (this toolchain is rustc 1.75), so the COM surface comes from the
+# `windows` crate pinned to the same 0.52 release as `windows-sys`.
+windows = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Threading",
+    # IMMDevice's Activate vtable slot is gated on StructuredStorage + Variant.
+    "Win32_System_Variant",
+    # IMMDevice's whole `impl` block (Activate included) is gated on the
+    # property-store feature, because OpenPropertyStore lives in the same block.
+    "Win32_UI_Shell_PropertiesSystem",
+] }

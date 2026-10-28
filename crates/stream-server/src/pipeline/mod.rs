@@ -56,6 +56,7 @@
 //! The shared statistics behind the gate use a `std::sync::Mutex` so the blocking
 //! worker can update counters without crossing an await.
 
+pub mod audio;
 pub mod capture;
 pub mod cursor;
 pub mod encoder;

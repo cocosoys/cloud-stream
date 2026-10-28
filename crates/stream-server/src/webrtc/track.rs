@@ -25,7 +25,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
 use bytes::Bytes;
-use webrtc::api::media_engine::MIME_TYPE_VP8;
+use webrtc::api::media_engine::{MIME_TYPE_OPUS, MIME_TYPE_VP8};
 use webrtc::media::Sample;
 use webrtc::rtp_transceiver::RTCPFeedback;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
@@ -65,6 +65,69 @@ fn vp8_capability() -> RTCRtpCodecCapability {
 #[derive(Clone)]
 pub struct VideoTrack {
     inner: Arc<TrackLocalStaticSample>,
+}
+
+/// #77: the game-sound downlink track.
+///
+/// A separate `TrackLocalStaticSample` rather than a second SSRC on the video
+/// one: audio and video have different clocks, different codecs and different
+/// loss budgets, and WebRTC's own bundling already shares the transport.
+///
+/// Capability note — `stereo=1` and `minptime=10` are not decoration: the
+/// frontend reads them (`webrtc.js:31-34`) to decide how it may reshape the
+/// Opus line in its answer, and an omitted `stereo=1` makes Chrome downmix to
+/// mono, which silently costs the player positional cues.
+#[derive(Clone)]
+pub struct AudioTrack {
+    inner: Arc<TrackLocalStaticSample>,
+}
+
+impl AudioTrack {
+    pub fn new() -> Result<Self> {
+        let track = TrackLocalStaticSample::new(
+            opus_capability(),
+            "audio-0".to_owned(),
+            "stream-0".to_owned(),
+        );
+        Ok(Self {
+            inner: Arc::new(track),
+        })
+    }
+
+    pub fn as_track_local(&self) -> Arc<dyn TrackLocal + Send + Sync> {
+        Arc::clone(&self.inner) as Arc<dyn TrackLocal + Send + Sync>
+    }
+
+    /// Write one Opus packet. Duration is always one frame (20 ms): unlike
+    /// video, an audio sample must carry the real frame length or the
+    /// packetizer's RTP timestamps drift against the device clock.
+    pub async fn write_sample(&self, data: Bytes, duration: Duration) -> Result<()> {
+        let sample = Sample {
+            data,
+            timestamp: SystemTime::now(),
+            duration,
+            packet_timestamp: 0,
+            prev_dropped_packets: 0,
+            prev_padding_packets: 0,
+        };
+        self.inner.write_sample(&sample).await?;
+        Ok(())
+    }
+}
+
+/// Opus capability: 48 kHz stereo, in-band FEC on, no RTCP feedback.
+///
+/// Audio deliberately carries no NACK/PLI: a retransmitted audio packet is
+/// worthless by the time it arrives (the FEC copy already covered the gap), and
+/// asking for one only adds RTT to a stream that must stay continuous.
+fn opus_capability() -> RTCRtpCodecCapability {
+    RTCRtpCodecCapability {
+        mime_type: MIME_TYPE_OPUS.to_owned(),
+        clock_rate: 48_000,
+        channels: 2,
+        sdp_fmtp_line: "minptime=10;useinbandfec=1;stereo=1".to_owned(),
+        rtcp_feedback: vec![],
+    }
 }
 
 impl VideoTrack {

@@ -50,12 +50,15 @@ use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
 use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
+use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
 use webrtc::rtp_transceiver::rtp_sender::RTCRtpSender;
+use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection;
+use webrtc::rtp_transceiver::RTCRtpTransceiverInit;
 use webrtc::peer_connection::RTCPeerConnection;
 
 use channels::ControlChannels;
 use ice::RemoteCandidate;
-pub use track::VideoTrack;
+pub use track::{AudioTrack, VideoTrack};
 
 /// Session-visible media state mapped from the PC connection state. The
 /// signaling layer subscribes to `state_rx` to gate the capture loop and the
@@ -77,6 +80,8 @@ pub enum MediaState {
 pub struct MediaSession {
     pc: Arc<RTCPeerConnection>,
     video: VideoTrack,
+    /// #77: game-sound downlink track (Opus). Fed by `pipeline::audio`.
+    audio: AudioTrack,
     channels: ControlChannels,
     /// #53: the video `RTCRtpSender` (wrapped in Arc: the type is not Clone),
     /// retained so an RTCP PLI/FIR listener task can read the inbound feedback
@@ -134,6 +139,26 @@ impl MediaSession {
 
         let video = VideoTrack::new()?;
         let sender = pc.add_track(video.as_track_local()).await?;
+
+        // #77: the sound track first (produces `m=audio sendonly`), then an
+        // explicit recvonly transceiver for the microphone.
+        //
+        // Order is semantic, not cosmetic: the frontend reserves "the first
+        // recvonly audio m-line" as its microphone slot
+        // (`webrtc.js:_prepareUplinkTransceivers`). Adding the recvonly one
+        // first would make the browser attach the mic to the downlink m-line
+        // and leave the game silent.
+        let audio = AudioTrack::new()?;
+        pc.add_track(audio.as_track_local()).await?;
+        pc.add_transceiver_from_kind(
+            RTPCodecType::Audio,
+            Some(RTCRtpTransceiverInit {
+                direction: RTCRtpTransceiverDirection::Recvonly,
+                send_encodings: vec![],
+            }),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("add recvonly audio transceiver for the mic: {e}"))?;
 
         let channels = ControlChannels::open(&pc).await?;
 
@@ -222,6 +247,7 @@ impl MediaSession {
         Ok(Self {
             pc,
             video,
+            audio,
             channels,
             sender,
             state_tx,
@@ -343,6 +369,11 @@ impl MediaSession {
     /// Video track handle for the capture loop's `write_sample` calls.
     pub fn video(&self) -> &VideoTrack {
         &self.video
+    }
+
+    /// #77: audio track handle for the loopback thread's `write_sample` calls.
+    pub fn audio(&self) -> &AudioTrack {
+        &self.audio
     }
 
     /// Data channel handles for downstream JSON and the upstream command hook.

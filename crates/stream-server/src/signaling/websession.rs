@@ -104,6 +104,13 @@ struct SessionCtx {
     /// #55: Windows clipboard bridge for REQUEST_CLIPBOARD / cw-cwe uplink.
     clipboard: Arc<ClipboardSink>,
     stats_on: Arc<AtomicBool>,
+    /// #77: stop flag for the game-sound downlink thread. Set on Drop, which
+    /// covers every exit path (the thread is a plain OS thread, not a tokio
+    /// task, so `tasks.abort()` cannot reach it).
+    audio_stop: Arc<AtomicBool>,
+    /// #77: set once the audio thread was started for this session, so an ICE
+    /// reconnect does not open a second loopback capture on the same endpoint.
+    audio_started: bool,
     media: Option<Arc<Mutex<MediaSession>>>,
     /// #62: background tasks owned by this session (see `SessionTasks`).
     tasks: SessionTasks,
@@ -130,12 +137,22 @@ impl SessionCtx {
             input,
             clipboard: Arc::new(ClipboardSink::default()),
             stats_on: Arc::new(AtomicBool::new(false)),
+            audio_stop: Arc::new(AtomicBool::new(false)),
+            audio_started: false,
             media: None,
             tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
             cfg,
             ws_tx,
             done_tx,
         }
+    }
+}
+
+impl Drop for SessionCtx {
+    fn drop(&mut self) {
+        // #77: the loopback thread exits on this flag; its `write_sample` would
+        // otherwise keep pushing into a closed track until the next beat.
+        self.audio_stop.store(true, Ordering::Relaxed);
     }
 }
 
@@ -359,11 +376,13 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
     let watcher_clipboard = ctx.clipboard.clone();
     let watcher_settings = ctx.settings.clone();
     let watcher_tasks = ctx.tasks.clone();
+    let watcher_audio_stop = ctx.audio_stop.clone();
     push_task(
         &ctx.tasks,
         tokio::spawn(async move {
             let mut state_rx = state_rx;
             let mut loop_started = false;
+            let mut audio_started = false;
             loop {
                 if state_rx.changed().await.is_err() {
                     break;
@@ -411,6 +430,15 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
                             // transient Disconnected) never re-ran `on_open`, so
                             // the panel kept stale settings / capture state.
                             resend_notices(&watcher_media, &watcher_settings).await;
+                        }
+                        // #77: the sound track needs the same `Connected` gate as
+                        // video, but its own lifecycle — a second Connected must
+                        // not open a second loopback capture on the same endpoint.
+                        if !audio_started {
+                            audio_started = true;
+                            let audio = watcher_media.lock().await.audio().clone();
+                            crate::pipeline::audio::spawn(audio, watcher_audio_stop.clone());
+                            log::info!("audio downlink spawned after PC connected");
                         }
                     }
                     MediaState::Failed | MediaState::Closed => {
