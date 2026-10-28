@@ -1,8 +1,10 @@
 # L3 音频设计稿：游戏声音下行 + 麦克风上行
 
-> 状态：**设计，未实现**。这是 L3 完善的第一项（P0）。
-> 现状：服务端没有任何 audio m-line，`START_AUDIO` 在 `commands.rs:78` 直接 `Ignore`。
-> 前端 audio 区块（设备选择、码率、麦克风）因此在空转。
+> 状态：**下行已实现（#77，提交 `6a095e2`），上行待做**。
+> 已落地：WASAPI loopback 采集 + Opus 48k/立体声/64kbps + `audio-0` 轨道 +
+> recvonly 麦克风 m-line 预留。部署后在 148 实测 `audio: loopback open
+> 48000 Hz / 2 ch / 16-bit`，无编码错误。
+> 未落地：第 3 步（`on_track` → Opus 解码 → WASAPI render），即麦克风上行。
 
 ---
 
