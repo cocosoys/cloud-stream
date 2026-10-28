@@ -17,10 +17,43 @@
 // referenced as `crate::http::static` downstream.
 pub mod r#static;
 pub mod server;
+pub mod file_transfer;
 
 pub use server::serve;
 
 use std::path::PathBuf;
+
+/// Look up a request header value case-insensitively (shared by the HTTP
+/// accept loop and the file-transfer handlers).
+pub(crate) fn header_value<'h>(headers: &'h [httparse::Header<'_>], name: &str) -> Option<&'h [u8]> {
+    headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case(name))
+        .map(|h| h.value)
+}
+
+/// Write a plain `Connection: close` HTTP/1.1 response and shut the socket.
+pub(crate) async fn write_http<S: tokio::io::AsyncWrite + Unpin>(
+    stream: &mut S,
+    status: u16,
+    status_text: &str,
+    mime: &str,
+    body: &[u8],
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let head = format!(
+        "HTTP/1.1 {status} {status_text}\r\nContent-Type: {mime}\r\nContent-Length: {len}\r\n\
+         Connection: close\r\nCache-Control: no-cache\r\n\r\n",
+        status = status,
+        status_text = status_text,
+        mime = mime,
+        len = body.len(),
+    );
+    stream.write_all(head.as_bytes()).await?;
+    stream.write_all(body).await?;
+    let _ = stream.shutdown().await;
+    Ok(())
+}
 
 /// Classified request target.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +62,12 @@ pub enum Route {
     Signaling { app: String },
     /// Liveness probe.
     Status,
+    /// #67: file-transfer tree: `GET /api/files/{rel}` lists a directory or
+    /// streams a file attachment under the `--upload-dir` root.
+    Files { rel: String },
+    /// #67: `POST /api/upload` — raw octet-stream body with the destination
+    /// relative path in the `X-Upload-Path` header.
+    Upload,
     /// Static file path (relative to dist) to serve.
     Static(PathBuf),
     /// Unrecognized API segment or unsupported method; 404 / 400.
@@ -49,6 +88,10 @@ pub fn classify(path: &str, _app_name: &str) -> Route {
 
     match segments.as_slice() {
         ["api", "status"] => Route::Status,
+        ["api", "upload"] => Route::Upload,
+        ["api", "files", rest @ ..] => Route::Files {
+            rel: rest.join("/"),
+        },
         ["api", app, "signaling"] | ["api", app, "signaling", ""] => {
             Route::Signaling { app: (*app).to_owned() }
         }
@@ -89,5 +132,26 @@ mod tests {
             Route::Static(_)
         ));
         assert!(matches!(classify("/api/other", "webrtc"), Route::NotFound));
+    }
+
+    #[test]
+    fn routes_file_transfer() {
+        assert!(matches!(classify("/api/upload", "webrtc"), Route::Upload));
+        assert!(matches!(
+            classify("/api/files/", "webrtc"),
+            Route::Files { ref rel } if rel.is_empty()
+        ));
+        assert!(matches!(
+            classify("/api/files", "webrtc"),
+            Route::Files { ref rel } if rel.is_empty()
+        ));
+        assert!(matches!(
+            classify("/api/files/saves/world.zip", "webrtc"),
+            Route::Files { ref rel } if rel == "saves/world.zip"
+        ));
+        assert!(matches!(
+            classify("/api/files/a/b/", "webrtc"),
+            Route::Files { ref rel } if rel == "a/b"
+        ));
     }
 }

@@ -33,7 +33,7 @@ use tokio_rustls::{rustls, TlsAcceptor};
 use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 
 use crate::config::Config;
-use crate::http::{classify, r#static};
+use crate::http::{classify, file_transfer, header_value, r#static, write_http};
 use crate::signaling::websession;
 use crate::signaling::SessionRegistry;
 
@@ -41,24 +41,28 @@ use crate::signaling::SessionRegistry;
 /// byte. Static GETs and the signaling handshake carry none.
 const MAX_HEAD: usize = 16 * 1024;
 
-/// Read bytes until the empty line (`\r\n\r\n`) closes the request head.
-async fn read_head<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<Vec<u8>> {
-    let mut head = Vec::with_capacity(2048);
-    let mut chunk = [0u8; 1024];
+/// Read bytes until the empty line (`\r\n\r\n`) closes the request head. A
+/// single `read` may deliver head and body together; the bytes past the head
+/// terminator are returned as `extra` so a POST body is never lost (the 4 KiB
+/// read chunk frequently contains the first body bytes).
+async fn read_head<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<(Vec<u8>, Vec<u8>)> {
+    let mut buf = Vec::with_capacity(2048);
+    let mut chunk = [0u8; 4096];
     loop {
         let n = stream.read(&mut chunk).await?;
         if n == 0 {
-            return if head.is_empty() {
+            return if buf.is_empty() {
                 Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed before request head"))
             } else {
                 Err(io::Error::new(io::ErrorKind::InvalidData, "truncated request head"))
             };
         }
-        head.extend_from_slice(&chunk[..n]);
-        if head.windows(4).any(|w| w == b"\r\n\r\n") {
-            return Ok(head);
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(idx) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let end = idx + 4;
+            return Ok((buf[..end].to_vec(), buf[end..].to_vec()));
         }
-        if head.len() > MAX_HEAD {
+        if buf.len() > MAX_HEAD {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "request head exceeds 16 KiB",
@@ -114,36 +118,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
     }
 }
 
-/// Write a plain `Connection: close` HTTP/1.1 response and shut the socket.
-async fn write_http<S: AsyncWrite + Unpin>(
-    stream: &mut S,
-    status: u16,
-    status_text: &str,
-    mime: &str,
-    body: &[u8],
-) -> io::Result<()> {
-    let head = format!(
-        "HTTP/1.1 {status} {status_text}\r\nContent-Type: {mime}\r\nContent-Length: {len}\r\n\
-         Connection: close\r\nCache-Control: no-cache\r\n\r\n",
-        status = status,
-        status_text = status_text,
-        mime = mime,
-        len = body.len(),
-    );
-    stream.write_all(head.as_bytes()).await?;
-    stream.write_all(body).await?;
-    let _ = stream.shutdown().await;
-    Ok(())
-}
-
-/// Look up a request header value case-insensitively.
-fn header_value<'h>(headers: &'h [httparse::Header<'_>], name: &str) -> Option<&'h [u8]> {
-    headers
-        .iter()
-        .find(|h| h.name.eq_ignore_ascii_case(name))
-        .map(|h| h.value)
-}
-
 /// Build the rustls acceptor when both certificate and key paths are supplied;
 /// `None` keeps the plain HTTP stage1 fallback. Self-signed PEM chains are
 /// expected on the LAN deploy; client auth is disabled.
@@ -181,11 +155,15 @@ fn build_tls_acceptor(cfg: &Config) -> Result<Option<TlsAcceptor>> {
 
 /// One accepted TCP connection: route the request, answer static/status, or
 /// hand the upgraded signaling socket to the session task.
-async fn handle_connection<S>(stream: S, cfg: Arc<Config>, registry: SessionRegistry)
-where
+async fn handle_connection<S>(
+    stream: S,
+    cfg: Arc<Config>,
+    registry: SessionRegistry,
+    chunks: file_transfer::ChunkStore,
+) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    if let Err(err) = handle_inner(stream, cfg, registry).await {
+    if let Err(err) = handle_inner(stream, cfg, registry, chunks).await {
         log::debug!("connection closed: {err:#}");
     }
 }
@@ -194,11 +172,12 @@ async fn handle_inner<S>(
     mut stream: S,
     cfg: Arc<Config>,
     registry: SessionRegistry,
+    chunks: file_transfer::ChunkStore,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let head = read_head(&mut stream).await?;
+    let (head, mut extra) = read_head(&mut stream).await?;
     let mut headers: [httparse::Header<'_>; 64] =
         std::array::from_fn(|_| httparse::Header { name: "", value: &[] });
     let mut req = httparse::Request::new(&mut headers);
@@ -209,6 +188,49 @@ where
     let method = req.method.unwrap_or("GET");
     let path = req.path.unwrap_or("/");
     let route = classify(path, &cfg.app_name);
+
+    // #67: POST /api/upload carries the raw body; every other method is 405.
+    if method == "POST" {
+        if matches!(route, crate::http::Route::Upload) {
+            let clen = header_value(&headers, "Content-Length")
+                .and_then(|v| std::str::from_utf8(v).ok())
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(0);
+            if clen > file_transfer::MAX_UPLOAD_BODY {
+                write_http(
+                    &mut stream,
+                    413,
+                    "Payload Too Large",
+                    "application/json; charset=utf-8",
+                    br#"{"status":"error","message":"request body too large"}"#,
+                )
+                .await?;
+                return Ok(());
+            }
+            // The body may already have arrived with the head; read only the
+            // remaining bytes, never re-read what `read_head` consumed.
+            let mut body = Vec::with_capacity(clen);
+            body.extend_from_slice(&extra);
+            extra.clear();
+            let need = clen.saturating_sub(body.len());
+            if need > 0 {
+                let mut rest = vec![0u8; need];
+                stream.read_exact(&mut rest).await?;
+                body.extend_from_slice(&rest);
+            }
+            let _ = file_transfer::handle_upload(&mut stream, &headers, &body, &cfg, &chunks).await;
+            return Ok(());
+        }
+        write_http(
+            &mut stream,
+            405,
+            "Method Not Allowed",
+            "text/plain; charset=utf-8",
+            b"405 Method Not Allowed",
+        )
+        .await?;
+        return Ok(());
+    }
 
     if method != "GET" {
         write_http(
@@ -223,6 +245,23 @@ where
     }
 
     match route {
+        crate::http::Route::Files { rel } => {
+            let _ = file_transfer::handle_files(&mut stream, &rel, &cfg).await;
+            return Ok(());
+        }
+
+        // A GET to the upload endpoint is a method mismatch.
+        crate::http::Route::Upload => {
+            write_http(
+                &mut stream,
+                405,
+                "Method Not Allowed",
+                "text/plain; charset=utf-8",
+                b"405 Method Not Allowed",
+            )
+            .await?;
+            return Ok(());
+        }
         crate::http::Route::Status => {
             write_http(
                 &mut stream,
@@ -321,11 +360,15 @@ pub async fn serve(cfg: Arc<Config>) -> Result<()> {
     }
 
     let registry = SessionRegistry::default();
+    // #67: one chunked-upload registry per process; each upload slice is an
+    // independent TCP connection, so the registry is shared across them.
+    let chunks = file_transfer::new_chunk_store();
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
                 let cfg = cfg.clone();
                 let registry = registry.clone();
+                let chunks = chunks.clone();
                 match &acceptor {
                     Some(_) => {
                         // TlsAcceptor wraps an Arc<ServerConfig>; clone it into
@@ -334,7 +377,7 @@ pub async fn serve(cfg: Arc<Config>) -> Result<()> {
                         let acc = acceptor.clone().unwrap();
                         tokio::spawn(async move {
                             match acc.accept(stream).await {
-                                Ok(tls) => handle_connection(tls, cfg, registry).await,
+                                Ok(tls) => handle_connection(tls, cfg, registry, chunks).await,
                                 Err(err) => {
                                     log::debug!("TLS handshake failed from {peer}: {err:#}")
                                 }
@@ -343,7 +386,7 @@ pub async fn serve(cfg: Arc<Config>) -> Result<()> {
                     }
                     None => {
                         tokio::spawn(async move {
-                            handle_connection(stream, cfg, registry).await;
+                            handle_connection(stream, cfg, registry, chunks).await;
                         });
                     }
                 }
