@@ -29,7 +29,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, MapVirtualKeyW,
+    KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC,
+    MapVirtualKeyW,
     MOUSEINPUT, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
     MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
     MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, SendInput, VkKeyScanW, INPUT,
@@ -119,6 +120,66 @@ pub fn note_pointer_channel_msg(line: &str) {
     if n < 8 {
         log::info!("pointer channel <- {line}");
     }
+}
+
+/// X11's explicit Unicode keysym range: `0x01000000 | codepoint`.
+///
+/// The frontend's `_keysymFor()` emits this for every character outside
+/// Latin-1 (`input.js:965-971`), which is exactly the set a keyboard layout
+/// cannot produce directly: `中`, `日本語`, `Привет`, emoji.
+const XK_UNICODE_BASE: u32 = 0x0100_0000;
+
+/// Resolve a keysym to a Unicode scalar that must be injected as text.
+///
+/// Two encodings reach us:
+/// * `0x01000000 | codepoint` — everything the layout cannot type.
+/// * Latin-1 (`0x00a0..=0x00ff`) — X11 makes the keysym *be* the codepoint
+///   (`input.js:966`), e.g. `é` = 0xe9.
+///
+/// Both MUST bypass `VkKeyScanW`: no layout maps `é` or `中` to a virtual key,
+/// so it returns -1 and the character is dropped. That was the entire reason
+/// "Chinese cannot be typed" while plain ASCII worked — the pre-#76 mapping
+/// only accepted `0x20..=0x7e` and the 0xff00 function-key block.
+///
+/// Printable ASCII is deliberately *not* routed here: those characters carry
+/// layout semantics (`?` = Shift+`/`) that `VkKeyScanW` resolves correctly,
+/// and `KEYEVENTF_UNICODE` would bypass dead keys and the host IME.
+fn keysym_to_unicode(keysym: u32) -> Option<u32> {
+    let cp = if keysym & 0xff00_0000 == XK_UNICODE_BASE {
+        keysym & 0x00ff_ffff
+    } else if (0xa0..=0xff).contains(&keysym) {
+        keysym
+    } else {
+        return None;
+    };
+    char::from_u32(cp).map(|_| cp)
+}
+
+/// Presses that type one codepoint through `SendInput`.
+///
+/// A codepoint above the BMP has to travel as its two UTF-16 surrogate halves;
+/// Windows composes them back into a single character. Only presses are
+/// emitted — `KEYEVENTF_UNICODE` types the character on the down edge, so a
+/// matching release would type it twice.
+fn unicode_input(cp: u32) -> Vec<INPUT> {
+    let ch = char::from_u32(cp).unwrap_or('\u{fffd}');
+    let mut buf = [0u16; 2];
+    ch.encode_utf16(&mut buf)
+        .iter()
+        .filter(|&&unit| unit != 0)
+        .map(|&unit| INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: 0,
+                    wScan: unit,
+                    dwFlags: KEYEVENTF_UNICODE,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        })
+        .collect()
 }
 
 /// Translate an X11 keysym into a Windows VK (plus a shift hint for
@@ -490,6 +551,15 @@ fn sync_scroll(state: &mut InputState, mask: u32, mag: i32) {
 /// Press or release one key. A printable char that needs Shift emits a
 /// Shift-down first (and Shift-up after release) unless Shift is already held.
 fn inject_key(state: &InputState, keysym: u32, down: bool) {
+    // #76: text that no keyboard layout can produce (CJK, Cyrillic, emoji,
+    // accented Latin) goes in as a Unicode scan code, not as a virtual key.
+    if let Some(cp) = keysym_to_unicode(keysym) {
+        if down {
+            let mut inputs = unicode_input(cp);
+            send_inputs(&mut inputs);
+        }
+        return;
+    }
     let Some(action) = keysym_to_vk(keysym) else {
         log::debug!("keysym 0x{keysym:x} not mapped; dropped");
         return;
@@ -770,6 +840,34 @@ fn _assert_c_int() -> c_int {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #76: the split between "let the layout type it" and "send it as text".
+    /// Getting this wrong in either direction is user-visible: routing ASCII
+    /// through Unicode breaks dead keys, and routing CJK through the layout
+    /// drops the character entirely.
+    #[test]
+    fn keysyms_split_between_layout_and_text() {
+        // Explicit Unicode range: 中 = U+4E2D.
+        assert_eq!(keysym_to_unicode(0x0100_0000 | 0x4e2d), Some(0x4e2d));
+        // Latin-1: X11 makes the keysym *be* the codepoint.
+        assert_eq!(keysym_to_unicode(0xe9), Some(0xe9));
+        // ASCII must stay on the VkKeyScanW path (Shift, dead keys, IME).
+        assert_eq!(keysym_to_unicode(0x41), None);
+        assert_eq!(keysym_to_unicode(0x3f), None);
+        // Function keys are not text.
+        assert_eq!(keysym_to_unicode(0xff0d), None);
+        // Invalid scalar (surrogate) must not panic, just decline.
+        assert_eq!(keysym_to_unicode(0x0100_d800), None);
+    }
+
+    /// A BMP character is one press; an astral one has to travel as two
+    /// UTF-16 surrogate halves or Windows types a replacement character.
+    #[test]
+    fn unicode_presses_match_utf16_length() {
+        assert_eq!(unicode_input(0x4e2d).len(), 1);
+        assert_eq!(unicode_input(0x1f600).len(), 2);
+        assert_eq!(unicode_input(0xfffd).len(), 1);
+    }
 
     /// A 1:1 stream (the #66 default path: no client request, no scaling) must
     /// be a pixel-exact identity, including the last pixel.
