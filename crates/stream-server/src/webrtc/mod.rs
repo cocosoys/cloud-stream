@@ -55,6 +55,7 @@ use webrtc::rtp_transceiver::rtp_sender::RTCRtpSender;
 use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection;
 use webrtc::rtp_transceiver::RTCRtpTransceiverInit;
 use webrtc::peer_connection::RTCPeerConnection;
+use webrtc::track::track_remote::TrackRemote;
 
 use channels::ControlChannels;
 use ice::RemoteCandidate;
@@ -101,6 +102,16 @@ pub struct MediaSession {
     pending: Arc<Mutex<Vec<RemoteCandidate>>>,
     remote_applied: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
+
+    /// #79: stop flag for the microphone uplink thread. Owned here (not by the
+    /// session) because the `on_track` handler starts the thread and `close()`
+    /// has to be able to end it even when the PC dies without the session
+    /// noticing.
+    mic_stop: Arc<AtomicBool>,
+    /// #79: one uplink per session. `on_track` can fire again after a
+    /// renegotiation, and a second WASAPI render client on the same endpoint
+    /// would double every word.
+    mic_started: Arc<AtomicBool>,
 }
 
 impl MediaSession {
@@ -244,6 +255,52 @@ impl MediaSession {
             Box::pin(async {})
         }));
 
+        // #79: the microphone. The recvonly audio transceiver above only puts a
+        // slot in the SDP; until a handler exists here the browser's audio is
+        // dropped by the library with no error anywhere.
+        //
+        // The callback fires from a peek on the *first RTP packet*, not at
+        // negotiation time (peer_connection_internal.rs:1163-1193): the answer
+        // only says "sendonly", the browser attaches its track on a user
+        // gesture, and only then does media flow. So the uplink thread is
+        // started here rather than from the session's Connected branch — that
+        // branch may run minutes before anyone touches the microphone button.
+        let mic_stop = Arc::new(AtomicBool::new(false));
+        let mic_started = Arc::new(AtomicBool::new(false));
+        {
+            let mic_stop = mic_stop.clone();
+            let mic_started = mic_started.clone();
+            pc.on_track(Box::new(move |track: Arc<TrackRemote>, _recv, _trans| {
+                let mic_stop = mic_stop.clone();
+                let mic_started = mic_started.clone();
+                Box::pin(async move {
+                    if track.kind() != RTPCodecType::Audio {
+                        // The frontend reserves a video slot for a webcam too;
+                        // this offer never declares one, but a future one might.
+                        log::info!("ignoring inbound non-audio track {:?}", track.kind());
+                        return;
+                    }
+                    if mic_stop.load(Ordering::SeqCst) {
+                        log::info!("mic uplink: track arrived after teardown, dropped");
+                        return;
+                    }
+                    if mic_started.swap(true, Ordering::SeqCst) {
+                        log::info!("mic uplink: second audio track ignored (ssrc={})", track.ssrc());
+                        return;
+                    }
+                    let codec = track.codec();
+                    log::info!(
+                        "mic uplink: remote track ssrc={} {} {} Hz / {} ch",
+                        track.ssrc(),
+                        codec.capability.mime_type,
+                        codec.capability.clock_rate,
+                        codec.capability.channels
+                    );
+                    crate::pipeline::audio::spawn_uplink(track, mic_stop.clone());
+                })
+            }));
+        }
+
         Ok(Self {
             pc,
             video,
@@ -257,6 +314,8 @@ impl MediaSession {
             pending,
             remote_applied,
             closed: closed_owned,
+            mic_stop,
+            mic_started,
         })
     }
 
@@ -388,6 +447,9 @@ impl MediaSession {
         if self.closed.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
+        // #79: the uplink thread blocks on `read_rtp`; closing the PC makes that
+        // call return, but the flag ends the writer even if the reader is stuck.
+        self.mic_stop.store(true, Ordering::SeqCst);
         let _ = self.channels.close_all().await;
         let _ = self.pc.close().await;
         let _ = self.state_tx.send(MediaState::Closed);

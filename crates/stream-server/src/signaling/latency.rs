@@ -174,6 +174,7 @@ mod tests {
         // state machine (a sample was taken), not about the value.
         assert!(probe.on_reply().is_some());
         let first = probe.rtt_ms().expect("one sample folded");
+        assert!(first < 1.0, "first sample read {first} ms for a local reply");
         let _ = probe.ping_line();
         assert!(probe.on_reply().is_some());
         let second = probe.rtt_ms().expect("two samples folded");

@@ -47,6 +47,13 @@ pub enum Action {
     ClipboardChunk(String),
     /// `vb,<N>` (#56) — client video bitrate request; 0 restores automatic.
     SetBitrate(u32),
+    /// `START_AUDIO` / `STOP_AUDIO` (#80) — the frontend's sound toggle. The
+    /// browser mutes its own `<video>` either way; this is what stops the server
+    /// from spending 64 kbps on audio nobody hears.
+    SetAudioOn(bool),
+    /// `ab,<N>` (#80) — client audio bitrate request, bits per second
+    /// (`selkies-wr-core.js:2346` sends 128000 by default). 0 restores it.
+    SetAudioBitrate(u32),
     /// `SET_NATIVE_CURSOR_RENDERING,<0|1>` (#57) — frontend pointer-rendering
     /// handover. 1 = pointer lock, the frontend hides its native cursor and
     /// the pipeline composites the OS cursor into frames (C1); 0 = the
@@ -78,7 +85,8 @@ pub fn classify(line: &str) -> Action {
     match line {
         "START_VIDEO" => return Action::StartVideo,
         "STOP_VIDEO" => return Action::StopVideo,
-        "START_AUDIO" | "STOP_AUDIO" => return Action::Ignore(String::from(line)),
+        "START_AUDIO" => return Action::SetAudioOn(true),
+        "STOP_AUDIO" => return Action::SetAudioOn(false),
         "REQUEST_CLIPBOARD" => return Action::ClipboardRequest,
         "cr" => return Action::Ignore(String::from(line)),
         "kr" => return Action::InputStub(String::from(line)),
@@ -119,8 +127,16 @@ pub fn classify(line: &str) -> Action {
         }
         "SETTINGS" => Action::SetSettings(rest.to_owned()),
 
+        // ---- #80: client audio bitrate request `ab,<N>` (bits per second). ----
+        "ab" => {
+            match rest.trim().parse::<u32>() {
+                Ok(bps) => Action::SetAudioBitrate(bps),
+                Err(_) => Action::Unknown(line.to_owned()),
+            }
+        }
+
         // ---- B group: ignored after debug log. ----
-        "s" | "ab" | "_crf" | "_rc" | "_ebc"
+        "s" | "_crf" | "_rc" | "_ebc"
         | "cmd" | "_stats_video" | "_f" | "_l" => {
             Action::Ignore(head.to_owned())
         }
@@ -150,5 +166,31 @@ pub fn classify(line: &str) -> Action {
         | "_pointer_echo" | "pointer" | "sf" | "vp" => Action::InputStub(line.to_owned()),
 
         _ => Action::Unknown(line.to_owned()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #80: both audio switches used to land in `Action::Ignore`, which is why
+    /// the panel's mute button only muted the browser's own `<video>` while the
+    /// server kept encoding 64 kbps nobody could hear.
+    #[test]
+    fn audio_switches_reach_the_encoder() {
+        assert!(matches!(classify("START_AUDIO"), Action::SetAudioOn(true)));
+        assert!(matches!(classify("STOP_AUDIO"), Action::SetAudioOn(false)));
+        assert!(matches!(
+            classify("ab,128000"),
+            Action::SetAudioBitrate(128_000)
+        ));
+    }
+
+    /// A garbled payload must stay `Unknown` rather than being read as "mute",
+    /// which is the failure mode a bare `matches!` on the head would produce.
+    #[test]
+    fn malformed_audio_bitrate_is_not_a_mute() {
+        assert!(matches!(classify("ab,"), Action::Unknown(_)));
+        assert!(matches!(classify("ab,fast"), Action::Unknown(_)));
     }
 }

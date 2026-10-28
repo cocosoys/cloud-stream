@@ -133,6 +133,12 @@ impl SessionCtx {
         // frame-space pointer coordinates onto the physical screen.
         let settings = StreamSettings::from_config(&cfg);
         let input: InputSinkRef = Arc::new(WinInputSink::new(settings.clone()));
+        // #80: the audio switches are process-wide (the audio thread is not
+        // tied to the select loop), so a fresh connection resets them. Without
+        // this, a reload while muted would come back silent with the panel
+        // showing "Sound on".
+        crate::pipeline::audio::set_enabled(true);
+        crate::pipeline::audio::set_bitrate_bps(0);
         Self {
             session: SignalingSession::new(),
             pipeline: PipelineHandle::new(),
@@ -809,6 +815,17 @@ async fn arm_connected_notices(
                 Action::SetBitrate(kbps) => {
                     log::info!("client sets bitrate -> {kbps}kbps");
                     pipeline_handle.set_bitrate_override(kbps);
+                }
+                // #80: sound on/off and its encoder bitrate. Process-wide
+                // statics rather than session state: the audio thread outlives
+                // the select loop and only reads them once per frame.
+                Action::SetAudioOn(on) => {
+                    log::info!("client sets audio -> {on}");
+                    crate::pipeline::audio::set_enabled(on);
+                }
+                Action::SetAudioBitrate(bps) => {
+                    log::info!("client sets audio bitrate -> {bps} bps");
+                    crate::pipeline::audio::set_bitrate_bps(bps as i32);
                 }
                 // #57: pointer-rendering handover. `true` (pointer lock):
                 // frontend hides its pointer, server composites the OS cursor
