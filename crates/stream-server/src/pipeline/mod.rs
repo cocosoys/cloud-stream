@@ -647,6 +647,9 @@ fn run_inner_beat(
     // #63: loop-rate / frame-count probe (see `STATS_LOG_INTERVAL`).
     let mut beats: u64 = 0;
     let mut prev_counters = FrameCounters::default();
+    // #70: baseline for the `m2` traffic diffed into each stats line.
+    let mut prev_rel_events: u64 = 0;
+    let mut prev_rel_pixels: i64 = 0;
     let mut last_stats_log = Instant::now();
     // #63: per-window cost split — capture block vs. BGRA->YUV+scale.
     let mut cap_wait_sum: f64 = 0.0;
@@ -731,10 +734,20 @@ fn run_inner_beat(
             } else {
                 0.0
             };
+            // #70 diagnostics: `m2` traffic as it reached the injector. The
+            // `paint=` counter can only climb when the OS pointer actually
+            // moved, so a "the pointer will not move" report splits cleanly
+            // here: `m2` flat => the frontend never sent a delta (client
+            // problem); `m2` climbing with `dm` non-zero but `paint` flat =>
+            // the deltas arrive but the pointer does not move (injection).
+            // `on=` is the video gate below: every beat that returns there
+            // repaints nothing, which is why a mostly-idle `wb=` can coexist
+            // with a 60 Hz loop.
+            let (rel_events, rel_pixels) = crate::dispatch::win_input::mouse_rel_totals();
             log::info!(
                 "pipeline {:.1}s: loop={:.1}Hz new={} repeat={} skip={} wb={} inv={} cap_err={} \
                  enc_ok={} enc_no_out={} enc_err={} ws_err={} cap_wait={:.2}ms poll={:.2}ms conv={:.2}ms \
-                 enc_avg={:.1}ms pipe_avg={:.1}ms scale={} carry={} paint={}",
+                 enc_avg={:.1}ms pipe_avg={:.1}ms scale={} carry={} paint={} on={} m2={} dm={}",
                 since_log.as_secs_f64(),
                 beats as f64 / since_log.as_secs_f64(),
                 d(c.new_frames, prev_counters.new_frames),
@@ -754,9 +767,14 @@ fn run_inner_beat(
                 pipe_ms,
                 last_scale,
                 last_copy,
-                cursor_repaints
+                cursor_repaints,
+                handle.is_on(),
+                rel_events.saturating_sub(prev_rel_events),
+                rel_pixels.saturating_sub(prev_rel_pixels)
             );
             prev_counters = c;
+            prev_rel_events = rel_events;
+            prev_rel_pixels = rel_pixels;
             beats = 0;
             cap_wait_sum = 0.0;
             cap_wait_n = 0;

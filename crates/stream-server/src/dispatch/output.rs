@@ -162,6 +162,21 @@ pub fn connection(poor: bool) -> String {
 /// adopting `manual_width/height` as the fixed framebuffer. The values are the
 /// *live* `StreamSettings`, so a client-requested fps / resolution change is
 /// re-announced here without a reconnect.
+///
+/// #71 — `manual_resolution` MUST stay `false` here.
+/// This server does not pin a framebuffer: `run_blocking_loop` sizes every
+/// beat as `min(client request, native display)` and follows the client when it
+/// asks for something else. Announcing `true` therefore does not describe a
+/// capability, it *locks the client into manual mode*: `wr-core` reads the flag
+/// (`Applying server-enforced manual resolution`) and calls
+/// `applyManualStyle(manual_width, manual_height, scaleLocally)`, so the stream
+/// is drawn at a fixed CSS box with `object-fit: contain` instead of following
+/// the window. Worse, `manual_width/height` below echo `s.width()/height()`,
+/// which on the next connect is whatever the client asked for last time — a
+/// self-referencing loop that froze a session at 1920x1072 (its window height
+/// captured once, then re-imposed forever, `scale=true` on a 1920x1080 host).
+/// Leaving it `false` keeps the frontend on its window-following path, which is
+/// what this pipeline actually implements.
 pub fn server_settings(s: &crate::pipeline::StreamSettings) -> String {
     json!({
         "type": "server_settings",
@@ -173,7 +188,10 @@ pub fn server_settings(s: &crate::pipeline::StreamSettings) -> String {
                     "max": 60,
                     "locked": false
                 },
-                "manual_resolution": { "value": true, "locked": false },
+                "manual_resolution": { "value": false, "locked": false },
+                // Kept as a read-only *report* of the live request, not as a
+                // framebuffer to adopt: the frontend shows it, and ignores it
+                // while `manual_resolution` is false.
                 "manual_width": { "value": s.width(), "locked": false },
                 "manual_height": { "value": s.height(), "locked": false },
                 "enable_resize": { "value": true, "locked": false },

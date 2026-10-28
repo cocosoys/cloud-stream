@@ -26,6 +26,7 @@
 
 use std::os::raw::c_int;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, MapVirtualKeyW,
@@ -46,6 +47,30 @@ struct VkAction {
     vk: u16,
     /// Set when the key must ride on a modifier (shift for `!`, `@`, ...).
     needs_shift: bool,
+}
+
+// #70 diagnostics: relative-pointer traffic as it reached the injector.
+//
+// Gaming mode is the only source of `m2`, and while it is on there is no
+// on-screen cursor in the page to compare against, so "the pointer does not
+// move" is otherwise unattributable. The pipeline's 5 s stats line reports the
+// deltas of these two counters:
+//
+//   `m2` flat                      -> the frontend sent no delta at all
+//   `m2` up, `dm` > 0, `paint` flat -> deltas arrive but the OS pointer stays
+//                                     put (injection), not a client problem
+//
+// Process-wide atomics rather than per-sink fields: stage1 runs one session
+// per process, and the pipeline reports from the beat, which holds no sink.
+static MOUSE_REL_EVENTS: AtomicU64 = AtomicU64::new(0);
+static MOUSE_REL_PIXELS: AtomicI64 = AtomicI64::new(0);
+
+/// #70: `(m2 messages injected, |dx| + |dy| summed)` since process start.
+pub fn mouse_rel_totals() -> (u64, i64) {
+    (
+        MOUSE_REL_EVENTS.load(Ordering::Relaxed),
+        MOUSE_REL_PIXELS.load(Ordering::Relaxed),
+    )
 }
 
 /// Translate an X11 keysym into a Windows VK (plus a shift hint for
@@ -519,6 +544,10 @@ impl WinInputSink {
                 // #62: relative deltas are frame-space too; scale them so a
                 // locked pointer keeps a 1:1 feel on a scaled-down stream.
                 let (sdx, sdy) = self.frame_to_screen_delta(dx, dy);
+                // #70: count what is actually injected, not what arrived — a
+                // scaled-to-zero delta is exactly the failure being looked for.
+                MOUSE_REL_EVENTS.fetch_add(1, Ordering::Relaxed);
+                MOUSE_REL_PIXELS.fetch_add(i64::from(sdx.abs() + sdy.abs()), Ordering::Relaxed);
                 mouse_move_rel(sdx, sdy);
                 if let Ok(mut st) = self.state.lock() {
                     sync_buttons(&mut st, mask);
