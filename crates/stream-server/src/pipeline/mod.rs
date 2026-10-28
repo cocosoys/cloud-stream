@@ -653,6 +653,11 @@ fn run_inner_beat(
     // #72: baseline for the absolute `m` traffic (`m=`), the counter that proves
     // the unordered `pointer` channel is actually being read.
     let mut prev_abs_events: u64 = 0;
+    // #73: baseline for payloads handed to the `pointer` channel hook. `pm=`
+    // rising while `m=`/`m2=` stay flat means the channel is wired but the
+    // injector is not being reached; `pm=` flat means the channel delivers
+    // nothing and motion is still riding (or falling back to) `control`.
+    let mut prev_pointer_msgs: u64 = 0;
     let mut last_stats_log = Instant::now();
     // #63: per-window cost split — capture block vs. BGRA->YUV+scale.
     let mut cap_wait_sum: f64 = 0.0;
@@ -748,10 +753,11 @@ fn run_inner_beat(
             // with a 60 Hz loop.
             let (rel_events, rel_pixels) = crate::dispatch::win_input::mouse_rel_totals();
             let abs_events = crate::dispatch::win_input::mouse_abs_total();
+            let pointer_msgs = crate::dispatch::win_input::pointer_channel_total();
             log::info!(
                 "pipeline {:.1}s: loop={:.1}Hz new={} repeat={} skip={} wb={} inv={} cap_err={} \
                  enc_ok={} enc_no_out={} enc_err={} ws_err={} cap_wait={:.2}ms poll={:.2}ms conv={:.2}ms \
-                 enc_avg={:.1}ms pipe_avg={:.1}ms scale={} carry={} paint={} on={} m={} m2={} dm={}",
+                 enc_avg={:.1}ms pipe_avg={:.1}ms scale={} carry={} paint={} on={} m={} m2={} dm={} pm={}",
                 since_log.as_secs_f64(),
                 beats as f64 / since_log.as_secs_f64(),
                 d(c.new_frames, prev_counters.new_frames),
@@ -775,12 +781,14 @@ fn run_inner_beat(
                 handle.is_on(),
                 abs_events.saturating_sub(prev_abs_events),
                 rel_events.saturating_sub(prev_rel_events),
-                rel_pixels.saturating_sub(prev_rel_pixels)
+                rel_pixels.saturating_sub(prev_rel_pixels),
+                pointer_msgs.saturating_sub(prev_pointer_msgs)
             );
             prev_counters = c;
             prev_abs_events = abs_events;
             prev_rel_events = rel_events;
             prev_rel_pixels = rel_pixels;
+            prev_pointer_msgs = pointer_msgs;
             beats = 0;
             cap_wait_sum = 0.0;
             cap_wait_n = 0;

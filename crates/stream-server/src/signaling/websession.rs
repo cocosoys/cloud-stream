@@ -635,6 +635,9 @@ async fn arm_connected_notices(
             if line.is_empty() {
                 return;
             }
+            // #73: counted before classification — arrival is the fact under
+            // test, not what the line parses to.
+            crate::dispatch::win_input::note_pointer_channel_msg(&line);
             match classify(&line) {
                 Action::InputStub(raw) => input.handle_line(&raw),
                 _ => log::debug!("non-input message on pointer channel dropped: {line}"),

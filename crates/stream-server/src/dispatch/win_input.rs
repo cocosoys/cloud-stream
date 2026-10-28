@@ -87,6 +87,40 @@ pub fn mouse_abs_total() -> u64 {
     MOUSE_ABS_EVENTS.load(Ordering::Relaxed)
 }
 
+/// #73: messages actually handed to the `pointer` channel hook since process
+/// start.
+///
+/// The #72 fix gave that channel an `on_message`, and the remaining question is
+/// binary: does the unordered channel deliver anything at all? `m=` alone
+/// cannot answer it, because `sendMotionMessage` falls back to `control` while
+/// `pointer` is not open (webrtc.js:898) — so a working `m=` can still mean the
+/// hook is dead and everything is arriving on the ordered channel. `pm=`
+/// counts the hook, `m=`/`m2=` count what the injector saw; a gap between them
+/// is the diagnosis.
+static POINTER_CHANNEL_MSGS: AtomicU64 = AtomicU64::new(0);
+/// #73: how many `pointer`-channel payloads have been echoed to the log. Bounded
+/// so a 500 Hz mouse cannot turn the log into the problem it is diagnosing.
+static POINTER_CHANNEL_ECHOED: AtomicU64 = AtomicU64::new(0);
+
+/// #73: `pointer`-channel payloads seen by the session hook.
+pub fn pointer_channel_total() -> u64 {
+    POINTER_CHANNEL_MSGS.load(Ordering::Relaxed)
+}
+
+/// #73: record one payload arriving on the unordered channel, echoing the
+/// first few verbatim.
+///
+/// Called from the session hook *before* classification: a payload that
+/// classifies to something else still proves the channel is wired, which is
+/// exactly the distinction that matters here.
+pub fn note_pointer_channel_msg(line: &str) {
+    POINTER_CHANNEL_MSGS.fetch_add(1, Ordering::Relaxed);
+    let n = POINTER_CHANNEL_ECHOED.fetch_add(1, Ordering::Relaxed);
+    if n < 8 {
+        log::info!("pointer channel <- {line}");
+    }
+}
+
 /// Translate an X11 keysym into a Windows VK (plus a shift hint for
 /// printable characters whose layout position requires Shift).
 fn keysym_to_vk(keysym: u32) -> Option<VkAction> {
