@@ -130,6 +130,16 @@ const STATS_LOG_INTERVAL: Duration = Duration::from_secs(5);
 /// network hiccup into unbounded latency + memory growth instead of dropped
 /// frames. 8 frames is ~0.27 s at 30 fps.
 const SAMPLE_QUEUE: usize = 8;
+
+/// #78: one encoded sample on its way to the track, stamped with the capture
+/// beat it came from. `pipeline_ms` stops at the encoder, so without this stamp
+/// the hand-off queue — the part that actually absorbs congestion — is absent
+/// from every figure the panel shows. The forwarder times the rest.
+struct Sample {
+    data: Bytes,
+    /// Start of the beat that produced this frame.
+    beat: Instant,
+}
 /// #59: while on the GDI backend, periodically retry the DXGI path. An idle
 /// desktop (MC main menu, static docs) legitimately yields no new DXGI frame
 /// for many seconds; #57's stall-window fallback misclassified that as a
@@ -268,6 +278,16 @@ impl PipelineHandle {
         self.keyframe_requested.store(true, Ordering::SeqCst);
     }
 
+    /// #78: count one PLI/FIR from the browser. The panel shows the session
+    /// total as "Keyframe requests": every one of them means the decoder lost
+    /// its reference chain, so a number that climbs while fps holds steady
+    /// points at loss on the way down, not at a slow encoder.
+    pub fn note_keyframe_request(&self) {
+        if let Ok(mut guard) = self.stats.lock() {
+            guard.pli_requests += 1;
+        }
+    }
+
     /// #56: `vb,<N>` client bitrate request. Stored for the capture loop,
     /// which consumes it on the next beat and re-targets the VP8 encoder.
     /// `0` restores the automatic fps-scaled budget.
@@ -398,21 +418,29 @@ pub fn spawn_loop(
 ) {
     // #62: bounded hand-off (see `SAMPLE_QUEUE`); the producer uses `try_send`
     // so a stalled transport can never grow the queue without bound.
-    let (tx, mut rx) = mpsc::channel::<Bytes>(SAMPLE_QUEUE);
+    let (tx, mut rx) = mpsc::channel::<Sample>(SAMPLE_QUEUE);
     let forward_handle = handle.clone();
     let forward_settings = settings.clone();
 
     // Async forwarder: only this task may touch `video.write_sample().await`.
     tokio::spawn(async move {
-        while let Some(data) = rx.recv().await {
+        let send_stats = forward_handle.stats();
+        while let Some(sample) = rx.recv().await {
             if forward_handle.stopped.load(Ordering::SeqCst) {
                 break;
             }
             // #50: the sample duration follows the *live* fps so a client
             // frame-rate change re-paces the RTP timestamps without a restart.
             let spf = forward_settings.spf();
-            if let Err(err) = video.write_sample(data, spf).await {
-                log::debug!("write_sample failed: {err:#}");
+            match video.write_sample(sample.data, spf).await {
+                Ok(()) => {
+                    // #78: capture -> on the wire. The queue wait is included
+                    // on purpose; it is the only visible cost of a link that is
+                    // falling behind.
+                    let ms = sample.beat.elapsed().as_secs_f64() * 1000.0;
+                    bump(&send_stats, |s| s.send_timing.add(ms));
+                }
+                Err(err) => log::debug!("write_sample failed: {err:#}"),
             }
         }
         log::debug!("sample forwarder exited");
@@ -451,7 +479,7 @@ pub fn spawn_loop(
 /// resolution change (#50), and only exit on session cleanup or a fatal failure.
 fn run_blocking_loop(
     cfg: Arc<Config>,
-    tx: mpsc::Sender<Bytes>,
+    tx: mpsc::Sender<Sample>,
     handle: PipelineHandle,
     settings: StreamSettings,
 ) -> Result<()> {
@@ -592,7 +620,7 @@ fn run_blocking_loop(
 /// `bgra_scale` when the target differs).
 #[allow(clippy::too_many_arguments)]
 fn run_inner_beat(
-    tx: mpsc::Sender<Bytes>,
+    tx: mpsc::Sender<Sample>,
     handle: PipelineHandle,
     // #65: the capturer lives on its own thread; the beat only takes the newest
     // published frame, so no capture wait can eat the beat budget.
@@ -1033,7 +1061,7 @@ fn run_inner_beat(
                                         s.counters.repeat_ok += 1;
                                         s.counters.repeat_frames += 1;
                                     });
-                                    forward_chunks(&tx, encoded, &stats, &handle);
+                                    forward_chunks(&tx, encoded, &stats, &handle, beat);
                                     last_paint = want;
                                     cursor_repaints += 1;
                                 }
@@ -1086,7 +1114,7 @@ fn run_inner_beat(
                             s.counters.repeat_ok += 1;
                             s.counters.repeat_frames += 1;
                         });
-                        forward_chunks(&tx, encoded, &stats, &handle);
+                        forward_chunks(&tx, encoded, &stats, &handle, beat);
                     }
                     Ok(None) => bump(&stats, |s| s.counters.repeat_skipped += 1),
                     Err(err) => {
@@ -1292,6 +1320,10 @@ fn run_inner_beat(
                 s.counters.encoded_ok += 1;
                 s.encode_timing.add(enc_ms);
                 s.pipeline_timing.add(pipeline_ms);
+                // #78: the live target, read from the encoder so a `vb,`
+                // override and an fps-scaled re-target both show up on the
+                // panel's "rate / target" without a second bookkeeping path.
+                s.target_kbps = encoder.bitrate();
                 s.first_frame_seen = true;
                 s.warmed_up = true;
             });
@@ -1320,7 +1352,7 @@ fn run_inner_beat(
                     }
                 }
             }
-            forward_chunks(&tx, encoded, &stats, &handle);
+            forward_chunks(&tx, encoded, &stats, &handle, beat);
         }
 
         settle_beat(&mut next_deadline, spf);
@@ -1332,16 +1364,28 @@ fn run_inner_beat(
 /// is behind: the remaining chunks of this frame are dropped and a keyframe is
 /// requested, so the receiver re-anchors instead of decoding a partial frame.
 /// A closed queue means the session is tearing down.
+///
+/// #78: the payload of every chunk that made it into the queue is added to
+/// `bytes_sent`, and the 250 ms peak tracker sees the same bytes — both must
+/// count what was *accepted*, not what was encoded, or a dropped-frame session
+/// reports a rate the link never carried.
 fn forward_chunks(
-    tx: &mpsc::Sender<Bytes>,
+    tx: &mpsc::Sender<Sample>,
     encoded: base::message_proto::VideoFrame,
     stats: &Arc<Mutex<PipelineStats>>,
     handle: &PipelineHandle,
+    beat: Instant,
 ) {
     let chunks = video_frame_to_chunks(encoded);
+    let now = Instant::now();
+    let mut accepted = 0u64;
     for chunk in chunks {
-        match tx.try_send(chunk.data) {
-            Ok(()) => {}
+        let len = chunk.data.len() as u64;
+        match tx.try_send(Sample {
+            data: chunk.data,
+            beat,
+        }) {
+            Ok(()) => accepted += len,
             Err(mpsc::error::TrySendError::Full(_)) => {
                 bump(stats, |s| s.counters.write_sample_err += 1);
                 handle.request_keyframe();
@@ -1352,6 +1396,15 @@ fn forward_chunks(
                 break;
             }
         }
+    }
+    if accepted > 0 {
+        // One lock for the whole frame: the stats mutex is shared with the
+        // capture thread's counters, and a per-chunk bump on a striped frame
+        // would contend with it for nothing.
+        bump(stats, |s| {
+            s.bytes_sent += accepted;
+            s.peak.add(accepted, now);
+        });
     }
 }
 

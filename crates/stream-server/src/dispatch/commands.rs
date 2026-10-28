@@ -1,7 +1,8 @@
 //! Upbound command classification (design 5.5).
 //!
 //! Groups:
-//! * A: stage1 must act on (start/stop video, stats gating, compression ack, ping).
+//! * A: stage1 must act on (start/stop video, stats gating, compression ack,
+//!   the browser's reply to the server's RTT ping).
 //! * B: record at debug then drop; no reply, no state change.
 //! * C: input commands; routed to the `InputSink` stub in stage1, mapped to enigo
 //!   in stage2.
@@ -22,8 +23,10 @@ pub enum Action {
     StatsOff,
     /// `_gz,1` — reply `_gz,0`; stage1 never compresses outbound frames.
     CompressedNegotiate,
-    /// `ping,<ts>` — echo `pong,<ts>`.
-    Pong(String),
+    /// `pong,<epoch_s>` — the browser's reply to the server's `{"type":"ping"}`
+    /// (#78). The payload is the browser clock and is ignored by the
+    /// measurement; the session only needs to know that a reply arrived.
+    PongReply(String),
     /// B group: debug-logged then ignored; carries the recognized prefix.
     Ignore(String),
     /// C group: handed to the input sink stub; carries the raw line.
@@ -77,7 +80,7 @@ pub fn classify(line: &str) -> Action {
         "STOP_VIDEO" => return Action::StopVideo,
         "START_AUDIO" | "STOP_AUDIO" => return Action::Ignore(String::from(line)),
         "REQUEST_CLIPBOARD" => return Action::ClipboardRequest,
-        "cr" | "pong" => return Action::Ignore(String::from(line)),
+        "cr" => return Action::Ignore(String::from(line)),
         "kr" => return Action::InputStub(String::from(line)),
         "sfe" => return Action::InputStub(String::from(line)),
         "pointer,none" => return Action::InputStub(String::from(line)),
@@ -90,7 +93,9 @@ pub fn classify(line: &str) -> Action {
         "_stats" if rest == "1" => Action::StatsOn,
         "_stats" if rest == "0" => Action::StatsOff,
         "_gz" if rest == "1" => Action::CompressedNegotiate,
-        "ping" => Action::Pong(rest.to_owned()),
+        // #78: the browser answers a server ping with this line
+        // (`lib/webrtc.js:777`). It is not a request and must never be echoed.
+        "pong" => Action::PongReply(rest.to_owned()),
 
         // ---- Setting requests (#50): the frontend sends these from the
         // settings panel and on connect (selkies-wr-core.js:1364 / :1667 /

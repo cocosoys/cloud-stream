@@ -288,6 +288,8 @@ impl MediaSession {
                                     "received {} request; forcing keyframe",
                                     if pli { "PLI" } else { "FIR" }
                                 );
+                                // #78: the panel's "Keyframe requests" figure.
+                                handle.note_keyframe_request();
                                 handle.request_keyframe();
                             }
                         }

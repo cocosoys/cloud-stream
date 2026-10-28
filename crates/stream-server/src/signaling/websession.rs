@@ -45,8 +45,8 @@ use crate::dispatch::{
 use crate::pipeline::{spawn_loop, PipelineEvent, PipelineHandle, StreamSettings};
 use crate::platform::{HostSample, Sampler};
 use crate::signaling::{
-    hello_ack, ice_line, parse_ws_line, session_ok, sdp_line, HandshakeState, IncomingLine,
-    SignalingSession, SERVER_PEER_ID,
+    hello_ack, ice_line, latency_measurement, parse_ws_line, session_ok, sdp_line, HandshakeState,
+    IncomingLine, LatencyProbe, SignalingSession, SERVER_PEER_ID,
 };
 use crate::webrtc::ice::remote_from_json;
 use crate::webrtc::{MediaSession, MediaState};
@@ -104,6 +104,9 @@ struct SessionCtx {
     /// #55: Windows clipboard bridge for REQUEST_CLIPBOARD / cw-cwe uplink.
     clipboard: Arc<ClipboardSink>,
     stats_on: Arc<AtomicBool>,
+    /// #78: control-channel round-trip probe. Written by the ping task and the
+    /// control-channel hook, read by the stats timer for `rtt_ms`.
+    latency: Arc<LatencyProbe>,
     /// #77: stop flag for the game-sound downlink thread. Set on Drop, which
     /// covers every exit path (the thread is a plain OS thread, not a tokio
     /// task, so `tasks.abort()` cannot reach it).
@@ -137,6 +140,7 @@ impl SessionCtx {
             input,
             clipboard: Arc::new(ClipboardSink::default()),
             stats_on: Arc::new(AtomicBool::new(false)),
+            latency: Arc::new(LatencyProbe::new()),
             audio_stop: Arc::new(AtomicBool::new(false)),
             audio_started: false,
             media: None,
@@ -371,6 +375,7 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
     // own Arc clones; the shared `media` value stays behind for the ICE forwarder.
     let watcher_media = media.clone();
     let watcher_stats_on = ctx.stats_on.clone();
+    let watcher_latency = ctx.latency.clone();
     let watcher_pipeline = ctx.pipeline.clone();
     let watcher_input = ctx.input.clone();
     let watcher_clipboard = ctx.clipboard.clone();
@@ -397,6 +402,7 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
                             &watcher_pipeline,
                             &cfg,
                             &watcher_stats_on,
+                            &watcher_latency,
                             &watcher_input,
                             &watcher_clipboard,
                             &watcher_settings,
@@ -452,12 +458,51 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
         }),
     );
 
+    // #78: control-channel RTT probe. One ping per second; the browser answers
+    // with a bare `pong,<epoch_s>` on the same ordered channel (webrtc.js:775-
+    // 777) and the control hook folds the round trip into `latency`. Started
+    // with the session rather than on the first Connected so a reconnect does
+    // not leave the panel without a number; while the channel is not open the
+    // send fails and the probe is disarmed again instead of counting a loss.
+    let ping_media = media.clone();
+    let ping_probe = ctx.latency.clone();
+    push_task(
+        &ctx.tasks,
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(crate::signaling::PING_INTERVAL);
+            // `interval`'s first tick completes immediately; drop it so the
+            // first ping follows a real interval.
+            tick.tick().await;
+            let mut announced = false;
+            loop {
+                tick.tick().await;
+                let line = ping_probe.ping_line();
+                let sent = ping_media
+                    .lock()
+                    .await
+                    .channels()
+                    .send_control(&line)
+                    .await
+                    .is_ok();
+                if sent {
+                    if !announced {
+                        announced = true;
+                        log::info!("rtt probe: first ping sent on the control channel");
+                    }
+                } else {
+                    ping_probe.cancel_pending();
+                }
+            }
+        }),
+    );
+
     // Stats timer: one sample per second while the client subscribed with
     // `_stats,1`. Pipeline snapshot fills encoded_fps / encode_ms / pipeline_ms;
     // the window resets after each snapshot so the next tick starts fresh.
     let stats_media = media.clone();
     let stats_flag = ctx.stats_on.clone();
     let stats_pipeline = ctx.pipeline.clone();
+    let stats_latency = ctx.latency.clone();
     push_task(
         &ctx.tasks,
         tokio::spawn(async move {
@@ -497,11 +542,16 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
                 // were dropped, so `encoded_fps` dipped on a regular cadence.
                 let snapshot = {
                     let mut guard = stats_arc.lock().unwrap_or_else(|p| p.into_inner());
-                    let snapshot = guard.snapshot(std::time::Duration::from_secs(1));
+                    let mut snapshot = guard.snapshot(std::time::Duration::from_secs(1));
+                    // #78: the peak tracker needs `&mut` and its own "now", so
+                    // it is closed here rather than inside `snapshot`.
+                    snapshot.peak_mbps = guard.peak.take_peak_mbps(std::time::Instant::now());
                     guard.reset_window();
                     snapshot
                 };
-                let stats = StreamStats::from_host(host).with_pipeline(&snapshot);
+                let stats = StreamStats::from_host(host)
+                    .with_pipeline(&snapshot)
+                    .with_rtt(stats_latency.rtt_ms());
                 if let Err(err) = stats_media
                     .lock()
                     .await
@@ -555,6 +605,7 @@ async fn arm_connected_notices(
     pipeline_handle: &PipelineHandle,
     cfg: &Arc<Config>,
     stats_on: &Arc<AtomicBool>,
+    latency: &Arc<LatencyProbe>,
     input: &InputSinkRef,
     clipboard: &Arc<ClipboardSink>,
     settings: &StreamSettings,
@@ -633,6 +684,8 @@ async fn arm_connected_notices(
     let input = input.clone();
     let clipboard = clipboard.clone();
     let control_hook = control.clone();
+    // #78: the RTT probe the `pong` reply feeds.
+    let latency = latency.clone();
     // #72: `Arc<dyn InputSink>` clone for the pointer-channel hook. Taken
     // before `input` is moved into the control hook below.
     let pointer_input = input.clone();
@@ -677,6 +730,7 @@ async fn arm_connected_notices(
         let control = control_hook.clone();
         let pipeline_handle = pipeline_handle.clone();
         let stats_on = stats_on.clone();
+        let latency = latency.clone();
         let input = input.clone();
         let clipboard = clipboard.clone();
         let settings = hook_settings.clone();
@@ -705,8 +759,15 @@ async fn arm_connected_notices(
                     // probe with gzip disabled.
                     let _ = control.send_text("_gz,0").await;
                 }
-                Action::Pong(ts) => {
-                    let _ = control.send_text(format!("pong,{ts}")).await;
+                Action::PongReply(_ts) => {
+                    // #78: the answer to our own ping. The payload is the
+                    // browser's clock and is not used; the round trip is the
+                    // time since we armed the probe. Announce the smoothed
+                    // figure so engines without `currentRoundTripTime` have
+                    // one (`lib/webrtc.js:778-781`).
+                    if let Some(rtt) = latency.on_reply() {
+                        let _ = control.send_text(&latency_measurement(rtt)).await;
+                    }
                 }
                 // #50 setting requests: mutate the live StreamSettings; the
                 // pipeline re-bases its cadence / rebuilds on the next beat.
