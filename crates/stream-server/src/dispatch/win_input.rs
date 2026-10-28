@@ -541,24 +541,29 @@ impl WinInputSink {
         (map_axis(x, fw, sw), map_axis(y, fh, sh))
     }
 
-    /// #62: the same frame -> screen ratio for relative deltas (`m2`, pointer
-    /// lock). Unscaled deltas make a locked pointer move only frame/screen of
-    /// the real distance, which reads as sluggish mouse sensitivity.
+    /// #74: pointer-locked deltas pass through unchanged.
     ///
-    /// #68 caveat: pointer-lock deltas are `MouseEvent.movementX/Y`, i.e. CSS
-    /// pixels of the *element*, not frame pixels, so this factor is an
-    /// approximation (exact only while the element is drawn at ~1:1). It is kept
-    /// on the transmitted-frame ratio because that is the closest information
-    /// the server has; do not "simplify" it away (an unscaled delta is far worse).
+    /// This used to scale them by `screen / frame`, on the #62 reasoning that a
+    /// locked pointer should keep a 1:1 feel "on the screen". That is the wrong
+    /// frame of reference for a camera: a game multiplies the delta by its own
+    /// sensitivity to get an angle, so any factor here becomes a sensitivity
+    /// multiplier that changes with the stream geometry. Worse, a factor above
+    /// 1 pushes each injected delta further up the host's mouse-acceleration
+    /// curve, which is non-linear — a measured `dm/m2` of 9.55 px per message
+    /// sat inside Windows' doubled band (Threshold1=6, Threshold2=10), so the
+    /// pointer moved roughly twice as far as the hand did (#74).
+    ///
+    /// Streamers that get this right inject relative motion verbatim: Moonlight
+    /// and Parsec hand the host a raw HID delta, and Sunshine's documentation is
+    /// explicit that relative movement goes through a real HID device rather
+    /// than being reconstructed from cursor positions. The gain a player wants
+    /// belongs in the game's own sensitivity setting, or in the client's
+    /// `pointerGain`, not here.
+    ///
+    /// The parameters stay so call sites and tests keep their shape; absolute
+    /// mapping (`frame_to_screen`) is untouched and must stay that way.
     fn frame_to_screen_delta(&self, dx: i32, dy: i32) -> (i32, i32) {
-        let (fw, fh) = self.transmitted_frame();
-        let (sw, sh) = screen_size();
-        if fw == 0 || fh == 0 {
-            return (dx, dy);
-        }
-        let sx = (dx as f64 * sw as f64 / fw as f64).round() as i32;
-        let sy = (dy as f64 * sh as f64 / fh as f64).round() as i32;
-        (sx, sy)
+        (dx, dy)
     }
 
     /// Full wire-message parser. Called by the session for every C-group
