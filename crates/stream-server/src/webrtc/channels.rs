@@ -5,9 +5,13 @@
 //!   JSON (`pipeline`, `stream_info`, `stream_stats`, `connection`) rides this
 //!   channel; the frontend stores every non-`pointer` label in `_send_channel`
 //!   (webrtc.js:610-615).
-//! * `pointer`: ordered = false, max_retransmits = 0 for motion messages;
-//!   stage1 sends nothing on it and leaves it attached to match the frontend
-//!   branch.
+//! * `pointer`: ordered = false, max_retransmits = 0 for motion messages.
+//!   The session attaches an `on_message` to it (#72) — see `pointer()`.
+//!
+//! Both channels need an `on_message` handler. webrtc-rs discards messages on a
+//! channel without one, and the frontend splits input across the two (motion
+//! here, everything else on `control`), so a missing handler on `pointer` looks
+//! exactly like "the pointer does not move but the keyboard works".
 //!
 //! No reassembly lives here: reliable `control` keeps fragment ordering; stage1
 //! emits whole JSON lines only. The session wires `control.on_message` in task
@@ -101,6 +105,23 @@ impl ControlChannels {
     /// registration in task #35.
     pub fn control(&self) -> &Arc<RTCDataChannel> {
         &self.control
+    }
+
+    /// Shared reference to `pointer` (#72).
+    ///
+    /// This channel is where the frontend sends *coalesced* pointer motion:
+    /// `Input._sendPointer(fields, motion=true)` prefers `input.sendMotion`,
+    /// which is bound to `webrtc.sendMotionMessage` (selkies-wr-core.js:3189),
+    /// which sends on the `pointer` channel whenever it is open (webrtc.js:898).
+    /// Everything else — key presses, buttons, wheel, settings — rides the
+    /// reliable `control` channel with `motion=false`.
+    ///
+    /// Therefore the session MUST attach `on_message` here too: webrtc-rs drops
+    /// every message on a channel that has no handler, which silently threw
+    /// away all mouse motion while clicks (sent on `control`) kept working —
+    /// the "keyboard fine, pointer frozen" #70 report.
+    pub fn pointer(&self) -> &Arc<RTCDataChannel> {
+        &self.pointer
     }
 
     /// Close both channels during session cleanup (plain `RTCDataChannel::close`,

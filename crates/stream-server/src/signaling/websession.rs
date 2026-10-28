@@ -532,8 +532,14 @@ async fn arm_connected_notices(
     settings: &StreamSettings,
     tasks: &SessionTasks,
 ) -> Result<()> {
-    let control = media.lock().await.channels().control().clone();
-
+    // #72: both channels get a handler; the frontend splits input across them
+    // (motion on `pointer`, everything else on `control`), and webrtc-rs drops
+    // messages on a channel with no `on_message`.
+    let (control, pointer) = {
+        let session = media.lock().await;
+        let channels = session.channels();
+        (channels.control().clone(), channels.pointer().clone())
+    };
     // Recovery event sink (#42-1): the blocking capture worker emits
     // `PipelineEvent` on rebuild / GDI fallback / fatal loss / restore; this task
     // maps each event to the whitelisted downstream message so the state stays
@@ -599,8 +605,42 @@ async fn arm_connected_notices(
     let input = input.clone();
     let clipboard = clipboard.clone();
     let control_hook = control.clone();
+    // #72: `Arc<dyn InputSink>` clone for the pointer-channel hook. Taken
+    // before `input` is moved into the control hook below.
+    let pointer_input = input.clone();
     // #50: the settings writer is shared with the pipeline worker.
     let hook_settings = settings.clone();
+
+    // #72: the unordered `pointer` channel carries exactly the coalesced pointer
+    // motion — `Input._sendPointer(fields, motion=true)` goes to
+    // `webrtc.sendMotionMessage` (selkies-wr-core.js:3189) which sends on the
+    // `pointer` channel while it is open (webrtc.js:898). webrtc-rs hands a
+    // message to the channel's `on_message` and **drops it when there is none**,
+    // so until this hook existed the server threw away every `m` (absolute,
+    // coalesced) and every `m2` (pointer-locked relative) message. Clicks kept
+    // working because a press is sent with `motion=false` on `control`, which
+    // made the failure look like "keyboard and clicking are fine, the pointer
+    // just does not move" (#70).
+    //
+    // Only input is accepted here: `control` owns settings, clipboard and the
+    // downstream channel, and none of that belongs on an unreliable stream.
+    pointer.on_message(Box::new(move |msg| {
+        let input = pointer_input.clone();
+        Box::pin(async move {
+            if !msg.is_string {
+                log::debug!("binary message on pointer channel ignored");
+                return;
+            }
+            let line = String::from_utf8_lossy(&msg.data).trim().to_owned();
+            if line.is_empty() {
+                return;
+            }
+            match classify(&line) {
+                Action::InputStub(raw) => input.handle_line(&raw),
+                _ => log::debug!("non-input message on pointer channel dropped: {line}"),
+            }
+        })
+    }));
 
     control.on_message(Box::new(move |msg| {
         let control = control_hook.clone();
@@ -696,7 +736,7 @@ async fn arm_connected_notices(
     }));
 
     log::info!(
-        "session connected: command hook armed; notices wait for control open (cfg {}x{}@{}fps)",
+        "session connected: command hook armed (control + pointer motion); notices wait for control open (cfg {}x{}@{}fps)",
         cfg.width,
         cfg.height,
         cfg.fps

@@ -60,10 +60,19 @@ struct VkAction {
 //   `m2` up, `dm` > 0, `paint` flat -> deltas arrive but the OS pointer stays
 //                                     put (injection), not a client problem
 //
+// #72: the same split applies to absolute motion, which is what the page sends
+// while *not* locked: `m=` is that counter. Both were flat for a different
+// reason — the session had no `on_message` on the unordered `pointer` channel,
+// so webrtc-rs read the messages off SCTP and dropped them.
+//
 // Process-wide atomics rather than per-sink fields: stage1 runs one session
 // per process, and the pipeline reports from the beat, which holds no sink.
 static MOUSE_REL_EVENTS: AtomicU64 = AtomicU64::new(0);
 static MOUSE_REL_PIXELS: AtomicI64 = AtomicI64::new(0);
+/// #72: absolute `m` messages applied since process start. Non-zero growth is
+/// the proof that the `pointer` channel hook works: without it the server
+/// received nothing from the unordered channel and this stayed flat too.
+static MOUSE_ABS_EVENTS: AtomicU64 = AtomicU64::new(0);
 
 /// #70: `(m2 messages injected, |dx| + |dy| summed)` since process start.
 pub fn mouse_rel_totals() -> (u64, i64) {
@@ -71,6 +80,11 @@ pub fn mouse_rel_totals() -> (u64, i64) {
         MOUSE_REL_EVENTS.load(Ordering::Relaxed),
         MOUSE_REL_PIXELS.load(Ordering::Relaxed),
     )
+}
+
+/// #72: `m` messages applied since process start.
+pub fn mouse_abs_total() -> u64 {
+    MOUSE_ABS_EVENTS.load(Ordering::Relaxed)
 }
 
 /// Translate an X11 keysym into a Windows VK (plus a shift hint for
@@ -172,6 +186,18 @@ pub struct WinInputSink {
     /// divisor equals the transmitted frame and whether `GetSystemMetrics`
     /// agrees with the captured desktop.
     mapping_logged: std::sync::atomic::AtomicBool,
+    /// #72: highest `seq` of an absolute `m` that was applied.
+    ///
+    /// Coalesced motion rides the unordered `pointer` channel, so a newer
+    /// absolute position can overtake an older one and applying the older one
+    /// afterwards would snap the cursor back for a frame. The frontend numbers
+    /// every pointer message (`Input._pointerSeq`, input.js:3126) for exactly
+    /// this purpose; a message with a lower-or-equal number than one already
+    /// applied is stale and is dropped.
+    ///
+    /// Only `m` is filtered. Relative `m2` deltas are summed, so their arrival
+    /// order carries no information and dropping one would lose real motion.
+    last_abs_seq: std::sync::atomic::AtomicU64,
 }
 
 impl Default for WinInputSink {
@@ -189,6 +215,7 @@ impl WinInputSink {
             state: Mutex::new(InputState::default()),
             frame,
             mapping_logged: std::sync::atomic::AtomicBool::new(false),
+            last_abs_seq: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -518,6 +545,15 @@ impl WinInputSink {
                 let Ok(y) = f[1].parse::<i32>() else { return };
                 let Ok(mask) = f[2].parse::<u32>() else { return };
                 let Ok(mag) = f[3].parse::<f64>() else { return };
+                // #72: absolute positions ride the unordered channel; see
+                // `last_abs_seq`. No `seq` on the wire (older client) = accept.
+                if let Some(seq) = f.get(4).and_then(|s| s.trim().parse::<u64>().ok()) {
+                    if seq <= self.last_abs_seq.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    self.last_abs_seq.store(seq, Ordering::Relaxed);
+                }
+                MOUSE_ABS_EVENTS.fetch_add(1, Ordering::Relaxed);
                 // #62: `m` carries stream-frame pixels; map them onto the
                 // physical screen before injecting (a 1:1 pass-through left the
                 // right/bottom of the desktop unreachable whenever the stream
