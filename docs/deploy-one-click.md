@@ -323,6 +323,19 @@ Session 1。体检会打印 `session=1`，看到 `session=0` 就是这条踩了�
 
 这**不是部署问题**，别在部署链上找它；记在这里是因为第一次看到会以为部署错了。
 
+### 7.13 `-SkipBuild` 会复用上一次的前端 zip（已修）
+
+**现象**：重新 `npm run build` 之后跑 `deploy.ps1 -SkipBuild`，部署日志全绿，
+但线上 `index.html` 引用的还是上一版的 `index-*.js`。
+
+**根因**：打包步骤被塞在 `if (-not $SkipBuild)` 里。`-SkipBuild` 的本意是
+「不重新编译」，但打包不是编译 —— dist 是磁盘上已经构建好的事实，zip 只是它
+的快照。跳过打包 = 把上一次的快照发上去。
+
+**防**：打包拆成独立步骤，只在 `-SkipFrontend` 时跳过；`-SkipBuild` 仍会按现有
+dist 重新打包。判定线上是不是新产物，别看日志，看
+`curl -sk https://<host>:8080/ | grep -o 'assets/[^"]*'` 里的文件名对不对。
+
 ---
 
 ## 8 验收清单

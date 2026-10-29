@@ -32,7 +32,9 @@
     只发后端。
 
 .PARAMETER SkipBuild
-    跳过构建，直接上传现有的 target\release 与 dashboard\dist。
+    跳过编译（cargo 与 npm），直接上传现有的 target\release 与 dashboard\dist。
+    注意：前端仍会按 dist 重新打包 —— dist 是磁盘上的事实，zip 只是快照，
+    跳过打包会让人以为"改了却没生效"。
 
 .PARAMETER DryRun
     构建 + 上传 + 核对 MD5，但不切换、不重启。
@@ -333,22 +335,36 @@ try {
         顺序不能反：dashboard 的 prebuild 会把 core 的 dist 拷进 src/selkies-core.js。
         先 dashboard 后 core，服务端拿到的还是旧的核心。
     #>
-    if (-not $SkipFrontend -and -not $SkipBuild) {
-        Write-Step '构建前端（core → dashboard → 打包）'
+    if (-not $SkipFrontend) {
+        if ($SkipBuild) {
+            Write-Step '前端：跳过构建，按现有 dist 重新打包'
+        } else {
+            Write-Step '构建前端（core → dashboard → 打包）'
+        }
         if (-not (Test-Path (Join-Path $CoreDir 'package.json'))) { throw "找不到前端仓库：$CoreDir" }
 
-        Push-Location $CoreDir
-        try { Invoke-Native -Exe 'npm' -Arguments @('run', 'build') -Quiet } finally { Pop-Location }
-        Write-Ok 'core 构建完成'
+        if (-not $SkipBuild) {
+            Push-Location $CoreDir
+            try { Invoke-Native -Exe 'npm' -Arguments @('run', 'build') -Quiet } finally { Pop-Location }
+            Write-Ok 'core 构建完成'
 
-        Push-Location $DashDir
-        try { Invoke-Native -Exe 'npm' -Arguments @('run', 'build') -Quiet } finally { Pop-Location }
+            Push-Location $DashDir
+            try { Invoke-Native -Exe 'npm' -Arguments @('run', 'build') -Quiet } finally { Pop-Location }
+            Write-Ok 'dashboard 构建完成'
+        }
+
         $dashDist = Join-Path $DashDir 'dist'
         $idx = Join-Path $dashDist 'index.html'
+        if (-not (Test-Path $idx)) { throw "没有 $idx，去掉 -SkipBuild 先构建一次" }
         $core = Get-ChildItem (Join-Path $dashDist 'assets') -Filter 'selkies-core-*.js' -ErrorAction SilentlyContinue | Select-Object -First 1
         if (-not $core) { throw 'dashboard dist 里没有 core chunk，prebuild 没跑成功' }
-        Write-Ok ("dashboard 构建完成（index.html {0} B，core {1}）" -f (Get-Item $idx).Length, $core.Name)
+        Write-Ok ("dist（index.html {0} B，core {1}）" -f (Get-Item $idx).Length, $core.Name)
 
+        # 打包**不能**跟着 `-SkipBuild` 一起跳过：dist 是磁盘上已经构建好的事实，
+        # zip 只是它的快照。上一版把两者塞进同一个 `if`，结果是 `-SkipBuild`
+        # 部署的永远是上一次的 zip —— 重新构建了 dist、页面 hash 却没变，只能
+        # 靠对比 index.html 引用的文件名才发现。
+        #
         # 只打包 dist 的内容，不加外层目录 —— Expand-Archive 会把层级原样展开，
         # 多套一层目录的话服务端根目录就成了 C:\dev\selkies-web\dist\，首页 404。
         if (Test-Path $ZipPath) { Remove-Item $ZipPath -Force }
@@ -364,7 +380,7 @@ try {
         Write-Ok 'stream-server.new.exe'
     }
     if (-not $SkipFrontend) {
-        if (-not (Test-Path $ZipPath)) { throw "没有 $ZipPath，去掉 -SkipBuild 重新打包" }
+        if (-not (Test-Path $ZipPath)) { throw "没有 $ZipPath：这是打包步骤失败，检查 dashboard\dist 是否存在" }
         Send-File $ZipPath "$RemoteDeploy/selkies-web.zip"
         Write-Ok 'selkies-web.zip'
     }
