@@ -270,6 +270,41 @@ impl CaptureWorker {
         }
     }
 
+    /// Is a published frame waiting for the beat? Never consumes it.
+    pub fn has_frame(&self) -> bool {
+        self.shared.lock().frame.is_some()
+    }
+
+    /// Block until a frame is published, a capture error is pending, the worker
+    /// stops, or `timeout` passes; true when one of the first three happened.
+    ///
+    /// Only the uncapped beat uses this (`spf == 0`, so it has no deadline of
+    /// its own): the capture thread's cadence — one frame per refresh of the
+    /// screen being shared — becomes the beat's, so a still desktop costs no
+    /// CPU and a moving one is never throttled by a timer. `publish`,
+    /// `take_error` and `stop` all notify this condvar, so a wakeup is the
+    /// publish itself; the timeout only bounds how long a stop or a gate
+    /// change can go unnoticed.
+    pub fn wait_frame(&self, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut mb = self.shared.lock();
+        loop {
+            if mb.frame.is_some() || mb.error.is_some() || self.shared.stop.load(Ordering::Relaxed) {
+                return true;
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (guard, _) = self
+                .shared
+                .consumed
+                .wait_timeout(mb, deadline - now)
+                .unwrap_or_else(|p| p.into_inner());
+            mb = guard;
+        }
+    }
+
     /// Take the newest frame, or `None` when the desktop produced nothing since
     /// the last beat. Never blocks on the capturer.
     pub fn take(&self) -> Option<CapturedFrame> {

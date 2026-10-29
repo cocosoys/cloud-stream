@@ -171,7 +171,11 @@ const IVF_WINDOW: usize = 300;
 /// (the configured value is defined at 30 fps). A 60 fps / 1080p session gets
 /// ~2x the budget so VP8 keeps a sane per-frame quality instead of block
 /// artifacts; clamped to a sane floor.
+///
+/// An uncapped session (`fps == 0`) has no rate to scale by and must not be
+/// budgeted as if it had stopped: `settings::FPS_BUDGET` stands in.
 fn bitrate_for(base_kbps: u32, fps: u32) -> u32 {
+    let fps = if fps == settings::FPS_UNCAPPED { settings::FPS_BUDGET } else { fps };
     ((base_kbps as u64 * fps as u64 / 30).clamp(200, 40_000)) as u32
 }
 
@@ -442,13 +446,32 @@ pub fn spawn_loop(
     // Async forwarder: only this task may touch `video.write_sample().await`.
     tokio::spawn(async move {
         let send_stats = forward_handle.stats();
+        // Last beat instant handed to the track, for an uncapped session's
+        // sample duration (see below).
+        let mut last_beat: Option<Instant> = None;
         while let Some(sample) = rx.recv().await {
             if forward_handle.stopped.load(Ordering::SeqCst) {
                 break;
             }
             // #50: the sample duration follows the *live* fps so a client
             // frame-rate change re-paces the RTP timestamps without a restart.
-            let spf = forward_settings.spf();
+            //
+            // An uncapped session has no nominal rate to stamp: a fixed 1 ms
+            // would run the media clock at a thousandth of real time and a zero
+            // one would give every frame the same RTP timestamp, which the
+            // browser reads as duplicates of one frame. The interval the beat
+            // actually ran at is both honest and wall-clock accurate, which is
+            // all the decoder delta needs to be here (see `pipeline::avsync`:
+            // video plays by arrival, this timestamp is a delta).
+            let spf = if forward_settings.uncapped() {
+                let gap = last_beat.map_or(Duration::from_millis(1), |prev| {
+                    sample.beat.saturating_duration_since(prev)
+                });
+                gap.clamp(Duration::from_micros(500), Duration::from_millis(200))
+            } else {
+                forward_settings.spf()
+            };
+            last_beat = Some(sample.beat);
             match video.write_sample(sample.data, spf).await {
                 Ok(()) => {
                     // #78: capture -> on the wire. The queue wait is included
@@ -770,10 +793,10 @@ fn run_inner_beat(
     let mut next_deadline = Instant::now() + spf;
 
     log::info!(
-        "pipeline loop started: target {}x{}@{}fps spf={:?} bitrate={}kbps hw={}",
+        "pipeline loop started: target {}x{}@{} spf={:?} bitrate={}kbps hw={}",
         enc_w,
         enc_h,
-        last_fps,
+        fps_label(last_fps),
         spf,
         encoder.bitrate(),
         encoder.is_hardware()
@@ -994,7 +1017,10 @@ fn run_inner_beat(
             settings.height().min(src_h).max(1),
         );
         if cur_fps != last_fps {
-            log::info!("client requested fps {cur_fps}: cadence re-based");
+            log::info!(
+                "client requested {}: cadence re-based",
+                fps_label(cur_fps)
+            );
             last_fps = cur_fps;
             next_deadline = Instant::now() + spf;
             // #52: fps change re-targets the bitrate (30 fps is the base of the
@@ -1020,7 +1046,14 @@ fn run_inner_beat(
         // Gate closed: idle beat without touching the capturer or encoder; the
         // deadline keeps advancing so a resume lands on a clean cadence.
         if !handle.is_on() {
-            settle_beat(&mut next_deadline, spf);
+            if spf.is_zero() {
+                // Uncapped: the mailbox still holds the frame that was pending
+                // when the gate closed, so waiting on it would return at once
+                // and spin. Sleep instead — nothing here is being paced.
+                std::thread::sleep(UNCAPPED_WAIT);
+            } else {
+                settle_beat(&worker, &mut next_deadline, spf);
+            }
             continue;
         }
 
@@ -1086,7 +1119,7 @@ fn run_inner_beat(
                         });
                         *abnormal = true;
                         gdi_err = 0;
-                        settle_beat(&mut next_deadline, spf);
+                        settle_beat(&worker, &mut next_deadline, spf);
                         continue;
                     }
                 }
@@ -1102,7 +1135,7 @@ fn run_inner_beat(
                         "capturer failed under gdi fallback after {gdi_err} consecutive errors: {e:#}"
                     ));
                 }
-                settle_beat(&mut next_deadline, spf);
+                settle_beat(&worker, &mut next_deadline, spf);
                 continue;
             }
         }
@@ -1205,7 +1238,7 @@ fn run_inner_beat(
                                     bump(&stats, |s| s.counters.encode_err += 1);
                                 }
                             }
-                            settle_beat(&mut next_deadline, spf);
+                            settle_beat(&worker, &mut next_deadline, spf);
                             continue;
                         }
                         Err(err) => {
@@ -1236,7 +1269,7 @@ fn run_inner_beat(
             repeat_beat_skip += 1;
             if repeat_beat_skip % repeat_every.max(1) != 0 {
                 bump(&stats, |s| s.counters.repeat_skipped += 1);
-                settle_beat(&mut next_deadline, spf);
+                settle_beat(&worker, &mut next_deadline, spf);
                 continue;
             }
             if repeat_budget > 0 && !last_yuv.is_empty() {
@@ -1261,7 +1294,7 @@ fn run_inner_beat(
                 bump(&stats, |s| s.counters.repeat_skipped += 1);
             }
 
-            settle_beat(&mut next_deadline, spf);
+            settle_beat(&worker, &mut next_deadline, spf);
             continue;
         };
 
@@ -1377,7 +1410,7 @@ fn run_inner_beat(
             log::warn!("frame YUV conversion failed: {err:#}");
             bump(&stats, |s| s.counters.encode_err += 1);
             worker.give_back(captured.data);
-            settle_beat(&mut next_deadline, spf);
+            settle_beat(&worker, &mut next_deadline, spf);
             continue;
         }
         let input = EncodeInput::YUV(&yuv);
@@ -1477,7 +1510,10 @@ fn run_inner_beat(
                                 dir.join(name),
                                 tw as usize,
                                 th as usize,
-                                settings.fps(),
+                                // An IVF header's rate field cannot be 0; an
+                                // uncapped session is diagnosed as its budget
+                                // ceiling, which is the nearest real figure.
+                                settings.budget_fps(),
                                 &ivf_frames,
                             );
                             ivf_seq += 1;
@@ -1489,7 +1525,7 @@ fn run_inner_beat(
             forward_chunks(&tx, encoded, &stats, &handle, beat);
         }
 
-        settle_beat(&mut next_deadline, spf);
+        settle_beat(&worker, &mut next_deadline, spf);
     }
 }
 
@@ -1696,7 +1732,43 @@ fn keep_pristine(dst: &mut Vec<u8>, src: &[u8]) {
     dst.copy_from_slice(src);
 }
 
-fn settle_beat(next_deadline: &mut Instant, spf: Duration) {
+/// A frame rate as the server logs it: the number with its unit, or the word
+/// for the uncapped case (`settings::FPS_UNCAPPED`), which is not a rate and
+/// must not be printed as `0fps` in a line a post-mortem is read from.
+fn fps_label(fps: u32) -> String {
+    if fps == settings::FPS_UNCAPPED {
+        "unlimited".to_owned()
+    } else {
+        format!("{fps}fps")
+    }
+}
+
+/// How long an uncapped beat waits for the desktop to produce a frame before
+/// giving up and taking the idle path. The wakeup is normally the publish
+/// itself (the capture thread notifies the mailbox condvar), so this only
+/// bounds how long a stop, a gate change, or a wedged capturer can go
+/// unnoticed — 8 ms is two refreshes of a 240 Hz display.
+const UNCAPPED_WAIT: Duration = Duration::from_millis(8);
+
+/// Pacing for one beat.
+///
+/// Capped (`spf > 0`): the sliding deadline below.
+///
+/// Uncapped (`spf == 0` — the panel's rightmost stop, `settings::FPS_UNCAPPED`):
+/// there is no deadline to settle on, so the capture thread's own cadence paces
+/// the beat. Blocking on the mailbox is what makes that safe: a still desktop
+/// wakes us once per [`UNCAPPED_WAIT`] instead of spinning a core at full
+/// speed, and a moving one hands over a frame the instant the screen changes,
+/// which is the lowest latency this pipeline can reach. Sleeping a millisecond
+/// per beat instead would still be a 1000 Hz timer doing nothing.
+fn settle_beat(worker: &CaptureWorker, next_deadline: &mut Instant, spf: Duration) {
+    if spf.is_zero() {
+        if !worker.has_frame() {
+            worker.wait_frame(UNCAPPED_WAIT);
+        }
+        *next_deadline = Instant::now();
+        return;
+    }
     // #65: `thread::sleep` still overshoots by ~0.5 ms even at 1 ms timer
     // resolution, which is enough to cap a 60 fps beat at ~58 Hz once the
     // overshoot feeds the next deadline. Sleep up to `SPIN_TAIL` early and spin

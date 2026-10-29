@@ -31,10 +31,30 @@ use std::time::Duration;
 use crate::config::Config;
 
 /// Lower/upper clamp for client-requested values.
+///
+/// `FPS_MAX` moved 120 -> 240 so the panel's slider can offer the rates a
+/// 144/165/240 Hz display actually runs at; the encoder backstop and the
+/// bitrate budget are both scaled off the same ceiling (`keyframe_backstop_frames`,
+/// `bitrate_for`), so nothing here assumes a 60 Hz session.
 const FPS_MIN: u32 = 1;
-const FPS_MAX: u32 = 120;
+const FPS_MAX: u32 = 240;
 const RES_MIN: u32 = 320;
 const RES_MAX: u32 = 4080;
+
+/// The "no limit" frame rate: the panel's rightmost slider stop.
+///
+/// Zero is not a rate, so it never reaches `spf()`'s division. It means the
+/// beat is paced by the capture thread instead of a timer — one encode per
+/// frame the desktop actually produced, which is the lowest latency this
+/// pipeline can reach and is capped only by the display's own refresh. See
+/// `pipeline::settle_beat` for the wait, and `sample_spf` for what a sample is
+/// stamped with when there is no nominal rate to stamp.
+pub const FPS_UNCAPPED: u32 = 0;
+
+/// The rate an uncapped session is budgeted and keyframed as. There is no rate
+/// to scale by, so the ceiling stands in: a session told to run flat out is not
+/// budgeted as if it ran at one frame per second.
+pub const FPS_BUDGET: u32 = FPS_MAX;
 
 #[derive(Clone, Default)]
 pub struct StreamSettings {
@@ -69,6 +89,11 @@ impl StreamSettings {
         self.fps.load(Ordering::SeqCst)
     }
 
+    /// Did the client ask for no frame-rate limit (`FPS_UNCAPPED`)?
+    pub fn uncapped(&self) -> bool {
+        self.fps() == FPS_UNCAPPED
+    }
+
     pub fn width(&self) -> u32 {
         self.width.load(Ordering::SeqCst)
     }
@@ -83,7 +108,15 @@ impl StreamSettings {
     }
 
     pub fn set_fps(&self, fps: u32) {
-        self.fps.store(fps.clamp(FPS_MIN, FPS_MAX), Ordering::SeqCst);
+        // 0 is the panel's "no limit" stop, not an absurd rate: keep it rather
+        // than clamping it up to `FPS_MIN`, which would turn unlimited into
+        // one frame per second.
+        let fps = if fps == FPS_UNCAPPED {
+            FPS_UNCAPPED
+        } else {
+            fps.clamp(FPS_MIN, FPS_MAX)
+        };
+        self.fps.store(fps, Ordering::SeqCst);
         self.dirty.store(true, Ordering::SeqCst);
     }
 
@@ -128,8 +161,41 @@ impl StreamSettings {
     }
 
     /// Seconds per frame at the current fps; re-read by the worker each beat.
+    ///
+    /// Zero for an uncapped session — the caller must read that as "no beat
+    /// deadline at all" (`pipeline::settle_beat`) rather than as a duration.
     pub fn spf(&self) -> Duration {
-        Duration::from_secs_f64(1.0 / self.fps() as f64)
+        let fps = self.fps();
+        if fps == FPS_UNCAPPED {
+            return Duration::ZERO;
+        }
+        Duration::from_secs_f64(1.0 / fps as f64)
+    }
+
+    /// The duration stamped on one emitted sample: `spf`, except for an uncapped
+    /// session, where there is no nominal rate and a zero duration would stamp
+    /// every frame with the same RTP timestamp (the browser reads the rest of
+    /// the burst as duplicates of one frame). One millisecond keeps the media
+    /// clock moving forward; the forwarder overrides it with the interval the
+    /// beat actually ran at, which is the honest figure.
+    pub fn sample_spf(&self) -> Duration {
+        let spf = self.spf();
+        if spf.is_zero() {
+            Duration::from_millis(1)
+        } else {
+            spf
+        }
+    }
+
+    /// The rate a bitrate budget and a keyframe backstop scale by: the live fps,
+    /// or `FPS_BUDGET` for an uncapped session.
+    pub fn budget_fps(&self) -> u32 {
+        let fps = self.fps();
+        if fps == FPS_UNCAPPED {
+            FPS_BUDGET
+        } else {
+            fps
+        }
     }
 }
 
@@ -174,11 +240,31 @@ mod tests {
     fn clamps_absurd_requests() {
         let s = StreamSettings::from_config(&cfg());
         s.set_fps(999);
-        assert_eq!(s.fps(), 120);
+        assert_eq!(s.fps(), 240);
         s.set_resolution(10, 10);
         assert!(s.width() >= 320);
         s.set_resolution(99999, 99999);
         assert!(s.width() <= 4080);
+    }
+
+    /// The panel's rightmost stop asks for no limit; it must survive `set_fps`
+    /// unchanged (a clamp to `FPS_MIN` would silently make it 1 fps) and must
+    /// not turn into a division by zero.
+    #[test]
+    fn zero_is_uncapped_not_a_rate() {
+        let s = StreamSettings::from_config(&cfg());
+        s.set_fps(0);
+        assert!(s.uncapped());
+        assert_eq!(s.fps(), 0);
+        assert_eq!(s.spf(), Duration::ZERO);
+        assert_eq!(s.sample_spf(), Duration::from_millis(1));
+        // Budgeted as the ceiling, not as zero.
+        assert_eq!(s.budget_fps(), 240);
+        // And back to a rate.
+        s.set_fps(144);
+        assert!(!s.uncapped());
+        assert_eq!(s.spf(), Duration::from_secs_f64(1.0 / 144.0));
+        assert_eq!(s.budget_fps(), 144);
     }
 
     /// #68 regression guard: the transmitted size must stay independent of the

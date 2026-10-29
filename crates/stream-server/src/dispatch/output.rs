@@ -229,6 +229,11 @@ pub fn connection(poor: bool) -> String {
 /// *live* `StreamSettings`, so a client-requested fps / resolution change is
 /// re-announced here without a reconnect.
 ///
+/// `framerate.uncapped` advertises the panel's last slider stop: `framerate:
+/// 0`, meaning "pace on the capture thread, no timer" (see
+/// `pipeline::settings::FPS_UNCAPPED`). A client that does not know the flag
+/// simply never sends it.
+///
 /// #71 — `manual_resolution` MUST stay `false` here.
 /// This server does not pin a framebuffer: `run_blocking_loop` sizes every
 /// beat as `min(client request, native display)` and follows the client when it
@@ -251,7 +256,11 @@ pub fn server_settings(s: &crate::pipeline::StreamSettings) -> String {
                 "framerate": {
                     "value": s.fps(),
                     "min": 10,
-                    "max": 60,
+                    // 240, not 60: the panel offers every rate up to the one a
+                    // 240 Hz display runs at, and `uncapped` adds the last stop
+                    // ("no limit", fps 0 — paced by the capture thread).
+                    "max": crate::pipeline::settings::FPS_BUDGET,
+                    "uncapped": true,
                     "locked": false
                 },
                 "manual_resolution": { "value": false, "locked": false },

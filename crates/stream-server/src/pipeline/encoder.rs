@@ -39,7 +39,11 @@ use scrap::{EncodeInput, EncodeYuvFormat, VpxEncoderConfig, VpxNoOutput, VpxVide
 /// libvpx takes this as a `c_uint`; `usize` is what `VpxEncoderConfig` carries,
 /// so the conversion happens here and the clamp keeps the cast in range.
 fn keyframe_backstop_frames(fps: u32, keyframe_secs: u32) -> usize {
-    let fps = u64::from(fps.clamp(1, 240));
+    // An uncapped session (`fps == 0`) has no frame rate to count from; the
+    // ceiling stands in so its backstop is as long as a 240 fps one, not as
+    // short as a 1 fps one (which would force an IDR every other frame).
+    let fps = if fps == 0 { 240 } else { fps.clamp(1, 240) };
+    let fps = u64::from(fps);
     let secs = u64::from(keyframe_secs.clamp(1, 120));
     (fps * secs * 2).clamp(60, 240_000) as usize
 }
@@ -198,6 +202,11 @@ mod tests {
     fn backstop_survives_garbage_input() {
         // `Config` can be built as a struct literal, so 0 must not panic or
         // produce a zero budget (libvpx treats 0 as "use the default 128").
-        assert_eq!(keyframe_backstop_frames(0, 0), 60);
+        // A rate of 0 is the panel's "no limit" (`settings::FPS_UNCAPPED`), and
+        // it is budgeted at the ceiling, not at one frame per second — the
+        // latter would drop an IDR every other frame on an uncapped session.
+        // The seconds keep their own floor of 1.
+        assert_eq!(keyframe_backstop_frames(0, 0), 480);
+        assert_eq!(keyframe_backstop_frames(1, 1), 60);
     }
 }
