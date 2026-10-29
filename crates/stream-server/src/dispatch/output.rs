@@ -81,7 +81,8 @@ pub struct StreamStats {
     pub rtt_ms: Option<f32>,
     /// #78: PLI/FIR received this session (the panel's "Keyframe requests").
     pub keyframe_requests: u64,
-    /// Stage1 has no QoS throttle; always false.
+    /// #84: the QoS controller has the encoder below its base rate. Was
+    /// hard-coded false until there was a controller to ask.
     pub throttled: bool,
 }
 
@@ -120,6 +121,13 @@ impl StreamStats {
     /// session, not in the pipeline.
     pub fn with_rtt(mut self, rtt_ms: Option<f32>) -> Self {
         self.rtt_ms = rtt_ms;
+        self
+    }
+
+    /// #84: attach the QoS state. Same reason as `with_rtt` — the controller
+    /// lives in the capture loop, which the stats task cannot see.
+    pub fn with_throttled(mut self, throttled: bool) -> Self {
+        self.throttled = throttled;
         self
     }
 }

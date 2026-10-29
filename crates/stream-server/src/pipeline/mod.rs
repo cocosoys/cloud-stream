@@ -57,9 +57,11 @@
 //! worker can update counters without crossing an await.
 
 pub mod audio;
+pub mod avsync;
 pub mod capture;
 pub mod cursor;
 pub mod encoder;
+pub mod qos;
 pub mod sample_map;
 pub mod scale;
 pub mod settings;
@@ -220,6 +222,10 @@ pub struct PipelineHandle {
     /// composite the OS cursor into the video frames (C1). Default 0 so the
     /// unfocused browser never shows a duplicated composited cursor.
     cursor_inject: Arc<AtomicBool>,
+    /// #84: whether the QoS controller has the encoder below its base rate.
+    /// Published as `stream_stats.throttled`, which used to be hard-coded
+    /// false because there was no controller to ask.
+    throttled: Arc<AtomicBool>,
     /// #62: the session installs a sink here; the blocking worker reports its
     /// own termination (error or panic) through it. Without this a dead worker
     /// left the PC / data channels alive, so the browser showed a frozen picture
@@ -248,6 +254,7 @@ impl PipelineHandle {
             keyframe_requested: Arc::new(AtomicBool::new(false)),
             bitrate_override: Arc::new(AtomicU32::new(0)),
             cursor_inject: Arc::new(AtomicBool::new(false)),
+            throttled: Arc::new(AtomicBool::new(false)),
             exit_sink: Arc::new(Mutex::new(None)),
         }
     }
@@ -308,6 +315,16 @@ impl PipelineHandle {
     /// Whether the pipeline should composite the OS cursor this beat.
     pub fn cursor_inject_on(&self) -> bool {
         self.cursor_inject.load(Ordering::SeqCst)
+    }
+
+    /// #84: published as `stream_stats.throttled` and set by the QoS
+    /// controller when it backs the encoder off its base rate.
+    pub fn set_throttled(&self, on: bool) {
+        self.throttled.store(on, Ordering::SeqCst);
+    }
+
+    pub fn is_throttled(&self) -> bool {
+        self.throttled.load(Ordering::SeqCst)
     }
 
     /// Shared aggregator for the stats timer's snapshot / reset window.
@@ -672,6 +689,12 @@ fn run_inner_beat(
     let mut repeat_beat_skip: u32 = 0;
     // #62: last forced keyframe, for the PLI debounce below.
     let mut last_keyframe: Option<Instant> = None;
+    // #84: adaptive bitrate. `base` is the configured budget (fps-scaled
+    // `--bitrate`); the controller only ever moves the target *below* it.
+    let mut qos = qos::QosController::new(bitrate_for(base_bitrate_kbps, settings.fps()));
+    let mut last_qos = Instant::now();
+    let mut qos_state = qos::QosState::Normal;
+    let mut prev_pli_total = 0u64;
     let mut gdi_err: u64 = 0;
     // #63: loop-rate / frame-count probe (see `STATS_LOG_INTERVAL`).
     let mut beats: u64 = 0;
@@ -783,10 +806,15 @@ fn run_inner_beat(
             let (rel_events, rel_pixels) = crate::dispatch::win_input::mouse_rel_totals();
             let abs_events = crate::dispatch::win_input::mouse_abs_total();
             let pointer_msgs = crate::dispatch::win_input::pointer_channel_total();
+            // #83: A/V offset as `signal`, the way the panel shows it. `-` means
+            // audio has not started (no baseline yet).
+            let av = avsync::report()
+                .map(|(ms, fixes)| format!("{ms:+.0}ms/{fixes}fix"))
+                .unwrap_or_else(|| "-".to_owned());
             log::info!(
                 "pipeline {:.1}s: loop={:.1}Hz new={} repeat={} skip={} wb={} inv={} cap_err={} \
                  enc_ok={} enc_no_out={} enc_err={} ws_err={} cap_wait={:.2}ms poll={:.2}ms conv={:.2}ms \
-                 enc_avg={:.1}ms pipe_avg={:.1}ms scale={} carry={} paint={} on={} m={} m2={} dm={} pm={}",
+                 enc_avg={:.1}ms pipe_avg={:.1}ms scale={} carry={} paint={} on={} m={} m2={} dm={} pm={} av={}",
                 since_log.as_secs_f64(),
                 beats as f64 / since_log.as_secs_f64(),
                 d(c.new_frames, prev_counters.new_frames),
@@ -811,7 +839,8 @@ fn run_inner_beat(
                 abs_events.saturating_sub(prev_abs_events),
                 rel_events.saturating_sub(prev_rel_events),
                 rel_pixels.saturating_sub(prev_rel_pixels),
-                pointer_msgs.saturating_sub(prev_pointer_msgs)
+                pointer_msgs.saturating_sub(prev_pointer_msgs),
+                av
             );
             prev_counters = c;
             prev_abs_events = abs_events;
@@ -827,6 +856,52 @@ fn run_inner_beat(
             // a locked pointer moves and stay at 0 otherwise.
             cursor_repaints = 0;
             last_stats_log = Instant::now();
+        }
+        // #84: adaptive bitrate. Before this the rate had exactly one source —
+        // the client's `vb,N` or the configured budget — so a congested link
+        // changed nothing and the picture stayed mosaic until a human dragged
+        // the slider. The two inputs are already measured: `send_ms - pipeline_ms`
+        // is the hand-off queue (the part `pipeline_ms` does not cover), and
+        // `pli_requests` is the decoder losing its anchor, which on a LAN means
+        // loss rather than a slow encoder.
+        //
+        // The window is read from the shared stats rather than kept locally:
+        // the session's 1 s tick resets the timing groups, so the averages here
+        // cover at most the last second — a *mean queue wait*, which is what the
+        // decision needs.
+        if last_qos.elapsed() >= qos::QOS_INTERVAL {
+            let window = last_qos.elapsed();
+            let (backlog_ms, pli_total) = {
+                let guard = stats.lock().unwrap_or_else(|p| p.into_inner());
+                (
+                    (guard.send_timing.avg_ms() - guard.pipeline_timing.avg_ms()).max(0.0),
+                    guard.pli_requests,
+                )
+            };
+            let step = qos.evaluate(qos::QosSample {
+                backlog_ms,
+                pli_total,
+                window,
+            });
+            handle.set_throttled(step.state.throttled());
+            if step.changed {
+                encoder.set_bitrate_kbps(step.target_kbps);
+            }
+            if step.state != qos_state {
+                log::info!(
+                    "qos: {} -> target {} of {} kbps (backlog {:.0} ms, {} PLI in {:.1}s)",
+                    step.state.label(),
+                    step.target_kbps,
+                    qos.base_kbps(),
+                    backlog_ms,
+                    pli_total.saturating_sub(prev_pli_total),
+                    window.as_secs_f64()
+                );
+                qos_state = step.state;
+            }
+            // Snapshot for the next window's PLI delta, and restart the clock.
+            prev_pli_total = pli_total;
+            last_qos = Instant::now();
         }
         // #53: PLI/FIR from the browser -> force the next encode to a keyframe
         // so the receiver re-anchors its reference chain after packet loss.
@@ -856,7 +931,15 @@ fn run_inner_beat(
         let bitrate_override = handle.bitrate_override.swap(0, Ordering::SeqCst);
         if bitrate_override > 0 {
             log::info!("client requested bitrate -> {bitrate_override}kbps");
-            encoder.set_bitrate_kbps(bitrate_override.clamp(200, 40_000));
+            let kbps = bitrate_override.clamp(200, 40_000);
+            encoder.set_bitrate_kbps(kbps);
+            // #84: a rate the client asked for is the new ceiling. Leaving the
+            // controller pinned to the old (possibly much lower) target would
+            // silently ignore the slider.
+            qos.set_base(kbps);
+            handle.set_throttled(false);
+            qos_state = qos::QosState::Normal;
+            last_qos = Instant::now();
         }
         // #50: re-read the live targets every beat (lock-free atomics).
         spf = settings.spf();
@@ -874,7 +957,14 @@ fn run_inner_beat(
             // configured `--bitrate`); a 60 fps session doubles the budget.
             // A #56 user override stays in place until the next `vb` request.
             if handle.bitrate_override.load(Ordering::SeqCst) == 0 {
-                encoder.set_bitrate_kbps(bitrate_for(base_bitrate_kbps, cur_fps));
+                let base = bitrate_for(base_bitrate_kbps, cur_fps);
+                encoder.set_bitrate_kbps(base);
+                // #84: a new fps means a new budget, so the controller's
+                // ceiling moves with it (and any back-off is forgotten).
+                qos.set_base(base);
+                handle.set_throttled(false);
+                qos_state = qos::QosState::Normal;
+                last_qos = Instant::now();
             }
         }
         if (tw, th) != (enc_w, enc_h) {

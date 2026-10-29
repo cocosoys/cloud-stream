@@ -448,6 +448,10 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
                         // not open a second loopback capture on the same endpoint.
                         if !audio_started {
                             audio_started = true;
+                            // #83: both media clocks restart with the audio
+                            // thread, so a reconnect does not inherit the skew of
+                            // the session that just ended.
+                            crate::pipeline::avsync::reset();
                             let audio = watcher_media.lock().await.audio().clone();
                             crate::pipeline::audio::spawn(audio, watcher_audio_stop.clone());
                             log::info!("audio downlink spawned after PC connected");
@@ -558,7 +562,10 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
                 };
                 let stats = StreamStats::from_host(host)
                     .with_pipeline(&snapshot)
-                    .with_rtt(stats_latency.rtt_ms());
+                    .with_rtt(stats_latency.rtt_ms())
+                    // #84: the QoS controller lives in the capture loop; this is
+                    // the only path from there to the panel.
+                    .with_throttled(stats_pipeline.is_throttled());
                 // #78: one line when a subscriber arrives. `stream_stats` is
                 // otherwise invisible in the log (it only exists while `_stats,1`
                 // is active), so "the panel is empty" had no server-side answer:
@@ -845,10 +852,17 @@ async fn arm_connected_notices(
                 // #55: Ctrl/Cmd+C in the browser — read the host clipboard and
                 // push the `clipboardContentUpdate` JSON on the control DC.
                 Action::ClipboardRequest => {
-                    let payload = read_clipboard_update();
-                    log::info!("REQUEST_CLIPBOARD: {} bytes of text answered", payload.len());
-                    if let Err(err) = control.send_text(&payload).await {
-                        log::debug!("clipboard reply skipped: {err:#}");
+                    let messages = read_clipboard_update();
+                    log::info!(
+                        "REQUEST_CLIPBOARD: answered with {} message(s), {} bytes of JSON",
+                        messages.len(),
+                        messages.iter().map(|m| m.len()).sum::<usize>()
+                    );
+                    for payload in messages {
+                        if let Err(err) = control.send_text(&payload).await {
+                            log::debug!("clipboard reply skipped: {err:#}");
+                            break;
+                        }
                     }
                 }
                 // #55: browser Ctrl/Cmd+V uplink — reassemble and write the
