@@ -38,8 +38,8 @@ use tokio_tungstenite::{
 
 use crate::config::Config;
 use crate::dispatch::{
-    classify, connection, cursor, pipeline, server_settings, stream_info, stream_stats, system,
-    Action, ClipboardSink, InputSinkRef, StreamInfo, StreamStats, WinInputSink,
+    classify, connection, cursor, display, pipeline, server_settings, stream_info, stream_stats,
+    system, Action, ClipboardSink, InputSinkRef, StreamInfo, StreamStats, WinInputSink,
     read_clipboard_update,
 };
 use crate::pipeline::{spawn_loop, PipelineEvent, PipelineHandle, StreamSettings};
@@ -640,6 +640,13 @@ fn surface_of(action: &Action) -> Option<EventKind> {
         Action::SetAudioOn(_) | Action::SetAudioBitrate(_) => EventKind::Media(MediaDir::AudioOut),
         Action::SetFps(_) => EventKind::Control("control.fps"),
         Action::SetResolution(..) => EventKind::Control("control.resolution"),
+        // #89: reflowing the host desktop is a bigger side effect than asking
+        // the scaler for a size, so it gets its own control surface name — a
+        // future policy must be able to allow `control.resolution` and refuse
+        // `control.display`.
+        Action::SetDisplayResolution(..) | Action::ResetDisplayResolution => {
+            EventKind::Control("control.display")
+        }
         Action::SetSettings(_) => EventKind::Control("control.settings"),
         Action::SetBitrate(_) => EventKind::Control("control.bitrate"),
         Action::SetNativeCursorRendering(_) => EventKind::Control("control.cursor-rendering"),
@@ -886,6 +893,63 @@ async fn arm_connected_notices(
                     settings.set_resolution(w, h);
                     let _ = control.send_text(server_settings(&settings)).await;
                 }
+                // #89: `dr,WxH` reflows the *host* desktop so the capture is
+                // 1:1 with the client viewport. `ChangeDisplaySettingsW` blocks
+                // for a few hundred milliseconds while the driver re-syncs, so
+                // it goes to a blocking worker; the session is deliberately
+                // kept waiting, because the frames are about to change size and
+                // every input in flight would be mapped against the old one.
+                Action::SetDisplayResolution(w, h) => {
+                    let (w, h) = (even_side(w), even_side(h));
+                    log::info!("client sets display mode -> {w}x{h}");
+                    match tokio::task::spawn_blocking(move || display::apply(w, h)).await {
+                        Ok(Ok(applied)) => {
+                            log::info!(
+                                "display mode {}x{} -> {}x{} (strategy={}, exact={})",
+                                applied.requested.0,
+                                applied.requested.1,
+                                applied.applied.0,
+                                applied.applied.1,
+                                applied.strategy,
+                                applied.exact
+                            );
+                            // Pin the scaler target to the new desktop size:
+                            // asking for anything else would reintroduce the
+                            // ratio this switch exists to remove. The pipeline
+                            // sees the size change and rebuilds the pair.
+                            settings.set_resolution(applied.applied.0, applied.applied.1);
+                            let _ = control.send_text(&display_mode_report(&applied)).await;
+                            let _ = control.send_text(server_settings(&settings)).await;
+                        }
+                        Ok(Err(reason)) => {
+                            log::warn!("display mode switch refused: {reason}");
+                            let _ = control
+                                .send_text(&display_mode_failure(w, h, &reason))
+                                .await;
+                        }
+                        Err(join) => {
+                            log::warn!("display mode worker failed: {join}");
+                            let _ = control
+                                .send_text(&display_mode_failure(w, h, "worker join error"))
+                                .await;
+                        }
+                    }
+                }
+                // #89: `dr,reset` — back to whatever the host had before the
+                // first switch of this process. Also re-pins the scaler target,
+                // so the restored desktop is transmitted 1:1 instead of being
+                // squeezed back into the viewport-sized buffer.
+                Action::ResetDisplayResolution => {
+                    match tokio::task::spawn_blocking(display::restore).await {
+                        Ok(Ok((w, h))) => {
+                            log::info!("display mode restored -> {w}x{h}");
+                            settings.set_resolution(w, h);
+                            let _ = control.send_text(server_settings(&settings)).await;
+                        }
+                        Ok(Err(reason)) => log::warn!("display restore refused: {reason}"),
+                        Err(join) => log::warn!("display restore worker failed: {join}"),
+                    }
+                }
                 Action::SetSettings(payload) => {
                     apply_settings_batch(&settings, &payload);
                     let _ = control.send_text(server_settings(&settings)).await;
@@ -981,6 +1045,43 @@ async fn resend_notices(media: &Arc<Mutex<MediaSession>>, settings: &StreamSetti
         }
     }
     log::info!("re-connected: stream_info / server_settings / connection re-sent");
+}
+
+/// Round a display dimension down to an even number (#89).
+///
+/// The VP8 encoder wants even rows to avoid padding the last chroma line, and a
+/// browser viewport is routinely an odd number of CSS pixels. Two pixels are
+/// invisible; an odd buffer is a visible seam on some drivers.
+fn even_side(v: u32) -> u32 {
+    v.max(2) & !1
+}
+
+/// `display_resolution` ack (#89): what the host is at now, and whether it is
+/// exactly what the browser asked for. The frontend uses `exact` to decide
+/// between "1:1" and "1:1 at the nearest the driver offers".
+fn display_mode_report(a: &display::Applied) -> String {
+    hbb_common::serde_json::json!({
+        "type": "display_resolution",
+        "requested": format!("{}x{}", a.requested.0, a.requested.1),
+        "applied": format!("{}x{}", a.applied.0, a.applied.1),
+        "width": a.applied.0,
+        "height": a.applied.1,
+        "exact": a.exact,
+        "strategy": a.strategy,
+    })
+    .to_string()
+}
+
+/// Failure counterpart of `display_mode_report`; the host desktop is unchanged.
+fn display_mode_failure(w: u32, h: u32, reason: &str) -> String {
+    hbb_common::serde_json::json!({
+        "type": "display_resolution",
+        "requested": format!("{w}x{h}"),
+        "applied": hbb_common::serde_json::Value::Null,
+        "exact": false,
+        "error": reason,
+    })
+    .to_string()
 }
 
 /// Apply the `SETTINGS,{json}` batch to the live `StreamSettings` (#50).

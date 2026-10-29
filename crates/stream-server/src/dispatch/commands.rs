@@ -35,6 +35,13 @@ pub enum Action {
     SetFps(u32),
     /// `r,<W>x<H>` (#50) — client resolution request (scaler target).
     SetResolution(u32, u32),
+    /// `dr,<W>x<H>` (#89) — change the *host display mode* itself so the
+    /// capture is 1:1 with the client viewport. Unlike `r,`, this reflows the
+    /// physical desktop; the browser asks for it explicitly from the toolbar.
+    SetDisplayResolution(u32, u32),
+    /// `dr,reset` (#89) — put the host back to the mode it had before the first
+    /// `dr,` of this process.
+    ResetDisplayResolution,
     /// `SETTINGS,{json}` (#50) — client settings batch; JSON parsed by the
     /// session (framerate / manual_width / manual_height / ...).
     SetSettings(String),
@@ -120,6 +127,19 @@ pub fn classify(line: &str) -> Action {
             match rest.split_once('x') {
                 Some((w, h)) => match (w.trim().parse::<u32>(), h.trim().parse::<u32>()) {
                     (Ok(w), Ok(h)) if w > 0 && h > 0 => Action::SetResolution(w, h),
+                    _ => Action::Unknown(line.to_owned()),
+                },
+                None => Action::Unknown(line.to_owned()),
+            }
+        }
+        // #89: `dr,<W>x<H>` switches the host *display mode*; `dr,reset` puts
+        // it back. Parsed next to `r` because the payload shape is identical —
+        // keep them apart: `r` is a scaler target, `dr` moves the real desktop.
+        "dr" if rest.trim() == "reset" => Action::ResetDisplayResolution,
+        "dr" => {
+            match rest.split_once('x') {
+                Some((w, h)) => match (w.trim().parse::<u32>(), h.trim().parse::<u32>()) {
+                    (Ok(w), Ok(h)) if w > 0 && h > 0 => Action::SetDisplayResolution(w, h),
                     _ => Action::Unknown(line.to_owned()),
                 },
                 None => Action::Unknown(line.to_owned()),

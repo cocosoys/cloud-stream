@@ -7,6 +7,8 @@
 pub mod clipboard;
 pub mod clipboard_image;
 pub mod commands;
+// #89: host display-mode control (the "match my viewport" toolbar switch).
+pub mod display;
 pub mod input_stub;
 pub mod output;
 pub mod win_input;
