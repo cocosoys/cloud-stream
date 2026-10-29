@@ -341,11 +341,13 @@ Session 1。体检会打印 `session=1`，看到 `session=0` 就是这条踩了�
 ## 9 脚本挂掉时的等价手工命令
 
 ```powershell
-# 构建
+# 构建（从仓库根目录开始）
 cargo build --release -p stream-server
 cd ..\selkies-webclient\addons\selkies-web-core ; npm run build
 cd ..\selkies-dashboard ; npm run build
-Compress-Archive -Path .\dist\* -DestinationPath ..\..\..\cloud-stream\target\deploy-selkies-web.zip -Force
+cd C:\Users\user\Desktop\cloud-stream
+Compress-Archive -Path ..\selkies-webclient\addons\selkies-dashboard\dist\* `
+                 -DestinationPath target\deploy-selkies-web.zip -Force
 
 # 上传
 scp target\release\stream-server.exe mc-admin:C:/dev/stream/stream-server.new.exe
