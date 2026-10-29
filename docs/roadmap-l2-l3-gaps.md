@@ -75,13 +75,20 @@
 | 24 | 音量 / 静音 / 音频码率 | ✅* | #80，`Action::SetAudioOn` / `SetAudioBitrate`，静音期间发静音帧（~1.6 kbps 而非停发）；*待实机验收 |
 | 25 | QoS 自适应码率（丢包 / 积压反压） | ✅ | #84，`pipeline/qos.rs`（积压 + PLI 率 → 2s 一次决策，-25%/+10%，floor 20%）；`throttled` 现为真实状态 |
 | 26 | 音画同步 | ✅ | #83，`pipeline/avsync.rs`：音频媒体时钟钉在墙钟上，偏斜 >80 ms 时以 20 ms 为一格收发帧。首版比两路介质时钟，实测误判成 -16 s（见设计稿 §3.1） |
-| 27 | 周期关键帧 / 长参考链守护 | ✅ | **此前误判为未做**。`pipeline/encoder.rs:59` 设 `keyframe_interval: Some(60)`，`vendor/scrap/src/common/vpxcodec.rs:102` 映射为 `kf_max_dist = 60` —— 每 60 个**编码帧**强制一个 IDR，而静态画面走 `repeat encode`（`mod.rs:1111`）同样经过编码器，所以静止时也在刷新参考链 |
+| 27 | 周期关键帧 / 长参考链守护 | ✅ | **此前误判为未做**；`#86` 又把它从「帧数」改成「秒数」。现在 `--keyframe-secs`（默认 10 s）由采集循环按墙钟执行 `force_keyframe`，`kf_max_dist` 降级为 2 倍周期的兜底网（`encoder.rs:keyframe_backstop_frames`） |
 | 28 | 截图 / 录屏 | ❌ | `grep screenshot\|record` 在 Rust 侧零命中，无 HTTP 端点也无下行命令 |
 
 > #27 的残余问题不是"没有周期关键帧"，而是**间隔不可配且偏短**：60 帧 ≈ 30 fps 下
 > 2 秒，1080p 一个 IDR 约 100–200 KB，等于常驻 0.4–0.8 Mbps 花在刷新参考链上。
 > 若要做的是"长静置守护"，正确形态是 `--keyframe-interval-sec`（默认 10 s）+
 > 保留 PLI 立即响应，即把 60 改大、把秒级守护交回策略层。属调优，不是缺口。
+>
+> **已落地（#86）**：旗标叫 `--keyframe-secs`（默认 10，clamp 1–120）。实现上不是
+> 简单把 60 改大——`kf_max_dist` 的计量单位是**编码帧**，而本管线"变化才发"，
+> 同一数值在动的画面是 1 s、在静的桌面是几分钟，用帧数根本表达不了秒。改为采集
+> 循环按墙钟计时、到点 `force_keyframe()`，`kf_max_dist` 只留 `fps × secs × 2`
+> 的兜底。实测日志：`periodic keyframe: 10.0s since the last IDR (period 10s)`，
+> 同一窗口 `kf=1`（`key_frames` 计数取自 VP8 包的 `key` 标志，证明 IDR 真发出去了）。
 
 ### 1.4 L4 产品闭环 — 4 完成 / 1 部分 / 1 未做
 
@@ -274,6 +281,15 @@ IDR 约 100–200 KB，等于持续付出 0.4–0.8 Mbps。若要的是「长静
 `--keyframe-interval-sec`（默认 10 s）并保留 PLI 立即响应 —— 这在做 QoS 时顺手做，
 因为降档会被过于频繁的 IDR 直接抵消。
 
+**已做完（#86）**：旗标落地为 `--keyframe-secs`（默认 10，clamp 1–120）。关键点是
+不能只把 60 改大：`kf_max_dist` 数的是**编码帧**，本管线又是"变化才发"，同一数值
+在动的画面是 1 s、在静的桌面是几分钟 —— 帧数表达不了秒。所以采集循环每拍检查
+`last_keyframe.elapsed() >= keyframe_period`，到点 `force_keyframe()`；`kf_max_dist`
+退成 `fps × secs × 2` 的兜底（`encoder.rs:keyframe_backstop_frames`，附 4 条单测）。
+同时新增 `FrameCounters::key_frames`，在 `forward_chunks` 里按 VP8 包的 `key` 标志
+计数 —— 请求了不等于发出去了，只有这个计数能证明。实测：日志每 10 s 一行
+`periodic keyframe: 10.0s since the last IDR (period 10s)`，对应窗口 `kf=1`。
+
 ### 2.10 截图 / 录屏（#28，P3，L3）
 
 **现象**：无。属产品功能缺失。
@@ -331,6 +347,7 @@ IDR 约 100–200 KB，等于持续付出 0.4–0.8 Mbps。若要的是「长静
 | ~~P1~~ | ~~2.4 QoS 自适应~~ | — | **已实现 #84**（比原计划早：没等关键帧调优，因为降档后 IDR 的相对开销问题要靠后续调 `kf_max_dist` 解决，不阻塞） |
 | ~~P2~~ | ~~2.7 音画同步~~ | — | **已实现 #83** |
 | ~~P2~~ | ~~2.8 二进制剪贴板~~ | — | **已实现 #85**，PNG 解码器是自写的（flate2），没引新依赖 |
+| ~~P2~~ | ~~2.9 残余：关键帧秒级可配~~ | — | **已实现 #86**，`--keyframe-secs` 默认 10 s，墙钟为准、帧数是兜底 |
 | **P1** | **2.12 音频观测** | — | 仍是 #79/#80 的验收工具；不做就只能靠耳朵 |
 | P1 | 2.5 鉴权 | — | 局域网内裸奔，**现在是最该做的一项** |
 | P2 | 2.11 一键部署 | — | 减少每次验证的摩擦；当前每轮验证要手工七步 |

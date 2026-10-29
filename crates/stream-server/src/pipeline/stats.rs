@@ -168,6 +168,11 @@ pub struct FrameCounters {
     pub repeat_skipped: u64,
     /// `track.write_sample` consecutive/total failures this window.
     pub write_sample_err: u64,
+    /// #86: encoded frames that actually went out as a keyframe (VP8 `key`
+    /// flag on the packet). Counted at the hand-off, not at the request site,
+    /// so a `force_keyframe` that never found an encode to ride on shows up as
+    /// a missing IDR instead of a log line claiming one was sent.
+    pub key_frames: u64,
 }
 
 /// Everything the loop accumulates between stats snapshots.

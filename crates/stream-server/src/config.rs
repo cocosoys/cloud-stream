@@ -47,6 +47,16 @@ pub struct Config {
     /// rate for a browser whose software VP8 decoder cannot keep up (measured
     /// 3.6 % dropped frames at ~54 repeats/s on this host).
     pub repeat_every: u32,
+    /// #86: wall-clock period of the periodic keyframe, in seconds (default
+    /// 10). This replaces `kf_max_dist = 60` as the authority: libvpx counts
+    /// that budget in **encoded frames**, and this pipeline only encodes when
+    /// the desktop changes or a repeat is due, so "60 frames" is ~1 s at 60 fps
+    /// on a moving picture and minutes on a static one. A keyframe is 100-200 KB
+    /// at 1080p, so one per second spends the entire bitrate budget and pins the
+    /// quantizer at `q_max` (the #61 experiment D finding); 10 s keeps the
+    /// reference chain anchored without paying for it, and the PLI path still
+    /// re-anchors on demand.
+    pub keyframe_secs: u32,
     /// #67: file-transfer root. When set, `/api/files/{rel}` lists/downloads
     /// files under this directory and `/api/upload` writes into it; `None`
     /// disables both endpoints (403), matching the retired Python service's
@@ -75,6 +85,7 @@ impl Default for Config {
             no_hdr: false,
             dump_frame: None,
             repeat_every: 2,
+            keyframe_secs: 10,
             upload_dir: None,
         }
     }
@@ -165,6 +176,13 @@ impl Config {
                         }
                     }
                 }
+                "--keyframe-secs" => {
+                    if let Some(v) = iter.next() {
+                        if let Ok(n) = v.parse::<u32>() {
+                            cfg.keyframe_secs = n.clamp(1, 120);
+                        }
+                    }
+                }
                 "--no-hdr" => cfg.no_hdr = true,
                 "--upload-dir" => {
                     if let Some(v) = iter.next() {
@@ -201,5 +219,55 @@ impl Config {
     /// True when both certificate and key paths are present.
     pub fn tls_enabled(&self) -> bool {
         self.tls_cert.is_some() && self.tls_key.is_some()
+    }
+
+    /// #86: wall-clock spacing between periodic keyframes. Clamped again here
+    /// because `Config` can also be built as a struct literal (tests, benches),
+    /// where `parse` never ran the clamp.
+    pub fn keyframe_period(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.keyframe_secs.clamp(1, 120) as u64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Config {
+        Config::parse(args.iter().map(|s| (*s).to_owned()).collect())
+    }
+
+    #[test]
+    fn keyframe_secs_defaults_to_ten_seconds() {
+        let cfg = parse(&[]);
+        assert_eq!(cfg.keyframe_secs, 10);
+        assert_eq!(cfg.keyframe_period(), std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn keyframe_secs_reads_the_flag() {
+        assert_eq!(parse(&["--keyframe-secs", "4"]).keyframe_period().as_secs(), 4);
+    }
+
+    #[test]
+    fn keyframe_secs_is_clamped_to_one_second_upwards() {
+        // 0 would mean "force a keyframe on every beat" — one IDR per frame eats
+        // the whole budget on a moving picture, so clamp instead of trusting it.
+        assert_eq!(parse(&["--keyframe-secs", "0"]).keyframe_period().as_secs(), 1);
+    }
+
+    #[test]
+    fn keyframe_secs_is_clamped_to_two_minutes_downwards() {
+        // The other end matters too: past ~2 min the reference chain drifts
+        // (the #53 quantizer-drift finding) and a late joiner waits for a PLI.
+        assert_eq!(
+            parse(&["--keyframe-secs", "999"]).keyframe_period().as_secs(),
+            120
+        );
+    }
+
+    #[test]
+    fn a_bad_keyframe_value_keeps_the_default() {
+        assert_eq!(parse(&["--keyframe-secs", "soon"]).keyframe_secs, 10);
     }
 }

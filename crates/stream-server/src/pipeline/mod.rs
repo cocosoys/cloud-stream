@@ -565,7 +565,13 @@ fn run_blocking_loop(
         // 1718/3840 = 44.7 % of the intended position — the #68 cursor offset.
         // Never delete this call without giving input mapping another source.
         settings.set_output(enc_w, enc_h);
-        let mut encoder = match VideoEncoder::new(enc_w, enc_h, cfg.bitrate_kbps) {
+        let mut encoder = match VideoEncoder::new(
+            enc_w,
+            enc_h,
+            cfg.bitrate_kbps,
+            cfg.keyframe_secs,
+            settings.fps(),
+        ) {
             Ok(encoder) => encoder,
             Err(err) => {
                 let reason = short_reason(&*err);
@@ -588,6 +594,7 @@ fn run_blocking_loop(
             settings.clone(),
             cfg.bitrate_kbps,
             cfg.repeat_every.max(1),
+            cfg.keyframe_period(),
             cfg.dump_frame.clone(),
             &mut abnormal,
             gdi_retries < GDI_RETRY_MAX,
@@ -647,6 +654,11 @@ fn run_inner_beat(
     base_bitrate_kbps: u32,
     // #64/#66: one static-screen repeat per N WouldBlock beats (`--repeat-every`).
     repeat_every: u32,
+    // #86: wall-clock spacing between periodic keyframes (`--keyframe-secs`).
+    // The encoder's own `kf_max_dist` cannot express this — it counts encoded
+    // frames, so the same value is seconds on a moving picture and minutes on a
+    // static one.
+    keyframe_period: Duration,
     dump_frame: Option<PathBuf>,
     abnormal: &mut bool,
     // #62: false once the GDI -> DXGI restore budget is spent, which disables
@@ -688,7 +700,11 @@ fn run_inner_beat(
     // `repeat_every` WouldBlock beats).
     let mut repeat_beat_skip: u32 = 0;
     // #62: last forced keyframe, for the PLI debounce below.
-    let mut last_keyframe: Option<Instant> = None;
+    // #86: seeded with "now" rather than left empty: the first frame libvpx
+    // encodes is always an IDR, so the periodic timer starts counting from the
+    // encoder open, and a PLI arriving in the first half second is coalesced
+    // with that IDR instead of buying a second one.
+    let mut last_keyframe: Option<Instant> = Some(Instant::now());
     // #84: adaptive bitrate. `base` is the configured budget (fps-scaled
     // `--bitrate`); the controller only ever moves the target *below* it.
     let mut qos = qos::QosController::new(bitrate_for(base_bitrate_kbps, settings.fps()));
@@ -814,7 +830,7 @@ fn run_inner_beat(
             log::info!(
                 "pipeline {:.1}s: loop={:.1}Hz new={} repeat={} skip={} wb={} inv={} cap_err={} \
                  enc_ok={} enc_no_out={} enc_err={} ws_err={} cap_wait={:.2}ms poll={:.2}ms conv={:.2}ms \
-                 enc_avg={:.1}ms pipe_avg={:.1}ms scale={} carry={} paint={} on={} m={} m2={} dm={} pm={} av={}",
+                 enc_avg={:.1}ms pipe_avg={:.1}ms scale={} carry={} paint={} on={} m={} m2={} dm={} pm={} av={} kf={}",
                 since_log.as_secs_f64(),
                 beats as f64 / since_log.as_secs_f64(),
                 d(c.new_frames, prev_counters.new_frames),
@@ -840,7 +856,8 @@ fn run_inner_beat(
                 rel_events.saturating_sub(prev_rel_events),
                 rel_pixels.saturating_sub(prev_rel_pixels),
                 pointer_msgs.saturating_sub(prev_pointer_msgs),
-                av
+                av,
+                d(c.key_frames, prev_counters.key_frames)
             );
             prev_counters = c;
             prev_abs_events = abs_events;
@@ -902,6 +919,33 @@ fn run_inner_beat(
             // Snapshot for the next window's PLI delta, and restart the clock.
             prev_pli_total = pli_total;
             last_qos = Instant::now();
+        }
+        // #86: periodic keyframe on the **wall clock**, not on a frame budget.
+        // Before this the only scheduled IDR came from `kf_max_dist = 60`, which
+        // libvpx counts in encoded frames: ~1 s at 60 fps on a moving picture,
+        // but this pipeline sends "on change", so a static desktop encodes
+        // `fps / repeat_every` repeats/s and the same 60 frames stretch to
+        // minutes. The two failure modes that fixes are opposite — an IDR every
+        // second pins the quantizer at `q_max` (#61 experiment D: 100-200 KB per
+        // 1080p IDR), and one every few minutes lets the reference chain drift
+        // (#53: the picture darkens and encode time grows). A wall-clock period
+        // is the only formulation that means the same thing at both ends.
+        //
+        // Ordered before the PLI block on purpose: a scheduled IDR satisfies a
+        // PLI from the same beat, and the debounce below then coalesces it.
+        if last_keyframe.map(|t| t.elapsed() >= keyframe_period).unwrap_or(true) {
+            let gap = last_keyframe.map(|t| t.elapsed()).unwrap_or_default();
+            log::info!(
+                "periodic keyframe: {:.1}s since the last IDR (period {:?})",
+                gap.as_secs_f64(),
+                keyframe_period
+            );
+            encoder.force_keyframe();
+            last_keyframe = Some(Instant::now());
+            // Same reason as the PLI path: an exhausted repeat budget means an
+            // idle desktop sends nothing, and a forced keyframe with no encode
+            // to ride on would wait for the desktop to change.
+            repeat_budget = REPEAT_ENCODE_MAX;
         }
         // #53: PLI/FIR from the browser -> force the next encode to a keyframe
         // so the receiver re-anchors its reference chain after packet loss.
@@ -1467,6 +1511,10 @@ fn forward_chunks(
     beat: Instant,
 ) {
     let chunks = video_frame_to_chunks(encoded);
+    // #86: whether this frame is an IDR, read off the packet (VP8 `key` flag).
+    // The periodic/PLI paths only *request* a keyframe; this is the one place
+    // that knows whether one was actually handed to the transport.
+    let is_key = chunks.iter().any(|chunk| chunk.key);
     let now = Instant::now();
     let mut accepted = 0u64;
     for chunk in chunks {
@@ -1494,6 +1542,9 @@ fn forward_chunks(
         bump(stats, |s| {
             s.bytes_sent += accepted;
             s.peak.add(accepted, now);
+            if is_key {
+                s.counters.key_frames += 1;
+            }
         });
     }
 }

@@ -2,13 +2,18 @@
 //!
 //! Stage1 fixed settings (design 4.4 / 8.1):
 //! * codec: VP8; stage3 re-evaluates VP9.
-//! * quality: 1.0; `keyframe_interval: Some(60)` (#53): a pure P-frame chain
-//!   (`VPX_KF_DISABLED`) drifts — quantizer error accumulates against the
-//!   reference, the picture progressively darkens / textures up and encode time
-//!   grows (fps drops). A periodic keyframe re-anchors the reference: 60 frames
-//!   = ~2 s at 30 fps, ~1 s at 60 fps. Combined with frame-dropping disabled
-//!   (`rc_dropframe_thresh = 0`) the receiver's reference chain is re-anchored
-//!   quickly after any loss; PLI-driven keyframes land in stage 3 QoS.
+//! * quality: 1.0; `keyframe_interval` (#86): sized from `--keyframe-secs` as a
+//!   frame-count **backstop** only. A pure P-frame chain (`VPX_KF_DISABLED`)
+//!   drifts — quantizer error accumulates against the reference, the picture
+//!   progressively darkens / textures up and encode time grows (fps drops) — so
+//!   a periodic keyframe still has to exist, but `kf_max_dist` counts encoded
+//!   frames, not seconds, and a static desktop encodes far fewer frames than a
+//!   moving one. The wall-clock period is therefore enforced by the capture
+//!   loop (`pipeline::mod`), which calls `force_keyframe` when
+//!   `--keyframe-secs` (default 10 s) has elapsed. Combined with frame-dropping
+//!   disabled (`rc_dropframe_thresh = 0`) the receiver's reference chain is
+//!   re-anchored quickly after any loss; PLI-driven keyframes land in the same
+//!   `force_keyframe` path.
 //! * i444: false (fullcolor = false in `stream_info`).
 //! * No recorder, no hardware fallback chain, no H264/H265/AV1 negotiation.
 //!
@@ -29,6 +34,16 @@ use base::message_proto::VideoFrame;
 use scrap::codec::{Encoder, EncoderCfg};
 use scrap::{EncodeInput, EncodeYuvFormat, VpxEncoderConfig, VpxNoOutput, VpxVideoCodecId};
 
+/// #86: frame-count backstop for `kf_max_dist`, sized at **twice** the
+/// configured wall-clock period so the loop's own timer always fires first.
+/// libvpx takes this as a `c_uint`; `usize` is what `VpxEncoderConfig` carries,
+/// so the conversion happens here and the clamp keeps the cast in range.
+fn keyframe_backstop_frames(fps: u32, keyframe_secs: u32) -> usize {
+    let fps = u64::from(fps.clamp(1, 240));
+    let secs = u64::from(keyframe_secs.clamp(1, 120));
+    (fps * secs * 2).clamp(60, 240_000) as usize
+}
+
 /// Thin lifecycle wrapper the capture loop holds between opens.
 pub struct VideoEncoder {
     encoder: Encoder,
@@ -43,7 +58,22 @@ impl VideoEncoder {
     /// base-bitrate curve (per resolution) is the initial target; the pipeline
     /// calls `set_bitrate_kbps` right after open so the user-configured bitrate
     /// and the fps multiplier take effect immediately.
-    pub fn new(width: u32, height: u32, _bitrate_kbps: u32) -> anyhow::Result<Self> {
+    ///
+    /// `keyframe_secs` (#86) is the wall-clock period the capture loop enforces
+    /// with `force_keyframe`; here it only sizes a frame-count **backstop** at
+    /// twice that period. `kf_max_dist` cannot express a duration: it counts
+    /// encoded frames, and a static desktop encodes `fps / repeat_every`
+    /// repeats/s, so the same number is 1 s on one screen and 30 s on another.
+    /// Keeping the backstop means a loop that somehow never reaches its own
+    /// timer still cannot leave a pure P-frame chain open indefinitely.
+    pub fn new(
+        width: u32,
+        height: u32,
+        _bitrate_kbps: u32,
+        keyframe_secs: u32,
+        fps: u32,
+    ) -> anyhow::Result<Self> {
+        let backstop = keyframe_backstop_frames(fps, keyframe_secs);
         let cfg = EncoderCfg::VPX(VpxEncoderConfig {
             width: width as c_uint,
             height: height as c_uint,
@@ -53,17 +83,19 @@ impl VideoEncoder {
             // 30 fps) to test the "broken reference chain" theory; the finding
             // was the opposite — at 1080p one IDR is 100-200 KB, so two per
             // second eat the entire bitrate budget (the quantizer then pins at
-            // `q_max` and the picture blurs). 60 frames = ~2 s at 30 fps, ~1 s
-            // at 60 fps, and the PLI path (debounced in `pipeline`) re-anchors
-            // on demand instead of by brute force.
-            keyframe_interval: Some(60),
+            // `q_max` and the picture blurs). The PLI path (debounced in
+            // `pipeline`) re-anchors on demand instead of by brute force.
+            // #86: the number is now derived from `--keyframe-secs` and is a
+            // backstop only; see the doc comment above.
+            keyframe_interval: Some(backstop),
         });
         let encoder = Encoder::new(cfg, false)?;
         let yuvfmt = encoder.yuvfmt();
         log::info!(
-            "VP8 encoder opened: {width}x{height} target={}kbps hw={}",
+            "VP8 encoder opened: {width}x{height} target={}kbps hw={} keyframe={}s (backstop {backstop} frames)",
             _bitrate_kbps,
-            encoder.is_hardware()
+            encoder.is_hardware(),
+            keyframe_secs.clamp(1, 120)
         );
         Ok(Self {
             encoder,
@@ -130,5 +162,42 @@ impl VideoEncoder {
     /// Stage1 is always CPU software; retained for the stream_info field set.
     pub fn is_hardware(&self) -> bool {
         self.encoder.is_hardware()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::keyframe_backstop_frames;
+
+    #[test]
+    fn backstop_is_twice_the_wall_clock_period() {
+        // 30 fps * 10 s * 2 = 600 encoded frames. The loop's timer fires at
+        // 300 frames' worth of *wall clock*, so the libvpx net can only ever be
+        // a safety net — never the thing that decides when an IDR goes out.
+        assert_eq!(keyframe_backstop_frames(30, 10), 600);
+        assert_eq!(keyframe_backstop_frames(60, 10), 1200);
+    }
+
+    #[test]
+    fn backstop_tracks_the_configured_seconds() {
+        assert_eq!(keyframe_backstop_frames(60, 2), 240);
+        assert_eq!(keyframe_backstop_frames(60, 120), 14_400);
+    }
+
+    #[test]
+    fn backstop_has_a_floor_and_a_ceiling() {
+        // 1 fps * 1 s * 2 would be 2 frames: an IDR every other frame. The floor
+        // keeps the net from becoming the authority on a tiny-fps session.
+        assert_eq!(keyframe_backstop_frames(1, 1), 60);
+        // 240 fps * 120 s * 2 = 57 600, under the ceiling; the ceiling only
+        // guards against a caller passing absurd values through the clamp.
+        assert_eq!(keyframe_backstop_frames(240, 120), 57_600);
+    }
+
+    #[test]
+    fn backstop_survives_garbage_input() {
+        // `Config` can be built as a struct literal, so 0 must not panic or
+        // produce a zero budget (libvpx treats 0 as "use the default 128").
+        assert_eq!(keyframe_backstop_frames(0, 0), 60);
     }
 }
