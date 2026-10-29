@@ -61,6 +61,8 @@ use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use crate::webrtc::AudioTrack;
 use webrtc::track::track_remote::TrackRemote;
 
+use super::avsync::{self, Fix};
+
 /// Opus only accepts 8/12/16/24/48 kHz. 48 kHz is native, so the host's audio
 /// engine does the (single, well-tested) conversion for us when the endpoint
 /// runs at 44.1 kHz.
@@ -357,6 +359,24 @@ fn run(
 
         unsafe { loopback.drain(&mut pcm)? };
 
+        // #83: re-align with the video clock before emitting. The audio thread
+        // owns the only correction that does not show up as a glitch: one 20 ms
+        // frame dropped (media clock slows) or one extra silence frame emitted
+        // (media clock speeds up). `avsync` rate-limits both to one step every
+        // 2 s and only past 80 ms of skew, so a healthy session never sees one.
+        match avsync::fix() {
+            // Both bounds are guarded by `avsync` (80 ms of skew, one step per
+            // 2 s), so this never fires on a healthy session.
+            Fix::Retard if pcm.len() >= INTS_PER_FRAME => {
+                pcm.drain(..INTS_PER_FRAME);
+                log::debug!("avsync: dropped one audio frame (audio was ahead of video)");
+            }
+            Fix::Advance => {
+                emit_frame(&mut encoder, &mut opus_buf, &silence, &track, &handle)?;
+                log::debug!("avsync: emitted one extra silence frame (audio was behind video)");
+            }
+            _ => {}
+        }
         // Emit whole frames only. Whatever is left over stays in `pcm` for the
         // next signal — that carry is what keeps the sample clock honest.
         while pcm.len() >= INTS_PER_FRAME {
@@ -364,21 +384,41 @@ fn run(
             // Muted: the clock keeps running (same frames, same 20 ms cadence),
             // only the payload becomes silence.
             let payload: &[i16] = if now_enabled { &frame } else { &silence };
-            let n = encoder
-                .encode(payload, &mut opus_buf)
-                .map_err(|e| anyhow!("opus encode: {e}"))?;
-            if n == 0 {
-                continue;
-            }
-            ENCODED_PACKETS.fetch_add(1, Ordering::Relaxed);
-            ENCODED_BYTES.fetch_add(n as u64, Ordering::Relaxed);
-            CAPTURED_FRAMES.fetch_add(1, Ordering::Relaxed);
-            let data = Bytes::copy_from_slice(&opus_buf[..n]);
-            if let Err(err) = handle.block_on(track.write_sample(data, Duration::from_millis(FRAME_MS as u64))) {
-                log::debug!("audio write_sample: {err}");
-            }
+            emit_frame(&mut encoder, &mut opus_buf, payload, &track, &handle)?;
         }
     }
+    Ok(())
+}
+
+/// Encode one 20 ms frame, write it to the track and advance the media clock.
+///
+/// Split out of the loop so the #83 correction path (an extra silence frame)
+/// and the normal path share exactly one definition of "one frame emitted" —
+/// including the `note_audio` call that tells the sync clock how far audio has
+/// advanced. Two copies would drift apart the first time one of them changed.
+fn emit_frame(
+    encoder: &mut Encoder,
+    opus_buf: &mut [u8],
+    payload: &[i16],
+    track: &AudioTrack,
+    handle: &tokio::runtime::Handle,
+) -> Result<()> {
+    let n = encoder
+        .encode(payload, opus_buf)
+        .map_err(|e| anyhow!("opus encode: {e}"))?;
+    if n == 0 {
+        return Ok(());
+    }
+    ENCODED_PACKETS.fetch_add(1, Ordering::Relaxed);
+    ENCODED_BYTES.fetch_add(n as u64, Ordering::Relaxed);
+    CAPTURED_FRAMES.fetch_add(1, Ordering::Relaxed);
+    let data = Bytes::copy_from_slice(&opus_buf[..n]);
+    if let Err(err) =
+        handle.block_on(track.write_sample(data, Duration::from_millis(FRAME_MS as u64)))
+    {
+        log::debug!("audio write_sample: {err}");
+    }
+    avsync::note_audio(Duration::from_millis(FRAME_MS as u64));
     Ok(())
 }
 
