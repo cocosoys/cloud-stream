@@ -468,7 +468,7 @@ try {
         先记下切换前的 PID，切换后 PID 没变本身就是最直接的证据。
     #>
     $pidBefore = $null
-    if ($SkipBackend -and -not $SkipFrontend) {
+    if (-not ($SkipBackend -and $SkipFrontend)) {
         $pre = Invoke-Ssh ("powershell -NoProfile -Command `"Get-Process stream-server " +
             "-ErrorAction SilentlyContinue | Select-Object -First 1 | ForEach-Object { 'pid=' + `$_.Id }`"") -AllowFail
         $t = ($pre.Output -split "`r?`n" | Where-Object { $_ -match '^pid=(\d+)' } | Select-Object -First 1)
@@ -499,7 +499,7 @@ try {
     #>
     $probe = @(
         "Get-Process stream-server -ErrorAction SilentlyContinue | ForEach-Object { 'pid=' + `$_.Id + ' session=' + `$_.SessionId + ' start=' + `$_.StartTime.ToString('o') }"
-        "Get-Content '$RemoteLog' -Tail 40 | Select-String 'listening on' | ForEach-Object { 'log=' + `$_.Line }"
+        "Get-Content '$RemoteLog' -Tail 400 | Select-String 'listening on' | ForEach-Object { 'log=' + `$_.Line }"
     ) -join '; '
     $p = Invoke-Ssh "powershell -NoProfile -Command `"$probe`"" -AllowFail
     $pidLine = ($p.Output -split "`r?`n" | Where-Object { $_ -like 'pid=*' } | Select-Object -First 1)
@@ -514,13 +514,23 @@ try {
 
     if ($notRestarted) {
         Write-Ok "pid=$pidNow（未重启，会话保持）"
-    } else {
-        if (-not $logLine) { throw '日志尾部没有 listening on —— 进程起来了但没在监听' }
+    } elseif ($logLine) {
         # 日志行带着 `INFO [stream_server::http::server]` 前缀，掐掉只留结论。
         $msg = $logLine -replace '^log=', ''
         $at = $msg.IndexOf('listening on')
         if ($at -gt 0) { $msg = $msg.Substring($at) }
         Write-Ok $msg
+    } elseif ($pidBefore -and $pidNow -eq $pidBefore) {
+        # 换过 exe，进程却还是原来那个：计划任务没把它拉起来，跑的是旧二进制
+        # （文件换了、映像没换）。这一条必须失败，否则「部署成功」是假的。
+        throw "后端没有重启（pid 仍是 $pidNow）—— 换上去的 exe 没生效"
+    } else {
+        # 只有连接存在，`pointer channel <- m,...` 每个指针事件一行，尾部 400 行
+        # 可能只覆盖几十秒，启动那行早被挤出窗口。端口已经 200 就是「在监听」
+        # 的直接证据，这一条不再是硬判据 —— 拿它当硬判据会把一次正确的部署判成
+        # 失败并触发回滚，换掉的文件白换。
+        Write-Ok "pid=$pidNow（新进程）"
+        Write-Note '日志尾部 400 行没有 listening on：多半是指针日志刷屏挤出了启动行，端口已通即视为在监听'
     }
 
     if ($pidLine) {

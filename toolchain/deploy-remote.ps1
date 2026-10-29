@@ -39,11 +39,16 @@ $LiveExe = Join-Path $Root 'stream-server.exe'
 $NewExe = Join-Path $Root 'stream-server.new.exe'
 $PrevExe = Join-Path $Root 'stream-server.exe.prev'
 $PrevWeb = "$WebDir.prev"
-# Written only by the backend swap. Rollback reads it to decide whether the exe
-# was touched at all: a frontend-only deploy must not "restore" an exe it never
-# replaced (that silently downgrades the binary) nor restart the process (that
-# drops the live session).
-$ExeMarker = Join-Path $Root 'deploy-exe-swapped.marker'
+# `-CycleOnly` is what a frontend-only failure passes: nothing in that cycle
+# touched the exe, so rolling it back would silently downgrade a binary that had
+# nothing to do with the failure, and restarting it would drop the live session.
+# A bare `-Rollback` (a human undoing a whole deploy) restores everything.
+#
+# This used to be inferred from a marker file the swap wrote and cleared, which
+# never worked: the swap clears it on success, so the caller that rolls back
+# after a failed health check always found it gone and reported "exe untouched"
+# even when it had just swapped it. The flag the caller already passes says the
+# same thing without any state to get out of step.
 
 function Say([string]$Text) { Write-Output $Text }
 function Fail([string]$Text) { Write-Output "FAIL $Text"; exit 1 }
@@ -100,16 +105,7 @@ function Get-Sha([string]$Path) { (Get-FileHash -Path $Path -Algorithm MD5).Hash
 # ---------------------------------------------------------------- rollback
 if ($Rollback) {
     Say 'STEP rollback'
-    # This script is also invoked after a failed -SkipBackend deploy. Restoring
-    # the exe unconditionally used to cost three things: the binary was replaced
-    # by whatever the *previous* backend deploy published (a silent downgrade),
-    # a process that had nothing to do with the failure was killed (session
-    # dropped), and the log claimed a backend fix that never happened. The
-    # marker tells us whether this cycle actually swapped the exe.
-    # Marker is cleared at the end of a successful run, so its presence means
-    # "the swap in flight right now replaced the exe". -CycleOnly trusts it; a
-    # manual -Rollback restores the previous version regardless.
-    $swappedExe = (-not $CycleOnly) -or (Test-Path $ExeMarker)
+    $swappedExe = -not $CycleOnly
 
     if ($swappedExe) {
         Stop-Server
@@ -132,7 +128,6 @@ if ($Rollback) {
     } else {
         Say 'OK  server left running (no restart)'
     }
-    Remove-Item $ExeMarker -Force -ErrorAction SilentlyContinue
     Say 'DONE rollback'
     exit 0
 }
@@ -165,9 +160,6 @@ if (-not $SkipBackend) {
     Say 'OK  backed up to stream-server.exe.prev'
     Move-Item $NewExe $LiveExe -Force
     Say "OK  swapped in $((Get-Item $LiveExe).Length) B md5 $(Get-Sha $LiveExe)"
-    # Leave a trace that rollback can read. Cleared by rollback itself, so it
-    # always describes the most recent backend swap rather than history.
-    (Get-Sha $PrevExe) | Set-Content -Path $ExeMarker -Encoding ASCII
 }
 
 # ---------------------------------------------------------------- swap frontend
@@ -192,8 +184,5 @@ if (-not $SkipFrontend) {
 # ---------------------------------------------------------------- start
 Say 'STEP start'
 Start-Server
-# Success: the marker has done its job (it described an in-flight swap). Clear
-# it so a later frontend-only failure is not mistaken for a backend one.
-Remove-Item $ExeMarker -Force -ErrorAction SilentlyContinue
 Say 'DONE swap'
 exit 0
