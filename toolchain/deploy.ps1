@@ -65,7 +65,11 @@ param(
     [switch]$SkipBuild,
     [switch]$DryRun,
     [switch]$Bootstrap,
-    [int]$HealthTimeoutSec = 90
+    [int]$HealthTimeoutSec = 90,
+    # 前端仓库的位置。默认在仓库的同级目录里按名字找（cloud-stream-web /
+    # selkies-webclient），找不到就报错停下 —— 前端与后端是两个仓库，
+    # 克隆下来的目录名不一定叫哪个。
+    [string]$WebRoot
 )
 
 $ErrorActionPreference = 'Stop'
@@ -88,8 +92,30 @@ $RemoteLog = "$RemoteRoot\logs\stream-server.log"
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $LocalExe = Join-Path $RepoRoot 'target\release\stream-server.exe'
-$CoreDir = Join-Path (Split-Path -Parent $RepoRoot) 'selkies-webclient\addons\selkies-web-core'
-$DashDir = Join-Path (Split-Path -Parent $RepoRoot) 'selkies-webclient\addons\selkies-dashboard'
+
+# 前端是独立仓库（cloud-stream-web）。同级目录下两种常见名字都认：
+# - 按仓库名克隆：cloud-stream-web
+# - 老工作区里沿用的目录名：selkies-webclient
+function Resolve-WebRoot {
+    param([string]$Explicit)
+
+    $candidates = if ($Explicit) { @($Explicit) } else {
+        $parent = Split-Path -Parent $RepoRoot
+        @(
+            (Join-Path $parent 'cloud-stream-web'),
+            (Join-Path $parent 'selkies-webclient')
+        )
+    }
+    foreach ($dir in $candidates) {
+        if (Test-Path (Join-Path $dir 'addons\selkies-web-core')) { return (Resolve-Path $dir).Path }
+    }
+    throw (("找不到前端仓库。它在后端仓库的同级目录，名字是 cloud-stream-web " +
+        "或 selkies-webclient（当前查找根：{0}），也可以用 -WebRoot 指定。") -f (Split-Path -Parent $RepoRoot))
+}
+
+$WebRepoRoot = Resolve-WebRoot $WebRoot
+$CoreDir = Join-Path $WebRepoRoot 'addons\selkies-web-core'
+$DashDir = Join-Path $WebRepoRoot 'addons\selkies-dashboard'
 # 产物放 target\（已 gitignore）：toolchain\ 里只放脚本，不放每次构建都变的二进制。
 $ZipPath = Join-Path $RepoRoot 'target\deploy-selkies-web.zip'
 $RemoteScript = Join-Path $PSScriptRoot 'deploy-remote.ps1'

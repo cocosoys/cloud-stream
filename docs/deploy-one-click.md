@@ -84,6 +84,25 @@ manifest.json / icon*.png / selkies.svg
 - 证书内容 —— 到期换证书是手工动作，脚本只验证文件在不在。
 - `stream-server.exe.bak*` 这类历史备份 —— 只读，不清理（清理是人的决定）。
 
+### 1.4 前端仓库在哪
+
+前端是**独立仓库**（`cloud-stream-web`），部署脚本要在本机先构建它，所以得知道它
+在哪。默认在后端仓库的同级目录里按名字找，两个常见名字都认：
+
+```
+<父目录>/
+  cloud-stream/          ← 后端（本仓库）
+  cloud-stream-web/      ← 前端，按仓库名克隆
+  # 或者老工作区沿用的 selkies-webclient/
+```
+
+两个都没有时脚本在第一步就 `throw`，不会带着空 `$CoreDir` 一路跑到打包阶段才炸。
+目录放在别处就用 `-WebRoot`：
+
+```powershell
+pwsh toolchain/deploy.ps1 -WebRoot D:\src\cloud-stream-web
+```
+
 ---
 
 ## 2 路径契约：为什么改一处要连带改三处
