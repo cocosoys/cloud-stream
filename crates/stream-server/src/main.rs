@@ -14,6 +14,7 @@ mod dispatch;
 mod http;
 mod pipeline;
 mod platform;
+mod security;
 mod signaling;
 mod webrtc;
 
@@ -71,6 +72,39 @@ async fn main() -> anyhow::Result<()> {
         log::info!("HDR duplication disabled by --no-hdr (VMware SVGA fallback)");
     }
     let _logger = init_logger(&cfg)?;
+
+    // #88: 监听面鉴权骨架。策略必须在 bind 之前装好 —— 第一个可能被裁决的
+    // 事件是 `serve` 收到的 HTTP 请求，装晚了就会出现"前几个请求按默认放行"
+    // 的窗口。策略名拼错时退回 allow-all 而不是退出：本项目的默认本来就是
+    // 全放行，退出只会让一个拼写错误变成一次停服；但那声 warn 必须留着。
+    let policy = security::policy::by_name(&cfg.policy).unwrap_or_else(|| {
+        log::warn!(
+            "unknown --policy {:?}, falling back to allow-all (builtin: {})",
+            cfg.policy,
+            security::policy::BUILTIN.join(", ")
+        );
+        Arc::new(security::AllowAll) as Arc<dyn security::Policy>
+    });
+    if security::install(policy).is_err() {
+        log::warn!(
+            "authz policy already installed, keeping {}",
+            security::policy_name()
+        );
+    }
+    // 启动本身也算一个被监听的事件：未来可以有"只允许在维护窗口启动"之类的
+    // 策略，但现在它的主要作用是让日志里出现第一条 surface，证明链路是通的。
+    if !security::allow(security::EventKind::Startup, &security::Principal::default()) {
+        anyhow::bail!(
+            "startup denied by policy {} (surface=startup)",
+            security::policy_name()
+        );
+    }
+    // 措辞刻意避开 `authz deny surface=` 这串：那行是拒绝记录的固定前缀，
+    // 提示里带上它会让 `grep -c "authz deny surface="` 永远至少得 1。
+    log::info!(
+        "authz policy={} surfaces=on (denials are logged with the `authz deny` prefix)",
+        security::policy_name()
+    );
 
     log::info!(
         "stream-server stage1 | listen={}:{} tls={} dist={} app={} video={}x{}@{}fps bitrate={}kbps",

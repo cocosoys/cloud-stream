@@ -284,6 +284,20 @@ impl MediaSession {
                         log::info!("mic uplink: track arrived after teardown, dropped");
                         return;
                     }
+                    // #88: 麦克风是这台机器上唯一"外部能把声音送进来"的入口，
+                    // 也是四条面里最该被单独关掉的一条。裁决放在 `mic_started`
+                    // 之前：被拒绝时不能把标记置上，否则日志会写"第二条被忽略"，
+                    // 而真相是"第一条就被策略挡了"。
+                    if !crate::security::allow(
+                        crate::security::EventKind::Media(crate::security::MediaDir::MicIn),
+                        &crate::security::Principal::default(),
+                    ) {
+                        log::info!(
+                            "mic uplink: denied by policy {}",
+                            crate::security::policy_name()
+                        );
+                        return;
+                    }
                     if mic_started.swap(true, Ordering::SeqCst) {
                         log::info!("mic uplink: second audio track ignored (ssrc={})", track.ssrc());
                         return;

@@ -8,10 +8,10 @@
 > `roadmap-l2-l3-gaps.md`」，此前一直没写。现在补上，两者严格不重叠——
 > 那边收「已分析清楚但暂缓」，这边收「范围内该做、还没做」。
 >
-> **全量 34 项：30 完成 / 2 部分 / 2 未做**（2026-10-29 第三批：#34 一键部署
-> 落地，`toolchain/deploy.ps1` + `deploy-remote.ps1`，见 `deploy-one-click.md`；
-> 第二批 #18 二进制剪贴板、#25 QoS 自适应、#26 音画同步 见
-> `stage3-clipboard-qos-avsync.md`）。
+> **全量 34 项：30 完成 / 3 部分 / 1 未做**（2026-10-29 第四批：#88 监听面鉴权
+> 骨架落地，22 个入口全部插桩、默认全放行，见 `listener-surface.md`；第三批
+> #34 一键部署见 `deploy-one-click.md`；第二批 #18 二进制剪贴板、#25 QoS 自适应、
+> #26 音画同步 见 `stage3-clipboard-qos-avsync.md`）。
 > 本轮订正两处此前误判：**#27 周期关键帧其实早已由编码器 `kf_max_dist=60` 覆盖**
 > （见 §1.3），**#32 服务自恢复已由 #81 完成并实测**。新增 §2.12「音频无观测」。
 >
@@ -100,7 +100,7 @@
 | 30 | 默认灵敏度三层固化（游戏 0.5 / 关加速 / gain 1.0） | ✅ | `mouse-sensitivity-default.md`、`start-mc.ps1` |
 | 31 | 单会话接管（第二个页签驱逐第一个） | ✅ | `websession.rs:70-78`，属策略非缺陷 |
 | 32 | 服务自恢复 | ✅ | #81 `0159076`：`MCStreamSrv` 改 `/SC MINUTE /MO 1` + `run-hidden.vbs` 隐藏宿主 + 单实例检查。实测 `taskkill` PID 1904 → 一分钟后 PID 7612 自起，当前跑的正是它 |
-| 33 | 鉴权 | ❌ | `http/mod.rs:7` 明写 "no auth gate in stage1"，`config.rs` 无 `--token`；局域网内任何人打开 8080 即取得鼠标键盘，并可读写 `upload_dir` |
+| 33 | 鉴权 | 🟡 | **骨架已就位（#88）**：22 个监听面全部插桩，五处裁决点都在副作用之前（HTTP / 信令 / 控制通道 / 指针通道 / 麦克风），`--policy allow-all\|deny-all` 可切换，`deny-all` 实测三个入口全 403 且进程照常启动。**仍无 token**：`http/mod.rs:7` 明写 "no auth gate in stage1"，`config.rs` 无 `--token`，局域网内任何人打开 8080 即取得鼠标键盘。见 `listener-surface.md` |
 | 34 | 一键部署 | ✅ | #34 `toolchain/deploy.ps1` + `deploy-remote.ps1`：构建 → 上传 → 两端 MD5 → 停任务/禁用 → 备份 → 换文件 → 起任务 → 三重体检（HTTP 200 + 进程启动时间 + 日志 `listening on`）→ 失败自动回滚。实测两次全量部署各 48 s、一次 `-Rollback` 通过；`-Bootstrap` 顺带把 sshd 钉成自动启动。见 `deploy-one-click.md` |
 
 ---
@@ -206,6 +206,15 @@
 **根因**：`http/mod.rs:7` 与 `server.rs:148` 明确不做校验。前端有
 `lib/auth-guard.js` / `lib/session-token.js`，但那是**客户端侧**的把戏，
 服务端完全信任 URL 里的 app 段。
+
+**2026-10-29 进展（#88）**：入口层面接完了，见 `listener-surface.md`。22 个监听面
+（`startup` / `http.*` / `signaling` / `control.*` / `input.*` / `clipboard.*` /
+`media.*` / `file.*`）全部映射到 `security::EventKind`，五处裁决点接在任何副作用
+**之前**：`http/server.rs:221`（所有 HTTP）、`:321`（信令建立）、`websession.rs:811`
+（指针通道）、`:846`（控制通道）、`webrtc/mod.rs:292`（麦克风）。默认 `allow-all`
+不改变行为，`deny-all` 是覆盖率探针。**缺的只有 token 本身**：`Principal` /
+`Credential` 结构已留好，WS 升级时把 cookie 解析成角色、随 `MediaSession` 带进
+DC 回调即可 —— 插桩点不用动。
 
 **改动点**：
 - 最小可用：`--token <str>` 启动参数，校验 `?token=` 或 Cookie；
@@ -364,13 +373,14 @@ IDR 约 100–200 KB，等于持续付出 0.4–0.8 Mbps。若要的是「长静
 | ~~P2~~ | ~~2.9 残余：关键帧秒级可配~~ | — | **已实现 #86**，`--keyframe-secs` 默认 10 s，墙钟为准、帧数是兜底 |
 | ~~P2~~ | ~~2.11 一键部署~~ | — | **已实现 #34**，`deploy.ps1` + `deploy-remote.ps1`，两次全量 + 一次回滚实测 |
 | **P1** | **2.12 音频观测** | — | 仍是 #79/#80 的验收工具；不做就只能靠耳朵 |
-| P1 | 2.5 鉴权 | — | 局域网内裸奔，**现在是最该做的一项** |
+| P1 | 2.5 鉴权 | — | **只剩 token 解析 + 一个 `impl Policy`**（#88 把入口全接好了） |
 | P2 | 2.2 手柄 | ← 需先决定是否装 ViGEmBus 驱动 | 前端全套已就绪，卡在驱动 |
 | P3 | 2.10 截图 | ← 2.5（鉴权） | 纯增量为先不碰 |
 
-**剩下的 2 项未做 + 2 项部分**，按建议顺序：2.12 音频观测 → 2.5 鉴权 →
+**剩下的 1 项未做 + 3 项部分**，按建议顺序：2.12 音频观测 → 2.5 鉴权 →
 2.2 手柄（需先决定驱动）→ 2.10 截图。
-2.12 是唯一"不做就没法验收已做完的东西"的一项；2.5 是唯一的安全债。
+2.12 是唯一"不做就没法验收已做完的东西"的一项；2.5 是唯一的安全债，而 #88
+已经把它的架子搭完了 —— 剩下的全是填写，不是接线。
 2.11 落地之后，剩下的每一项验收都只要一条命令，摩擦不再是理由。
 
 ---

@@ -64,6 +64,13 @@ pub struct Config {
     /// traversal, drive letters and reserved characters before touching the
     /// filesystem (RustDesk `fs::join_validated_path` style).
     pub upload_dir: Option<PathBuf>,
+    /// #88: 监听面鉴权策略名（`allow-all` / `deny-all`）。
+    ///
+    /// 默认 `allow-all`，与插桩前行为完全一致 —— 骨架本身不改变任何访问
+    /// 控制。`deny-all` 不是安全模式，是**覆盖率探针**：装上它跑一遍，凡是
+    /// 还能用的入口就是漏插桩的地方。真正的策略由上层项目实现 `Policy`
+    /// 后注入。
+    pub policy: String,
 }
 
 impl Default for Config {
@@ -87,6 +94,7 @@ impl Default for Config {
             repeat_every: 2,
             keyframe_secs: 10,
             upload_dir: None,
+            policy: "allow-all".to_owned(),
         }
     }
 }
@@ -184,6 +192,13 @@ impl Config {
                     }
                 }
                 "--no-hdr" => cfg.no_hdr = true,
+                "--policy" => {
+                    if let Some(v) = iter.next() {
+                        // 未知名保留默认并在 main 里告警，不在这里吞掉 ——
+                        // "策略名拼错了" 必须看得见，否则会以为鉴权已经生效。
+                        cfg.policy = v;
+                    }
+                }
                 "--upload-dir" => {
                     if let Some(v) = iter.next() {
                         if v.is_empty() {

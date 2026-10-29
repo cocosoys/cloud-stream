@@ -33,9 +33,26 @@ use tokio_rustls::{rustls, TlsAcceptor};
 use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 
 use crate::config::Config;
-use crate::http::{classify, file_transfer, header_value, r#static, write_http};
+use crate::http::{classify, file_transfer, header_value, r#static, write_http, Route};
+use crate::security::{self, Endpoint, EventKind};
 use crate::signaling::websession;
 use crate::signaling::SessionRegistry;
+
+/// 把路由映射成鉴权骨架认的端点（#88）。
+///
+/// 映射写成独立函数而不是内联在 `handle_inner` 里，是因为它是**唯一**一处
+/// 需要跟着 `Route` 变化的地方：以后加端点时，编译器不会提醒你补策略，
+/// 但补在这里至少只有一处会漏。
+fn surface_of(route: &Route) -> EventKind {
+    EventKind::Http(match route {
+        Route::Status => Endpoint::Status,
+        Route::Upload => Endpoint::Upload,
+        Route::Files { .. } => Endpoint::Files,
+        Route::Signaling { .. } => Endpoint::Signaling,
+        Route::Static(_) => Endpoint::Static,
+        Route::NotFound => Endpoint::NotFound,
+    })
+}
 
 /// Maximum accepted size of a plain HTTP request head before the first body
 /// byte. Static GETs and the signaling handshake carry none.
@@ -155,15 +172,20 @@ fn build_tls_acceptor(cfg: &Config) -> Result<Option<TlsAcceptor>> {
 
 /// One accepted TCP connection: route the request, answer static/status, or
 /// hand the upgraded signaling socket to the session task.
+///
+/// #88: `peer` is carried all the way down so the policy sees who is asking.
+/// Before this it only appeared in a debug log line, which meant a future
+/// allow-list had nothing to match on at the one point every request passes.
 async fn handle_connection<S>(
     stream: S,
     cfg: Arc<Config>,
     registry: SessionRegistry,
     chunks: file_transfer::ChunkStore,
+    peer: std::net::IpAddr,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    if let Err(err) = handle_inner(stream, cfg, registry, chunks).await {
+    if let Err(err) = handle_inner(stream, cfg, registry, chunks, peer).await {
         log::debug!("connection closed: {err:#}");
     }
 }
@@ -173,6 +195,7 @@ async fn handle_inner<S>(
     cfg: Arc<Config>,
     registry: SessionRegistry,
     chunks: file_transfer::ChunkStore,
+    peer: std::net::IpAddr,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -188,6 +211,24 @@ where
     let method = req.method.unwrap_or("GET");
     let path = req.path.unwrap_or("/");
     let route = classify(path, &cfg.app_name);
+
+    // #88: 每个请求的第一个副作用点。裁决放在方法检查之前 —— 一个被判死的
+    // 客户端不该还能从 405/413 这些响应里读到任何东西。
+    //
+    // 注意 `Route::Files` 同时承载"列目录"和"下载"，两者都是读，所以统一映射
+    // 到 `Endpoint::Files`；真正的写入口只有 `Endpoint::Upload`。
+    let principal = crate::security::Principal::from_peer(peer);
+    if !crate::security::allow(surface_of(&route), &principal) {
+        write_http(
+            &mut stream,
+            403,
+            "Forbidden",
+            "text/plain; charset=utf-8",
+            b"403 Forbidden\n",
+        )
+        .await?;
+        return Ok(());
+    }
 
     // #67: POST /api/upload carries the raw body; every other method is 405.
     if method == "POST" {
@@ -274,6 +315,20 @@ where
         }
 
         crate::http::Route::Signaling { .. } => {
+            // #88: 路径匹配放行不等于允许开会话。"这个 URL 存不存在"和"你能
+            // 不能拿到一路画面"是两个问题，前者在 `Endpoint::Signaling` 判过，
+            // 后者在这里判 —— 未来的观众/操作员分级就落在这一道上。
+            if !security::allow(EventKind::Signaling, &principal) {
+                write_http(
+                    &mut stream,
+                    403,
+                    "Forbidden",
+                    "text/plain; charset=utf-8",
+                    b"403 Forbidden\n",
+                )
+                .await?;
+                return Ok(());
+            }
             let upgrade = header_value(&headers, "Upgrade")
                 .and_then(|v| std::str::from_utf8(v).ok())
                 .unwrap_or("");
@@ -377,7 +432,9 @@ pub async fn serve(cfg: Arc<Config>) -> Result<()> {
                         let acc = acceptor.clone().unwrap();
                         tokio::spawn(async move {
                             match acc.accept(stream).await {
-                                Ok(tls) => handle_connection(tls, cfg, registry, chunks).await,
+                                Ok(tls) => {
+                                    handle_connection(tls, cfg, registry, chunks, peer.ip()).await
+                                }
                                 Err(err) => {
                                     log::debug!("TLS handshake failed from {peer}: {err:#}")
                                 }
@@ -386,7 +443,7 @@ pub async fn serve(cfg: Arc<Config>) -> Result<()> {
                     }
                     None => {
                         tokio::spawn(async move {
-                            handle_connection(stream, cfg, registry, chunks).await;
+                            handle_connection(stream, cfg, registry, chunks, peer.ip()).await;
                         });
                     }
                 }

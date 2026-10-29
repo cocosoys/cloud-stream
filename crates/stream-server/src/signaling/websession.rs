@@ -44,6 +44,7 @@ use crate::dispatch::{
 };
 use crate::pipeline::{spawn_loop, PipelineEvent, PipelineHandle, StreamSettings};
 use crate::platform::{HostSample, Sampler};
+use crate::security::{self, ClipOp, Device, EventKind, MediaDir, Principal};
 use crate::signaling::{
     hello_ack, ice_line, latency_measurement, parse_ws_line, session_ok, sdp_line, HandshakeState,
     IncomingLine, LatencyProbe, SignalingSession, SERVER_PEER_ID,
@@ -627,6 +628,48 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
     Ok(())
 }
 
+/// 把控制通道上的一条已分类指令映射成鉴权骨架认的面（#88）。
+///
+/// 返回 `None` 表示这条指令不构成"访问"：`pong` 是服务端 ping 的回执，
+/// `Ignore` 是设计上就该丢弃的 B 组噪音，`Unknown` 是解不出来的行 —— 给它们
+/// 记审计只会淹没真正的拒绝。**其余每一条都必须映射**，漏掉一条就等于那条
+/// 指令永远绕过策略。
+fn surface_of(action: &Action) -> Option<EventKind> {
+    Some(match action {
+        Action::StartVideo | Action::StopVideo => EventKind::Media(MediaDir::VideoOut),
+        Action::SetAudioOn(_) | Action::SetAudioBitrate(_) => EventKind::Media(MediaDir::AudioOut),
+        Action::SetFps(_) => EventKind::Control("control.fps"),
+        Action::SetResolution(..) => EventKind::Control("control.resolution"),
+        Action::SetSettings(_) => EventKind::Control("control.settings"),
+        Action::SetBitrate(_) => EventKind::Control("control.bitrate"),
+        Action::SetNativeCursorRendering(_) => EventKind::Control("control.cursor-rendering"),
+        Action::CompressedNegotiate => EventKind::Control("control.gzip"),
+        Action::StatsOn | Action::StatsOff => EventKind::Diagnostics("control.stats"),
+        // 统计开关只决定"推不推数字"，改不了主机，归到诊断面。
+        Action::ClipboardRequest => EventKind::Clipboard(ClipOp::Read),
+        Action::ClipboardChunk(_) => EventKind::Clipboard(ClipOp::Write),
+        Action::InputStub(raw) => EventKind::Input(device_of(raw)),
+        Action::PongReply(_) | Action::Ignore(_) | Action::Unknown(_) => return None,
+    })
+}
+
+/// 输入行 → 设备。只看首 token，与 `dispatch::commands::classify` 的切分规则
+/// 一致（逗号分隔，裸命令无余量）。
+///
+/// `kr`（松键）与 `kd`/`ku`/`kh` 是同一类动作，归键盘。`sfe`（焦点事件）与
+/// `vp`（视口尺寸）既不按键也不移动指针，落到 `Other` —— 归错类会让"只允许
+/// 键鼠"的策略把视口同步一起放行，而那正是想单独关掉的东西。
+fn device_of(line: &str) -> Device {
+    let head = line.split([',', ' ']).next().unwrap_or("");
+    match head {
+        "kd" | "ku" | "kh" | "kr" => Device::Keyboard,
+        "m" | "m2" | "p" | "_pointer_echo" | "pointer" => Device::Pointer,
+        "sf" => Device::Touch,
+        "js" => Device::Gamepad,
+        _ => Device::Other,
+    }
+}
+
 /// After Connected: register the control-channel upstream command hook and arm
 /// the one-shot downstream notices to fire when the channel actually opens. The
 /// PC `Connected` state can arrive a moment before the `control` channel does,
@@ -737,8 +780,18 @@ async fn arm_connected_notices(
     //
     // Only input is accepted here: `control` owns settings, clipboard and the
     // downstream channel, and none of that belongs on an unreliable stream.
+    // #88: DataChannel 层的 principal 是空的 —— peer 地址只在 TCP 建连那一刻
+    // 存在，属于 WS 升级时的上下文，这里拿不到；会话号也还没引入。未来做
+    // 鉴权时，正确做法是在 WS 升级把 token 解析成角色、随 MediaSession 带进
+    // 来，这里换掉 `Principal::default()` 即可，插桩点不用动。
+    let dc_principal = Principal::default();
+    // 两个闭包都是 `move`，各拿一份；`Principal` 是小结构，clone 比 Arc 便宜。
+    let pointer_principal = dc_principal.clone();
+    let control_principal = dc_principal;
+
     pointer.on_message(Box::new(move |msg| {
         let input = pointer_input.clone();
+        let principal = pointer_principal.clone();
         Box::pin(async move {
             if !msg.is_string {
                 log::debug!("binary message on pointer channel ignored");
@@ -751,7 +804,16 @@ async fn arm_connected_notices(
             // #73: counted before classification — arrival is the fact under
             // test, not what the line parses to.
             crate::dispatch::win_input::note_pointer_channel_msg(&line);
-            match classify(&line) {
+            let action = classify(&line);
+            // #88: 裁决必须在 `handle_line` 之前。放在后面就成了"先注入再
+            // 记账"，拒绝没有任何意义。
+            if let Some(kind) = surface_of(&action) {
+                if !security::allow(kind, &principal) {
+                    log::debug!("pointer message denied: {}", kind.label());
+                    return;
+                }
+            }
+            match action {
                 Action::InputStub(raw) => input.handle_line(&raw),
                 _ => log::debug!("non-input message on pointer channel dropped: {line}"),
             }
@@ -766,6 +828,7 @@ async fn arm_connected_notices(
         let input = input.clone();
         let clipboard = clipboard.clone();
         let settings = hook_settings.clone();
+        let principal = control_principal.clone();
         Box::pin(async move {
             if !msg.is_string {
                 log::debug!("binary control message ignored in stage1");
@@ -775,7 +838,17 @@ async fn arm_connected_notices(
             if line.is_empty() {
                 return;
             }
-            match classify(&line) {
+            let action = classify(&line);
+            // #88: 控制通道是所有非指针指令的唯一入口（设置、码率、剪贴板、
+            // 音频开关、视频开关），所以一处裁决就覆盖了整片 —— 这也是为什么
+            // 它值得插桩而不是每个分支各写一遍。
+            if let Some(kind) = surface_of(&action) {
+                if !security::allow(kind, &principal) {
+                    log::debug!("control message denied: {}", kind.label());
+                    return;
+                }
+            }
+            match action {
                 Action::StartVideo => {
                     pipeline_handle.start();
                     log::debug!("START_VIDEO: capture gate opened");
@@ -944,5 +1017,94 @@ fn apply_settings_batch(settings: &StreamSettings, payload: &str) {
             settings.set_resolution(w, h);
             log::info!("SETTINGS: manual resolution -> {w}x{h}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #88 的核心断言：控制通道上的**每一条**指令都要有面，或明确豁免。
+    /// 新增一个 `Action` 变体时这条会失败 —— 那正是想要的提醒，因为漏映射
+    /// 等于那条指令永远绕过策略，而且是静默绕过。
+    #[test]
+    fn every_action_maps_to_a_surface_or_is_exempt() {
+        let actions = [
+            Action::StartVideo,
+            Action::StopVideo,
+            Action::StatsOn,
+            Action::StatsOff,
+            Action::CompressedNegotiate,
+            Action::PongReply("0".to_owned()),
+            Action::Ignore("s".to_owned()),
+            Action::InputStub("kd,65".to_owned()),
+            Action::SetFps(30),
+            Action::SetResolution(1280, 720),
+            Action::SetSettings("{}".to_owned()),
+            Action::ClipboardRequest,
+            Action::ClipboardChunk("cw,1,2,3,abcd".to_owned()),
+            Action::SetBitrate(2500),
+            Action::SetAudioOn(true),
+            Action::SetAudioBitrate(128_000),
+            Action::SetNativeCursorRendering(true),
+            Action::Unknown("bogus".to_owned()),
+        ];
+
+        for action in actions {
+            let exempt = matches!(
+                action,
+                Action::PongReply(_) | Action::Ignore(_) | Action::Unknown(_)
+            );
+            let surface = surface_of(&action);
+            if exempt {
+                assert!(
+                    surface.is_none(),
+                    "{action:?} is exempt but still maps to a surface"
+                );
+            } else {
+                assert!(surface.is_some(), "{action:?} has no surface — a policy cannot see it");
+            }
+        }
+    }
+
+    /// 豁免的三个不能顺手扩大：`PongReply` 是服务端自己 ping 的回执，
+    /// 拒绝它只会让 RTT 统计失真，挡不住任何人。
+    #[test]
+    fn exempt_actions_are_exactly_the_three() {
+        assert!(surface_of(&Action::PongReply(String::new())).is_none());
+        assert!(surface_of(&Action::Ignore("s".to_owned())).is_none());
+        assert!(surface_of(&Action::Unknown("?".to_owned())).is_none());
+    }
+
+    /// 输入行到设备的归类决定"只允许键鼠"这类策略的实际边界。
+    #[test]
+    fn input_lines_classify_by_device() {
+        assert_eq!(device_of("kd,65"), Device::Keyboard);
+        assert_eq!(device_of("ku,65"), Device::Keyboard);
+        assert_eq!(device_of("kh,1,65"), Device::Keyboard);
+        assert_eq!(device_of("kr"), Device::Keyboard);
+        assert_eq!(device_of("m,0.5,0.5"), Device::Pointer);
+        assert_eq!(device_of("m2,1,-2"), Device::Pointer);
+        assert_eq!(device_of("p,left,1"), Device::Pointer);
+        assert_eq!(device_of("sf,1,2,3"), Device::Touch);
+        assert_eq!(device_of("js,0,1"), Device::Gamepad);
+        // `sfe`（焦点）与 `vp`（视口）既不按键也不移动指针，归 Other 才能让
+        // 策略单独拒绝它们。
+        assert_eq!(device_of("sfe,1"), Device::Other);
+        assert_eq!(device_of("vp,1280,720"), Device::Other);
+    }
+
+    /// 剪贴板两个方向必须分开：读主机剪贴板（`REQUEST_CLIPBOARD`）和写主机
+    /// 剪贴板（`cb*`）在权限模型里从来不是一回事。
+    #[test]
+    fn clipboard_read_and_write_are_distinct() {
+        assert_eq!(
+            surface_of(&Action::ClipboardRequest),
+            Some(EventKind::Clipboard(ClipOp::Read))
+        );
+        assert_eq!(
+            surface_of(&Action::ClipboardChunk("cb,1,2,3,abcd".to_owned())),
+            Some(EventKind::Clipboard(ClipOp::Write))
+        );
     }
 }
