@@ -1,15 +1,21 @@
 # L2 / L3 缺口清单与任务分解
 
-> **代码基线**：#78（后端 `b3156d9`，前端 `afcf2ad`），`cargo test -p stream-server`
-> 39 通过 / 0 失败。部署机 192.168.59.148（stream-server PID 9532、MC 客户端 java
-> PID 3908 同在 Console 会话 1）。
+> **代码基线**：#81（后端 `9734d1f`，前端 `e43b56e`），`cargo test -p stream-server`
+> **41 通过 / 0 失败**（2026-10-29 复跑）。部署机 192.168.59.148：stream-server
+> PID 7612（看门狗拉起）、MC 客户端 java PID 3908，同在 Console 会话 1。
 >
 > **本文档的定位**：`roadmap-future.md` 末尾写「L2/L3 的缺口清单另见
 > `roadmap-l2-l3-gaps.md`」，此前一直没写。现在补上，两者严格不重叠——
 > 那边收「已分析清楚但暂缓」，这边收「范围内该做、还没做」。
 >
-> **全量 34 项：24 完成 / 3 部分 / 7 未做**（2026-10-28 更新：#21 麦克风上行、
-> #24 音量/静音/码率 已落地，见 §2.1 / §2.3）。
+> **全量 34 项：26 完成 / 2 部分 / 6 未做**（2026-10-29 复核）。
+> 本轮订正两处此前误判：**#27 周期关键帧其实早已由编码器 `kf_max_dist=60` 覆盖**
+> （见 §1.3），**#32 服务自恢复已由 #81 完成并实测**。新增 §2.12「音频无观测」。
+>
+> **「完成」不等于「已验收」**：`#21 麦克风上行`、`#24 音量/静音/码率`、
+> `#23 统计浮层`、`#79 前端按钮` 四项代码已部署，但服务端日志里
+> `findstr "mic uplink|render open|uplink playing"` 命中数为 **0** —— 也就是
+> 还没有一次真实开麦记录。判定为 ✅ 依据是链路闭环 + 单测，**实机验收仍待用户操作**。
 
 ---
 
@@ -57,30 +63,35 @@
 | 18 | 二进制剪贴板（`cb/cbs/cbd/cbe`） | ❌ | `clipboard.rs` 头部明写 "Binary flavours … logged and dropped in stage 1" |
 | 19 | 触控 | 🟡 | 单指拖动走 `m`/`m2` 已通；**屏幕虚拟摇杆走 `js,a`**（`gamepad.js:125` 监听 `touchgamepadinput`），因此随 #17 一起被挡 |
 
-### 1.3 L3 画质与体验 — 3 完成 / 6 未做
+### 1.3 L3 画质与体验 — 6 完成 / 3 未做
 
 | # | 能力 | 状态 | 证据与断点 |
 | --- | --- | --- | --- |
 | 20 | 游戏声音下行（WASAPI loopback → Opus 48k/2ch/64kbps） | ✅ | #77 `6a095e2`，`pipeline/audio.rs` |
-| 21 | 麦克风上行（`on_track` → Opus 解码 → WASAPI render） | ✅ | #79，`webrtc/mod.rs` `on_track` + `pipeline/audio.rs` `spawn_uplink` 双线程 |
+| 21 | 麦克风上行（`on_track` → Opus 解码 → WASAPI render） | ✅* | #79，`webrtc/mod.rs` `on_track` + `pipeline/audio.rs` `spawn_uplink` 双线程；*待实机验收 |
 | 22 | 服务端可观测性（RTT / video_mbps / send_ms / peak / 关键帧请求） | ✅ | #78 `88e80dd`，`docs/stage3-observability.md` |
 | 23 | 统计浮层 HUD（F3，九行） | ✅ | 前端 `lib/stats-hud.js`，`afcf2ad` |
-| 24 | 音量 / 静音 / 音频码率 | ✅ | #80，`Action::SetAudioOn` / `SetAudioBitrate`，静音期间发静音帧（~1.6 kbps 而非停发） |
-| 25 | QoS 自适应码率（丢包 / 积压反压） | ❌ | `output.rs:85` `throttled` 恒 false；#78 已把 `send_ms - pipeline_ms`（积压）做成数字，但没人用它回头调码率 |
+| 24 | 音量 / 静音 / 音频码率 | ✅* | #80，`Action::SetAudioOn` / `SetAudioBitrate`，静音期间发静音帧（~1.6 kbps 而非停发）；*待实机验收 |
+| 25 | QoS 自适应码率（丢包 / 积压反压） | ❌ | `output.rs:97` `throttled` 恒 false；#78 已把 `send_ms - pipeline_ms`（积压）做成数字，但没人用它回头调码率 |
 | 26 | 音画同步 | ❌ | 音频是独立 OS 线程按样本数推进，视频走 DXGI beat，两者无共享时基，无漂移校正 |
-| 27 | 周期关键帧 / 长参考链守护 | ❌ | 只有 PLI/FIR 触发 + 500 ms 去抖；无「距上一关键帧超过 N 秒强制一次」 |
+| 27 | 周期关键帧 / 长参考链守护 | ✅ | **此前误判为未做**。`pipeline/encoder.rs:59` 设 `keyframe_interval: Some(60)`，`vendor/scrap/src/common/vpxcodec.rs:102` 映射为 `kf_max_dist = 60` —— 每 60 个**编码帧**强制一个 IDR，而静态画面走 `repeat encode`（`mod.rs:1111`）同样经过编码器，所以静止时也在刷新参考链 |
 | 28 | 截图 / 录屏 | ❌ | `grep screenshot\|record` 在 Rust 侧零命中，无 HTTP 端点也无下行命令 |
 
-### 1.4 L4 产品闭环 — 3 完成 / 2 部分 / 1 未做
+> #27 的残余问题不是"没有周期关键帧"，而是**间隔不可配且偏短**：60 帧 ≈ 30 fps 下
+> 2 秒，1080p 一个 IDR 约 100–200 KB，等于常驻 0.4–0.8 Mbps 花在刷新参考链上。
+> 若要做的是"长静置守护"，正确形态是 `--keyframe-interval-sec`（默认 10 s）+
+> 保留 PLI 立即响应，即把 60 改大、把秒级守护交回策略层。属调优，不是缺口。
+
+### 1.4 L4 产品闭环 — 4 完成 / 1 部分 / 1 未做
 
 | # | 能力 | 状态 | 证据与断点 |
 | --- | --- | --- | --- |
 | 29 | 自动拉起游戏 + 全屏 + 自动进服 | ✅ | `C:\dev\mc\launch-remote.ps1`（`-Server/-Port/-Fullscreen`），schtasks `MCGame` /IT 进交互会话 |
 | 30 | 默认灵敏度三层固化（游戏 0.5 / 关加速 / gain 1.0） | ✅ | `mouse-sensitivity-default.md`、`start-mc.ps1` |
 | 31 | 单会话接管（第二个页签驱逐第一个） | ✅ | `websession.rs:70-78`，属策略非缺陷 |
-| 32 | 服务化 | 🟡 | `MCStreamSrv` 能拉起并常驻（PID 9532 已跑），但 `schtasks /Query /V` 显示「重复: 已禁用」，**进程崩了不会自己回来** |
-| 33 | 鉴权 | ❌ | `http/mod.rs:7` 明写 "no auth gate in stage1"，`with_no_client_auth()`；局域网内任何人打开 8080 即取得鼠标键盘 |
-| 34 | 一键部署 | 🟡 | 现在靠手工 `scp` + `certutil` 校验 + `schtasks /Run`；前端还要 `npm run build` 再整目录上传 |
+| 32 | 服务自恢复 | ✅ | #81 `0159076`：`MCStreamSrv` 改 `/SC MINUTE /MO 1` + `run-hidden.vbs` 隐藏宿主 + 单实例检查。实测 `taskkill` PID 1904 → 一分钟后 PID 7612 自起，当前跑的正是它 |
+| 33 | 鉴权 | ❌ | `http/mod.rs:7` 明写 "no auth gate in stage1"，`config.rs` 无 `--token`；局域网内任何人打开 8080 即取得鼠标键盘，并可读写 `upload_dir` |
+| 34 | 一键部署 | 🟡 | 仍靠手工 `scp` + `certutil` 校验 + `schtasks /Run`；前端还要 `npm run build` 再整目录上传。`toolchain/` 下**没有** `deploy-148.ps1`（只有 `deploy143`，是另一台机器的旧脚本） |
 
 ---
 
@@ -89,7 +100,7 @@
 每项按「现象 → 根因 → 改动点 → 验收 → 风险」写。改动点给到文件级，
 不预设实现细节——实现细节属于各自的设计稿。
 
-### 2.1 麦克风上行（#21，P0，L3）— 已实现，#79
+### 2.1 麦克风上行（#21，P0，L3）— 已实现 #79，**待实机验收**
 
 **现象**：前端开麦后浏览器显示已发送，被控机没有任何声音，也不报错。
 
@@ -98,28 +109,19 @@
 `RTCRtpReceiver::read_rtp`。SDP 协商是成功的（前端 `_prepareUplinkTransceivers`
 把那条 m-line 改成 sendonly 并 `replaceTrack`），所以**链路上行是通的，只是没人读**。
 
-**改动点**：
-- `webrtc/mod.rs`：`pc.on_track(Box::new(...))`，只接受 `RTPCodecType::Audio`
-  的第一条远端轨（webcam 那条是 video，忽略）；把 `Arc<Mutex<Option<TrackRemote>>>`
-  存进 `MediaSession`。
-- `pipeline/audio.rs` 镜像出 `spawn_uplink`：读 RTP payload → `audiopus` Decoder
-  （48k/2ch）→ WASAPI **render** 共享模式（与下行 loopback 是两个方向、两个 client，
-  互不干扰）。
-- `signaling/websession.rs`：PC Connected 时若上行轨存在，起第二个线程；`Drop` 里
-  用独立 stop flag（不能和下行共用，否则关麦会连游戏声音一起停）。
+**落地形态**（与本文档原计划的差异，以代码为准）：
+- `on_track` 的触发点是**第一个 RTP 包**，不是协商完成 —— 所以上行线程从回调里起，
+  不能放在 PC Connected 分支（那个时刻麦克风可能还没被按下）。
+- 上行是**两个 OS 线程**：`audio-mic-rx` 永久 `block_on(read_rtp)` 把 `(seq,payload)`
+  塞进容量 64 的 `sync_channel`；`audio-mic-tx` 每 5 ms 取包解码写 WASAPI render。
+  单线程做不到「既不阻塞读、又不丢包」——给 `read_rtp` 加超时会丢掉已经出队的包。
+- 播放侧：预滚 60 ms 开播、队列超 500 ms 裁回 60 ms 且保留最新、欠载补零、
+  丢包用 Opus PLC 补最多 3 帧。
+- 已知物理限制：注入落在默认 render 端点 = loopback 采集的同一端点，所以开麦会听到
+  自己一次。三条出路见 `stage3-audio-design.md` §8.2 与 `roadmap-future.md` §5。
 
-**必须注意的三件事**：
-1. **抖动缓冲**。RTP 到达间隔不均，直接 `write` 会爆音。至少要一个 3~5 帧（60~100 ms）
-   的环形缓冲，按「最早未播帧」推进。
-2. **采样率不匹配**。浏览器可能发 48k 单声道；Opus 解码后要按声道数做上混，
-   不能假设立体声。
-3. **回环啸叫**。loopback 采的是系统混音，麦克风注入到默认 render 设备后会被自己
-   再采一遍，形成正反馈。要么注入到非默认设备，要么在下行链路做回声消除
-   （AEC 自己做不现实）——**这是本项最大的技术风险，需先做一次 30 秒实测再决定
-   是否接受"仅耳机可用"的约束**。
-
-**验收**：浏览器开麦说话，被控机本地扬声器能听到；关麦后下行游戏声不受影响；
-连续说话 60 秒无爆音、无累积延迟（听感上与画面同步）。
+**验收**（尚未发生）：`audio: render open` / `mic uplink: remote track` /
+`audio: uplink playing` 三行日志目前命中数为 0，说明还没人真正开过麦。
 
 ### 2.2 手柄（#17，P1，L2）
 
@@ -205,20 +207,22 @@
 **验收**：无 token 打开得到 401 且 WS 握手被拒；带 token 正常；改 token 后旧
 链接失效。
 
-### 2.6 服务自恢复（#32，P1，L4）
+### 2.6 服务自恢复（#32，P1，L4）— 已实现 #81
 
 **现象**：`stream-server.exe` 崩溃或被杀后不会自己起来，要人 `schtasks /Run`。
 
 **根因**：`MCStreamSrv` 是 `ONCE` 任务、`重复: 已禁用`。
 
-**改动点**：把任务改成「触发器=登录时 + 重复每 1 分钟无限期」，或改用
-`sc.exe create ... start= auto` + `sc failure ... restart/60000`。
-后者语义更准（这是服务不是计划任务），但当前服务以 Administrator 交互会话跑，
-改成 Windows 服务会丢掉 Session 1 的桌面捕获能力——**所以只能用计划任务 +
-重复触发**，且要加"单实例"保护（进程已在跑就直接退出，否则每分钟起一个）。
+**落地形态**：`/SC MINUTE /MO 1` + 单实例检查 + `wscript run-hidden.vbs` 隐藏宿主。
+注意**不能**改 `sc.exe create`：Windows 服务跑在 Session 0，会丢掉 Session 1 的
+桌面捕获，等于没有画面。
 
-**验收**：`taskkill /F /IM stream-server.exe` 后一分钟内自动回来，浏览器重连即出画面；
-连续杀 5 次不会堆积僵尸进程。
+**已实测**：`taskkill /F /IM stream-server.exe` 杀掉 PID 1904，一分钟后 PID 7612
+自起，`/api/status` 返回 200，浏览器重连即出画面。
+
+**残余**：只覆盖「进程死」。**卡死（活着但不推流）不在覆盖范围** —— 看门狗只看
+进程在不在。要做健康检查得在 `start-stream.cmd` 里加一步 `/api/status` 探活并
+超时自杀，属增强项。
 
 ### 2.7 音画同步（#26，P2，L3）
 
@@ -247,19 +251,22 @@
 
 **验收**：截图后 Ctrl+C 在浏览器 → 被控机 Ctrl+V 进画图能出图；反向亦然。
 
-### 2.9 周期关键帧（#27，P2，L3）
+### 2.9 周期关键帧（#27）— 复核结论：**不是缺口**
 
-**现象**：静态画面挂十几分钟后，偶发一次"整屏错位一瞬再恢复"。
+**现象**（原记录）：静态画面挂十几分钟后，偶发一次「整屏错位一瞬再恢复」；推测
+repeat 帧一直在 P 帧链上累积。
 
-**根因**：repeat 帧一直在 P 帧链上累积，VP8 的 8-bit 参考在长时间静止 + 偶发
-脏块情况下会漂。当前只有 PLI 触发关键帧。
+**复核**：`pipeline/encoder.rs:59` 已经设了 `keyframe_interval: Some(60)`，
+`vendor/scrap/src/common/vpxcodec.rs:100-102` 把它写成 `c->kf_max_dist = 60`，
+libvpx 会每 60 个编码帧产出一次关键帧；静态画面走的是 `repeat encode`
+（`pipeline/mod.rs:1108-1118`，仍然是 `encoder.encode(...)`），所以画面静止时
+参考链同样在被刷新。此前的 ❌ 判断是只看了 `pipeline` 的 PLI 分支、没往下看
+编码器配置。
 
-**改动点**：`pipeline/mod.rs` 加 `last_keyframe_at: Instant`，超过
-`--keyframe-interval`（默认 10 s）强制一次；与现有 500 ms 去抖共用同一个
-`request_keyframe` 入口即可。
-
-**验收**：静置 30 分钟不再出现错位；带宽代价可量化（关键帧 ~5×P 帧，
-10 s 一次在 2.5 Mbps 下约 +3%）。
+**残余（调优，非缺口）**：60 帧在 60 fps 下约 1 秒、30 fps 下约 2 秒，1080p 一个
+IDR 约 100–200 KB，等于持续付出 0.4–0.8 Mbps。若要的是「长静置守护」，应改成
+`--keyframe-interval-sec`（默认 10 s）并保留 PLI 立即响应 —— 这在做 QoS 时顺手做，
+因为降档会被过于频繁的 IDR 直接抵消。
 
 ### 2.10 截图 / 录屏（#28，P3，L3）
 
@@ -282,28 +289,52 @@
 
 **验收**：一条命令从干净工作区到可连；中途失败能自动回滚。
 
+### 2.12 音频没有观测（新增，P1，L3）
+
+**现象**：静音到底生效了没有、音频在发多少码率、麦克风有没有真的在送数据 ——
+服务端一行日志都不打，只能抓包或拿耳朵判断。
+
+**根因**：`pipeline/audio.rs` 里 `totals()`（captured / encoded / bytes / silence）
+与 `uplink_totals()`（packets / frames / concealed / silence / dropped）**都已经写好了，
+但全仓没有一处调用**；`stream_stats` 里也没有任何 `audio_*` 字段。这两组计数器
+是 #77/#79 留下的半成品，只差一个消费者。
+
+**改动点**：
+- `pipeline/audio.rs`：每 5 s 打一行摘要（与 `pipeline 5.0s:` 同格式），
+  静音切换时打状态变化而不是每帧打。
+- `dispatch/output.rs`：`StreamStats` 加 `audio_kbps` / `audio_on` / `mic_kbps`
+  三个字段，前端 `stream-stats-view.js` 与 HUD 各加一行。
+- 判据：关音频后 `audio_kbps` 掉到个位数（静音帧），开回来 100 ms 内有声；
+  开麦后 `mic_kbps` 从 0 变正数。
+
+**为什么排 P1**：这是 #79/#80 的验收工具。没有它，那两项只能算「代码写完了」，
+出问题时也无从定位是编码、传输还是设备。
+
 ---
 
 ## 3. 任务排序
 
 依赖关系用「← 表示前置」标。同一优先级内，序号即建议执行顺序。
+**已划掉的项表示本轮已完成**，保留在表里是为了让排序理由可回溯。
 
 | 优先级 | 任务 | 依赖 | 一句话理由 |
 | --- | --- | --- | --- |
-| P0 | 2.1 麦克风上行 | — | P0 遗留的最后一环，协议侧已通，只差消费端 |
-| P1 | 2.6 服务自恢复 | — | 十分钟工作量，却是"能用"与"能交付"的分界 |
-| P1 | 2.3 音量/静音/码率 | — | 用户每天会点的按钮，现在是假的 |
+| ~~P0~~ | ~~2.1 麦克风上行~~ | — | 已实现 #79，**待实机验收** |
+| ~~P1~~ | ~~2.6 服务自恢复~~ | — | 已实现 #81，已实测杀掉自起 |
+| ~~P1~~ | ~~2.3 音量/静音/码率~~ | — | 已实现 #80，**待实机验收** |
+| **P1** | **2.12 音频观测** | — | 是上面两项的验收工具；不做就只能靠耳朵 |
 | P1 | 2.5 鉴权 | — | 局域网内裸奔，属安全债 |
-| P1 | 2.4 QoS 自适应 | ← 2.1 无关；建议在 2.9 之后做（需要关键帧策略稳定） | 唯一能把"糊"变成"自动恢复"的机制 |
-| P2 | 2.9 周期关键帧 | — | 3 行改动，消掉长时漂移 |
-| P2 | 2.7 音画同步 | ← 2.1 | 有麦克风后音画关系才真正复杂 |
-| P2 | 2.11 一键部署 | — | 减少每次验证的摩擦成本 |
+| P1 | 2.4 QoS 自适应 | ← 先做 2.9 残余（关键帧间隔可配） | 唯一能把"糊"变成"自动恢复"的机制 |
+| P2 | 2.11 一键部署 | — | 减少每次验证的摩擦；当前每轮验证要手工七步 |
+| P2 | 2.7 音画同步 | ← 2.1 验收通过 | 有麦克风后音画关系才真正复杂 |
 | P2 | 2.2 手柄 | ← 需先决定是否装 ViGEmBus 驱动 | 前端全套已就绪，卡在驱动 |
 | P2 | 2.8 二进制剪贴板 | — | 依赖 PNG 编解码，收益中等 |
 | P3 | 2.10 截图 | ← 2.5（鉴权） | 纯增量为先不碰 |
 
-**建议下一轮做 P0 + P1 的前三项**（2.1 / 2.6 / 2.3）：三项都不改架构，
-且做完之后「云游戏会话」在体验上才第一次完整——有声、可关、崩了能自己回来。
+**建议下一轮**：2.12 音频观测 → 2.5 鉴权 → 2.4 QoS。
+2.12 放第一不是为了功能，而是因为它把「麦克风到底通没通」从主观变成一行数；
+2.5 是唯一的安全债，越晚做越难补（前端 token 通道已就绪，越往后改路由面越大）；
+2.4 放最后是因为它需要 2.9 的残余先落地，否则降档会和过于频繁的 IDR 打架。
 
 ---
 
