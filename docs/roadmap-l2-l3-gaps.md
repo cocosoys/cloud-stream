@@ -73,7 +73,7 @@
 | 20 | 游戏声音下行（WASAPI loopback → Opus 48k/2ch/64kbps） | ✅ | #77 `6a095e2`，`pipeline/audio.rs` |
 | 21 | 麦克风上行（`on_track` → Opus 解码 → WASAPI render） | ✅* | #79，`webrtc/mod.rs` `on_track` + `pipeline/audio.rs` `spawn_uplink` 双线程；*待实机验收 |
 | 22 | 服务端可观测性（RTT / video_mbps / send_ms / peak / 关键帧请求） | ✅ | #78 `88e80dd`，`docs/stage3-observability.md` |
-| 23 | 统计浮层 HUD（F3，九行） | ✅ | 前端 `lib/stats-hud.js`，`afcf2ad` |
+| 23 | 统计浮层 HUD（九行，跟随「在画面上显示」开关，无热键） | ✅ | 前端 `lib/stats-hud.js`，`afcf2ad`；开关同步与撤掉 F3/F4 见 `docs/host-knobs.md` §7 |
 | 24 | 音量 / 静音 / 音频码率 | ✅* | #80，`Action::SetAudioOn` / `SetAudioBitrate`，静音期间发静音帧（~1.6 kbps 而非停发）；*待实机验收 |
 | 25 | QoS 自适应码率（丢包 / 积压反压） | ✅ | #84，`pipeline/qos.rs`（积压 + PLI 率 → 2s 一次决策，-25%/+10%，floor 20%）；`throttled` 现为真实状态 |
 | 26 | 音画同步 | ✅ | #83，`pipeline/avsync.rs`：音频媒体时钟钉在墙钟上，偏斜 >80 ms 时以 20 ms 为一格收发帧。首版比两路介质时钟，实测误判成 -16 s（见设计稿 §3.1） |
