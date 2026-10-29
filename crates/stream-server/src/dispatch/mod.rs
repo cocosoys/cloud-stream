@@ -5,6 +5,7 @@
 //! classifier, the builders and the input sink trait.
 
 pub mod clipboard;
+pub mod clipboard_image;
 pub mod commands;
 pub mod input_stub;
 pub mod output;
