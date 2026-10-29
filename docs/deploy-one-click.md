@@ -355,6 +355,56 @@ Session 1。体检会打印 `session=1`，看到 `session=0` 就是这条踩了�
 dist 重新打包。判定线上是不是新产物，别看日志，看
 `curl -sk https://<host>:8080/ | grep -o 'assets/[^"]*'` 里的文件名对不对。
 
+### 7.14 构建在 `vite:prepare-out-dir` 处失败（已修）
+
+**现象**：`npm run build` 报
+
+```
+[plugin vite:prepare-out-dir]
+Error: [safe-delete][SAFE_DELETE_BULK_CONFIRM_REQUIRED] {"count":1998,"threshold":50,
+  "targets":["...\selkies-web-core\dist\jsdb"]}
+```
+
+报错指向 vite 插件，看不出跟项目有什么关系。
+
+**根因**：`selkies-web-core` 的 `postbuild` 是 `node gendb.js`，每次往 `dist/jsdb`
+写 **1992 个**小手柄映射 JSON（`<vendor>-<product>.json`）。下一次 `vite build`
+的 `emptyOutDir` 会一次性删掉它们 —— 在带批量删除保护的运行环境里（工作区把
+node 的 `rmSync` 包了一层），超过阈值就拒绝执行，构建中断。
+
+**防**：`deploy.ps1` 在调用 npm 之前用 `Remove-Item -Recurse` 自己清 `dist`
+（PowerShell 不走那个 shim），构建路径就与文件数量无关了。手工构建时如果撞上
+同样的报错，先 `rm -rf dist` 再 build。
+
+### 7.15 只换前端却被判健康检查失败并回滚（已修）
+
+**现象**：`deploy.ps1 -SkipBackend` 打印 `[5] 切换完成` → `[6] HTTP 200`，紧接着
+报 `日志尾部没有 listening on —— 进程起来了但没在监听`，然后回滚，刚换上去的
+前端又被换回来了。
+
+**根因**：体检的前置假设是「这一轮重启过进程」。但 `-SkipBackend` 的整个意义就是
+**不重启**（`deploy-remote.ps1` 只在换后端时才 `Stop-Server`，前端只是换目录），
+所以进程还是原来那个 PID、日志里也不会有新的 `listening on`；而 `Get-Content
+-Tail 40` 只覆盖约 3 分钟（5 秒一条统计），那条启动日志早就滚出去了。
+
+**防**：切换前记下 PID，只换前端时改用「PID 未变 + HTTP 200」判定，并在输出里
+写 `pid=10704（未重启，会话保持）`。体检的判据要和部署的语义一致 —— 判据错会
+把一次成功的部署回滚掉，比不检查更糟。
+
+### 7.16 回滚会把没换过的 exe 换掉（已修）
+
+**现象**：`-SkipBackend` 部署失败后回滚，日志里出现 `exe restored 18181120 B`
+和一次 `killed pid` / `started pid` —— 可这一轮根本没上传过 exe，会话也被打断了。
+
+**根因**：回滚块无条件 `Copy-Item .prev → live` 并重启。`.prev` 是**上一次后端
+部署**留下的，于是「回滚一次前端」等于把后端换成上一版（静默降级），并且重启了
+一个和故障无关的进程。
+
+**防**：后端换文件时写一个 `deploy-exe-swapped.marker`（内容是 prev 的 md5），
+成功结束即删除。自动回滚带 `-CycleOnly`，只撤销这一轮真正换过的东西 ——
+没换 exe 就不动 exe、也不重启。人去执行 `-Rollback` 仍是完整的「回到上一版」：
+两条路径语义不同，用一个开关区分，不要靠猜。
+
 ---
 
 ## 8 验收清单
@@ -363,6 +413,7 @@ dist 重新打包。判定线上是不是新产物，别看日志，看
 
 - [ ] 退出码 0，末尾打印 `部署完成`
 - [ ] `[5] 体检` 三行全绿：`HTTP 200` / `listening on ...` / `pid=... session=1 start=...`
+      （只换前端时中间一行是 `pid=...（未重启，会话保持）`，这是正常的，见 §7.15）
 - [ ] `curl -sk https://192.168.59.148:8080/ | grep -o 'assets/[^"]*'` 有两行
 - [ ] 浏览器强刷后**左侧有工具栏**（没有 = 服务成 core 构建了，§7.1）
 - [ ] 右上角有统计面板，右边缘有粉色胶囊

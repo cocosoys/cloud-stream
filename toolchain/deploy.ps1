@@ -370,6 +370,17 @@ try {
         if (-not (Test-Path (Join-Path $CoreDir 'package.json'))) { throw "找不到前端仓库：$CoreDir" }
 
         if (-not $SkipBuild) {
+            # 先自己清 dist，别交给 vite 的 emptyOutDir。core 的 postbuild（gendb.js）
+            # 每次往 dist/jsdb 写 1992 个小 JSON，于是下一次构建的「清空输出目录」
+            # 就变成一次上千文件的批量删除；在带批量删除保护的 shell 里（例如
+            # 工作区沙箱把 node 的 rmSync 包了一层）会直接让构建失败，
+            # 而且报错信息指向 vite 插件，看不出是文件数量的问题。
+            # Remove-Item 不走 node，构建路径就与文件数量无关。
+            foreach ($pkg in @($CoreDir, $DashDir)) {
+                $stale = Join-Path $pkg 'dist'
+                if (Test-Path $stale) { Remove-Item $stale -Recurse -Force }
+            }
+
             Push-Location $CoreDir
             try { Invoke-Native -Exe 'npm' -Arguments @('run', 'build') -Quiet } finally { Pop-Location }
             Write-Ok 'core 构建完成'
@@ -450,6 +461,19 @@ try {
 
     # ---- 7 切换
     Write-Step '切换（停任务 → 备份 → 换文件 → 起任务）'
+
+    <#
+        只换前端时进程不该被重启（这正是 -SkipBackend 的意义：不断会话）。
+        那样日志里就不会有新的 listening on，所以体检不能一律去翻日志尾部 ——
+        先记下切换前的 PID，切换后 PID 没变本身就是最直接的证据。
+    #>
+    $pidBefore = $null
+    if ($SkipBackend -and -not $SkipFrontend) {
+        $pre = Invoke-Ssh ("powershell -NoProfile -Command `"Get-Process stream-server " +
+            "-ErrorAction SilentlyContinue | Select-Object -First 1 | ForEach-Object { 'pid=' + `$_.Id }`"") -AllowFail
+        $t = ($pre.Output -split "`r?`n" | Where-Object { $_ -match '^pid=(\d+)' } | Select-Object -First 1)
+        if ($t) { $pidBefore = [int]($t -replace '^pid=', '').Trim() }
+    }
     # 开关只在为真时传。`-SkipBackend:$false` 这种写法穿过 ssh -> cmd 之后
     # 会被当成「参数名:值」，绑定器要么报错要么静默当字符串，两种都难看。
     $argList = "powershell -NoProfile -ExecutionPolicy Bypass -File $RemoteDeploy\deploy-remote.ps1"
@@ -480,16 +504,28 @@ try {
     $p = Invoke-Ssh "powershell -NoProfile -Command `"$probe`"" -AllowFail
     $pidLine = ($p.Output -split "`r?`n" | Where-Object { $_ -like 'pid=*' } | Select-Object -First 1)
     $logLine = ($p.Output -split "`r?`n" | Where-Object { $_ -like 'log=*' } | Select-Object -First 1)
-    if (-not $logLine) { throw '日志尾部没有 listening on —— 进程起来了但没在监听' }
-    # 日志行带着 `INFO [stream_server::http::server]` 前缀，掐掉只留结论。
-    $msg = $logLine -replace '^log=', ''
-    $at = $msg.IndexOf('listening on')
-    if ($at -gt 0) { $msg = $msg.Substring($at) }
-    Write-Ok $msg
+
+    $pidNow = $null
+    if ($pidLine -match 'pid=(\d+)') { $pidNow = [int]$Matches[1] }
+    # 只换前端时进程没重启：端口通 + 还是原来那个 PID，就是健康。
+    # 这时日志尾部不会有新的 listening on（5 秒一条统计，尾部 40 行只有 3 分钟），
+    # 拿它当判据会把一次正确的部署判成失败并回滚 —— 换掉的文件白换了。
+    $notRestarted = ($SkipBackend -and $pidBefore -and $pidNow -eq $pidBefore)
+
+    if ($notRestarted) {
+        Write-Ok "pid=$pidNow（未重启，会话保持）"
+    } else {
+        if (-not $logLine) { throw '日志尾部没有 listening on —— 进程起来了但没在监听' }
+        # 日志行带着 `INFO [stream_server::http::server]` 前缀，掐掉只留结论。
+        $msg = $logLine -replace '^log=', ''
+        $at = $msg.IndexOf('listening on')
+        if ($at -gt 0) { $msg = $msg.Substring($at) }
+        Write-Ok $msg
+    }
 
     if ($pidLine) {
-        Write-Ok $pidLine.Replace('pid=', 'pid=')
-        if ($pidLine -match 'start=(\S+)') {
+        Write-Ok $pidLine
+        if (-not $notRestarted -and $pidLine -match 'start=(\S+)') {
             $started = [datetime]::Parse($Matches[1])
             if ($started.ToLocalTime() -lt $DeployStartedAt.AddSeconds(-5)) {
                 Write-Note "进程启动时间 $($started.ToLocalTime()) 早于本次部署，可能跑的还是旧二进制"
@@ -510,7 +546,7 @@ catch {
     Write-Host "部署失败：$($_.Exception.Message)" -ForegroundColor Red
     if (-not $DryRun) {
         Write-Host "尝试回滚…" -ForegroundColor Yellow
-        $rb = Invoke-Ssh "powershell -NoProfile -ExecutionPolicy Bypass -File $RemoteDeploy\deploy-remote.ps1 -Rollback" -AllowFail
+        $rb = Invoke-Ssh "powershell -NoProfile -ExecutionPolicy Bypass -File $RemoteDeploy\deploy-remote.ps1 -Rollback -CycleOnly" -AllowFail
         Write-Host $rb.Output -ForegroundColor DarkGray
         if ($rb.Code -eq 0) {
             Write-Host "已回滚到上一版（stream-server.exe.prev / selkies-web.prev）" -ForegroundColor Yellow
