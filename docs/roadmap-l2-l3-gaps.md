@@ -305,6 +305,13 @@ IDR 约 100–200 KB，等于持续付出 0.4–0.8 Mbps。若要的是「长静
 **现状**：后端 `scp` + `certutil` + `schtasks /Run` 三步手工；前端 `npm run build`
 后整目录上传（旧目录改名备份）。每次都靠人记。
 
+**踩过的坑（2026-10-29）**：`--dist C:\dev\selkies-web` 服务的是 **dashboard** 构建
+（`addons/selkies-dashboard/dist`，`index.html` 786 B，带 `#root` + `assets/`），
+不是 core 构建（`addons/selkies-web-core/dist`，`index.html` 185 B）。只拷
+`selkies-core.js` + core 的 index.html 上去，页面还能出画面，但**左侧工具栏整个消失**
+—— 因为它住在 dashboard 的 React 侧边栏里，而那个页面根本没被服务。判定方法：
+`curl -sk https://<host>:8080/ | grep -c dashboard` 或看 index.html 大小。
+
 **改动点**：`toolchain/deploy-148.ps1`：构建 → MD5 比对 → 停任务 → 备份 →
 覆盖 → 启任务 → 轮询 `/api/status` 直到 200 → 断言日志里出现
 `listening on`。失败即回滚到 `.bak`。
