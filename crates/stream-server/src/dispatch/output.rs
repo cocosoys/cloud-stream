@@ -203,7 +203,16 @@ pub fn stream_stats(s: &StreamStats) -> String {
     }
     // gpu_percent / gpu_mem_used / gpu_mem_total stay out on purpose: no GPU
     // passthrough, so there is nothing measured to report.
-    data.to_string()
+    //
+    // The envelope is not decoration: `lib/webrtc.js` dispatches on `msg.type`
+    // and hands `msg.data` to `StreamStats.serverSample`, and every other
+    // builder here (`stream_info`, `connection`, `cursor`) ships the same
+    // `{type, data}` pair. This one used to go out as the bare figure object, so
+    // no branch matched and the browser dropped the whole sample: the panel's
+    // client-side tiles (decode, jitter, loss, NACK, PLI) kept counting while
+    // every server figure — encode / capture-to-encode / capture-to-send, the
+    // video rate and its peak, host CPU and memory — drew a dash forever.
+    json!({"type": "stream_stats", "data": data}).to_string()
 }
 
 /// One decimal, the precision the panel's time tiles print. Sending raw f32
@@ -333,6 +342,19 @@ mod tests {
             total_frames: 60,
             warm: true,
         }
+    }
+
+    /// The sample is a message, not a bag of figures: `lib/webrtc.js` dispatches
+    /// on `type` and reads `data`, so a bare object is dropped in silence and
+    /// every server tile draws a dash while the client's own tiles keep counting.
+    #[test]
+    fn stats_arrive_as_a_stream_stats_message() {
+        let line = stream_stats(&StreamStats::default().with_pipeline(&snapshot()));
+        let parsed: hbb_common::serde_json::Value =
+            hbb_common::serde_json::from_str(&line).expect("stats line is not JSON");
+        assert_eq!(parsed["type"], json!("stream_stats"), "wrong envelope: {line}");
+        assert!(parsed["data"]["encode_ms"].is_number(), "no figures under data: {line}");
+        assert!(parsed["data"]["peak_mbps"].is_number(), "no figures under data: {line}");
     }
 
     /// The names are the frontend's (`lib/stream-stats-view.js` reads them off
