@@ -262,6 +262,41 @@ pub fn server_settings(s: &crate::pipeline::StreamSettings) -> String {
         "type": "server_settings",
         "data": {
             "settings": {
+                // #91: the encoder, and the one place the panel could contradict
+                // itself. `pipeline::encoder` builds exactly one encoder —
+                // libvpx VP8, software — so the list has one entry and the row
+                // renders read-only. Before this key existed the panel fell back
+                // to its own local default and printed "H.264" while the
+                // statistics tile (which reads `stream_info`) said "libvpx ·
+                // VP8": two answers to one question, neither of them from here.
+                "encoder": {
+                    "value": "vp8enc",
+                    "allowed": ["vp8enc"],
+                    "locked": true
+                },
+                // #91: the encoder has no CRF path — `set_quality` exists, but
+                // the pipeline only ever drives a bitrate target — so CRF is not
+                // offered. Announcing one option is how the panel learns to stop
+                // drawing the quality/CRF knobs, which used to be selectable and
+                // did nothing.
+                "rate_control_mode": {
+                    "value": "cbr",
+                    "allowed": ["cbr"],
+                    "locked": true
+                },
+                // #91: the audio slider was disabled, not broken: the panel
+                // greys a control out when `allowed` has fewer than two entries,
+                // and with no `audio_bitrate` key at all that count was zero.
+                // The stops are Opus targets this server will take
+                // (`audio::BITRATE_STEPS`), and `value` is the live target, not
+                // a remembered one.
+                "audio_bitrate": {
+                    "value": crate::pipeline::audio::current_bitrate_bps(),
+                    "allowed": crate::pipeline::audio::BITRATE_STEPS,
+                    "min": crate::pipeline::audio::BITRATE_STEPS[0],
+                    "max": crate::pipeline::audio::BITRATE_STEPS[crate::pipeline::audio::BITRATE_STEPS.len() - 1],
+                    "locked": false
+                },
                 "framerate": {
                     "value": s.fps(),
                     "min": 10,
@@ -279,6 +314,35 @@ pub fn server_settings(s: &crate::pipeline::StreamSettings) -> String {
                 "manual_width": { "value": s.width(), "locked": false },
                 "manual_height": { "value": s.height(), "locked": false },
                 "enable_resize": { "value": true, "locked": false },
+                // #90: the Screen section's UI-scale dropdown. Without this key
+                // the panel drew an empty (but enabled) `<select>`: its option
+                // list is `serverSettings.scaling_dpi.allowed`, so an absent
+                // payload meant no options at all. The values are DPI against
+                // 96 — the panel prints `dpi / 96 * 100` as the percentage and
+                // compares stored picks as strings — and they are exactly the
+                // steps `hostui::apply_scale` can land on, so no option can
+                // silently do nothing. `value` is read from the host, not
+                // remembered, so a fresh browser shows the desktop it is
+                // actually looking at.
+                "scaling_dpi": {
+                    "value": crate::dispatch::hostui::current_scale_dpi()
+                        .unwrap_or(96)
+                        .to_string(),
+                    "allowed": crate::dispatch::hostui::SCALE_DPI
+                        .map(|dpi| dpi.to_string()),
+                    "overridden": false,
+                    "locked": false
+                },
+                // #90: the pointer-DPI slider. `allowed` is every speed step
+                // Windows has, as DPI against a 400 DPI baseline (step 10, the
+                // OS default, is 400). A typed value snaps to one of these; the
+                // host cannot express anything between two steps.
+                "mouse_dpi": {
+                    "value": crate::dispatch::hostui::current_mouse_dpi()
+                        .unwrap_or(crate::dispatch::hostui::BASE_DPI),
+                    "allowed": crate::dispatch::hostui::speed_steps_dpi(),
+                    "base": crate::dispatch::hostui::BASE_DPI,
+                },
                 "video_fullcolor": { "value": false, "locked": true },
                 "video_10bit": { "value": false, "locked": true },
                 "use_cpu": { "value": true, "locked": true },
@@ -405,5 +469,45 @@ mod tests {
         assert!(line.contains("\"video_mbps\":2.46"), "unexpected: {line}");
         assert!(line.contains("\"peak_mbps\":9.87"), "unexpected: {line}");
         assert!(line.contains("\"send_ms\":19.8"), "unexpected: {line}");
+    }
+
+    /// #91: this payload is the panel's only description of what the server can
+    /// do, and every control in the sidebar is enabled or greyed by something in
+    /// here. Two keys were missing and both lied in the same direction — the
+    /// sidebar printed its own defaults over a server that could not honour
+    /// them: the encoder row said "H.264" over a libvpx/VP8 stream, and the
+    /// audio slider was disabled because `allowed.length <= 1` is exactly how
+    /// "no choices" reads, so a missing list meant "one choice, take it".
+    ///
+    /// The assertions are about *shape*, not today's values: one encoder entry
+    /// (the pipeline builds one), one rate-control mode (there is no CRF path),
+    /// and an audio list long enough to un-grey the slider with nothing above
+    /// the Opus ceiling the encoder would clamp away.
+    #[test]
+    fn settings_describe_the_encoder_and_audio_the_pipeline_has() {
+        let s = crate::pipeline::StreamSettings::from_config(&crate::config::Config::default());
+        let line = server_settings(&s);
+        let parsed: hbb_common::serde_json::Value =
+            hbb_common::serde_json::from_str(&line).expect("server_settings is not JSON");
+        let settings = &parsed["data"]["settings"];
+
+        assert_eq!(
+            settings["encoder"]["allowed"],
+            json!(["vp8enc"]),
+            "the encoder list is the panel's only honest answer: {line}"
+        );
+        assert_eq!(settings["encoder"]["locked"], json!(true));
+        assert_eq!(settings["rate_control_mode"]["allowed"], json!(["cbr"]));
+
+        let audio = settings["audio_bitrate"]["allowed"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no audio stops: {line}"));
+        assert!(audio.len() > 1, "one stop greys the slider out: {line}");
+        let ceiling = crate::pipeline::audio::BITRATE_STEPS;
+        assert_eq!(
+            audio.last().unwrap(),
+            &json!(ceiling[ceiling.len() - 1]),
+            "a stop above the encoder's ceiling is one it silently clamps: {line}"
+        );
     }
 }

@@ -42,6 +42,13 @@ pub enum Action {
     /// `dr,reset` (#89) — put the host back to the mode it had before the first
     /// `dr,` of this process.
     ResetDisplayResolution,
+    /// `md,<dpi>` (#90) — set the host's *pointer speed* so its pointer DPI is
+    /// that number (400 = the OS default). Unlike a client-side gain, this rules
+    /// the host's real pointer, so the desktop and every game agree.
+    SetMouseDpi(u32),
+    /// `dd,<dpi>` (#90) — set the host's *UI scaling* (96 = 100 %), the
+    /// Settings > Display > Scale dropdown, in DPI against 96.
+    SetUiScale(u32),
     /// `SETTINGS,{json}` (#50) — client settings batch; JSON parsed by the
     /// session (framerate / manual_width / manual_height / ...).
     SetSettings(String),
@@ -146,6 +153,18 @@ pub fn classify(line: &str) -> Action {
             }
         }
         "SETTINGS" => Action::SetSettings(rest.to_owned()),
+        // #90: `md,<dpi>` — the host's pointer speed expressed as DPI (400 =
+        // the OS default step 10). Base-10 digits only: a stray suffix must be
+        // a rejection, not a silently different number.
+        "md" => match rest.trim().parse::<u32>() {
+            Ok(dpi) => Action::SetMouseDpi(dpi),
+            Err(_) => Action::Unknown(line.to_owned()),
+        },
+        // #90: `dd,<dpi>` — the host's UI scaling, in DPI against 96 (96 = 100 %).
+        "dd" => match rest.trim().parse::<u32>() {
+            Ok(dpi) => Action::SetUiScale(dpi),
+            Err(_) => Action::Unknown(line.to_owned()),
+        },
 
         // ---- #80: client audio bitrate request `ab,<N>` (bits per second). ----
         "ab" => {

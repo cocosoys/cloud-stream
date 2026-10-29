@@ -131,6 +131,25 @@ pub fn set_bitrate_bps(bps: i32) {
     TARGET_BPS.store(clamped, Ordering::Relaxed);
 }
 
+/// The downlink's live Opus target, in bps.
+///
+/// Read by `server_settings` so the panel's audio slider shows what the encoder
+/// is actually aimed at: the value lives here rather than in `StreamSettings`
+/// because the audio thread outlives the session, and a copy in two places is a
+/// copy that can disagree.
+pub fn current_bitrate_bps() -> u32 {
+    TARGET_BPS.load(Ordering::Relaxed).max(0) as u32
+}
+
+/// The stops the panel's audio-bitrate slider indexes into, in bps.
+///
+/// Advertised in `server_settings` so the track can only hold values this
+/// server will actually take: everything here is inside `MIN_BPS..=MAX_BPS`,
+/// and nothing outside it is offered. The upstream list went to 510k, which
+/// [`set_bitrate_bps`] silently clamps to 128k — a stop that lies about what it
+/// did.
+pub const BITRATE_STEPS: [u32; 5] = [32_000, 48_000, 64_000, 96_000, 128_000];
+
 /// #80: `START_AUDIO` / `STOP_AUDIO`. Process-wide because the encoder thread is
 /// per-session and looks this up every frame.
 pub fn set_enabled(on: bool) {

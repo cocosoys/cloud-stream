@@ -38,9 +38,9 @@ use tokio_tungstenite::{
 
 use crate::config::Config;
 use crate::dispatch::{
-    classify, connection, cursor, display, pipeline, server_settings, stream_info, stream_stats,
-    system, Action, ClipboardSink, InputSinkRef, StreamInfo, StreamStats, WinInputSink,
-    read_clipboard_update,
+    classify, connection, cursor, display, hostui, pipeline, server_settings, stream_info,
+    stream_stats, system, Action, ClipboardSink, InputSinkRef, StreamInfo, StreamStats,
+    WinInputSink, read_clipboard_update,
 };
 use crate::pipeline::{spawn_loop, PipelineEvent, PipelineHandle, StreamSettings};
 use crate::platform::{HostSample, Sampler};
@@ -647,6 +647,12 @@ fn surface_of(action: &Action) -> Option<EventKind> {
         Action::SetDisplayResolution(..) | Action::ResetDisplayResolution => {
             EventKind::Control("control.display")
         }
+        // #90: these two move the *host's own* settings, not the stream. They
+        // are separate surfaces from `control.display` for the same reason that
+        // one is separate from `control.resolution`: a policy may well allow a
+        // desktop reflow and still refuse to touch the user's pointer.
+        Action::SetMouseDpi(_) => EventKind::Control("control.mouse-dpi"),
+        Action::SetUiScale(_) => EventKind::Control("control.ui-scale"),
         Action::SetSettings(_) => EventKind::Control("control.settings"),
         Action::SetBitrate(_) => EventKind::Control("control.bitrate"),
         Action::SetNativeCursorRendering(_) => EventKind::Control("control.cursor-rendering"),
@@ -954,6 +960,72 @@ async fn arm_connected_notices(
                     apply_settings_batch(&settings, &payload);
                     let _ = control.send_text(server_settings(&settings)).await;
                 }
+                // #90: `md,<dpi>` — the host's pointer speed, expressed as DPI.
+                // `SPI_SETMOUSESPEED` is a user-session call (it writes the
+                // profile and broadcasts a settings change), so it goes to a
+                // blocking worker like the display switch does. The reply names
+                // the step that actually landed: Windows only has 20 of them, so
+                // a typed 780 becomes 800 and the panel says so.
+                Action::SetMouseDpi(dpi) => {
+                    log::info!("client sets host pointer dpi -> {dpi}");
+                    match tokio::task::spawn_blocking(move || hostui::apply_mouse_dpi(dpi)).await {
+                        Ok(Ok(applied)) => {
+                            log::info!(
+                                "host pointer dpi {} -> {} (speed={}, exact={})",
+                                applied.requested,
+                                applied.applied,
+                                applied.speed,
+                                applied.exact
+                            );
+                            let _ = control.send_text(&mouse_dpi_report(&applied)).await;
+                        }
+                        Ok(Err(reason)) => {
+                            log::warn!("host pointer dpi refused: {reason}");
+                            let _ = control
+                                .send_text(&host_knob_failure("mouse_dpi", dpi, &reason))
+                                .await;
+                        }
+                        Err(join) => {
+                            log::warn!("host pointer dpi worker failed: {join}");
+                            let _ = control
+                                .send_text(&host_knob_failure("mouse_dpi", dpi, "worker join error"))
+                                .await;
+                        }
+                    }
+                }
+                // #90: `dd,<dpi>` — the host's UI scaling (96 = 100 %).
+                Action::SetUiScale(dpi) => {
+                    log::info!("client sets host ui scale -> {dpi} dpi");
+                    match tokio::task::spawn_blocking(move || hostui::apply_scale(dpi)).await {
+                        Ok(Ok(applied)) => {
+                            log::info!(
+                                "host ui scale {} -> {} (strategy={}, exact={})",
+                                applied.requested,
+                                applied.applied,
+                                applied.strategy,
+                                applied.exact
+                            );
+                            let _ = control.send_text(&ui_scale_report(&applied)).await;
+                            // The scale moves what the desktop draws, not the
+                            // framebuffer, so the settings payload is unchanged;
+                            // re-announcing it keeps the panel's copy honest for
+                            // any client that only listens for that.
+                            let _ = control.send_text(server_settings(&settings)).await;
+                        }
+                        Ok(Err(reason)) => {
+                            log::warn!("host ui scale refused: {reason}");
+                            let _ = control
+                                .send_text(&host_knob_failure("ui_scale", dpi, &reason))
+                                .await;
+                        }
+                        Err(join) => {
+                            log::warn!("host ui scale worker failed: {join}");
+                            let _ = control
+                                .send_text(&host_knob_failure("ui_scale", dpi, "worker join error"))
+                                .await;
+                        }
+                    }
+                }
                 // #56: `vb,<N>` client bitrate request; the capture loop
                 // consumes it next beat (0 = restore automatic).
                 Action::SetBitrate(kbps) => {
@@ -1084,9 +1156,50 @@ fn display_mode_failure(w: u32, h: u32, reason: &str) -> String {
     .to_string()
 }
 
+/// #90: what the host pointer ended up at. `exact: false` means Windows has no
+/// step for the requested DPI and the nearest one is in force — the panel says
+/// so under the slider rather than pretending the typed number took.
+fn mouse_dpi_report(a: &hostui::AppliedMouse) -> String {
+    hbb_common::serde_json::json!({
+        "type": "mouse_dpi",
+        "requested": a.requested,
+        "applied": a.applied,
+        "speed": a.speed,
+        "exact": a.exact,
+    })
+    .to_string()
+}
+
+/// #90: what the host's UI scaling ended up at, and which `uiParam` reading of
+/// `SPI_SETLOGICALDPIOVERRIDE` this build accepted (`absolute` / `relative` /
+/// `already`). The strategy is in the reply so a wrong guess is visible in the
+/// log instead of being absorbed into a scale nobody can explain.
+fn ui_scale_report(a: &hostui::AppliedScale) -> String {
+    hbb_common::serde_json::json!({
+        "type": "ui_scale",
+        "requested": a.requested,
+        "applied": a.applied,
+        "strategy": a.strategy,
+        "exact": a.exact,
+    })
+    .to_string()
+}
+
+/// #90: a refused host knob, shaped like `display_mode_failure` so the panel can
+/// use one handler for both.
+fn host_knob_failure(kind: &str, requested: u32, reason: &str) -> String {
+    hbb_common::serde_json::json!({
+        "type": kind,
+        "requested": requested,
+        "applied": hbb_common::serde_json::Value::Null,
+        "exact": false,
+        "error": reason,
+    })
+    .to_string()
+}
+
 /// Apply the `SETTINGS,{json}` batch to the live `StreamSettings` (#50).
 /// Only the keys the stage-1 server can honor are consumed: `framerate`,
-/// `manual_width`, `manual_height`, `manual_resolution`. Everything else
 /// (keyboard layout, clipboard toggles, CRF, rate control, ...) is untouched
 /// and belongs to stage 3.
 fn apply_settings_batch(settings: &StreamSettings, payload: &str) {
@@ -1107,6 +1220,17 @@ fn apply_settings_batch(settings: &StreamSettings, payload: &str) {
     if let Some(fps) = map.get("framerate").and_then(as_u32) {
         settings.set_fps(fps);
         log::info!("SETTINGS: framerate -> {fps}");
+    }
+    // #91: the audio slider's pick. `ab,<bps>` carries the same number on the
+    // live path, but a pick also rides this batch (`picked`), and a batch that
+    // dropped it would leave the two channels disagreeing about the target.
+    // 0 means "back to the built-in default", which `set_bitrate_bps` encodes.
+    if let Some(bps) = map.get("audio_bitrate").and_then(as_u32) {
+        crate::pipeline::audio::set_bitrate_bps(bps as i32);
+        log::info!(
+            "SETTINGS: audio bitrate -> {bps} bps (applied {})",
+            crate::pipeline::audio::current_bitrate_bps()
+        );
     }
     // manual_resolution=true switches the frontend to fixed dimensions; the
     // width/height pair is honored together when both are present.
@@ -1141,6 +1265,10 @@ mod tests {
             Action::InputStub("kd,65".to_owned()),
             Action::SetFps(30),
             Action::SetResolution(1280, 720),
+            Action::SetDisplayResolution(1280, 720),
+            Action::ResetDisplayResolution,
+            Action::SetMouseDpi(800),
+            Action::SetUiScale(144),
             Action::SetSettings("{}".to_owned()),
             Action::ClipboardRequest,
             Action::ClipboardChunk("cw,1,2,3,abcd".to_owned()),
