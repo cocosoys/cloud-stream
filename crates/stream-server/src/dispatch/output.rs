@@ -389,6 +389,18 @@ pub fn server_settings(s: &crate::pipeline::StreamSettings) -> String {
                     "allowed": crate::dispatch::hostui::speed_steps_dpi(),
                     "base": crate::dispatch::hostui::BASE_DPI,
                 },
+                // #96: the game-mode ghost pointer. This payload is the only
+                // way the page learns the deployment's fade time — the timer
+                // itself runs in the browser, so `idle_secs` is a number to
+                // announce, not a knob the server enforces. `value` is the
+                // starting point of the panel's ladder (a stored client pick
+                // still wins), and the row is not `locked`: which pointer a
+                // player wants is their own choice, not the operator's.
+                "ghost_cursor": {
+                    "value": true,
+                    "idle_secs": crate::dispatch::ghost::idle_secs(),
+                    "locked": false
+                },
                 "video_fullcolor": { "value": false, "locked": true },
                 "video_10bit": { "value": false, "locked": true },
                 "use_cpu": { "value": true, "locked": true },
@@ -579,6 +591,18 @@ mod tests {
         ] {
             assert_eq!(settings[key]["locked"], json!(true), "{key}: {line}");
         }
+
+        // #96: the ghost pointer's row. The switch itself is the client's, so
+        // `value` is only the ladder's starting point and must not be `locked`;
+        // the fade time has to be a number the page can turn into milliseconds,
+        // because a missing one leaves the ghost on screen forever.
+        assert_eq!(settings["ghost_cursor"]["locked"], json!(false), "{line}");
+        assert_eq!(settings["ghost_cursor"]["value"], json!(true), "{line}");
+        let idle = settings["ghost_cursor"]["idle_secs"].as_u64();
+        assert!(
+            matches!(idle, Some(secs) if secs >= 1),
+            "ghost_cursor.idle_secs must be a positive number: {line}"
+        );
 
         let audio = settings["audio_bitrate"]["allowed"]
             .as_array()

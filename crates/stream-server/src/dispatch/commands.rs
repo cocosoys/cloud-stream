@@ -49,6 +49,11 @@ pub enum Action {
     /// `dd,<dpi>` (#90) — set the host's *UI scaling* (96 = 100 %), the
     /// Settings > Display > Scale dropdown, in DPI against 96.
     SetUiScale(u32),
+    /// `ma,<0|1>` (#96) — 指针直通（游戏模式）。`1` 把主机指针钉成 1:1
+    /// （关闭「提高指针精确度」+ 速度档归 10，一个计数一个像素），`0` 把进入
+    /// 游戏模式前的档位与加速曲线原样放回去。客户端画本地幽灵指针时，只有
+    /// 主机的映射真是 1:1，幽灵才追得上真实指针。
+    SetPointerDirect(bool),
     /// `SETTINGS,{json}` (#50) — client settings batch; JSON parsed by the
     /// session (framerate / manual_width / manual_height / ...).
     SetSettings(String),
@@ -171,6 +176,14 @@ pub fn classify(line: &str) -> Action {
             Ok(dpi) => Action::SetUiScale(dpi),
             Err(_) => Action::Unknown(line.to_owned()),
         },
+        // #96: `ma,<0|1>` — pin the host pointer to 1:1 for game mode, or put
+        // back what it was. Only the two literals are accepted: a third value
+        // would have to guess whether it means "pin" or "release".
+        "ma" => match rest.trim() {
+            "1" => Action::SetPointerDirect(true),
+            "0" => Action::SetPointerDirect(false),
+            _ => Action::Unknown(line.to_owned()),
+        },
 
         // ---- #80: client audio bitrate request `ab,<N>` (bits per second). ----
         "ab" => {
@@ -265,5 +278,17 @@ mod tests {
     fn malformed_audio_bitrate_is_not_a_mute() {
         assert!(matches!(classify("ab,"), Action::Unknown(_)));
         assert!(matches!(classify("ab,fast"), Action::Unknown(_)));
+    }
+
+    /// #96: only the two literals pin and release. `ma,2` and `ma,` must not be
+    /// read as "release" — releasing is what puts the user's acceleration curve
+    /// back, and doing it on a typo would move their pointer mid-session.
+    #[test]
+    fn the_pointer_direct_pair_is_two_literals() {
+        assert!(matches!(classify("ma,1"), Action::SetPointerDirect(true)));
+        assert!(matches!(classify("ma,0"), Action::SetPointerDirect(false)));
+        assert!(matches!(classify("ma,2"), Action::Unknown(_)));
+        assert!(matches!(classify("ma,"), Action::Unknown(_)));
+        assert!(matches!(classify("ma"), Action::Unknown(_)));
     }
 }

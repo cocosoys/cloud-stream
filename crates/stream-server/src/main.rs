@@ -87,6 +87,15 @@ async fn main() -> anyhow::Result<()> {
         ),
     }
 
+    // #96: how long a game-mode ghost pointer stays on screen without moving.
+    // Announced through `server_settings`, not enforced here — the browser owns
+    // the pointer that fades.
+    dispatch::ghost::set_idle_secs(cfg.ghost_cursor_idle_secs);
+    log::info!(
+        "game-mode ghost pointer: fades after {}s without an effective move",
+        dispatch::ghost::idle_secs()
+    );
+
     // #88: 监听面鉴权骨架。策略必须在 bind 之前装好 —— 第一个可能被裁决的
     // 事件是 `serve` 收到的 HTTP 请求，装晚了就会出现"前几个请求按默认放行"
     // 的窗口。策略名拼错时退回 allow-all 而不是退出：本项目的默认本来就是

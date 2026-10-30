@@ -293,6 +293,14 @@ where
     // away — a vanished tab used to leave WASD held on the host until someone
     // physically touched the keyboard.
     ctx.input.reset();
+    // #96: a game-mode pin moves the *host's* pointer settings, so it outlives
+    // the page that asked for it unless the release runs here. A tab closed
+    // while locked away from pointer lock would otherwise leave the desktop at
+    // 1:1 with acceleration off — a change nobody made and nobody can see. A
+    // no-op when nothing is pinned.
+    if let Err(reason) = hostui::unpin_pointer() {
+        log::warn!("host pointer not restored on session teardown: {reason}");
+    }
     if let Some(media) = ctx.media.take() {
         let _ = media.lock().await.close().await;
     }
@@ -807,6 +815,11 @@ fn surface_of(action: &Action) -> Option<EventKind> {
         // desktop reflow and still refuse to touch the user's pointer.
         Action::SetMouseDpi(_) => EventKind::Control("control.mouse-dpi"),
         Action::SetUiScale(_) => EventKind::Control("control.ui-scale"),
+        // #96: pinning the pointer is a third host-pointer surface. It is the
+        // most intrusive of the three — it moves both the speed and the
+        // acceleration curve, and a policy that lets a user pick a DPI may
+        // still refuse to let a session decide the curve for them.
+        Action::SetPointerDirect(_) => EventKind::Control("control.pointer-direct"),
         Action::SetSettings(_) => EventKind::Control("control.settings"),
         Action::SetBitrate(_) => EventKind::Control("control.bitrate"),
         // #92: rate control decides how every subsequent frame is quantised, so
@@ -1215,6 +1228,52 @@ async fn arm_connected_notices(
                         }
                     }
                 }
+                // #96: `ma,1` pins the host pointer to 1:1 while the client
+                // draws its own ghost pointer in game mode; `ma,0` puts back
+                // the speed step and the acceleration curve the pin replaced.
+                // Both are `SystemParametersInfo` calls on the user session, so
+                // both go through the blocking pool like `md,`.
+                //
+                // A release is also a no-op when nothing is pinned, which is
+                // what lets the client send `ma,0` on every unlock instead of
+                // tracking whether it ever sent `ma,1`.
+                Action::SetPointerDirect(on) => {
+                    log::info!("client sets pointer direct -> {on}");
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        if on {
+                            hostui::pin_pointer().map(|applied| {
+                                log::info!(
+                                    "host pointer pinned to 1:1 (speed={}, accel_off={}, \
+                                     strategy={})",
+                                    applied.speed,
+                                    applied.accel,
+                                    applied.strategy
+                                );
+                                pointer_direct_report(&applied)
+                            })
+                        } else {
+                            hostui::unpin_pointer().map(|()| {
+                                log::info!("host pointer released back to the session's own settings");
+                                pointer_direct_release()
+                            })
+                        }
+                    })
+                    .await;
+                    match outcome {
+                        Ok(Ok(report)) => {
+                            let _ = control.send_text(&report).await;
+                        }
+                        Ok(Err(reason)) => {
+                            log::warn!("host pointer direct refused: {reason}");
+                            let _ = control.send_text(&pointer_direct_failure(&reason)).await;
+                        }
+                        Err(join) => {
+                            log::warn!("host pointer direct worker failed: {join}");
+                            let _ =
+                                control.send_text(&pointer_direct_failure("worker join error")).await;
+                        }
+                    }
+                }
                 // #56: `vb,<N>` client bitrate request; the capture loop
                 // consumes it next beat (0 = restore automatic).
                 Action::SetBitrate(kbps) => {
@@ -1375,6 +1434,44 @@ fn mouse_dpi_report(a: &hostui::AppliedMouse) -> String {
         "speed": a.speed,
         "exact": a.exact,
         "strategy": a.strategy,
+    })
+    .to_string()
+}
+
+/// #96: the host pointer after a game-mode pin. `pinned: true` with
+/// `strategy: "already"` means the host was 1:1 to begin with and the pin only
+/// recorded what the release has to put back. The panel ignores the message;
+/// the log and `docs/host-knobs.md` read it when a ghost pointer drifts.
+fn pointer_direct_report(a: &hostui::AppliedPin) -> String {
+    hbb_common::serde_json::json!({
+        "type": "pointer_direct",
+        "pinned": true,
+        "speed": a.speed,
+        "accel": a.accel,
+        "strategy": a.strategy,
+    })
+    .to_string()
+}
+
+/// #96: the release's ack. `pinned: false` is also what a release with nothing
+/// pinned answers, which is the normal case for a client that sends `ma,0` on
+/// every unlock without tracking whether it ever sent `ma,1`.
+fn pointer_direct_release() -> String {
+    hbb_common::serde_json::json!({
+        "type": "pointer_direct",
+        "pinned": false,
+    })
+    .to_string()
+}
+
+/// #96: a pin or release the host refused. `pinned: null` because the host is
+/// in neither state the client asked for — saying `false` would claim the
+/// release succeeded.
+fn pointer_direct_failure(reason: &str) -> String {
+    hbb_common::serde_json::json!({
+        "type": "pointer_direct",
+        "pinned": hbb_common::serde_json::Value::Null,
+        "error": reason,
     })
     .to_string()
 }
@@ -1581,6 +1678,7 @@ mod tests {
             Action::ResetDisplayResolution,
             Action::SetMouseDpi(800),
             Action::SetUiScale(144),
+            Action::SetPointerDirect(true),
             Action::SetSettings("{}".to_owned()),
             Action::ClipboardRequest,
             Action::ClipboardChunk("cw,1,2,3,abcd".to_owned()),

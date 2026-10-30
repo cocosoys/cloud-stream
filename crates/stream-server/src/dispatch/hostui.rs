@@ -29,6 +29,16 @@
 //! the relative form. The reply carries what the host actually reports, so the
 //! panel can never claim a scale the desktop is not at.
 //!
+//! Game-mode pointer (#96)
+//! ----------------------
+//! A ghost pointer drawn by the client follows the hand at 0 latency, but it
+//! only keeps up with the host's real pointer while the host maps one count to
+//! one pixel. Two Windows layers decide that: the acceleration switch
+//! (`SPI_SETMOUSE`) and the speed step (`SPI_SETMOUSESPEED`). [`pin_pointer`]
+//! pins both, [`unpin_pointer`] puts back exactly what was there — including
+//! the thresholds — and the release runs on unlock *and* on session teardown,
+//! so a closed tab cannot leave the host at 1:1 forever.
+//!
 //! Both calls are per-session: they must run inside the interactive session the
 //! desktop lives in (the server runs there, session 1), not from an SSH shell in
 //! session 0, where `SPI_GETLOGICALDPIOVERRIDE` simply fails.
@@ -41,6 +51,7 @@
 //! host without guessing.
 
 use std::ffi::c_void;
+use std::sync::{Mutex, OnceLock};
 
 use windows_sys::Win32::Foundation::SetLastError;
 use windows_sys::Win32::UI::WindowsAndMessaging::SystemParametersInfoW;
@@ -52,6 +63,14 @@ const SPI_GETMOUSESPEED: u32 = 0x0070;
 const SPI_SETMOUSESPEED: u32 = 0x0071;
 const SPI_GETLOGICALDPIOVERRIDE: u32 = 0x009E;
 const SPI_SETLOGICALDPIOVERRIDE: u32 = 0x009F;
+// #96: the pointer-acceleration triple. `SPI_GETMOUSE`/`SPI_SETMOUSE` pass it
+// through `pvParam` as an array of three `INT`s —
+// `{MouseSpeed, MouseThreshold1, MouseThreshold2}`. `MouseSpeed` is the
+// "enhance pointer precision" switch (0 = off, 1/2 = the two acceleration
+// curves); the thresholds only decide when a curve bends, so they are carried
+// through untouched and only ever handed back on release.
+const SPI_GETMOUSE: u32 = 0x0003;
+const SPI_SETMOUSE: u32 = 0x0004;
 /// Persist the change in the user profile.
 const SPIF_UPDATEINIFILE: u32 = 0x0001;
 /// Tell every top-level window the setting moved, so they re-read it.
@@ -74,6 +93,17 @@ fn spi(action: u32, ui_param: u32, pv_param: *mut c_void, flags: u32) -> bool {
 
 /// The DPI a 1x pointer speed is reported as.
 pub const BASE_DPI: u32 = 400;
+
+/// The speed step whose multiplier is exactly 1: one mouse count, one pixel.
+///
+/// #96 needs this, not just "acceleration off". Acceleration bends the curve,
+/// the speed step scales it, and a client-side ghost pointer can mirror the
+/// host only when neither is in play — at step 15 one count is two pixels and
+/// the ghost falls behind by the same factor the hand moves.
+pub const UNIT_SPEED: u8 = 10;
+
+/// Windows' pointer-acceleration triple: `[MouseSpeed, threshold1, threshold2]`.
+pub type Accel = [i32; 3];
 
 /// Windows' pointer-speed steps 1..=20 as the DPI they mean against
 /// [`BASE_DPI`]. `SPEED_DPI[n - 1]` is step `n`; step 10, the OS default, is
@@ -210,6 +240,42 @@ fn write_speed(speed: u8, broadcast: bool) -> bool {
     )
 }
 
+/// The host's pointer-acceleration triple, or `None` where the query fails.
+pub fn current_accel() -> Option<Accel> {
+    let mut value: Accel = [0, 0, 0];
+    let ok = spi(SPI_GETMOUSE, 0, value.as_mut_ptr() as *mut c_void, 0);
+    if !ok {
+        return None;
+    }
+    Some(value)
+}
+
+/// Whether the host is accelerating the pointer ("enhance pointer precision").
+pub fn accel_on() -> Option<bool> {
+    current_accel().map(|accel| accel[0] != 0)
+}
+
+/// The same triple with the acceleration switch off and the thresholds kept.
+///
+/// Keeping them is what makes the release a true restore: the thresholds are
+/// the values the user's own profile holds, and they decide where the curve
+/// bends once it is switched back on.
+fn accel_off_triple(accel: Accel) -> Accel {
+    [0, accel[1], accel[2]]
+}
+
+/// Write the acceleration triple. `broadcast` is off for the same reason
+/// [`write_speed`] drops it on retry: notifying every top-level window is a
+/// courtesy a hung window can veto, and it would fail the whole call with it.
+fn write_accel(accel: Accel, broadcast: bool) -> bool {
+    let mut value = accel;
+    let mut flags = SPIF_UPDATEINIFILE;
+    if broadcast {
+        flags |= SPIF_SENDCHANGE;
+    }
+    spi(SPI_SETMOUSE, 0, value.as_mut_ptr() as *mut c_void, flags)
+}
+
 /// Why a `SystemParametersInfoW` call reported failure, in words.
 ///
 /// The API does not set the last error on every failure path, and a stale zero
@@ -331,6 +397,169 @@ pub fn apply_mouse_dpi(dpi: u32) -> Result<AppliedMouse, String> {
             refusal_detail()
         )),
     }
+}
+
+/// What pinning the pointer for game mode ended as (#96).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppliedPin {
+    /// The step the host is on afterwards: [`UNIT_SPEED`] when the pin landed.
+    pub speed: u8,
+    /// Whether the host reports acceleration off afterwards.
+    pub accel: bool,
+    /// `pinned` when both writes were needed, `already` when the host was
+    /// already 1:1 and the pin only recorded what to restore.
+    pub strategy: &'static str,
+}
+
+/// What the host was at before a pin, so the release can put it back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PointerPin {
+    speed: u8,
+    accel: Accel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct PinSlot {
+    saved: Option<PointerPin>,
+    active: bool,
+}
+
+static PIN: OnceLock<Mutex<PinSlot>> = OnceLock::new();
+
+fn pin_slot() -> &'static Mutex<PinSlot> {
+    PIN.get_or_init(|| Mutex::new(PinSlot::default()))
+}
+
+/// Put the host pointer on a 1:1 mapping for as long as a game-mode session
+/// holds it: acceleration off, speed step [`UNIT_SPEED`].
+///
+/// #96 — the client draws a ghost pointer in game mode, at 0 latency, and the
+/// host composites nothing. That only works while the host's own pointer moves
+/// exactly as far as the deltas the client sends: one count, one pixel. Either
+/// of Windows' two layers breaks it — "enhance pointer precision" makes the
+/// displacement a curve of hand speed, and the speed step multiplies it — so
+/// both are pinned here and both are restored by [`unpin_pointer`].
+///
+/// The previous values are recorded **before** the writes, so a host that
+/// takes one write and refuses the other is put back instead of being left
+/// half-changed. The readback decides, not the `BOOL` (see [`write_speed`]).
+pub fn pin_pointer() -> Result<AppliedPin, String> {
+    let mut slot = pin_slot().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if slot.active {
+        // Idempotent: the pointer-lock event fires on every re-lock, and a
+        // second pin must not overwrite what the first one has to restore.
+        return Ok(AppliedPin {
+            speed: current_speed().unwrap_or(UNIT_SPEED),
+            accel: accel_on().map(|on| !on).unwrap_or(true),
+            strategy: "already",
+        });
+    }
+
+    let speed = current_speed().ok_or_else(|| {
+        String::from("the host reports no pointer speed in this session (SPI_GETMOUSESPEED)")
+    })?;
+    let accel = current_accel().ok_or_else(|| {
+        String::from("the host reports no pointer acceleration in this session (SPI_GETMOUSE)")
+    })?;
+    let saved = PointerPin { speed, accel };
+
+    // Already 1:1: record where to return to and write nothing. Writing would
+    // be two broadcasts for a setting that is not going to move.
+    if saved.speed == UNIT_SPEED && saved.accel[0] == 0 {
+        slot.saved = Some(saved);
+        slot.active = true;
+        return Ok(AppliedPin {
+            speed: UNIT_SPEED,
+            accel: true,
+            strategy: "already",
+        });
+    }
+
+    let wrote_speed = write_speed(UNIT_SPEED, false);
+    let wrote_accel = write_accel(accel_off_triple(accel), false);
+    let now_speed = current_speed();
+    let now_accel = current_accel();
+    // The bool only stands in where the host cannot be read back at all; where
+    // it can, the reading is the outcome (#95).
+    let speed_ok = now_speed.map(|step| step == UNIT_SPEED).unwrap_or(wrote_speed);
+    let accel_ok = now_accel
+        .map(|triple| triple[0] == 0)
+        .unwrap_or(wrote_accel);
+    if speed_ok && accel_ok {
+        slot.saved = Some(saved);
+        slot.active = true;
+        return Ok(AppliedPin {
+            speed: now_speed.unwrap_or(UNIT_SPEED),
+            accel: true,
+            strategy: "pinned",
+        });
+    }
+
+    // Put back what the two writes did manage, so a refused pin leaves the
+    // host exactly as it was found.
+    let _ = write_speed(saved.speed, false);
+    let _ = write_accel(saved.accel, false);
+    Err(format!(
+        "the host would not take the 1:1 pointer: it reports speed {} and \
+         acceleration {} (asked for step {UNIT_SPEED} and acceleration off)",
+        match now_speed {
+            Some(step) => format!("step {step}"),
+            None => String::from("unknown"),
+        },
+        match now_accel {
+            Some(triple) => if triple[0] == 0 { "off" } else { "on" },
+            None => "unknown",
+        },
+    ))
+}
+
+/// Put back what [`pin_pointer`] replaced. A no-op when nothing is pinned, so
+/// the client can send it on every unlock, including the first.
+pub fn unpin_pointer() -> Result<(), String> {
+    let mut slot = pin_slot().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !slot.active {
+        return Ok(());
+    }
+    let saved = slot.saved.take();
+    slot.active = false;
+    let saved = match saved {
+        Some(saved) => saved,
+        None => return Ok(()),
+    };
+
+    let wrote_speed = write_speed(saved.speed, false);
+    let wrote_accel = write_accel(saved.accel, false);
+    let now_speed = current_speed();
+    let now_accel = current_accel();
+    let speed_ok = now_speed
+        .map(|step| step == saved.speed)
+        .unwrap_or(wrote_speed);
+    let accel_ok = now_accel
+        .map(|triple| triple == saved.accel)
+        .unwrap_or(wrote_accel);
+    if speed_ok && accel_ok {
+        return Ok(());
+    }
+    Err(format!(
+        "the host kept {} / acceleration {:?} after the pointer was released \
+         (wanted step {} / {:?})",
+        match now_speed {
+            Some(step) => format!("step {step}"),
+            None => String::from("an unreadable speed"),
+        },
+        now_accel,
+        saved.speed,
+        saved.accel,
+    ))
+}
+
+/// Whether a pin is currently held. Read by the tests and by anything that has
+/// to tell "the client is in game mode" from "the host happens to be at 1:1".
+pub fn pointer_pinned() -> bool {
+    pin_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .active
 }
 
 /// Read the raw `SPI_GETLOGICALDPIOVERRIDE` value. It is negative when the
@@ -532,6 +761,80 @@ mod tests {
             "SPI_SETMOUSESPEED rejected writing back step {now}"
         );
         assert_eq!(current_speed(), Some(now));
+    }
+
+    /// #96: the 1:1 pin is only 1:1 at the step whose multiplier is 1. Step 10
+    /// is that step, and it is also the OS default — so a host nobody touched
+    /// needs no speed write at all.
+    #[test]
+    fn the_unit_speed_is_the_os_default_step() {
+        assert_eq!(UNIT_SPEED, 10);
+        assert_eq!(dpi_for_speed(u32::from(UNIT_SPEED)), BASE_DPI);
+        assert_eq!(speed_for_dpi(BASE_DPI), UNIT_SPEED);
+    }
+
+    /// Switching the acceleration off must not drop the thresholds: they are
+    /// the user's own profile values and they are what the release writes back.
+    #[test]
+    fn turning_acceleration_off_keeps_the_thresholds() {
+        assert_eq!(accel_off_triple([1, 6, 10]), [0, 6, 10]);
+        assert_eq!(accel_off_triple([2, 4, 12]), [0, 4, 12]);
+        // Already off: the triple is unchanged, so the pin's write is a no-op.
+        assert_eq!(accel_off_triple([0, 6, 10]), [0, 6, 10]);
+    }
+
+    /// #96, live: pin, read back, release, and assert the host is where it
+    /// started. Gated like the write test above — it moves the pointer for the
+    /// moment it runs:
+    ///
+    /// ```text
+    /// $env:CLOUD_STREAM_LIVE_SPI = '1'; cargo test -p stream-server live_pin
+    /// ```
+    ///
+    /// The assertions come *after* the release, so a failed pin cannot leave
+    /// the machine it ran on pinned.
+    #[test]
+    fn a_live_pin_and_release_leave_the_host_where_it_was() {
+        if std::env::var_os("CLOUD_STREAM_LIVE_SPI").is_none() {
+            return;
+        }
+        let before_speed = current_speed().expect("no pointer speed in this session");
+        let before_accel = current_accel().expect("no pointer acceleration in this session");
+        let applied = pin_pointer().expect("the pin was refused");
+        let pinned_speed = current_speed();
+        let pinned_accel = current_accel();
+        let pinned = pointer_pinned();
+        unpin_pointer().expect("the release was refused");
+
+        assert_eq!(applied.speed, UNIT_SPEED);
+        assert_eq!(pinned_speed, Some(UNIT_SPEED), "the pin did not take the speed");
+        assert_eq!(
+            pinned_accel.map(|triple| triple[0]),
+            Some(0),
+            "the pin did not turn acceleration off"
+        );
+        assert!(pinned, "the pin did not record itself");
+        assert_eq!(current_speed(), Some(before_speed), "speed not restored");
+        assert_eq!(current_accel(), Some(before_accel), "acceleration not restored");
+        assert!(!pointer_pinned(), "the release did not clear the pin");
+    }
+
+    /// A second pin while one is held must be a no-op: pointer-lock fires on
+    /// every re-lock, and a pin that overwrote the saved values would restore
+    /// the *pinned* 1:1 settings instead of the user's own.
+    #[test]
+    fn a_second_pin_keeps_the_first_ones_restore_point() {
+        if std::env::var_os("CLOUD_STREAM_LIVE_SPI").is_none() {
+            return;
+        }
+        let before_speed = current_speed().expect("no pointer speed in this session");
+        let before_accel = current_accel().expect("no pointer acceleration in this session");
+        pin_pointer().expect("the first pin was refused");
+        let again = pin_pointer().expect("the second pin was refused");
+        assert_eq!(again.strategy, "already");
+        unpin_pointer().expect("the release was refused");
+        assert_eq!(current_speed(), Some(before_speed), "speed not restored");
+        assert_eq!(current_accel(), Some(before_accel), "acceleration not restored");
     }
 
     /// The scaling steps are exactly the ones the panel can name, and 275 % is

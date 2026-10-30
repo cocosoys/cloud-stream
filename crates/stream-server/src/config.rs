@@ -71,6 +71,16 @@ pub struct Config {
     /// carried it, or the reload it triggers would revert it). This flag exists
     /// so a fresh process can start on VP9 without anyone touching the UI.
     pub video_codec: String,
+    /// #96: how long the client's game-mode ghost pointer stays on screen
+    /// without an effective move, in seconds (default 5).
+    ///
+    /// The pointer itself is drawn by the browser, so this is a *number to
+    /// announce*, not a timer the server runs: it rides `server_settings` as
+    /// `ghost_cursor.idle_secs` and the page fades its ghost after that. A
+    /// game draws its own crosshair, so a ghost that never disappears sits on
+    /// top of the action and lies about where the pointer is; one that
+    /// disappears too early is gone before the hand starts moving again.
+    pub ghost_cursor_idle_secs: u64,
     /// #88: 监听面鉴权策略名（`allow-all` / `deny-all`）。
     ///
     /// 默认 `allow-all`，与插桩前行为完全一致 —— 骨架本身不改变任何访问
@@ -102,6 +112,7 @@ impl Default for Config {
             keyframe_secs: 10,
             upload_dir: None,
             video_codec: "vp8".to_owned(),
+            ghost_cursor_idle_secs: crate::dispatch::ghost::DEFAULT_IDLE_SECS,
             policy: "allow-all".to_owned(),
         }
     }
@@ -207,6 +218,15 @@ impl Config {
                         cfg.video_codec = v;
                     }
                 }
+                // #96: optional, like the two above — the default (5 s) is what
+                // almost every host wants, so a launch script need not carry it.
+                "--ghost-cursor-idle" => {
+                    if let Some(v) = iter.next() {
+                        if let Ok(n) = v.parse::<u64>() {
+                            cfg.ghost_cursor_idle_secs = crate::dispatch::ghost::clamped(n);
+                        }
+                    }
+                }
                 "--policy" => {
                     if let Some(v) = iter.next() {
                         // 未知名保留默认并在 main 里告警，不在这里吞掉 ——
@@ -299,5 +319,30 @@ mod tests {
     #[test]
     fn a_bad_keyframe_value_keeps_the_default() {
         assert_eq!(parse(&["--keyframe-secs", "soon"]).keyframe_secs, 10);
+    }
+
+    /// #96: the ghost pointer's fade time is optional on purpose — the default
+    /// is what almost every host wants, so a launch script need not carry it.
+    #[test]
+    fn ghost_cursor_idle_defaults_to_five_seconds() {
+        assert_eq!(parse(&[]).ghost_cursor_idle_secs, 5);
+    }
+
+    /// A value outside the range is clamped rather than announced: 0 would read
+    /// as "never fade" on the client, which is the behavior the knob exists to
+    /// remove.
+    #[test]
+    fn ghost_cursor_idle_reads_the_flag_and_clamps_it() {
+        assert_eq!(parse(&["--ghost-cursor-idle", "8"]).ghost_cursor_idle_secs, 8);
+        assert_eq!(parse(&["--ghost-cursor-idle", "0"]).ghost_cursor_idle_secs, 1);
+        assert_eq!(
+            parse(&["--ghost-cursor-idle", "99999"]).ghost_cursor_idle_secs,
+            600
+        );
+        assert_eq!(
+            parse(&["--ghost-cursor-idle", "soon"]).ghost_cursor_idle_secs,
+            5,
+            "a value that is not a number keeps the default"
+        );
     }
 }

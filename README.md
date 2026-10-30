@@ -128,6 +128,8 @@ target\release\stream-server.exe `
 | [`docs/listener-surface.md`](docs/listener-surface.md) | 22 个监听面清单与鉴权插桩点 |
 | [`docs/deploy-one-click.md`](docs/deploy-one-click.md) | 一键部署说明书 + 踩坑记录 |
 | [`docs/deploy-new-host.md`](docs/deploy-new-host.md) | 换设备部署：要几台、每台准备什么、验收与换机坑 |
+| [`docs/density-budget.md`](docs/density-budget.md) | 密度预算：一台宿主能跑几个实例、CPU 与内存谁是天花板（待办，未实施） |
+| [`docs/ghost-cursor.md`](docs/ghost-cursor.md) | 游戏模式幽灵光标：客户端画指针、主机钉 1:1、5 秒淡出（#96） |
 
 ## 说明
 

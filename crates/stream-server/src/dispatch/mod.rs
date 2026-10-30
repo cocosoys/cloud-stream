@@ -9,6 +9,9 @@ pub mod clipboard_image;
 pub mod commands;
 // #89: host display-mode control (the "match my viewport" toolbar switch).
 pub mod display;
+// #96: how long the game-mode ghost pointer stays on screen (a number to
+// announce; the page runs the timer).
+pub mod ghost;
 // #90: host UI scaling and pointer DPI (the screen section's two knobs).
 pub mod hostui;
 pub mod input_stub;
