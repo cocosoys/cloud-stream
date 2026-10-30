@@ -77,6 +77,10 @@ pub struct AppliedMouse {
     pub speed: u8,
     /// `applied == requested`. False means the nearest step was used.
     pub exact: bool,
+    /// Which write landed it: `already`, `broadcast`, `no-broadcast`, or
+    /// `unverified`. Present so a host that accepts the write while its
+    /// broadcast fails is visible in the log instead of being inferred.
+    pub strategy: &'static str,
 }
 
 /// What a UI-scaling request ended as.
@@ -153,11 +157,82 @@ pub fn current_mouse_dpi() -> Option<u32> {
     current_speed().map(|speed| dpi_for_speed(u32::from(speed)))
 }
 
+/// Write the pointer-speed step and say whether the call reported success.
+///
+/// `broadcast` adds `SPIF_SENDCHANGE`, which makes the call post
+/// `WM_SETTINGCHANGE` to every top-level window of the session through a
+/// `SendMessageTimeout`. That is the part that fails on a real gaming session:
+/// an elevated or hung window never answers, the timeout fires, and the whole
+/// call returns FALSE even though the registry write already happened. The
+/// caller therefore never treats this bool as the outcome — it writes, then
+/// reads the speed back (see [`judge`]).
+fn write_speed(speed: u8, broadcast: bool) -> bool {
+    let mut flags = SPIF_UPDATEINIFILE;
+    if broadcast {
+        flags |= SPIF_SENDCHANGE;
+    }
+    let ok = unsafe {
+        SystemParametersInfoW(
+            SPI_SETMOUSESPEED,
+            u32::from(speed),
+            std::ptr::null_mut(),
+            flags,
+        )
+    };
+    ok != 0
+}
+
+/// Why a `SystemParametersInfoW` call reported failure, in words.
+///
+/// The API does not set the last error on every failure path, and a stale zero
+/// from an earlier call reads as "the operation completed successfully" — which
+/// is how the panel once announced "refused: 操作成功完成。 (os error 0)". A
+/// sentence that says nothing went wrong is worse than no detail at all.
+fn refusal_detail() -> String {
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(0) | None => String::from("no error code was set"),
+        _ => err.to_string(),
+    }
+}
+
+/// What a readback says about the write that preceded it. Split out from
+/// [`apply_mouse_dpi`] because it is the one piece of the decision that can be
+/// tested without a desktop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// The host reports the step we asked for.
+    Applied,
+    /// The host reports a different step — the write did not take.
+    Kept(u8),
+    /// The write said yes and the speed cannot be read back in this session.
+    Unverified,
+    /// The write said no and the speed cannot be read back either.
+    Refused,
+}
+
+fn judge(now: Option<u8>, want: u8, wrote: bool) -> Verdict {
+    match now {
+        Some(step) if step == want => Verdict::Applied,
+        Some(step) => Verdict::Kept(step),
+        None if wrote => Verdict::Unverified,
+        None => Verdict::Refused,
+    }
+}
+
 /// Set the host's pointer speed so its DPI is as close to `dpi` as Windows can
 /// express, then read it back.
 ///
 /// `Err` carries a sentence for the log and the panel; a session that refuses
 /// `SPI_SETMOUSESPEED` is a normal outcome (no interactive desktop), not a bug.
+///
+/// #94: the return value of `SystemParametersInfoW` is *not* the outcome. It is
+/// FALSE whenever any part of the call failed, and its `SPIF_SENDCHANGE` half
+/// fails on sessions where an elevated window blocks the broadcast — while the
+/// pointer speed itself moved. Trusting it made the panel report "the host
+/// refused this change: 操作成功完成 (os error 0)" for a change that had in fact
+/// been applied. The readback is the authority; the bool only decides how much
+/// to retry and what to say when the readback disagrees.
 pub fn apply_mouse_dpi(dpi: u32) -> Result<AppliedMouse, String> {
     let lowest = SPEED_DPI[0];
     let highest = SPEED_DPI[SPEED_DPI.len() - 1];
@@ -167,30 +242,54 @@ pub fn apply_mouse_dpi(dpi: u32) -> Result<AppliedMouse, String> {
         ));
     }
     let speed = speed_for_dpi(dpi);
-    let ok = unsafe {
-        SystemParametersInfoW(
-            SPI_SETMOUSESPEED,
-            u32::from(speed),
-            std::ptr::null_mut(),
-            SPIF_UPDATEINIFILE | SPIF_SENDCHANGE,
-        )
+    let applied = dpi_for_speed(u32::from(speed));
+    let exact = applied == dpi;
+    let ok = |strategy| {
+        Ok(AppliedMouse {
+            requested: dpi,
+            applied,
+            speed,
+            exact,
+            strategy,
+        })
     };
-    if ok == 0 {
-        return Err(format!(
-            "SPI_SETMOUSESPEED({speed}) refused: {}",
-            std::io::Error::last_os_error()
-        ));
+
+    // Nothing to do: the host is already on this step. Skipping the write also
+    // skips the broadcast, which is the expensive half of the call.
+    if current_speed() == Some(speed) {
+        return ok("already");
     }
-    let speed_now = current_speed().ok_or_else(|| {
-        String::from("SPI_GETMOUSESPEED failed right after the write; the host pointer may not have moved")
-    })?;
-    let applied = dpi_for_speed(u32::from(speed_now));
-    Ok(AppliedMouse {
-        requested: dpi,
-        applied,
-        speed: speed_now,
-        exact: applied == dpi,
-    })
+
+    // First attempt: persist, and tell the session about it.
+    let wrote = write_speed(speed, true);
+    match judge(current_speed(), speed, wrote) {
+        Verdict::Applied => {
+            // `wrote == false` here is the exact case the panel used to report
+            // as a refusal: the broadcast timed out, the write did not.
+            return ok(if wrote { "broadcast" } else { "broadcast-failed" });
+        }
+        Verdict::Unverified => return ok("unverified"),
+        Verdict::Kept(_) | Verdict::Refused => {}
+    }
+
+    // Second attempt: drop the broadcast. Persisting is what changes the
+    // pointer; notifying every window is a courtesy a stuck window can veto.
+    let wrote_again = write_speed(speed, false);
+    match judge(current_speed(), speed, wrote_again) {
+        Verdict::Applied => ok("no-broadcast"),
+        Verdict::Unverified => ok("unverified"),
+        Verdict::Kept(now) => Err(format!(
+            "the host kept pointer speed step {now} instead of {speed} \
+             (SystemParametersInfoW reported failure: {})",
+            refusal_detail()
+        )),
+        Verdict::Refused => Err(format!(
+            "SPI_SETMOUSESPEED({speed}) had no effect: the host reports no \
+             pointer speed in this session (SystemParametersInfoW: {}). The \
+             server has to run inside the interactive desktop session",
+            refusal_detail()
+        )),
+    }
 }
 
 /// Read the raw `SPI_GETLOGICALDPIOVERRIDE` value. It is negative when the
@@ -336,6 +435,42 @@ mod tests {
         assert!(apply_mouse_dpi(0).is_err());
         assert!(apply_mouse_dpi(10).is_err());
         assert!(apply_mouse_dpi(99_999).is_err());
+    }
+
+    /// #94: the readback decides, not the call's bool. The regression this
+    /// pins down is the host that reported FALSE (`os error 0`) while the
+    /// pointer speed had in fact moved — a refusal the panel announced and the
+    /// user saw, for a setting that was already live.
+    #[test]
+    fn a_failed_broadcast_is_still_an_applied_write() {
+        assert_eq!(judge(Some(15), 15, false), Verdict::Applied);
+        assert_eq!(judge(Some(15), 15, true), Verdict::Applied);
+    }
+
+    /// A write that did not take is visible as a different step, and that is
+    /// what makes the second attempt (without `SPIF_SENDCHANGE`) worth making.
+    #[test]
+    fn a_kept_step_is_not_an_applied_write() {
+        assert_eq!(judge(Some(10), 15, false), Verdict::Kept(10));
+        assert_eq!(judge(Some(10), 15, true), Verdict::Kept(10));
+    }
+
+    /// With no readback available the bool is the only evidence left: a
+    /// successful write is "unverified", not "applied", and a failed one is a
+    /// refusal rather than a silent success.
+    #[test]
+    fn without_a_readback_the_bool_is_scaffolding_not_proof() {
+        assert_eq!(judge(None, 15, true), Verdict::Unverified);
+        assert_eq!(judge(None, 15, false), Verdict::Refused);
+    }
+
+    /// The failure detail must never be "the operation completed successfully":
+    /// that sentence came from reading a last-error of 0 as a reason.
+    #[test]
+    fn a_zero_last_error_is_not_printed_as_a_reason() {
+        // Not asserted against the live error — this only pins the shape of the
+        // fallback string, which is what the panel showed verbatim.
+        assert!(!refusal_detail().contains("os error 0"));
     }
 
     /// The scaling steps are exactly the ones the panel can name, and 275 % is

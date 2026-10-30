@@ -10,6 +10,14 @@
 //!   handed to the PC via `add_track` as `Arc<dyn TrackLocal + Send + Sync>`
 //!   (examples/play-from-disk-h264.rs:157-159 pattern).
 //!
+//! #94: the mime type is now the pipeline's pick (`pipeline::codec`), not a
+//! constant. That single string is what the whole downlink hinges on — it
+//! selects the SDP `a=rtpmap`, and `TrackLocalStaticSample::bind` asks the
+//! capability for its payloader (`payloader_for_codec`, webrtc-rs
+//! `rtp_codec.rs:70`), so `video/VP9` here is what makes the sender packetize
+//! VP9 frames with a VP9 descriptor instead of a VP8 one. Get it wrong and the
+//! browser decodes noise; the two have no common framing.
+//!
 //! Stage6.3 maps each encoded chunk to a `webrtc::media::Sample`:
 //! * duration always equals spf (repeat frames included, design 9.2 #4);
 //! * timestamp `SystemTime::now()`, packet_timestamp 0; the internal packetizer
@@ -25,39 +33,55 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
 use bytes::Bytes;
-use webrtc::api::media_engine::{MIME_TYPE_OPUS, MIME_TYPE_VP8};
+use webrtc::api::media_engine::{MIME_TYPE_OPUS, MIME_TYPE_VP8, MIME_TYPE_VP9};
 use webrtc::media::Sample;
 use webrtc::rtp_transceiver::RTCPFeedback;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
-/// Build the VP8 capability with the four RTCP feedback entries the default
-/// VP8 payloader understands (goog-remb, ccm/fir, nack, nack/pli).
-fn vp8_capability() -> RTCRtpCodecCapability {
+use crate::pipeline::codec::VideoCodec;
+
+/// The four RTCP feedback entries the default VP8/VP9 payloaders understand
+/// (goog-remb, ccm/fir, nack, nack/pli). Both codecs take the same set.
+fn video_feedback() -> Vec<RTCPFeedback> {
+    vec![
+        RTCPFeedback {
+            typ: "goog-remb".to_owned(),
+            parameter: String::new(),
+        },
+        RTCPFeedback {
+            typ: "ccm".to_owned(),
+            parameter: "fir".to_owned(),
+        },
+        RTCPFeedback {
+            typ: "nack".to_owned(),
+            parameter: String::new(),
+        },
+        RTCPFeedback {
+            typ: "nack".to_owned(),
+            parameter: "pli".to_owned(),
+        },
+    ]
+}
+
+/// Build the capability for `codec` with the entries the default payloader
+/// understands.
+///
+/// The VP8 arm is byte-for-byte what this function produced before #94: same
+/// mime, same clock rate, same empty fmtp. Anything else would change the offer
+/// for every existing session, which is exactly the kind of "while I was in
+/// there" edit this project keeps paying for.
+fn video_capability(codec: VideoCodec) -> RTCRtpCodecCapability {
     RTCRtpCodecCapability {
-        mime_type: MIME_TYPE_VP8.to_owned(),
+        mime_type: match codec {
+            VideoCodec::Vp8 => MIME_TYPE_VP8.to_owned(),
+            VideoCodec::Vp9 => MIME_TYPE_VP9.to_owned(),
+        },
         clock_rate: 90_000,
         channels: 0,
-        sdp_fmtp_line: String::new(),
-        rtcp_feedback: vec![
-            RTCPFeedback {
-                typ: "goog-remb".to_owned(),
-                parameter: String::new(),
-            },
-            RTCPFeedback {
-                typ: "ccm".to_owned(),
-                parameter: "fir".to_owned(),
-            },
-            RTCPFeedback {
-                typ: "nack".to_owned(),
-                parameter: String::new(),
-            },
-            RTCPFeedback {
-                typ: "nack".to_owned(),
-                parameter: "pli".to_owned(),
-            },
-        ],
+        sdp_fmtp_line: codec.sdp_fmtp().to_owned(),
+        rtcp_feedback: video_feedback(),
     }
 }
 
@@ -133,9 +157,14 @@ fn opus_capability() -> RTCRtpCodecCapability {
 impl VideoTrack {
     /// Stage6.2: build the capability and construct the track. The owning
     /// session registers it on the PC with `as_track_local`.
-    pub fn new() -> Result<Self> {
+    ///
+    /// #94: `codec` has to be the *same* pick the capture loop opens its
+    /// encoder with (`pipeline::codec::current()`). A track that advertises VP8
+    /// while the encoder produces VP9 packets is not a degraded stream, it is a
+    /// broken one: the payload descriptor and the decoder disagree.
+    pub fn new(codec: VideoCodec) -> Result<Self> {
         let track = TrackLocalStaticSample::new(
-            vp8_capability(),
+            video_capability(codec),
             "video-0".to_owned(),
             "stream-0".to_owned(),
         );

@@ -456,6 +456,29 @@ where
             };
             media.lock().await.apply_answer(&sdp_type, &sdp).await?;
             ctx.session.transition(HandshakeState::AnswerApplied);
+            // #94: our m-line named one codec, and the answer is where a
+            // browser that cannot decode it says no. That refusal is silent —
+            // the transport still connects (the data channels are codec-free),
+            // so the session would come up healthy with a black picture. Put
+            // the process back on the codec everyone can decode and take the
+            // reconnect the client already handles.
+            let codec = crate::pipeline::codec::current();
+            if let Some(reason) = refused_video_codec(&sdp, codec) {
+                log::error!(
+                    "client refused the {} video line ({reason})",
+                    codec.label()
+                );
+                // Only worth restarting when there is something to fall back
+                // *to*. Already on VP8 there is no cheaper codec left, and a
+                // kick would turn one refusal into a reload every two seconds.
+                if codec != crate::pipeline::codec::VideoCodec::Vp8 {
+                    crate::pipeline::codec::set(crate::pipeline::codec::VideoCodec::Vp8);
+                    let _ = ctx
+                        .registry
+                        .kick("video codec not supported by this browser; retrying with VP8")
+                        .await;
+                }
+            }
         }
 
         IncomingLine::Ice { peer_id, candidate } => {
@@ -517,6 +540,7 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
     let watcher_clipboard = ctx.clipboard.clone();
     let watcher_settings = ctx.settings.clone();
     let watcher_tasks = ctx.tasks.clone();
+    let watcher_registry = ctx.registry.clone();
     let watcher_audio_stop = ctx.audio_stop.clone();
     push_task(
         &ctx.tasks,
@@ -543,6 +567,7 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
                             &watcher_clipboard,
                             &watcher_settings,
                             &watcher_tasks,
+                            &watcher_registry,
                         )
                         .await
                         {
@@ -832,6 +857,11 @@ async fn arm_connected_notices(
     clipboard: &Arc<ClipboardSink>,
     settings: &StreamSettings,
     tasks: &SessionTasks,
+    // #94: a codec pick has to restart the session, and the restart is this
+    // registry's close notice — the same one `/api/v1/control/session/kick`
+    // sends. Passed in rather than reached for globally so the DC hook stays a
+    // plain set of handles.
+    registry: &SessionRegistry,
 ) -> Result<()> {
     // #72: both channels get a handler; the frontend splits input across them
     // (motion on `pointer`, everything else on `control`), and webrtc-rs drops
@@ -913,6 +943,8 @@ async fn arm_connected_notices(
     let pointer_input = input.clone();
     // #50: the settings writer is shared with the pipeline worker.
     let hook_settings = settings.clone();
+    // #94: the codec pick's restart path.
+    let codec_registry = registry.clone();
 
     // #72: the unordered `pointer` channel carries exactly the coalesced pointer
     // motion — `Input._sendPointer(fields, motion=true)` goes to
@@ -976,6 +1008,9 @@ async fn arm_connected_notices(
         let clipboard = clipboard.clone();
         let settings = hook_settings.clone();
         let principal = control_principal.clone();
+        // #94: cloned per call like every other handle here — the closure is
+        // `FnMut` and must not move anything out of its captures.
+        let codec_registry = codec_registry.clone();
         Box::pin(async move {
             if !msg.is_string {
                 log::debug!("binary control message ignored in stage1");
@@ -1091,8 +1126,27 @@ async fn arm_connected_notices(
                     }
                 }
                 Action::SetSettings(payload) => {
-                    apply_settings_batch(&settings, &payload);
+                    let switched = apply_settings_batch(&settings, &payload);
+                    // The echo goes out first: the panel repaints from it, and
+                    // after a codec pick it is the only chance to show the new
+                    // value before the socket closes.
                     let _ = control.send_text(server_settings(&settings)).await;
+                    // #94: a negotiated codec cannot change inside a live
+                    // PeerConnection. The pick is recorded, so the restart is
+                    // the whole mechanism: the client reconnects on its own
+                    // (~2 s, code 4002) and its next offer carries the new
+                    // m-line. Nothing is silently deferred — a session that
+                    // stayed on the old codec while the panel said otherwise is
+                    // the #91 lie in a new place.
+                    if let Some(codec) = switched {
+                        log::info!(
+                            "video codec -> {}: restarting the session so the new m-line can be negotiated",
+                            codec.wire()
+                        );
+                        if !codec_registry.kick("video codec changed; reconnecting").await {
+                            log::warn!("codec changed but there is no live session to restart yet");
+                        }
+                    }
                 }
                 // #90: `md,<dpi>` — the host's pointer speed, expressed as DPI.
                 // `SPI_SETMOUSESPEED` is a user-session call (it writes the
@@ -1105,11 +1159,12 @@ async fn arm_connected_notices(
                     match tokio::task::spawn_blocking(move || hostui::apply_mouse_dpi(dpi)).await {
                         Ok(Ok(applied)) => {
                             log::info!(
-                                "host pointer dpi {} -> {} (speed={}, exact={})",
+                                "host pointer dpi {} -> {} (speed={}, exact={}, via={})",
                                 applied.requested,
                                 applied.applied,
                                 applied.speed,
-                                applied.exact
+                                applied.exact,
+                                applied.strategy
                             );
                             let _ = control.send_text(&mouse_dpi_report(&applied)).await;
                         }
@@ -1307,6 +1362,11 @@ fn display_mode_failure(w: u32, h: u32, reason: &str) -> String {
 /// #90: what the host pointer ended up at. `exact: false` means Windows has no
 /// step for the requested DPI and the nearest one is in force — the panel says
 /// so under the slider rather than pretending the typed number took.
+///
+/// #94: `strategy` says which write landed it. `broadcast-failed` is the one
+/// worth reading in a bug report: the speed moved, and only the WM_SETTINGCHANGE
+/// broadcast was refused (a hung or elevated top-level window vetoes it). The
+/// panel ignores the field; the log and `docs/host-knobs.md` do not.
 fn mouse_dpi_report(a: &hostui::AppliedMouse) -> String {
     hbb_common::serde_json::json!({
         "type": "mouse_dpi",
@@ -1314,6 +1374,7 @@ fn mouse_dpi_report(a: &hostui::AppliedMouse) -> String {
         "applied": a.applied,
         "speed": a.speed,
         "exact": a.exact,
+        "strategy": a.strategy,
     })
     .to_string()
 }
@@ -1346,25 +1407,110 @@ fn host_knob_failure(kind: &str, requested: u32, reason: &str) -> String {
     .to_string()
 }
 
+/// #94: did the remote answer accept the video codec we offered?
+///
+/// `None` means yes. `Some(reason)` means the answer carried no usable video
+/// m-line for this codec — either the m-section was rejected (port 0) or its
+/// `a=rtpmap` list does not contain the codec. Only the negotiated list is
+/// inspected: the offer always names every codec the media engine knows, so
+/// "it appears in the answer" is the only statement that means anything.
+///
+/// Kept as a plain SDP scan rather than a parsed description because the only
+/// question is a string membership test inside the video section; a full parse
+/// would be a second SDP model to keep in step with the one webrtc-rs owns.
+fn refused_video_codec(answer: &str, codec: crate::pipeline::codec::VideoCodec) -> Option<String> {
+    let mut in_video = false;
+    let mut rejected = false;
+    let mut seen: Vec<String> = Vec::new();
+    for raw in answer.lines() {
+        let line = raw.trim();
+        if let Some(rest) = line.strip_prefix("m=") {
+            if in_video {
+                break;
+            }
+            if rest.starts_with("video ") {
+                in_video = true;
+                // `m=video <port> <proto> <fmt list>`; a rejected m-line is the
+                // port-0 form, which browsers send instead of dropping the line
+                // so the m-line indices stay stable.
+                rejected = rest.split_whitespace().nth(1) == Some("0");
+            }
+            continue;
+        }
+        if !in_video {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("a=rtpmap:") {
+            // `a=rtpmap:98 VP9/90000`
+            if let Some(name) = rest.split_whitespace().nth(1) {
+                if let Some((encoding, _rate)) = name.split_once('/') {
+                    seen.push(encoding.to_ascii_uppercase());
+                }
+            }
+        }
+    }
+    if !in_video {
+        return Some(String::from("the answer has no video section"));
+    }
+    if rejected {
+        return Some(String::from("the video m-line was rejected (port 0)"));
+    }
+    if !seen.iter().any(|c| c == codec.label()) {
+        return Some(format!(
+            "the answer offers {} but not {}",
+            seen.join("/"),
+            codec.label()
+        ));
+    }
+    None
+}
+
 /// Apply the `SETTINGS,{json}` batch to the live `StreamSettings` (#50).
 /// Only the keys the stage-1 server can honor are consumed: `framerate`,
 /// `audio_bitrate`, `manual_resolution`/`manual_width`/`manual_height`, and
 /// (#92) the `rate_control_mode` + `video_crf` pair. Everything else in the
 /// batch belongs to a capability this server does not have.
-fn apply_settings_batch(settings: &StreamSettings, payload: &str) {
+///
+/// #94: `encoder` is the one key here that does **not** land in
+/// `StreamSettings`. The codec is not a stream parameter — it is the m-line and
+/// the libvpx context, both fixed before a frame is encoded — so the pick is
+/// recorded in `pipeline::codec` and the caller restarts the session when it
+/// changes. The returned `Some(codec)` is that signal; `None` means nothing that
+/// needs a reconnect moved.
+fn apply_settings_batch(settings: &StreamSettings, payload: &str) -> Option<crate::pipeline::codec::VideoCodec> {
     let value: Result<hbb_common::serde_json::Value, _> = hbb_common::serde_json::from_str(payload);
     let Ok(value) = value else {
         log::debug!("SETTINGS payload is not JSON: {payload}");
-        return;
+        return None;
     };
     let Some(map) = value.as_object() else {
         log::debug!("SETTINGS payload is not an object: {payload}");
-        return;
+        return None;
     };
 
     let as_u32 = |v: &hbb_common::serde_json::Value| -> Option<u32> {
         v.as_u64().map(|n| n as u32).or_else(|| v.as_str().and_then(|s| s.parse().ok()))
     };
+
+    let mut codec_changed = None;
+
+    // #94: the encoder row. `vp8enc` / `vp9enc` are the panel's ids; anything
+    // else (h264enc, av1enc, or a typo) is a codec this build cannot encode, and
+    // accepting it would leave the menu claiming a stream that does not exist.
+    if let Some(id) = map.get("encoder").and_then(|v| v.as_str()) {
+        match crate::pipeline::codec::VideoCodec::from_encoder_id(id) {
+            Some(pick) => {
+                let previous = crate::pipeline::codec::current();
+                if crate::pipeline::codec::set(pick) {
+                    log::info!("SETTINGS: video codec {} -> {}", previous.wire(), pick.wire());
+                    codec_changed = Some(pick);
+                }
+            }
+            None => log::warn!(
+                "SETTINGS: encoder {id:?} is not one this build can encode (have: vp8enc, vp9enc)"
+            ),
+        }
+    }
 
     if let Some(fps) = map.get("framerate").and_then(as_u32) {
         settings.set_fps(fps);
@@ -1408,6 +1554,7 @@ fn apply_settings_batch(settings: &StreamSettings, payload: &str) {
             log::info!("SETTINGS: manual resolution -> {w}x{h}");
         }
     }
+    codec_changed
 }
 
 #[cfg(test)]
@@ -1502,5 +1649,32 @@ mod tests {
             surface_of(&Action::ClipboardChunk("cb,1,2,3,abcd".to_owned())),
             Some(EventKind::Clipboard(ClipOp::Write))
         );
+    }
+    /// #94: a codec pick only means something if the answer takes it. The
+    /// three shapes below are the ones a browser actually sends: accepted,
+    /// rejected as a whole m-line (port 0), and accepted-but-without-our-codec.
+    #[test]
+    fn the_answer_decides_whether_the_codec_pick_survives() {
+        use crate::pipeline::codec::VideoCodec;
+
+        let accepted = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 98\r\na=rtpmap:98 VP9/90000\r\n";
+        assert_eq!(refused_video_codec(accepted, VideoCodec::Vp9), None);
+
+        // The browser keeps the m-line and zeroes its port rather than dropping
+        // it, so the offer's m-line indices stay stable.
+        let rejected = "v=0\r\nm=video 0 UDP/TLS/RTP/SAVPF 98\r\na=rtpmap:98 VP9/90000\r\n";
+        let reason = refused_video_codec(rejected, VideoCodec::Vp9).expect("port 0 is a refusal");
+        assert!(reason.contains("port 0"), "unexpected reason: {reason}");
+
+        // The audio section must not be mistaken for the video one: an Opus
+        // rtpmap is not a VP8 answer.
+        let only_audio = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=rtpmap:111 opus/48000/2\r\n";
+        assert!(refused_video_codec(only_audio, VideoCodec::Vp8).is_some());
+
+        let wrong_codec = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=rtpmap:96 VP8/90000\r\n";
+        let reason = refused_video_codec(wrong_codec, VideoCodec::Vp9)
+            .expect("VP8 in the answer is not a VP9 answer");
+        assert!(reason.contains("VP8"), "the reason names what arrived: {reason}");
+        assert_eq!(refused_video_codec(wrong_codec, VideoCodec::Vp8), None);
     }
 }

@@ -64,6 +64,13 @@ pub struct Config {
     /// traversal, drive letters and reserved characters before touching the
     /// filesystem (RustDesk `fs::join_validated_path` style).
     pub upload_dir: Option<PathBuf>,
+    /// #94: the video codec sessions negotiate with, `vp8` (default) or `vp9`.
+    ///
+    /// Only the starting value: the panel can change it at runtime, and the
+    /// choice lives in `pipeline::codec` (a pick has to outlive the session that
+    /// carried it, or the reload it triggers would revert it). This flag exists
+    /// so a fresh process can start on VP9 without anyone touching the UI.
+    pub video_codec: String,
     /// #88: 监听面鉴权策略名（`allow-all` / `deny-all`）。
     ///
     /// 默认 `allow-all`，与插桩前行为完全一致 —— 骨架本身不改变任何访问
@@ -94,6 +101,7 @@ impl Default for Config {
             repeat_every: 2,
             keyframe_secs: 10,
             upload_dir: None,
+            video_codec: "vp8".to_owned(),
             policy: "allow-all".to_owned(),
         }
     }
@@ -192,6 +200,13 @@ impl Config {
                     }
                 }
                 "--no-hdr" => cfg.no_hdr = true,
+                "--video-codec" => {
+                    if let Some(v) = iter.next() {
+                        // 未知值保留默认：本项目的默认是 VP8，拼错不该变成
+                        // "启动失败"，但也别静默接受 —— main 里会记一条 warn。
+                        cfg.video_codec = v;
+                    }
+                }
                 "--policy" => {
                     if let Some(v) = iter.next() {
                         // 未知名保留默认并在 main 里告警，不在这里吞掉 ——

@@ -31,6 +31,33 @@
 存储值改成 `applied` —— 存用户填的 777 会在下一次 `server_settings` 同步时
 把 800 顶回 777。
 
+### `SPI_SETMOUSESPEED` 的返回值不可信（#94）
+
+现场报回来的错误是：
+
+```
+SPI_SETMOUSESPEED(15) refused: 操作成功完成。 (os error 0)
+```
+
+一句自相矛盾的拒绝。原因有两层：
+
+1. `SystemParametersInfoW` 的 `BOOL` 说的是**整次调用**，包括
+   `SPIF_SENDCHANGE` 那一半——它要向会话里的每个顶层窗口投
+   `WM_SETTINGCHANGE`（`SendMessageTimeout`）。有个挂死的窗口，或者目标窗口
+   比调用方权限高（UIPI 直接挡掉跨完整性级别的消息），广播就会超时，整次调用
+   返回 FALSE，**而注册表里的指针速度已经写进去了**。
+2. 这类失败路径不设 `GetLastError`，于是读到的是上一次调用留下的 0，格式化成
+   了「操作成功完成」。
+
+所以现在**以回读为准**：写完立刻 `SPI_GETMOUSESPEED`，读回来就是请求的档位
+就是成功（`strategy: "broadcast-failed"` 会在日志里留下这次广播失败）；读回来
+不是，就**去掉广播再写一次**（持久化才是改指针的那一步，通知只是礼貌）；两次
+都不成才报错，并且错误文案里不会再出现「os error 0」。
+
+回执多一个字段 `strategy`：`already` / `broadcast` / `broadcast-failed` /
+`no-broadcast` / `unverified`。面板不看它，日志和这里看。
+单测 `a_failed_broadcast_is_still_an_applied_write` 钉住的就是这次回归。
+
 ## 2. 界面缩放
 
 `dd,<dpi>`（96 = 100%）。背后是 `SPI_SETLOGICALDPIOVERRIDE`，SDK 标着

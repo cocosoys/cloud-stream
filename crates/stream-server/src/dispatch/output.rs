@@ -154,7 +154,10 @@ pub fn stream_info(info: &StreamInfo) -> String {
             "gpu_present": false,
             "hardware_expected": false,
             "encoder_reason": "CPU software encoder; no GPU passthrough",
-            "codec": "VP8",
+            // #94: whichever libvpx encoder the session actually opened. The
+            // statistics tile reads this string, so it has to follow the live
+            // pick — a tile that says VP8 over a VP9 stream is the #91 bug.
+            "codec": crate::pipeline::codec::current().label(),
             "fullcolor": false,
             "bit_depth": 8,
             "striped": false,
@@ -264,15 +267,25 @@ pub fn server_settings(s: &crate::pipeline::StreamSettings) -> String {
             "settings": {
                 // #91: the encoder, and the one place the panel could contradict
                 // itself. `pipeline::encoder` builds exactly one encoder —
-                // libvpx VP8, software — so the list has one entry and the row
-                // renders read-only. Before this key existed the panel fell back
-                // to its own local default and printed "H.264" while the
-                // statistics tile (which reads `stream_info`) said "libvpx ·
-                // VP8": two answers to one question, neither of them from here.
+                // libvpx, software — so the row names which libvpx codec is
+                // running. Before this key existed the panel fell back to its own
+                // local default and printed "H.264" while the statistics tile
+                // (which reads `stream_info`) said "libvpx · VP8": two answers to
+                // one question, neither of them from here.
+                //
+                // #94: the row is a real choice now. Two entries, because this
+                // build has two libvpx encoders; picking one records the pick and
+                // restarts the session, since a negotiated codec cannot change
+                // inside a live PeerConnection. H.264/AV1 stay absent on purpose:
+                // this build has no encoder for them, and a menu entry that
+                // cannot be encoded is a knob that only pretends to work.
                 "encoder": {
-                    "value": "vp8enc",
-                    "allowed": ["vp8enc"],
-                    "locked": true
+                    "value": crate::pipeline::codec::current().encoder_id(),
+                    "allowed": crate::pipeline::codec::VideoCodec::ALL
+                        .iter()
+                        .map(|c| c.encoder_id())
+                        .collect::<Vec<_>>(),
+                    "locked": false
                 },
                 // #91: the encoder has no CRF path — `set_quality` exists, but
                 // the pipeline only ever drives a bitrate target — so CRF is not
@@ -512,11 +525,11 @@ mod tests {
     /// audio slider was disabled because `allowed.length <= 1` is exactly how
     /// "no choices" reads, so a missing list meant "one choice, take it".
     ///
-    /// The assertions are about *shape*, not today's values: one encoder entry
-    /// (the pipeline builds one), two rate-control modes (#92: CBR and the CQ
-    /// path the encoder can actually open), and an audio list long enough to
-    /// un-grey the slider with nothing above the Opus ceiling the encoder would
-    /// clamp away.
+    /// The assertions are about *shape*, not today's values: the encoder list
+    /// holds exactly the codecs this build can encode (#94: VP8 and VP9, both
+    /// libvpx), two rate-control modes (#92: CBR and the CQ path the encoder can
+    /// actually open), and an audio list long enough to un-grey the slider with
+    /// nothing above the Opus ceiling the encoder would clamp away.
     #[test]
     fn settings_describe_the_encoder_and_audio_the_pipeline_has() {
         let s = crate::pipeline::StreamSettings::from_config(&crate::config::Config::default());
@@ -527,10 +540,17 @@ mod tests {
 
         assert_eq!(
             settings["encoder"]["allowed"],
-            json!(["vp8enc"]),
+            json!(["vp8enc", "vp9enc"]),
             "the encoder list is the panel's only honest answer: {line}"
         );
-        assert_eq!(settings["encoder"]["locked"], json!(true));
+        // #94: one entry would grey the row (and did, as `locked: true`); two
+        // make it a choice, so the value has to name one of them.
+        assert_eq!(settings["encoder"]["locked"], json!(false));
+        let value = settings["encoder"]["value"].as_str().unwrap_or_default();
+        assert!(
+            ["vp8enc", "vp9enc"].contains(&value),
+            "encoder value {value:?} is not one of the offered ids: {line}"
+        );
         assert_eq!(
             settings["rate_control_mode"]["allowed"],
             json!(["cbr", "crf"]),

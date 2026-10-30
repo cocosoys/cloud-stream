@@ -69,6 +69,13 @@ pub struct VpxEncoder {
     id: VpxVideoCodecId,
     i444: bool,
     yuvfmt: EncodeYuvFormat,
+    /// #94: a forced keyframe waiting to be attached to the next encode call.
+    ///
+    /// The old path used `VP8E_SET_FRAME_FLAGS`, which a VP9 context rejects —
+    /// so on VP9 the periodic/PLI keyframe would have silently stopped working
+    /// and only the `kf_max_dist` backstop would remain. `VPX_EFLAG_FORCE_KF` at
+    /// encode time is the codec-neutral way to say the same thing.
+    force_kf: bool,
 }
 
 pub struct VpxDecoder {
@@ -228,6 +235,7 @@ impl EncoderApi for VpxEncoder {
                     id: config.codec,
                     i444,
                     yuvfmt: Self::get_yuvfmt(config.width, config.height, i444),
+                    force_kf: false,
                 })
             }
             _ => Err(anyhow!("encoder type mismatch")),
@@ -284,14 +292,13 @@ impl EncoderApi for VpxEncoder {
     }
 
     fn force_keyframe(&mut self) -> ResultType<()> {
-        // VP8E_SET_FRAME_FLAGS with VPX_EFLAG_FORCE_KF marks the *next* frame
-        // as a keyframe (chromium vpx_video_encoder.cc does the same for
-        // request_keyframe / PLI responses).
-        call_vpx!(vpx_codec_control_(
-            &mut self.ctx,
-            VP8E_SET_FRAME_FLAGS as _,
-            VPX_EFLAG_FORCE_KF as c_int,
-        ));
+        // #94: flagged for the next `vpx_codec_encode`, not applied through a
+        // control. `VP8E_SET_FRAME_FLAGS` is a VP8-only control (chromium's
+        // vpx_video_encoder.cc uses it for request_keyframe/PLI on VP8), and a
+        // VP9 context answers it with `VPX_CODEC_UNSUP_BITSTREAM` — which, in a
+        // `call_vpx!`, would turn every PLI and every periodic keyframe into a
+        // warning while the reference chain drifted.
+        self.force_kf = true;
         Ok(())
     }
 
@@ -337,12 +344,21 @@ impl VpxEncoder {
             data.as_ptr() as _,
         ));
 
+        // #94: a pending force-keyframe rides this frame, then clears. Reset
+        // before the call so a failed encode does not keep the flag armed for a
+        // frame that was never submitted.
+        let flags = if self.force_kf {
+            VPX_EFLAG_FORCE_KF as _
+        } else {
+            0
+        };
+        self.force_kf = false;
         call_vpx!(vpx_codec_encode(
             &mut self.ctx,
             &image,
             pts as _,
-            1, // Duration
-            0, // Flags
+            1,         // Duration
+            flags,     // Flags
             VPX_DL_REALTIME as _,
         ));
 

@@ -13,7 +13,8 @@
 //!   is kept for diagnostics only.
 //! * The `key` flag decides whether a chunk belongs to a keyframe; the `Sample`
 //!   struct itself has no keyframe field.
-//! * Non-VP8 unions return an empty list (stage1 only negotiates VP8).
+//! * VP8 and (#94) VP9 are accepted; every other union returns an empty list,
+//!   because this pipeline has no encoder for it.
 
 use base::message_proto::{video_frame, VideoFrame};
 use bytes::Bytes;
@@ -36,20 +37,32 @@ pub fn video_frame_to_chunks(vf: VideoFrame) -> Vec<EncodedChunk> {
         return Vec::new();
     };
     match union {
-        video_frame::Union::Vp8s(frames) => frames
-            .frames
-            .into_iter()
-            .map(|f| EncodedChunk {
-                data: f.data,
-                key: f.key,
-                pts: f.pts as u32,
-            })
-            .collect(),
+        video_frame::Union::Vp8s(frames) => chunks_of(frames),
+        // #94: the VP9 encoder emits the same `EncodedVideoFrames` shape in a
+        // different oneof arm. Dropping it here would have been a silent black
+        // screen: the encoder would produce frames, the loop would count
+        // `encoded_ok`, and nothing would ever reach the track.
+        video_frame::Union::Vp9s(frames) => chunks_of(frames),
         other => {
-            log::debug!("drop non-VP8 encoder union: {:?}", codec_tag(&other));
+            log::debug!("drop encoder union this pipeline cannot send: {:?}", codec_tag(&other));
             Vec::new()
         }
     }
+}
+
+/// One frame list -> one chunk list. Shared by the VP8 and VP9 arms: both carry
+/// `Vec<EncodedVideoFrame>` with the same fields, and the RTP payloader (not
+/// this function) is what knows the codec's descriptor layout.
+fn chunks_of(frames: base::message_proto::EncodedVideoFrames) -> Vec<EncodedChunk> {
+    frames
+        .frames
+        .into_iter()
+        .map(|f| EncodedChunk {
+            data: f.data,
+            key: f.key,
+            pts: f.pts as u32,
+        })
+        .collect()
 }
 
 /// Tiny discriminator tag for the debug line above; avoids Display on the oneof.

@@ -59,6 +59,7 @@
 pub mod audio;
 pub mod avsync;
 pub mod capture;
+pub mod codec;
 pub mod cursor;
 pub mod encoder;
 pub mod qos;
@@ -616,12 +617,18 @@ fn run_blocking_loop(
             // later change comes back through `InnerOutcome::Rebuild`.
             settings.rate_control(),
             settings.crf(),
+            // #94: likewise fixed at open (it selects the libvpx encoder), and
+            // the same rebuild path covers a pick made while the stream is live.
+            codec::current(),
         ) {
             Ok(encoder) => encoder,
             Err(err) => {
                 let reason = short_reason(&*err);
                 handle.emit_event(PipelineEvent::Lost(format!("encoder_open_failed: {reason}")));
-                anyhow::bail!("VP8 encoder open failed: {err:#}");
+                anyhow::bail!(
+                    "{} encoder open failed: {err:#}",
+                    codec::current().label()
+                );
             }
         };
         // #52: re-target the libvpx bitrate right after open so the configured
@@ -1084,6 +1091,20 @@ fn run_inner_beat(
             );
             return InnerOutcome::Rebuild { from_gdi: worker.is_gdi() };
         }
+        // #94: a codec pick is fixed at open as well — it selects which libvpx
+        // encoder is instantiated, and the SDP already named one of them for
+        // this session. Normally the pick is followed by a session restart (the
+        // only way a *negotiated* codec can change), so this fires only if a
+        // pick lands in the window before that restart; rebuilding keeps the
+        // encoder from disagreeing with the track until then.
+        if codec::current() != encoder.codec() {
+            log::info!(
+                "client switched codec {} -> {}: rebuilding encoder (session restart follows)",
+                encoder.codec().wire(),
+                codec::current().wire()
+            );
+            return InnerOutcome::Rebuild { from_gdi: worker.is_gdi() };
+        }
         // Gate closed: idle beat without touching the capturer or encoder; the
         // deadline keeps advancing so a resume lands on a clean cadence.
         if !handle.is_on() {
@@ -1539,31 +1560,38 @@ fn run_inner_beat(
                 s.first_frame_seen = true;
                 s.warmed_up = true;
             });
-            // #60: encoded VP8 dump — a window of raw encoder output as an IVF
+            // #60: encoded frame dump — a window of raw encoder output as an IVF
             // file, so `ffmpeg -i enc-*.ivf` can decode it off-line and prove
             // whether the artifact originates in the encoder output or later in
             // the RTP/transport path.
             if let Some(dir) = &dump_frame {
-                if let Some(union) = &encoded.union {
-                    if let base::message_proto::video_frame::Union::Vp8s(frames) = union {
-                        for f in &frames.frames {
-                            ivf_frames.push((f.data.to_vec(), f.pts));
-                        }
-                        if ivf_frames.len() >= IVF_WINDOW {
-                            let name = format!("enc-{ivf_seq:04}.ivf");
-                            write_ivf(
-                                dir.join(name),
-                                tw as usize,
-                                th as usize,
-                                // An IVF header's rate field cannot be 0; an
-                                // uncapped session is diagnosed as its budget
-                                // ceiling, which is the nearest real figure.
-                                settings.budget_fps(),
-                                &ivf_frames,
-                            );
-                            ivf_seq += 1;
-                            ivf_frames.clear();
-                        }
+                // #94: both codecs emit the same frame list; only the IVF magic
+                // in the header differs (VP80 / VP90), so the dump keeps working
+                // after a codec pick.
+                let dumped = match &encoded.union {
+                    Some(base::message_proto::video_frame::Union::Vp8s(frames)) => Some(frames),
+                    Some(base::message_proto::video_frame::Union::Vp9s(frames)) => Some(frames),
+                    _ => None,
+                };
+                if let Some(frames) = dumped {
+                    for f in &frames.frames {
+                        ivf_frames.push((f.data.to_vec(), f.pts));
+                    }
+                    if ivf_frames.len() >= IVF_WINDOW {
+                        let name = format!("enc-{ivf_seq:04}.ivf");
+                        write_ivf(
+                            dir.join(name),
+                            tw as usize,
+                            th as usize,
+                            // An IVF header's rate field cannot be 0; an
+                            // uncapped session is diagnosed as its budget
+                            // ceiling, which is the nearest real figure.
+                            settings.budget_fps(),
+                            encoder.codec(),
+                            &ivf_frames,
+                        );
+                        ivf_seq += 1;
+                        ivf_frames.clear();
                     }
                 }
             }
@@ -1874,17 +1902,31 @@ fn write_bgra_bmp(path: PathBuf, data: &[u8], w: usize, h: usize) {
     }
 }
 
-/// #60: wrap a window of raw VP8 encoder frames as an IVF file (DKIF header,
-/// one 4-byte size + 8-byte pts + payload record per frame) so ffmpeg's VP8
-/// demuxer/decoder can play the exact bytes the pipeline produced. Write
-/// failures are ignored — diagnostics must never break the stream.
-fn write_ivf(path: PathBuf, w: usize, h: usize, fps: u32, frames: &[(Vec<u8>, i64)]) {
+/// #60: wrap a window of raw encoder frames as an IVF file (DKIF header,
+/// one 4-byte size + 8-byte pts + payload record per frame) so ffmpeg's VP8/VP9
+/// demuxer can play the exact bytes the pipeline produced. Write failures are
+/// ignored — diagnostics must never break the stream.
+///
+/// #94: `codec` only selects the four-byte header magic (`VP80` / `VP90`); the
+/// record layout is identical, and ffmpeg keys off that magic to pick the
+/// decoder, so a VP9 dump labelled VP80 would decode to noise.
+fn write_ivf(
+    path: PathBuf,
+    w: usize,
+    h: usize,
+    fps: u32,
+    codec: codec::VideoCodec,
+    frames: &[(Vec<u8>, i64)],
+) {
     use std::io::Write;
     let mut out = Vec::with_capacity(32 + frames.len() * 12 + frames.iter().map(|f| f.0.len()).sum::<usize>());
     out.extend_from_slice(b"DKIF");
     out.extend_from_slice(&0u16.to_le_bytes());
     out.extend_from_slice(&32u16.to_le_bytes());
-    out.extend_from_slice(b"VP80");
+    out.extend_from_slice(match codec {
+        codec::VideoCodec::Vp8 => b"VP80",
+        codec::VideoCodec::Vp9 => b"VP90",
+    });
     out.extend_from_slice(&(w as u16).to_le_bytes());
     out.extend_from_slice(&(h as u16).to_le_bytes());
     out.extend_from_slice(&fps.to_le_bytes());

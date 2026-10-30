@@ -15,7 +15,8 @@
 //!   (examples/play-from-disk-h264.rs:106-123): an empty MediaEngine would
 //!   produce an offer with no negotiable codec.
 //! * Server is always the offerer: after SESSION_OK the session builds the PC,
-//!   opens the two data channels, adds the VP8 track, `make_offer` pushes the
+//!   opens the two data channels, adds the video track (VP8 or (#94) VP9 —
+//!   whichever `pipeline::codec` holds), `make_offer` pushes the
 //!   offer over the WS signaling line; the client answers and its remote
 //!   candidates arrive on the same line.
 //! * State callback: Connected -> signaling layer starts the pipeline and
@@ -148,7 +149,7 @@ impl MediaSession {
         };
         let pc = Arc::new(api.new_peer_connection(config).await?);
 
-        let video = VideoTrack::new()?;
+        let video = VideoTrack::new(crate::pipeline::codec::current())?;
         let sender = pc.add_track(video.as_track_local()).await?;
 
         // #77: the sound track first (produces `m=audio sendonly`), then an

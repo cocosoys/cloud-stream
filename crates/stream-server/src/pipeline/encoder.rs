@@ -1,7 +1,11 @@
-//! VP8 encoder wrapper over `scrap::codec::Encoder` (design 8.1 rows 2-3).
+//! libvpx encoder wrapper over `scrap::codec::Encoder` (design 8.1 rows 2-3).
 //!
 //! Stage1 fixed settings (design 4.4 / 8.1):
-//! * codec: VP8; stage3 re-evaluates VP9.
+//! * codec: VP8 by default; #94 makes it a pick between the two encoders libvpx
+//!   already builds (`VP8` / `VP9`), carried in [`crate::pipeline::codec`]. The
+//!   codec is fixed at open — it decides which `vpx_codec_*_cx()` is
+//!   instantiated — and the SDP names the same one, so switching is a session
+//!   restart, not a hot swap.
 //! * quality: 1.0; `keyframe_interval` (#86): sized from `--keyframe-secs` as a
 //!   frame-count **backstop** only. A pure P-frame chain (`VPX_KF_DISABLED`)
 //!   drifts — quantizer error accumulates against the reference, the picture
@@ -23,19 +27,19 @@
 //! * `encoder.yuvfmt()`, `encoder.encode_to_message(input, ms)`, `encoder.bitrate()`.
 //!
 //! Encoded frames arrive as `base::message_proto::VideoFrame` carrying
-//! `union=Vp8s(EncodedVideoFrames{frames})`; slicing into RTP-ready chunks lives
-//! in `pipeline::sample_map`. `VpxNoOutput` (this round produced no packet) is
-//! normalized to `Ok(None)` so the loop counts it as `encode_no_output` without
-//! treating it as a fatal encoder error.
+//! `union=Vp8s(EncodedVideoFrames{frames})` — or `Vp9s` for the VP9 encoder; the
+//! two unions have the same shape and `pipeline::sample_map` accepts both.
+//! Slicing into RTP-ready chunks lives in `pipeline::sample_map`. `VpxNoOutput`
+//! (this round produced no packet) is normalized to `Ok(None)` so the loop
+//! counts it as `encode_no_output` without treating it as a fatal encoder error.
 
 use std::ffi::c_uint;
 
 use base::message_proto::VideoFrame;
 use scrap::codec::{Encoder, EncoderCfg};
-use scrap::{
-    EncodeInput, EncodeYuvFormat, VpxEncoderConfig, VpxNoOutput, VpxRateControl, VpxVideoCodecId,
-};
+use scrap::{EncodeInput, EncodeYuvFormat, VpxEncoderConfig, VpxNoOutput, VpxRateControl};
 
+use crate::pipeline::codec::VideoCodec;
 use crate::pipeline::settings::RateControl;
 
 /// #86: frame-count backstop for `kf_max_dist`, sized at **twice** the
@@ -64,6 +68,10 @@ pub struct VideoEncoder {
     rc: RateControl,
     /// The quantizer this encoder was opened with (only meaningful under CQ).
     crf: u32,
+    /// #94: which libvpx encoder this is. Same reason as `rc`: the codec is a
+    /// property of the instantiated codec context, so the loop compares it
+    /// against the process-wide pick.
+    codec: VideoCodec,
 }
 
 impl VideoEncoder {
@@ -88,13 +96,17 @@ impl VideoEncoder {
         fps: u32,
         rc: RateControl,
         crf: u32,
+        codec: VideoCodec,
     ) -> anyhow::Result<Self> {
         let backstop = keyframe_backstop_frames(fps, keyframe_secs);
         let cfg = EncoderCfg::VPX(VpxEncoderConfig {
             width: width as c_uint,
             height: height as c_uint,
             quality: 1.0,
-            codec: VpxVideoCodecId::VP8,
+            // #94: VP8 by default, VP9 when the panel picked it. Both branches
+            // are the same `VpxEncoderConfig`; only the `vpx_codec_*_cx()` the
+            // vendored wrapper picks differs.
+            codec: codec.vpx_id(),
             // #62: 15 -> 60. `#61 experiment D` lowered this to 15 (~2 IDR/s at
             // 30 fps) to test the "broken reference chain" theory; the finding
             // was the opposite — at 1080p one IDR is 100-200 KB, so two per
@@ -117,7 +129,8 @@ impl VideoEncoder {
         let encoder = Encoder::new(cfg, false)?;
         let yuvfmt = encoder.yuvfmt();
         log::info!(
-            "VP8 encoder opened: {width}x{height} target={}kbps hw={} keyframe={}s (backstop {backstop} frames) rc={} crf={}",
+            "{} encoder opened: {width}x{height} target={}kbps hw={} keyframe={}s (backstop {backstop} frames) rc={} crf={}",
+            codec.label(),
             _bitrate_kbps,
             encoder.is_hardware(),
             keyframe_secs.clamp(1, 120),
@@ -131,7 +144,13 @@ impl VideoEncoder {
             height,
             rc,
             crf,
+            codec,
         })
+    }
+
+    /// #94: the codec this encoder was opened with.
+    pub fn codec(&self) -> VideoCodec {
+        self.codec
     }
 
     /// #92: the mode this encoder was opened with.
@@ -217,7 +236,7 @@ impl VideoEncoder {
 
 #[cfg(test)]
 mod tests {
-    use super::keyframe_backstop_frames;
+    use super::{keyframe_backstop_frames, VideoCodec};
 
     /// #92: the CQ configuration has to be accepted by libvpx *at open time* —
     /// this is the one thing that can fail silently when a client picks CRF,
@@ -233,6 +252,7 @@ mod tests {
                 30,
                 crate::pipeline::settings::RateControl::Cq,
                 crf,
+                VideoCodec::Vp8,
             )
             .unwrap_or_else(|e| panic!("CQ encoder failed to open at crf {}: {:#}", crf, e));
             assert_eq!(enc.rate_control(), crate::pipeline::settings::RateControl::Cq);
@@ -246,9 +266,31 @@ mod tests {
             30,
             crate::pipeline::settings::RateControl::Cbr,
             25,
+            VideoCodec::Vp8,
         )
         .expect("CBR encoder must keep opening exactly as before #92");
         assert_eq!(cbr.rate_control(), crate::pipeline::settings::RateControl::Cbr);
+    }
+
+    /// #94: the second codec has to be *really* openable, not just advertised.
+    /// This is the whole risk of the feature — a codec listed in the menu whose
+    /// `vpx_codec_vp9_cx()` fails on this build would turn a pick into a dead
+    /// session, and the failure would surface much later as "no video".
+    #[test]
+    fn vp9_opens_and_reports_itself() {
+        let enc = super::VideoEncoder::new(
+            320,
+            240,
+            800,
+            10,
+            30,
+            crate::pipeline::settings::RateControl::Cbr,
+            25,
+            VideoCodec::Vp9,
+        )
+        .expect("libvpx must build a VP9 encoder in this binary");
+        assert_eq!(enc.codec(), VideoCodec::Vp9);
+        assert!(!enc.is_hardware(), "VP9 here is the software libvpx one");
     }
 
     #[test]

@@ -393,7 +393,9 @@ fn build(
                 // The same string the panel advertises (`server_settings.encoder`):
                 // one encoder, one name. `codec` carries the detail.
                 "encoder": "libvpx",
-                "codec": "vp8",
+                // #94: the codec this server is negotiating with; a session
+                // that picked VP9 is not running the same encoder as before.
+                "codec": crate::pipeline::codec::current().wire(),
                 "rate_control": settings.rate_control().as_str(),
                 "crf": settings.crf(),
                 "target_kbps": target_kbps,
@@ -432,7 +434,9 @@ fn build(
                 "height": cfg.height,
                 "fps": cfg.fps,
                 "encoder": "libvpx",
-                "codec": "vp8",
+                // #94: the codec this server is negotiating with; a session
+                // that picked VP9 is not running the same encoder as before.
+                "codec": crate::pipeline::codec::current().wire(),
                 "target_kbps": cfg.bitrate_kbps,
                 "audio": {
                     "enabled": audio::enabled(),

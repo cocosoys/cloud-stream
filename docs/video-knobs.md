@@ -53,12 +53,14 @@ CQ（constant quality）在 libvpx 里是 `rc_end_usage = VPX_CQ` + 量化器钉
 要让它们真的有意义，得先做区域重绘（独立的大改），或把 Turbo/paint-over 一起
 重新定义成本管线的"静态画面重复帧节流"。
 
-## 4. 编码器只有一个
+## 4. 编码器只有一个（#94 之后不再是）
 
-`pipeline/encoder.rs` 只构造一个 `VpxVideoCodecId::VP8`，WebRTC 侧也是一条 VP8
-轨道（`main.rs`：VP8 track + VP8 payloader）。要真的能选 VP9，需要动 RTP 打包器
-与 codec 协商，不是面板能决定的事。所以这一行的正确形态是**陈述**而不是选择：
-`VP8 · 服务端唯一`，鼠标悬停说明"统计信息的「编码」读的是同一个事实"。
+当时 `pipeline/encoder.rs` 只构造一个 `VpxVideoCodecId::VP8`，WebRTC 侧也是一条
+VP8 轨道，所以那一行的正确形态是**陈述**而不是选择：`VP8 · 服务端唯一`。
+
+#94 把它做成了真的选择（VP8 / VP9 两个 libvpx 编码器），代价与约束写在
+[`codec-choice.md`](codec-choice.md)：编解码器是协商属性，选完要重连一次。
+H.264 / AV1 仍然没有——不是没做，是这个构建里编不出来。
 
 ## 5. 验证
 
@@ -75,7 +77,9 @@ CQ（constant quality）在 libvpx 里是 `rc_end_usage = VPX_CQ` + 量化器钉
 
 ## 6. 还没做的
 
-- **VP9 / 硬件编码**：要动 RTP 轨道与协商
+- **硬件编码（NVENC / QSV / AMF）**：要启用 `scrap/hwcodec` 并处理 D3D11 纹理
+  路径，是独立工程；VP9 已在 #94 落地
+- **H.264 / AV1**：H.264 缺软件编码器与 `sprop-parameter-sets`，AV1 无编码器
 - **paint-over（区域重绘）**：Turbo 与「覆盖层 CRF/连发」的共同前提
 - **CRF 的 QoS 交互**：CQ 下 QoS 只调上限，画面质量恒定——这是有意的，但
   "码率爆了自动降质"这条保护在 CQ 模式下等于不存在，值得单独评估

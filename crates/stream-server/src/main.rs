@@ -73,6 +73,20 @@ async fn main() -> anyhow::Result<()> {
     }
     let _logger = init_logger(&cfg)?;
 
+    // #94: the codec the process starts on. A name this build cannot encode
+    // keeps VP8 and says so — silently accepting it would leave the panel
+    // claiming a codec nothing produces.
+    match pipeline::codec::VideoCodec::from_wire(&cfg.video_codec) {
+        Some(codec) => {
+            pipeline::codec::set(codec);
+        }
+        None => log::warn!(
+            "unknown --video-codec {:?}, keeping {} (built in: vp8, vp9)",
+            cfg.video_codec,
+            pipeline::codec::current().wire()
+        ),
+    }
+
     // #88: 监听面鉴权骨架。策略必须在 bind 之前装好 —— 第一个可能被裁决的
     // 事件是 `serve` 收到的 HTTP 请求，装晚了就会出现"前几个请求按默认放行"
     // 的窗口。策略名拼错时退回 allow-all 而不是退出：本项目的默认本来就是
@@ -107,7 +121,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     log::info!(
-        "stream-server stage1 | listen={}:{} tls={} dist={} app={} video={}x{}@{}fps bitrate={}kbps",
+        "stream-server stage1 | listen={}:{} tls={} dist={} app={} video={}x{}@{}fps bitrate={}kbps codec={}",
         cfg.host,
         cfg.port,
         cfg.tls_enabled(),
@@ -117,6 +131,9 @@ async fn main() -> anyhow::Result<()> {
         cfg.height,
         cfg.fps,
         cfg.bitrate_kbps,
+        // #94: the codec the first session will negotiate with. The panel can
+        // change it later; `pipeline::codec` holds the live value.
+        pipeline::codec::current().wire(),
     );
     log::info!(
         "log_file={} | spf={:.3}ms | upload_dir={}",
