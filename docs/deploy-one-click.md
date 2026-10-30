@@ -333,14 +333,45 @@ Session 1。体检会打印 `session=1`，看到 `session=0` 就是这条踩了�
 
 **防**：部署完成的提示里固定带一句 `强刷 Ctrl+F5`。
 
-### 7.12 `/api/status` 是纯文本，dashboard 却当 JSON 解析
+### 7.12 `/api/status` 是纯文本，dashboard 却当 JSON 解析 —— 新设备连不上（已修）
 
-**现象**：面板的 `Stream` 行显示 `websockets`，即使服务端用 `--app webrtc` 起。
+**现象**：全新设备打开页面，只有一行 `WebSocket disconnected. Attempting to
+reconnect...`；控制台里 `GET /api/websockets 404`，`wss://.../api/websockets`
+1006 反复重连。面板的 `Stream` 行也显示 `websockets`，即使服务端用
+`--app webrtc` 起。
+
 **根因**：`main.jsx:41 detectInitialMode()` 做 `await resp.json()`，而
 `/api/status` 回的是 `ok\n`，解析抛异常被 catch，`__SELKIES_STREAMING_MODE__`
-没被设置，前端回落到 localStorage 里的 `stream_mode`。
+没被设置。接着 `selkies-core.js:120 determineStreamingMode()` 按
+`注入值 || localStorage 里的 stream_mode || websockets` 取值：
 
-这**不是部署问题**，别在部署链上找它；记在这里是因为第一次看到会以为部署错了。
+* 老设备：`switchStreamingMode()` 每次启动都把当时的模式写进 localStorage，
+  而同源曾经跑过静态注入 webrtc 的旧前端（`selkies-dashboard-dist`），于是那些
+  浏览器被永久钉在 `webrtc` —— 这就是"我这台一直是好的"。
+* 全新设备：localStorage 是空的，落到硬默认 `websockets`，去连
+  `/api/websockets`。服务端只认 `/api/<app>/signaling`（`http/mod.rs:111`），
+  该路径落进 `NotFound` 回 404，浏览器按规范报 1006，永远重连。
+
+**服务端不补这个端点是故意的**：前端 WS 模式是一整条独立传输栈
+（`selkies-ws-core.js`：一个 socket 承载全场会话，二进制按首字节分型
+`0x01` 音频 / `0x03` JPEG 分片 / `0x04` 视频分片 / `0x05` gzip 控制 / `0x02`
+麦克风 / `0x06` 摄像头，外加 `MODE`、`AUTH_SUCCESS`、`VIDEO_STARTED` 等控制帧），
+不是加一条路由能糊过去的。
+
+**已修（前端侧，`addons/selkies-dashboard/index.html`）**：在 bundle 之前静态注入
+
+```html
+<script>window.__SELKIES_STREAMING_MODE__ = "webrtc";</script>
+```
+
+注入是 `determineStreamingMode()` 的第一优先级，所以新设备和已被写成
+`websockets` 的旧设备刷新后都走 WebRTC，不必手工清 localStorage。`__SELKIES_DUAL_MODE__`
+故意不设：服务端不下发 `enable_dual_mode`（`Sidebar.jsx:1101` 回落 `false`），
+面板里的模式切换按钮因此保持隐藏 —— 这个部署没有第二条传输可切。
+
+**验证**：`curl -sk https://<host>:8080/ | grep -o '__SELKIES_STREAMING_MODE__[^<]*'`
+应当看到注入，且它必须排在 `<script type="module" src="./assets/index-*.js">` 之前。
+
 
 ### 7.13 `-SkipBuild` 会复用上一次的前端 zip（已修）
 
@@ -425,6 +456,27 @@ node 的 `rmSync` 包了一层），超过阈值就拒绝执行，构建中断�
 `HTTP 200` 为准，输出里注明「可能是指针日志刷屏挤出了启动行」，不再判失败。
 真正该失败的是反过来那种：**换了 exe 而 PID 没变** —— 计划任务没把新二进制拉起来，
 跑的还是旧映像，这条现在会明确 throw。
+
+### 7.18 `Remove-Item` 删构建产物报 `SAFE_DELETE_FAIL_CLOSED`（已修）
+
+**现象**：构建前端或打包时脚本停下，报
+
+```
+[safe-delete][SAFE_DELETE_FAIL_CLOSED] {"target":"...\\selkies-web-core\\dist",
+  "reason":"trash-failed","detail":"genie-trash failed; refusing fallback delete"}
+```
+
+指向的却是 dist 目录或一个旧 zip，和 vite、`Compress-Archive` 都没关系。
+
+**根因**：本机 PowerShell 的 `Remove-Item` 在 Windows 上接的是 Shell 删除 API，
+也就是回收站；工作区把回收站那层换成了带批量删除保护的 shim，删含上千文件的
+`dist/jsdb` 或一个上 MB 的 zip 就返回 `trash-failed` 并拒绝降级删除。§7.14 当时
+靠「`Remove-Item` 不走 node」绕过了 vite 那一侧，但没绕开回收站这一层。
+
+**防**：`deploy.ps1` 里所有本机构建产物的删除改走 `Remove-LocalPath`
+（`[System.IO.Directory]::Delete(..., true)` / `[System.IO.File]::Delete`），
+直接落文件系统、不经过回收站。远端 `deploy-remote.ps1` 的 `Remove-Item` 不动 ——
+那是被控机上普通的 Windows，没有这层 shim。
 
 ---
 

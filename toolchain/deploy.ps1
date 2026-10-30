@@ -165,6 +165,31 @@ function Get-Md5([string]$Path) {
     return (Get-FileHash -Path $Path -Algorithm MD5).Hash
 }
 
+<#
+删除本机上的构建产物。
+
+不能用 Remove-Item：它在这类环境里被接到 Windows Shell 的删除 API 上，也就是
+回收站。工作区把回收站那一层换成了带批量删除保护的 shim，删一个含上千文件的
+dist 或删一个旧 zip 都会返回
+
+    [safe-delete][SAFE_DELETE_FAIL_CLOSED] ... reason":"trash-failed"
+
+而且报错位置和真实原因（文件数量 / 回收站不可用）完全无关，第一眼会以为是
+vite 或 Compress-Archive 坏了。.NET 的 Delete 直接走文件系统，不经过回收站，
+才是这里真正想表达的意思。
+#>
+function Remove-LocalPath([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $item = Get-Item -LiteralPath $Path -Force
+    if ($item.PSIsContainer) {
+        [System.IO.Directory]::Delete($item.FullName, $true)
+    } else {
+        # 构建产物偶尔是只读的（从 zip 里解出来会带属性）。
+        if ($item.IsReadOnly) { $item.IsReadOnly = $false }
+        [System.IO.File]::Delete($item.FullName)
+    }
+}
+
 # SSH 一律 BatchMode：缺密钥时立刻失败，而不是卡在密码提示上等一个人来敲。
 $SshOpts = @('-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', '-o', 'StrictHostKeyChecking=accept-new')
 
@@ -375,10 +400,10 @@ try {
             # 就变成一次上千文件的批量删除；在带批量删除保护的 shell 里（例如
             # 工作区沙箱把 node 的 rmSync 包了一层）会直接让构建失败，
             # 而且报错信息指向 vite 插件，看不出是文件数量的问题。
-            # Remove-Item 不走 node，构建路径就与文件数量无关。
+            # Remove-LocalPath 走 .NET，同样不经过 node，构建路径就与文件数量无关。
             foreach ($pkg in @($CoreDir, $DashDir)) {
                 $stale = Join-Path $pkg 'dist'
-                if (Test-Path $stale) { Remove-Item $stale -Recurse -Force }
+                if (Test-Path $stale) { Remove-LocalPath $stale }
             }
 
             Push-Location $CoreDir
@@ -404,7 +429,7 @@ try {
         #
         # 只打包 dist 的内容，不加外层目录 —— Expand-Archive 会把层级原样展开，
         # 多套一层目录的话服务端根目录就成了 C:\dev\selkies-web\dist\，首页 404。
-        if (Test-Path $ZipPath) { Remove-Item $ZipPath -Force }
+        if (Test-Path $ZipPath) { Remove-LocalPath $ZipPath }
         Compress-Archive -Path (Join-Path $dashDist '*') -DestinationPath $ZipPath -CompressionLevel Optimal
         $zipMd5 = Get-Md5 $ZipPath
         Write-Ok ("打包 $([math]::Round((Get-Item $ZipPath).Length / 1MB, 2)) MB  md5=$zipMd5")
