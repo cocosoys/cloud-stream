@@ -56,6 +56,62 @@ pub const FPS_UNCAPPED: u32 = 0;
 /// budgeted as if it ran at one frame per second.
 pub const FPS_BUDGET: u32 = FPS_MAX;
 
+/// #92: the quantizer index bounds for constant quality.
+///
+/// VP8 quantizers run 0..=63, where 0 is near-lossless and 63 is a smear. The
+/// floor is 4 rather than 0 because lossless-ish VP8 at 1080p is several hundred
+/// megabits — a "quality" setting nobody can run. The panel starts at
+/// `CRF_DEFAULT` (25), which is roughly what CRF 23 means for x264: transparent
+/// on text, still cheap on video.
+pub const CRF_MIN: u32 = 4;
+pub const CRF_MAX: u32 = 63;
+pub const CRF_DEFAULT: u32 = 25;
+
+/// #92: how the encoder spends its bitrate. Fixed for the life of an encoder —
+/// libvpx refuses to change `rc_end_usage` on a live one, so a change here makes
+/// the capture loop rebuild the encoder (same path as a resolution change).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RateControl {
+    /// Constant bitrate: the target is held, quantizers float.
+    Cbr,
+    /// Constant quality: quantizers are pinned, the target is the ceiling.
+    Cq,
+}
+
+impl RateControl {
+    /// The panel's `_rc,<mode>` vocabulary, which is also what
+    /// `server_settings.rate_control_mode.value` carries.
+    pub fn from_wire(mode: &str) -> Option<Self> {
+        match mode.trim().to_ascii_lowercase().as_str() {
+            "cbr" => Some(RateControl::Cbr),
+            "crf" | "cq" => Some(RateControl::Cq),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RateControl::Cbr => "cbr",
+            RateControl::Cq => "crf",
+        }
+    }
+
+    fn as_u32(self) -> u32 {
+        match self {
+            RateControl::Cbr => 0,
+            RateControl::Cq => 1,
+        }
+    }
+
+    fn from_u32(v: u32) -> Self {
+        if v == 1 {
+            RateControl::Cq
+        } else {
+            RateControl::Cbr
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct StreamSettings {
     fps: Arc<AtomicU32>,
@@ -69,6 +125,11 @@ pub struct StreamSettings {
     /// (0, 0) = the capture loop has not reported yet.
     out_width: Arc<AtomicU32>,
     out_height: Arc<AtomicU32>,
+    /// #92: `RateControl` as a number (0 = CBR, 1 = CQ) plus the quantizer it
+    /// pins when it is CQ. Read every beat; a change makes the loop rebuild the
+    /// encoder, since libvpx will not switch `rc_end_usage` in place.
+    rc: Arc<AtomicU32>,
+    crf: Arc<AtomicU32>,
     dirty: Arc<AtomicBool>,
 }
 
@@ -81,6 +142,8 @@ impl StreamSettings {
             height: Arc::new(AtomicU32::new(cfg.height)),
             out_width: Arc::new(AtomicU32::new(0)),
             out_height: Arc::new(AtomicU32::new(0)),
+            rc: Arc::new(AtomicU32::new(RateControl::Cbr.as_u32())),
+            crf: Arc::new(AtomicU32::new(CRF_DEFAULT)),
             dirty: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -197,6 +260,28 @@ impl StreamSettings {
             fps
         }
     }
+
+    /// #92: how the encoder allocates its bitrate.
+    pub fn rate_control(&self) -> RateControl {
+        RateControl::from_u32(self.rc.load(Ordering::SeqCst))
+    }
+
+    /// #92: the pinned quantizer used under `RateControl::Cq`.
+    pub fn crf(&self) -> u32 {
+        self.crf.load(Ordering::SeqCst)
+    }
+
+    pub fn set_rate_control(&self, rc: RateControl) {
+        self.rc.store(rc.as_u32(), Ordering::SeqCst);
+        self.dirty.store(true, Ordering::SeqCst);
+    }
+
+    /// Clamped to the quantizer range a VP8 encoder actually has.
+    pub fn set_crf(&self, crf: u32) {
+        self.crf
+            .store(crf.clamp(CRF_MIN, CRF_MAX), Ordering::SeqCst);
+        self.dirty.store(true, Ordering::SeqCst);
+    }
 }
 
 #[cfg(test)]
@@ -282,5 +367,36 @@ mod tests {
         s.set_resolution(2560, 1440);
         assert_eq!(s.output(), (1718, 926));
         assert_eq!((s.width(), s.height()), (2560, 1440));
+    }
+
+    /// #92: the rate-control pair. The defaults must be the pre-#92 behaviour
+    /// (CBR), and a crf outside the quantizer range must clamp rather than be
+    /// stored as-is — libvpx would otherwise take 1000 as a quantizer.
+    #[test]
+    fn rate_control_defaults_to_cbr_and_clamps_crf() {
+        let s = StreamSettings::from_config(&cfg());
+        assert_eq!(s.rate_control(), RateControl::Cbr);
+        assert_eq!(s.crf(), CRF_DEFAULT);
+        assert!(!s.dirty(), "seeded from the CLI, not a client request");
+
+        s.set_rate_control(RateControl::Cq);
+        s.set_crf(1000);
+        assert_eq!(s.rate_control(), RateControl::Cq);
+        assert_eq!(s.crf(), CRF_MAX);
+        s.set_crf(0);
+        assert_eq!(s.crf(), CRF_MIN);
+        assert!(s.dirty());
+    }
+
+    /// The panel's wire vocabulary is `cbr` / `crf`; anything else must be
+    /// refused instead of silently becoming CBR.
+    #[test]
+    fn wire_names_round_trip() {
+        assert_eq!(RateControl::from_wire("crf"), Some(RateControl::Cq));
+        assert_eq!(RateControl::from_wire("CBR"), Some(RateControl::Cbr));
+        assert_eq!(RateControl::from_wire("cq"), Some(RateControl::Cq));
+        assert_eq!(RateControl::from_wire("vbr"), None);
+        assert_eq!(RateControl::Cq.as_str(), "crf");
+        assert_eq!(RateControl::Cbr.as_str(), "cbr");
     }
 }

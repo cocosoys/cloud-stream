@@ -79,6 +79,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         quality: 1.0,
         codec: VpxVideoCodecId::VP8,
         keyframe_interval: None,
+        // #92: the bench measures the CBR path, same as the default session.
+        rc: scrap::VpxRateControl::Cbr,
+        cq_level: 0,
     });
     let mut encoder = Encoder::new(cfg, false)?;
     println!("[bench] encoder: VP8  target_bitrate={} kbps", encoder.bitrate());

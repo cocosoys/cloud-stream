@@ -79,6 +79,7 @@
 | 26 | 音画同步 | ✅ | #83，`pipeline/avsync.rs`：音频媒体时钟钉在墙钟上，偏斜 >80 ms 时以 20 ms 为一格收发帧。首版比两路介质时钟，实测误判成 -16 s（见设计稿 §3.1） |
 | 27 | 周期关键帧 / 长参考链守护 | ✅ | **此前误判为未做**；`#86` 又把它从「帧数」改成「秒数」。现在 `--keyframe-secs`（默认 10 s）由采集循环按墙钟执行 `force_keyframe`，`kf_max_dist` 降级为 2 倍周期的兜底网（`encoder.rs:keyframe_backstop_frames`） |
 | 28 | 截图 / 录屏 | ❌ | `grep screenshot\|record` 在 Rust 侧零命中，无 HTTP 端点也无下行命令 |
+| 92 | 视频设置五控件：码率 / 码控(CBR↔CRF) / CRF 真可改；编码器改事实行；覆盖层三项按无 paint-over 隐藏 | ✅ | `docs/video-knobs.md`；`VpxRateControl`（vendor/scrap）、`pipeline::settings::RateControl`、`_rc,`/`_crf,` 已不再是 B 组噪音 |
 
 > #27 的残余问题不是"没有周期关键帧"，而是**间隔不可配且偏短**：60 帧 ≈ 30 fps 下
 > 2 秒，1080p 一个 IDR 约 100–200 KB，等于常驻 0.4–0.8 Mbps 花在刷新参考链上。

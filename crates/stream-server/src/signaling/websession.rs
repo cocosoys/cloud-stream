@@ -655,6 +655,11 @@ fn surface_of(action: &Action) -> Option<EventKind> {
         Action::SetUiScale(_) => EventKind::Control("control.ui-scale"),
         Action::SetSettings(_) => EventKind::Control("control.settings"),
         Action::SetBitrate(_) => EventKind::Control("control.bitrate"),
+        // #92: rate control decides how every subsequent frame is quantised, so
+        // it is its own surface: a policy can cap the bitrate without also
+        // letting the client swap the encoder's whole allocation strategy.
+        Action::SetRateControl(_) => EventKind::Control("control.rate-control"),
+        Action::SetCrf(_) => EventKind::Control("control.crf"),
         Action::SetNativeCursorRendering(_) => EventKind::Control("control.cursor-rendering"),
         Action::CompressedNegotiate => EventKind::Control("control.gzip"),
         Action::StatsOn | Action::StatsOff => EventKind::Diagnostics("control.stats"),
@@ -1032,6 +1037,20 @@ async fn arm_connected_notices(
                     log::info!("client sets bitrate -> {kbps}kbps");
                     pipeline_handle.set_bitrate_override(kbps);
                 }
+                // #92: the panel's rate-control pair. Both only write the shared
+                // settings; the capture loop notices the change on its next beat
+                // and rebuilds the encoder (libvpx fixes `rc_end_usage` at init).
+                Action::SetRateControl(mode) => match crate::pipeline::settings::RateControl::from_wire(&mode) {
+                    Some(rc) => {
+                        log::info!("client sets rate control -> {}", rc.as_str());
+                        settings.set_rate_control(rc);
+                    }
+                    None => log::warn!("ignoring unknown rate control mode {mode:?}"),
+                },
+                Action::SetCrf(crf) => {
+                    log::info!("client sets crf -> {crf}");
+                    settings.set_crf(crf);
+                }
                 // #80: sound on/off and its encoder bitrate. Process-wide
                 // statics rather than session state: the audio thread outlives
                 // the select loop and only reads them once per frame.
@@ -1200,8 +1219,9 @@ fn host_knob_failure(kind: &str, requested: u32, reason: &str) -> String {
 
 /// Apply the `SETTINGS,{json}` batch to the live `StreamSettings` (#50).
 /// Only the keys the stage-1 server can honor are consumed: `framerate`,
-/// (keyboard layout, clipboard toggles, CRF, rate control, ...) is untouched
-/// and belongs to stage 3.
+/// `audio_bitrate`, `manual_resolution`/`manual_width`/`manual_height`, and
+/// (#92) the `rate_control_mode` + `video_crf` pair. Everything else in the
+/// batch belongs to a capability this server does not have.
 fn apply_settings_batch(settings: &StreamSettings, payload: &str) {
     let value: Result<hbb_common::serde_json::Value, _> = hbb_common::serde_json::from_str(payload);
     let Ok(value) = value else {
@@ -1231,6 +1251,22 @@ fn apply_settings_batch(settings: &StreamSettings, payload: &str) {
             "SETTINGS: audio bitrate -> {bps} bps (applied {})",
             crate::pipeline::audio::current_bitrate_bps()
         );
+    }
+    // #92: the panel's CRF pair rides the batch too. `_rc,` / `_crf,` carry the
+    // same picks on the live path, but a batch that dropped them would leave the
+    // two channels disagreeing — the same trap `audio_bitrate` had in #91.
+    if let Some(mode) = map.get("rate_control_mode").and_then(|v| v.as_str()) {
+        match crate::pipeline::settings::RateControl::from_wire(mode) {
+            Some(rc) => {
+                settings.set_rate_control(rc);
+                log::info!("SETTINGS: rate control -> {}", rc.as_str());
+            }
+            None => log::warn!("SETTINGS: unknown rate control mode {mode:?}"),
+        }
+    }
+    if let Some(crf) = map.get("video_crf").and_then(as_u32) {
+        settings.set_crf(crf);
+        log::info!("SETTINGS: crf -> {}", settings.crf());
     }
     // manual_resolution=true switches the frontend to fixed dimensions; the
     // width/height pair is honored together when both are present.
@@ -1273,6 +1309,8 @@ mod tests {
             Action::ClipboardRequest,
             Action::ClipboardChunk("cw,1,2,3,abcd".to_owned()),
             Action::SetBitrate(2500),
+            Action::SetRateControl("crf".to_owned()),
+            Action::SetCrf(25),
             Action::SetAudioOn(true),
             Action::SetAudioBitrate(128_000),
             Action::SetNativeCursorRendering(true),

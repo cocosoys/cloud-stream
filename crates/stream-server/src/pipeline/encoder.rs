@@ -32,7 +32,11 @@ use std::ffi::c_uint;
 
 use base::message_proto::VideoFrame;
 use scrap::codec::{Encoder, EncoderCfg};
-use scrap::{EncodeInput, EncodeYuvFormat, VpxEncoderConfig, VpxNoOutput, VpxVideoCodecId};
+use scrap::{
+    EncodeInput, EncodeYuvFormat, VpxEncoderConfig, VpxNoOutput, VpxRateControl, VpxVideoCodecId,
+};
+
+use crate::pipeline::settings::RateControl;
 
 /// #86: frame-count backstop for `kf_max_dist`, sized at **twice** the
 /// configured wall-clock period so the loop's own timer always fires first.
@@ -54,6 +58,12 @@ pub struct VideoEncoder {
     yuvfmt: EncodeYuvFormat,
     width: u32,
     height: u32,
+    /// #92: what this encoder was opened with. libvpx will not switch
+    /// `rc_end_usage` on a live encoder, so the loop compares this against
+    /// `StreamSettings::rate_control()` and rebuilds when they differ.
+    rc: RateControl,
+    /// The quantizer this encoder was opened with (only meaningful under CQ).
+    crf: u32,
 }
 
 impl VideoEncoder {
@@ -76,6 +86,8 @@ impl VideoEncoder {
         _bitrate_kbps: u32,
         keyframe_secs: u32,
         fps: u32,
+        rc: RateControl,
+        crf: u32,
     ) -> anyhow::Result<Self> {
         let backstop = keyframe_backstop_frames(fps, keyframe_secs);
         let cfg = EncoderCfg::VPX(VpxEncoderConfig {
@@ -92,21 +104,44 @@ impl VideoEncoder {
             // #86: the number is now derived from `--keyframe-secs` and is a
             // backstop only; see the doc comment above.
             keyframe_interval: Some(backstop),
+            // #92: the panel's rate-control pick. `Cq` pins the quantizer and
+            // treats the bitrate target as a ceiling; the value only takes
+            // effect when the user chooses CRF, so the default path (CBR) is
+            // byte-for-byte what it was before this key existed.
+            rc: match rc {
+                RateControl::Cbr => VpxRateControl::Cbr,
+                RateControl::Cq => VpxRateControl::Cq,
+            },
+            cq_level: crf,
         });
         let encoder = Encoder::new(cfg, false)?;
         let yuvfmt = encoder.yuvfmt();
         log::info!(
-            "VP8 encoder opened: {width}x{height} target={}kbps hw={} keyframe={}s (backstop {backstop} frames)",
+            "VP8 encoder opened: {width}x{height} target={}kbps hw={} keyframe={}s (backstop {backstop} frames) rc={} crf={}",
             _bitrate_kbps,
             encoder.is_hardware(),
-            keyframe_secs.clamp(1, 120)
+            keyframe_secs.clamp(1, 120),
+            rc.as_str(),
+            crf
         );
         Ok(Self {
             encoder,
             yuvfmt,
             width,
             height,
+            rc,
+            crf,
         })
+    }
+
+    /// #92: the mode this encoder was opened with.
+    pub fn rate_control(&self) -> RateControl {
+        self.rc
+    }
+
+    /// #92: the quantizer this encoder was opened with.
+    pub fn crf(&self) -> u32 {
+        self.crf
     }
 
     /// YUV layout the frame conversion must target this round.
@@ -140,6 +175,17 @@ impl VideoEncoder {
     /// quantizers, which is exactly what a 60 fps session needs to avoid VP8
     /// block artifacts.
     pub fn set_bitrate_kbps(&mut self, kbps: u32) {
+        // #92: under constant quality the quantizer is the user's decision and
+        // the bitrate is only a ceiling — `set_quality` would recompute both
+        // from a ratio and quietly undo the CRF. `set_target_bitrate` moves the
+        // ceiling alone.
+        if self.rc == RateControl::Cq {
+            match self.encoder.set_target_bitrate(kbps) {
+                Ok(()) => log::info!("encoder bitrate ceiling -> {kbps}kbps (crf mode)"),
+                Err(e) => log::warn!("set_target_bitrate {kbps}kbps failed: {e:#}"),
+            }
+            return;
+        }
         let base = scrap::codec::base_bitrate(self.width, self.height) as f32;
         let ratio = if base > 0.0 {
             (kbps as f32 / base).clamp(0.25, 8.0)
@@ -172,6 +218,38 @@ impl VideoEncoder {
 #[cfg(test)]
 mod tests {
     use super::keyframe_backstop_frames;
+
+    /// #92: the CQ configuration has to be accepted by libvpx *at open time* —
+    /// this is the one thing that can fail silently when a client picks CRF,
+    /// because a rejected config surfaces as "the encoder never opened".
+    #[test]
+    fn cq_encoder_opens_at_the_panel_bounds() {
+        for crf in [5u32, 25, 50] {
+            let enc = super::VideoEncoder::new(
+                320,
+                240,
+                800,
+                10,
+                30,
+                crate::pipeline::settings::RateControl::Cq,
+                crf,
+            )
+            .unwrap_or_else(|e| panic!("CQ encoder failed to open at crf {}: {:#}", crf, e));
+            assert_eq!(enc.rate_control(), crate::pipeline::settings::RateControl::Cq);
+            assert_eq!(enc.crf(), crf);
+        }
+        let cbr = super::VideoEncoder::new(
+            320,
+            240,
+            800,
+            10,
+            30,
+            crate::pipeline::settings::RateControl::Cbr,
+            25,
+        )
+        .expect("CBR encoder must keep opening exactly as before #92");
+        assert_eq!(cbr.rate_control(), crate::pipeline::settings::RateControl::Cbr);
+    }
 
     #[test]
     fn backstop_is_twice_the_wall_clock_period() {

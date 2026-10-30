@@ -74,6 +74,7 @@ pub use encoder::VideoEncoder;
 pub use sample_map::video_frame_to_chunks;
 pub use scale::bgra_scale;
 pub use settings::StreamSettings;
+use settings::RateControl;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -594,6 +595,10 @@ fn run_blocking_loop(
             cfg.bitrate_kbps,
             cfg.keyframe_secs,
             settings.fps(),
+            // #92: read before open — libvpx fixes `rc_end_usage` at init, and a
+            // later change comes back through `InnerOutcome::Rebuild`.
+            settings.rate_control(),
+            settings.crf(),
         ) {
             Ok(encoder) => encoder,
             Err(err) => {
@@ -1040,6 +1045,18 @@ fn run_inner_beat(
         if (tw, th) != (enc_w, enc_h) {
             log::info!(
                 "client requested resolution {tw}x{th}: rebuilding capture/encoder pair"
+            );
+            return InnerOutcome::Rebuild { from_gdi: worker.is_gdi() };
+        }
+        // #92: rate control cannot be switched under a live libvpx encoder
+        // (`vpx_codec_enc_config_set` validates `rc_end_usage` against the
+        // config it was initialised with), so a new mode — or a new quantizer
+        // while in CQ — takes the same rebuild path as a resolution change.
+        let (want_rc, want_crf) = (settings.rate_control(), settings.crf());
+        if want_rc != encoder.rate_control() || (want_rc == RateControl::Cq && want_crf != encoder.crf()) {
+            log::info!(
+                "client requested rate control {} (crf {want_crf}): rebuilding encoder",
+                want_rc.as_str()
             );
             return InnerOutcome::Rebuild { from_gdi: worker.is_gdi() };
         }

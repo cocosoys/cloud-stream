@@ -43,6 +43,25 @@ impl Default for VpxVideoCodecId {
     }
 }
 
+/// How the encoder spends its bitrate budget (#92).
+///
+/// This has to be decided **at open time**: libvpx's
+/// `vpx_codec_enc_config_set` refuses a change of `rc_end_usage` on a live
+/// encoder (it validates the field against the config it was initialised
+/// with), so the caller picks a mode here and reopens the encoder to switch.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum VpxRateControl {
+    /// Constant bitrate: libvpx targets `rc_target_bitrate` and chooses
+    /// quantizers to land on it. Predictable network load, which is what a
+    /// remote desktop wants.
+    #[default]
+    Cbr,
+    /// Constant quality (`VPX_CQ`): quantizers are pinned at `cq_level` and the
+    /// bitrate target is only a ceiling. Sharper stills and text; the bitrate
+    /// then follows the content instead of the other way round.
+    Cq,
+}
+
 pub struct VpxEncoder {
     ctx: vpx_codec_ctx_t,
     width: usize,
@@ -96,7 +115,14 @@ impl EncoderApi for VpxEncoder {
                 c.g_error_resilient = VPX_ERROR_RESILIENT_DEFAULT;
                 // https://developers.google.com/media/vp9/bitrate-modes/
                 // Constant Bitrate mode (CBR) is recommended for live streaming with VP9.
-                c.rc_end_usage = vpx_rc_mode::VPX_CBR;
+                //
+                // #92: unless the caller asked for constant quality, in which
+                // case the quantizer is pinned instead and the bitrate below is
+                // only the ceiling.
+                c.rc_end_usage = match config.rc {
+                    VpxRateControl::Cbr => vpx_rc_mode::VPX_CBR,
+                    VpxRateControl::Cq => vpx_rc_mode::VPX_CQ,
+                };
                 if let Some(keyframe_interval) = config.keyframe_interval {
                     c.kf_min_dist = 0;
                     c.kf_max_dist = keyframe_interval as _;
@@ -104,7 +130,11 @@ impl EncoderApi for VpxEncoder {
                     c.kf_mode = vpx_kf_mode::VPX_KF_DISABLED; // reduce bandwidth a lot
                 }
 
-                let (q_min, q_max) = Self::calc_q_values(config.quality);
+                let cq_level = config.cq_level.min(63);
+                let (q_min, q_max) = match config.rc {
+                    VpxRateControl::Cbr => Self::calc_q_values(config.quality),
+                    VpxRateControl::Cq => (cq_level, cq_level),
+                };
                 c.rc_min_quantizer = q_min;
                 c.rc_max_quantizer = q_max;
                 c.rc_target_bitrate =
@@ -177,6 +207,18 @@ impl EncoderApi for VpxEncoder {
                     // https://github.com/webmproject/libvpx/blob/972149cafeb71d6f08df89e91a0130d6a38c4b15/vpx/vp8cx.h#L172
                     // https://groups.google.com/a/webmproject.org/g/webm-discuss/c/DJhSrmfQ61M
                     call_vpx!(vpx_codec_control_(&mut ctx, VP8E_SET_CPUUSED as _, 12,));
+                    // #92: in CQ mode the quantizer is the whole point, so state
+                    // it as the CQ level too (chromium's vpx_video_encoder.cc
+                    // sets it alongside rc_end_usage). Without this libvpx still
+                    // runs its rate-control loop and the picture's quality drifts
+                    // with the content instead of staying at `cq_level`.
+                    if config.rc == VpxRateControl::Cq {
+                        call_vpx!(vpx_codec_control_(
+                            &mut ctx,
+                            VP8E_SET_CQ_LEVEL as _,
+                            cq_level as c_int,
+                        ));
+                    }
                 }
 
                 Ok(Self {
@@ -227,6 +269,16 @@ impl EncoderApi for VpxEncoder {
         c.rc_min_quantizer = q_min;
         c.rc_max_quantizer = q_max;
         c.rc_target_bitrate = Self::bitrate(self.width as _, self.height as _, ratio);
+        call_vpx!(vpx_codec_enc_config_set(&mut self.ctx, &c));
+        Ok(())
+    }
+
+    /// #92: bitrate ceiling only. `rc_min_quantizer` / `rc_max_quantizer` are
+    /// read back from the live config and written back untouched, so a CQ
+    /// encoder keeps its pinned quantizer while the ceiling moves.
+    fn set_target_bitrate(&mut self, kbps: u32) -> ResultType<()> {
+        let mut c = unsafe { *self.ctx.config.enc.to_owned() };
+        c.rc_target_bitrate = kbps.max(1);
         call_vpx!(vpx_codec_enc_config_set(&mut self.ctx, &c));
         Ok(())
     }
@@ -431,6 +483,11 @@ pub struct VpxEncoderConfig {
     pub codec: VpxVideoCodecId,
     /// keyframe interval
     pub keyframe_interval: Option<usize>,
+    /// #92: bitrate allocation strategy, fixed for the life of the encoder.
+    pub rc: VpxRateControl,
+    /// #92: VP8 quantizer index (0..=63, lower is better) used when `rc` is
+    /// `Cq`. Ignored under `Cbr`, where `quality` drives the quantizer range.
+    pub cq_level: c_uint,
 }
 
 #[derive(Clone, Copy, Debug)]

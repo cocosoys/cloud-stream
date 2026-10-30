@@ -279,11 +279,44 @@ pub fn server_settings(s: &crate::pipeline::StreamSettings) -> String {
                 // offered. Announcing one option is how the panel learns to stop
                 // drawing the quality/CRF knobs, which used to be selectable and
                 // did nothing.
+                //
+                // #92: that is no longer true — the encoder now opens in CBR or
+                // CQ (`scrap::VpxRateControl`), so both modes are real and the
+                // panel's two rows (`rate_control_mode`, `video_crf`) work.
                 "rate_control_mode": {
-                    "value": "cbr",
-                    "allowed": ["cbr"],
-                    "locked": true
+                    "value": s.rate_control().as_str(),
+                    "allowed": ["cbr", "crf"],
+                    "locked": false
                 },
+                // #92: the quantizer pinned in CRF mode. `min`/`max` are the
+                // stops the panel can express (`CRF_STOPS`, 50..5) — the encoder
+                // itself takes 0..=63, so every value the panel can send is
+                // inside the range the server clamps to.
+                "video_crf": {
+                    "value": s.crf(),
+                    "min": crate::pipeline::settings::CRF_MIN.max(5),
+                    "max": 50,
+                    "default": crate::pipeline::settings::CRF_DEFAULT,
+                },
+                // #56/#92: the bitrate slider. Without this key the panel's
+                // disabled test (`min === max`, both undefined) greys it out —
+                // the slider was dead in the UI while `vb,<kbps>` had been
+                // working end to end all along (`pipeline::set_bitrate_override`).
+                // The bounds are the ones the server accepts (`mod.rs` clamps to
+                // 200..40_000); `default` matches the panel's own fallback so a
+                // browser with nothing stored lands where it used to.
+                "video_bitrate": {
+                    "min": 200,
+                    "max": 40_000,
+                    "default": 8_000,
+                },
+                // #92: paint-over (incremental region redraw) is not implemented
+                // anywhere in this pipeline, so its three knobs are `locked` —
+                // the panel hides a locked key instead of drawing a slider that
+                // cannot change anything.
+                "video_paintover_crf": { "locked": true },
+                "video_paintover_burst_frames": { "locked": true },
+                "use_paint_over_quality": { "locked": true },
                 // #91: the audio slider was disabled, not broken: the panel
                 // greys a control out when `allowed` has fewer than two entries,
                 // and with no `audio_bitrate` key at all that count was zero.
@@ -480,9 +513,10 @@ mod tests {
     /// "no choices" reads, so a missing list meant "one choice, take it".
     ///
     /// The assertions are about *shape*, not today's values: one encoder entry
-    /// (the pipeline builds one), one rate-control mode (there is no CRF path),
-    /// and an audio list long enough to un-grey the slider with nothing above
-    /// the Opus ceiling the encoder would clamp away.
+    /// (the pipeline builds one), two rate-control modes (#92: CBR and the CQ
+    /// path the encoder can actually open), and an audio list long enough to
+    /// un-grey the slider with nothing above the Opus ceiling the encoder would
+    /// clamp away.
     #[test]
     fn settings_describe_the_encoder_and_audio_the_pipeline_has() {
         let s = crate::pipeline::StreamSettings::from_config(&crate::config::Config::default());
@@ -497,7 +531,34 @@ mod tests {
             "the encoder list is the panel's only honest answer: {line}"
         );
         assert_eq!(settings["encoder"]["locked"], json!(true));
-        assert_eq!(settings["rate_control_mode"]["allowed"], json!(["cbr"]));
+        assert_eq!(
+            settings["rate_control_mode"]["allowed"],
+            json!(["cbr", "crf"]),
+            "both modes must be real or the row has to say so: {line}"
+        );
+        assert_eq!(settings["rate_control_mode"]["locked"], json!(false));
+        assert_eq!(settings["rate_control_mode"]["value"], json!("cbr"));
+
+        // #92: a min/max pair that is equal or missing disables the panel's
+        // slider (`min === max`, and `undefined === undefined` counts), which is
+        // exactly how `video_bitrate` and `video_crf` used to be unreachable.
+        for key in ["video_crf", "video_bitrate"] {
+            let min = settings[key]["min"].as_u64();
+            let max = settings[key]["max"].as_u64();
+            assert!(
+                matches!((min, max), (Some(a), Some(b)) if a < b),
+                "{key} needs a real span or the panel greys it out: {line}"
+            );
+        }
+        // The paint-over knobs belong to a path this server does not have; a
+        // locked key is hidden rather than drawn dead.
+        for key in [
+            "video_paintover_crf",
+            "video_paintover_burst_frames",
+            "use_paint_over_quality",
+        ] {
+            assert_eq!(settings[key]["locked"], json!(true), "{key}: {line}");
+        }
 
         let audio = settings["audio_bitrate"]["allowed"]
             .as_array()

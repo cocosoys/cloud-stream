@@ -69,6 +69,16 @@ pub trait EncoderApi {
 
     fn set_quality(&mut self, ratio: f32) -> ResultType<()>;
 
+    /// #92: move the bitrate ceiling only, leaving the quantizer policy alone.
+    /// Under constant quality (`VpxRateControl::Cq`) `set_quality` would undo the
+    /// pinned quantizer, so a client's bitrate request has to travel this way.
+    /// Backends that cannot separate the two keep the default error.
+    fn set_target_bitrate(&mut self, _kbps: u32) -> ResultType<()> {
+        Err(hbb_common::anyhow::anyhow!(
+            "this encoder cannot re-target its bitrate alone"
+        ))
+    }
+
     /// #53 PLI response: force the next encoded frame to be a keyframe so the
     /// receiver can re-anchor its reference chain after packet loss. Default is
     /// a no-op for backends that cannot force one (hwcodec stub).

@@ -61,6 +61,12 @@ pub enum Action {
     ClipboardChunk(String),
     /// `vb,<N>` (#56) — client video bitrate request; 0 restores automatic.
     SetBitrate(u32),
+    /// `_rc,<cbr|crf>` (#92) — the panel's rate-control pick. libvpx fixes
+    /// `rc_end_usage` at encoder init, so this makes the loop rebuild the
+    /// encoder rather than reconfigure it in place.
+    SetRateControl(String),
+    /// `_crf,<N>` (#92) — the quantizer pinned under constant quality.
+    SetCrf(u32),
     /// `START_AUDIO` / `STOP_AUDIO` (#80) — the frontend's sound toggle. The
     /// browser mutes its own `<video>` either way; this is what stops the server
     /// from spending 64 kbps on audio nobody hears.
@@ -175,10 +181,17 @@ pub fn classify(line: &str) -> Action {
         }
 
         // ---- B group: ignored after debug log. ----
-        "s" | "_crf" | "_rc" | "_ebc"
+        "s" | "_ebc"
         | "cmd" | "_stats_video" | "_f" | "_l" => {
             Action::Ignore(head.to_owned())
         }
+
+        // ---- #92: the panel's rate-control pair. ----
+        "_rc" => Action::SetRateControl(rest.trim().to_owned()),
+        "_crf" => match rest.trim().parse::<u32>() {
+            Ok(v) => Action::SetCrf(v),
+            Err(_) => Action::Unknown(line.to_owned()),
+        },
 
         // ---- #56: client bitrate request `vb,<N>` (settings panel / RELP). ----
         "vb" => {
@@ -211,6 +224,27 @@ pub fn classify(line: &str) -> Action {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #92: `_rc,` / `_crf,` were in the ignored B group, which is why the
+    /// panel's rate-control row and CRF slider could be dragged and changed
+    /// nothing — the frontend has sent both since the WR core was written, and
+    /// only the server half was missing.
+    #[test]
+    fn rate_control_pair_reaches_the_settings() {
+        assert!(matches!(
+            classify("_rc,crf"),
+            Action::SetRateControl(ref m) if m == "crf"
+        ));
+        assert!(matches!(
+            classify("_rc,cbr"),
+            Action::SetRateControl(ref m) if m == "cbr"
+        ));
+        assert!(matches!(classify("_crf,25"), Action::SetCrf(25)));
+        // Not a number: refuse rather than silently applying 0 (a near-lossless
+        // quantizer nobody asked for).
+        assert!(matches!(classify("_crf,"), Action::Unknown(_)));
+        assert!(matches!(classify("_crf,high"), Action::Unknown(_)));
+    }
 
     /// #80: both audio switches used to land in `Action::Ignore`, which is why
     /// the panel's mute button only muted the browser's own `<video>` while the
