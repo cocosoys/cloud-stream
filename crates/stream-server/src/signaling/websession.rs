@@ -59,11 +59,58 @@ struct CloseNotice {
     reason: String,
 }
 
+/// Who is connected and what the pipeline is doing (#93), published for the
+/// HTTP health endpoint.
+///
+/// This is a *report*, not a control surface: the live numbers are read from
+/// the same handles the session already owns (`PipelineHandle`,
+/// `StreamSettings`), so nothing here has to be kept in sync by hand except the
+/// few identity fields set when the client says `HELLO`.
+#[derive(Clone, Default)]
+pub struct SessionInfo {
+    /// Monotonic per-process id, so a finishing session cannot clear the entry
+    /// a newer session already published.
+    pub id: u64,
+    pub connected_at: Option<std::time::Instant>,
+    /// Peer address of the signaling socket.
+    pub peer_ip: String,
+    /// `User-Agent` of the WebSocket upgrade — the only device fingerprint a
+    /// browser gives up without being asked.
+    pub user_agent: String,
+    /// `client_device_id` from the hello (a UUID this browser keeps in
+    /// localStorage). Empty when the page predates #93.
+    pub device_id: String,
+    /// `client_tab_id` from the hello: per-tab, dies with the tab.
+    pub tab_id: String,
+    /// `client_type` from the hello (`primary` / `secondary` / ...).
+    pub role: String,
+    /// The live handles, so the health endpoint reads the pipeline rather than a
+    /// copy of its numbers.
+    pub pipeline: Option<PipelineHandle>,
+    pub settings: Option<StreamSettings>,
+}
+
+/// What the client told us about itself when it opened the WebSocket.
+#[derive(Clone, Debug, Default)]
+pub struct ClientMeta {
+    pub ip: String,
+    pub user_agent: String,
+}
+
 /// Shared registry: the newest session holds the handle that evicts the older
 /// one. Stage1 single-session scope; a second browser tab evicts the first.
 #[derive(Clone, Default)]
 pub struct SessionRegistry {
     inner: Arc<Mutex<Option<mpsc::UnboundedSender<CloseNotice>>>>,
+    /// #93: the live session's identity, read by `GET /api/v1/health`.
+    ///
+    /// A **std** mutex, not the tokio one above: the value is a small struct
+    /// that is never held across an `await`, and both sides want it
+    /// synchronously — the publish happens in the hello branch of a `select!`
+    /// arm, the read happens in a plain HTTP handler.
+    info: Arc<std::sync::Mutex<Option<SessionInfo>>>,
+    /// Next session id; monotonic so `clear_if` can tell whose entry it is.
+    next_id: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SessionRegistry {
@@ -75,6 +122,46 @@ impl SessionRegistry {
                 code: 4001,
                 reason: "Session superseded by a new connection. Reload to take over.".to_owned(),
             });
+        }
+    }
+
+    /// Allocate the id this session publishes under.
+    fn next_session_id(&self) -> u64 {
+        self.next_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+    }
+
+    /// Publish (or replace) the live session's identity.
+    fn publish(&self, info: SessionInfo) {
+        let mut guard = self.info.lock().unwrap_or_else(|p| p.into_inner());
+        *guard = Some(info);
+    }
+
+    /// Drop the entry if it is still ours; a newer session's entry survives.
+    fn clear_if(&self, id: u64) {
+        let mut guard = self.info.lock().unwrap_or_else(|p| p.into_inner());
+        if guard.as_ref().map(|i| i.id) == Some(id) {
+            *guard = None;
+        }
+    }
+
+    /// #93: read handle for the HTTP side.
+    pub fn info(&self) -> Arc<std::sync::Mutex<Option<SessionInfo>>> {
+        self.info.clone()
+    }
+
+    /// #93: `POST /api/v1/control/kick` — drop the current session's socket
+    /// through the same notice path a newer connection uses.
+    pub async fn kick(&self, reason: &str) -> bool {
+        let mut guard = self.inner.lock().await;
+        match guard.take() {
+            Some(tx) => {
+                let _ = tx.send(CloseNotice {
+                    code: 4002,
+                    reason: reason.to_owned(),
+                });
+                true
+            }
+            None => false,
         }
     }
 }
@@ -122,6 +209,11 @@ struct SessionCtx {
     ws_tx: mpsc::UnboundedSender<Message>,
     /// Ends the WS loop when the PC reaches a terminal state.
     done_tx: mpsc::UnboundedSender<()>,
+    /// #93: who connected (peer address, UA) and the id this session publishes
+    /// under; the registry also publishes the live state for `/api/v1/health`.
+    client: ClientMeta,
+    session_id: u64,
+    registry: SessionRegistry,
 }
 
 impl SessionCtx {
@@ -129,6 +221,9 @@ impl SessionCtx {
         cfg: Arc<Config>,
         ws_tx: mpsc::UnboundedSender<Message>,
         done_tx: mpsc::UnboundedSender<()>,
+        client: ClientMeta,
+        session_id: u64,
+        registry: SessionRegistry,
     ) -> Self {
         // #62: the sink needs the live frame size so it can map the frontend's
         // frame-space pointer coordinates onto the physical screen.
@@ -155,6 +250,9 @@ impl SessionCtx {
             cfg,
             ws_tx,
             done_tx,
+            client,
+            session_id,
+            registry,
         }
     }
 }
@@ -168,7 +266,12 @@ impl Drop for SessionCtx {
 }
 
 /// Run one upgraded signaling socket to its terminal state.
-pub async fn run<S>(ws: WebSocketStream<S>, cfg: Arc<Config>, registry: SessionRegistry) -> Result<()>
+pub async fn run<S>(
+    ws: WebSocketStream<S>,
+    cfg: Arc<Config>,
+    registry: SessionRegistry,
+    client: ClientMeta,
+) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -177,7 +280,8 @@ where
     let (ws_tx, ws_rx) = mpsc::unbounded_channel::<Message>();
     registry.register(notice_tx).await;
 
-    let mut ctx = SessionCtx::new(cfg, ws_tx, done_tx);
+    let session_id = registry.next_session_id();
+    let mut ctx = SessionCtx::new(cfg, ws_tx, done_tx, client, session_id, registry);
     let mut ws = ws;
 
     let outcome = session_loop(&mut ws, &mut ctx, notice_rx, done_rx, ws_rx).await;
@@ -193,6 +297,9 @@ where
         let _ = media.lock().await.close().await;
     }
     ctx.pipeline.stop_loop();
+    // #93: the health endpoint must go back to `idle` even if this session
+    // crashed its way out; `clear_if` keeps a newer session's entry intact.
+    ctx.registry.clear_if(ctx.session_id);
     // #62: cancel the per-session background tasks (stats timer, state watcher,
     // ICE forwarder, recovery sink). Without this a reload leaked them.
     let tasks = {
@@ -289,6 +396,28 @@ where
     match parse_ws_line(line) {
         IncomingLine::Hello { peer_type, meta } => {
             log::info!("client hello: type={peer_type}");
+            // #93: publish who is connected, for `GET /api/v1/health`. Done
+            // here rather than at upgrade time because the device id and the
+            // role only exist in the hello.
+            let meta_ref = meta.as_ref();
+            let read = |key: &str| -> String {
+                meta_ref
+                    .and_then(|m| m.get(key))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned()
+            };
+            ctx.registry.publish(SessionInfo {
+                id: ctx.session_id,
+                connected_at: Some(std::time::Instant::now()),
+                peer_ip: ctx.client.ip.clone(),
+                user_agent: ctx.client.user_agent.clone(),
+                device_id: read("client_device_id"),
+                tab_id: read("client_tab_id"),
+                role: if read("client_type").is_empty() { peer_type.clone() } else { read("client_type") },
+                pipeline: Some(ctx.pipeline.clone()),
+                settings: Some(ctx.settings.clone()),
+            });
             ctx.session.meta = meta;
             ctx.session.transition(HandshakeState::HelloSent);
             ws.send(Message::Text(hello_ack().into())).await?;

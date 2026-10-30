@@ -13,4 +13,4 @@ pub mod websession;
 pub use latency::{latency_measurement, LatencyProbe, PING_INTERVAL};
 pub use line::{parse_ws_line, hello_ack, session_ok, sdp_line, ice_line, IncomingLine, SERVER_PEER_ID};
 pub use session::{HandshakeState, SignalingSession};
-pub use websession::SessionRegistry;
+pub use websession::{ClientMeta, SessionInfo, SessionRegistry};

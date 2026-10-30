@@ -18,8 +18,11 @@
 pub mod r#static;
 pub mod server;
 pub mod file_transfer;
+// #93: `GET /api/v1/health` + the two `POST /api/v1/control/*` actions.
+pub mod health;
 
 pub use server::serve;
+pub use health::HealthProbe;
 
 use std::path::PathBuf;
 
@@ -68,6 +71,12 @@ pub enum Route {
     /// #67: `POST /api/upload` — raw octet-stream body with the destination
     /// relative path in the `X-Upload-Path` header.
     Upload,
+    /// #93: `GET /api/v1/health` — the liveness + telemetry report.
+    Health,
+    /// #93: `POST /api/v1/control/<action>` — the small write surface. The
+    /// action is kept as a raw string here and matched against a whitelist in
+    /// the handler, so a typo yields 404 instead of a silent no-op.
+    Control { action: String },
     /// Static file path (relative to dist) to serve.
     Static(PathBuf),
     /// Unrecognized API segment or unsupported method; 404 / 400.
@@ -89,6 +98,13 @@ pub fn classify(path: &str, _app_name: &str) -> Route {
     match segments.as_slice() {
         ["api", "status"] => Route::Status,
         ["api", "upload"] => Route::Upload,
+        // #93: versioned surface. The unversioned `/api/status` above stays as
+        // the deploy wrapper's cheap probe; this one is for machines, not for
+        // "did the port open".
+        ["api", "v1", "health"] => Route::Health,
+        ["api", "v1", "control", rest @ ..] => Route::Control {
+            action: rest.join("/"),
+        },
         ["api", "files", rest @ ..] => Route::Files {
             rel: rest.join("/"),
         },
@@ -153,5 +169,28 @@ mod tests {
             classify("/api/files/a/b/", "webrtc"),
             Route::Files { ref rel } if rel == "a/b"
         ));
+    }
+
+    #[test]
+    fn routes_health_and_control() {
+        assert!(matches!(classify("/api/v1/health", "webrtc"), Route::Health));
+        // A query string must not change the route.
+        assert!(matches!(classify("/api/v1/health?x=1", "webrtc"), Route::Health));
+        assert!(matches!(
+            classify("/api/v1/control/capture/restart", "webrtc"),
+            Route::Control { ref action } if action == "capture/restart"
+        ));
+        assert!(matches!(
+            classify("/api/v1/control/session/kick", "webrtc"),
+            Route::Control { ref action } if action == "session/kick"
+        ));
+        // An empty action still lands in the handler, which answers 404 with the
+        // whitelist — better than pretending the endpoint does not exist.
+        assert!(matches!(
+            classify("/api/v1/control/", "webrtc"),
+            Route::Control { ref action } if action.is_empty()
+        ));
+        // Unknown version segments stay 404 rather than falling through to static.
+        assert!(matches!(classify("/api/v2/health", "webrtc"), Route::NotFound));
     }
 }

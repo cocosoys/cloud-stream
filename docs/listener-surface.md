@@ -44,6 +44,8 @@ L1 和 L2 不是一一对应：一次 `keydown` 可能发三条上行（修饰�
 | `http.files` | `GET /api/files/…` | — | 同上 | 无 |
 | `http.static` | 页面/bundle/jsdb | — | 同上 | 无 |
 | `http.signaling` | WS 升级路径 | — | 同上 | 无 |
+| `http.health` | `GET /api/v1/health` | — | `http/health.rs:handle_health` | 无（#93，见 `health-api.md`） |
+| `http.control` | `POST /api/v1/control/*` | — | `http/health.rs:handle_control` | 无（#93，白名单：`capture/restart`、`session/kick`） |
 | `signaling` | 真正建立会话 | `signaling.js:481` | `http/server.rs:321` | 无 |
 | `control.*` | 设置/码率/统计开关 | `selkies-wr-core.js` | `websession.rs:846` | 无 |
 | `input.keyboard` | `kd`/`ku`/`kh`/`kr` | `input.js:5894` | `websession.rs:811` / `:846` | 无 |

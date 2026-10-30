@@ -67,6 +67,15 @@ pub enum Endpoint {
     Static,
     /// 信令升级路径（真正的裁决在 [`EventKind::Signaling`]）。
     Signaling,
+    /// #93: `GET /api/v1/health` —— 主机 / 推流 / 进程 / 连接的全量报告。
+    ///
+    /// 单独立一个端点而不是复用 [`Endpoint::Status`]，是因为两者暴露的东西
+    /// 差了一个量级：`status` 只有 `ok` 两个字，这个端点会报出谁连着、从哪个
+    /// IP、什么设备码。将来装真策略时，"能探活"和"能看连接清单"完全可以是
+    /// 两个不同的权限。
+    Health,
+    /// #93: `POST /api/v1/control/<action>` —— 少量控制（重建采集器、踢会话）。
+    Control,
     /// `/api/` 下的未知路径。
     NotFound,
 }
@@ -131,6 +140,8 @@ impl EventKind {
                 Endpoint::Files => "http.files",
                 Endpoint::Static => "http.static",
                 Endpoint::Signaling => "http.signaling",
+                Endpoint::Health => "http.health",
+                Endpoint::Control => "http.control",
                 Endpoint::NotFound => "http.not-found",
             },
             EventKind::Signaling => "signaling",
@@ -175,6 +186,10 @@ impl EventKind {
             EventKind::Http(Endpoint::Status)
                 | EventKind::Http(Endpoint::Static)
                 | EventKind::Http(Endpoint::Files)
+                // #93: `/health` 只读。它比 `status` 报得多（连接清单、进程表），
+                // 但同样不改变任何状态 —— 所以归在观测里；与之相邻的
+                // `Control` 故意**不在**这个列表：那条路径会重开采集器、踢会话。
+                | EventKind::Http(Endpoint::Health)
                 | EventKind::Http(Endpoint::NotFound)
                 | EventKind::Media(MediaDir::VideoOut)
                 | EventKind::Media(MediaDir::AudioOut)
@@ -441,6 +456,8 @@ mod tests {
             EventKind::Http(Endpoint::Files),
             EventKind::Http(Endpoint::Static),
             EventKind::Http(Endpoint::Signaling),
+            EventKind::Http(Endpoint::Health),
+            EventKind::Http(Endpoint::Control),
             EventKind::Http(Endpoint::NotFound),
             EventKind::Signaling,
             EventKind::Input(Device::Keyboard),

@@ -203,6 +203,16 @@ pub struct PipelineStats {
     /// Encoder warm-up / first-keyframe flag (design 8.3).
     pub warmed_up: bool,
     pub first_frame_seen: bool,
+    /// #93: when a frame last went out on the track — new **or** repeat.
+    ///
+    /// The health endpoint answers "is this pipeline stuck?" with
+    /// `now - last_sample_at`. Repeat frames count on purpose: a static desktop
+    /// emits no new frames (the sampler produces none), yet a healthy pipeline
+    /// keeps re-sending the last one every `--repeat-every`, so only "nothing at
+    /// all went out" is evidence of a wedge.
+    ///
+    /// Written under the same lock that bumps the counters it pairs with.
+    pub last_sample_at: Option<std::time::Instant>,
 }
 
 impl PipelineStats {

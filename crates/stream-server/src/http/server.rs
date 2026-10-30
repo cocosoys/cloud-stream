@@ -49,6 +49,10 @@ fn surface_of(route: &Route) -> EventKind {
         Route::Upload => Endpoint::Upload,
         Route::Files { .. } => Endpoint::Files,
         Route::Signaling { .. } => Endpoint::Signaling,
+        // #93: 报告与控制分开映射 —— 前者是观测（谁连着、推流健不健康），
+        // 后者会重开采集器或踢人，将来分级时必须是两道门。
+        Route::Health => Endpoint::Health,
+        Route::Control { .. } => Endpoint::Control,
         Route::Static(_) => Endpoint::Static,
         Route::NotFound => Endpoint::NotFound,
     })
@@ -181,11 +185,12 @@ async fn handle_connection<S>(
     cfg: Arc<Config>,
     registry: SessionRegistry,
     chunks: file_transfer::ChunkStore,
+    health: crate::http::HealthProbe,
     peer: std::net::IpAddr,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    if let Err(err) = handle_inner(stream, cfg, registry, chunks, peer).await {
+    if let Err(err) = handle_inner(stream, cfg, registry, chunks, health, peer).await {
         log::debug!("connection closed: {err:#}");
     }
 }
@@ -195,6 +200,7 @@ async fn handle_inner<S>(
     cfg: Arc<Config>,
     registry: SessionRegistry,
     chunks: file_transfer::ChunkStore,
+    health: crate::http::HealthProbe,
     peer: std::net::IpAddr,
 ) -> Result<()>
 where
@@ -262,6 +268,12 @@ where
             let _ = file_transfer::handle_upload(&mut stream, &headers, &body, &cfg, &chunks).await;
             return Ok(());
         }
+        // #93: the write surface is two POSTs; everything else on POST stays 405
+        // so a stray form post cannot look like it did something.
+        if let crate::http::Route::Control { action } = &route {
+            let _ = crate::http::health::handle_control(&mut stream, action, &registry, &cfg).await;
+            return Ok(());
+        }
         write_http(
             &mut stream,
             405,
@@ -314,6 +326,27 @@ where
             .await?;
         }
 
+        // #93: the probing endpoint. Answers 200 when the pipeline is healthy or
+        // simply idle, 503 when the process is up but frames stopped going out —
+        // that distinction is the whole point, `Route::Status` cannot make it.
+        crate::http::Route::Health => {
+            let _ = crate::http::health::handle_health(&mut stream, &cfg, &registry, &health).await;
+            return Ok(());
+        }
+
+        // The control surface is POST-only; a GET is a method mismatch.
+        crate::http::Route::Control { .. } => {
+            write_http(
+                &mut stream,
+                405,
+                "Method Not Allowed",
+                "text/plain; charset=utf-8",
+                b"405 Method Not Allowed",
+            )
+            .await?;
+            return Ok(());
+        }
+
         crate::http::Route::Signaling { .. } => {
             // #88: 路径匹配放行不等于允许开会话。"这个 URL 存不存在"和"你能
             // 不能拿到一路画面"是两个问题，前者在 `Endpoint::Signaling` 判过，
@@ -351,6 +384,21 @@ where
                 return Ok(());
             }
 
+            // #93: hand the identity down so `/api/v1/health` can name the
+            // client. `User-Agent` is the only fingerprint a browser volunteers;
+            // the rest (`client_device_id`) comes in the hello.
+            //
+            // Built **before** `head` is moved into `PrefixedStream` — `headers`
+            // borrows those bytes, so reading a header afterwards does not
+            // compile.
+            let client = crate::signaling::ClientMeta {
+                ip: peer.to_string(),
+                user_agent: header_value(&headers, "User-Agent")
+                    .and_then(|v| std::str::from_utf8(v).ok())
+                    .unwrap_or("")
+                    .to_owned(),
+            };
+
             let prefixed = PrefixedStream { head, pos: 0, inner: stream };
             // The route was already classified as signaling; the callback only
             // confirms the request method/token with tungstenite and accepts.
@@ -360,7 +408,7 @@ where
             .await
             .map_err(|err| anyhow!("signaling upgrade failed: {err}"))?;
 
-            websession::run(ws, cfg, registry).await?;
+            websession::run(ws, cfg, registry, client).await?;
         }
 
         crate::http::Route::Static(rel) => {
@@ -418,12 +466,17 @@ pub async fn serve(cfg: Arc<Config>) -> Result<()> {
     // #67: one chunked-upload registry per process; each upload slice is an
     // independent TCP connection, so the registry is shared across them.
     let chunks = file_transfer::new_chunk_store();
+    // #93: one probe per process, shared by every connection. Per-connection
+    // probes would each own a sysinfo `System` and re-scan the process table on
+    // every request — the observer would become the load.
+    let health = crate::http::HealthProbe::new();
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
                 let cfg = cfg.clone();
                 let registry = registry.clone();
                 let chunks = chunks.clone();
+                let health = health.clone();
                 match &acceptor {
                     Some(_) => {
                         // TlsAcceptor wraps an Arc<ServerConfig>; clone it into
@@ -433,7 +486,8 @@ pub async fn serve(cfg: Arc<Config>) -> Result<()> {
                         tokio::spawn(async move {
                             match acc.accept(stream).await {
                                 Ok(tls) => {
-                                    handle_connection(tls, cfg, registry, chunks, peer.ip()).await
+                                    handle_connection(tls, cfg, registry, chunks, health, peer.ip())
+                                        .await
                                 }
                                 Err(err) => {
                                     log::debug!("TLS handshake failed from {peer}: {err:#}")
@@ -443,7 +497,8 @@ pub async fn serve(cfg: Arc<Config>) -> Result<()> {
                     }
                     None => {
                         tokio::spawn(async move {
-                            handle_connection(stream, cfg, registry, chunks, peer.ip()).await;
+                            handle_connection(stream, cfg, registry, chunks, health, peer.ip())
+                                .await;
                         });
                     }
                 }

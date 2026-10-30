@@ -231,6 +231,12 @@ pub struct PipelineHandle {
     /// Published as `stream_stats.throttled`, which used to be hard-coded
     /// false because there was no controller to ask.
     throttled: Arc<AtomicBool>,
+    /// #93: `POST /api/v1/control/capture/restart` — a rebuild request with no
+    /// other state (the resolution path only rebuilds when the size changes).
+    /// The capture loop consumes it on the next beat and takes the same
+    /// `InnerOutcome::Rebuild` exit, which is the only way to reopen a capture
+    /// worker that has wedged without killing the process.
+    rebuild: Arc<AtomicBool>,
     /// #62: the session installs a sink here; the blocking worker reports its
     /// own termination (error or panic) through it. Without this a dead worker
     /// left the PC / data channels alive, so the browser showed a frozen picture
@@ -260,6 +266,7 @@ impl PipelineHandle {
             bitrate_override: Arc::new(AtomicU32::new(0)),
             cursor_inject: Arc::new(AtomicBool::new(false)),
             throttled: Arc::new(AtomicBool::new(false)),
+            rebuild: Arc::new(AtomicBool::new(false)),
             exit_sink: Arc::new(Mutex::new(None)),
         }
     }
@@ -330,6 +337,16 @@ impl PipelineHandle {
 
     pub fn is_throttled(&self) -> bool {
         self.throttled.load(Ordering::SeqCst)
+    }
+
+    /// #93: ask the capture loop to reopen the capture worker and encoder.
+    pub fn request_rebuild(&self) {
+        self.rebuild.store(true, Ordering::SeqCst);
+    }
+
+    /// #93: read-and-clear, so one request is one rebuild.
+    pub fn take_rebuild_request(&self) -> bool {
+        self.rebuild.swap(false, Ordering::SeqCst)
     }
 
     /// Shared aggregator for the stats timer's snapshot / reset window.
@@ -1048,6 +1065,13 @@ fn run_inner_beat(
             );
             return InnerOutcome::Rebuild { from_gdi: worker.is_gdi() };
         }
+        // #93: an explicit rebuild request from the control API — the same exit
+        // a resolution change takes, which is the only way back from a capture
+        // worker that has wedged while the process stayed alive.
+        if handle.take_rebuild_request() {
+            log::info!("control: capture/encoder rebuild requested over HTTP");
+            return InnerOutcome::Rebuild { from_gdi: worker.is_gdi() };
+        }
         // #92: rate control cannot be switched under a live libvpx encoder
         // (`vpx_codec_enc_config_set` validates `rc_end_usage` against the
         // config it was initialised with), so a new mode — or a new quantizer
@@ -1244,6 +1268,7 @@ fn run_inner_beat(
                                     bump(&stats, |s| {
                                         s.counters.repeat_ok += 1;
                                         s.counters.repeat_frames += 1;
+                                        s.last_sample_at = Some(std::time::Instant::now());
                                     });
                                     forward_chunks(&tx, encoded, &stats, &handle, beat);
                                     last_paint = want;
@@ -1297,6 +1322,7 @@ fn run_inner_beat(
                         bump(&stats, |s| {
                             s.counters.repeat_ok += 1;
                             s.counters.repeat_frames += 1;
+                            s.last_sample_at = Some(std::time::Instant::now());
                         });
                         forward_chunks(&tx, encoded, &stats, &handle, beat);
                     }
@@ -1502,6 +1528,8 @@ fn run_inner_beat(
             bump(&stats, |s| {
                 s.counters.new_frames += 1;
                 s.counters.encoded_ok += 1;
+                // #93: stamped with the same lock as the counter it pairs with.
+                s.last_sample_at = Some(std::time::Instant::now());
                 s.encode_timing.add(enc_ms);
                 s.pipeline_timing.add(pipeline_ms);
                 // #78: the live target, read from the encoder so a `vb,`
