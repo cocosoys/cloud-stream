@@ -32,9 +32,17 @@
 //! Both calls are per-session: they must run inside the interactive session the
 //! desktop lives in (the server runs there, session 1), not from an SSH shell in
 //! session 0, where `SPI_GETLOGICALDPIOVERRIDE` simply fails.
+//!
+//! Two things bit this module on the way and are worth reading before touching
+//! either call: the parameter slot each action takes (mouse speed wants the step
+//! in `pvParam`; the DPI override wants it in `uiParam` — see [`write_speed`] and
+//! [`write_override`]), and the fact that a FALSE return does not mean the write
+//! failed. `toolchain/mouse-probe.ps1` answers both questions against a real
+//! host without guessing.
 
 use std::ffi::c_void;
 
+use windows_sys::Win32::Foundation::SetLastError;
 use windows_sys::Win32::UI::WindowsAndMessaging::SystemParametersInfoW;
 
 // Documented (mouse) and undocumented-but-universal (logical DPI override)
@@ -48,6 +56,21 @@ const SPI_SETLOGICALDPIOVERRIDE: u32 = 0x009F;
 const SPIF_UPDATEINIFILE: u32 = 0x0001;
 /// Tell every top-level window the setting moved, so they re-read it.
 const SPIF_SENDCHANGE: u32 = 0x0002;
+
+/// `SystemParametersInfoW` with the last error cleared first.
+///
+/// The API reports failure by its `BOOL` and, on most of these paths, does not
+/// touch `GetLastError` at all — so a code left over from an unrelated call gets
+/// reported as this call's reason. #95 saw a stale 203 ("the system cannot find
+/// the environment option that was entered") quoted as the reason a *successful*
+/// write supposedly failed. Clearing first makes "no error code was set" the
+/// truth instead of a guess.
+fn spi(action: u32, ui_param: u32, pv_param: *mut c_void, flags: u32) -> bool {
+    unsafe {
+        SetLastError(0);
+        SystemParametersInfoW(action, ui_param, pv_param, flags) != 0
+    }
+}
 
 /// The DPI a 1x pointer speed is reported as.
 pub const BASE_DPI: u32 = 400;
@@ -138,15 +161,13 @@ pub fn speed_steps_dpi() -> [u32; 20] {
 /// (a session with no interactive desktop).
 pub fn current_speed() -> Option<u8> {
     let mut value: i32 = 0;
-    let ok = unsafe {
-        SystemParametersInfoW(
-            SPI_GETMOUSESPEED,
-            0,
-            &mut value as *mut i32 as *mut c_void,
-            0,
-        )
-    };
-    if ok == 0 || !(1..=20).contains(&value) {
+    let ok = spi(
+        SPI_GETMOUSESPEED,
+        0,
+        &mut value as *mut i32 as *mut c_void,
+        0,
+    );
+    if !ok || !(1..=20).contains(&value) {
         return None;
     }
     Some(value as u8)
@@ -159,27 +180,34 @@ pub fn current_mouse_dpi() -> Option<u32> {
 
 /// Write the pointer-speed step and say whether the call reported success.
 ///
+/// #95 — the step goes in `pvParam`, **not** `uiParam`. `SystemParametersInfoW`
+/// wears one signature for every action and `SPI_SETMOUSESPEED` takes its
+/// integer as the pointer value itself (`(PVOID)speed`), the way the SDK text
+/// says "pvParam is an integer between 1 and 20". Passing it in `uiParam` looks
+/// right, compiles, and returns FALSE while changing nothing at all — measured
+/// on the #95 host: `ok=False spi=10 reg=10`. That silently wrong form is what
+/// the panel was reporting as "the host refused this change".
+///
 /// `broadcast` adds `SPIF_SENDCHANGE`, which makes the call post
 /// `WM_SETTINGCHANGE` to every top-level window of the session through a
-/// `SendMessageTimeout`. That is the part that fails on a real gaming session:
-/// an elevated or hung window never answers, the timeout fires, and the whole
-/// call returns FALSE even though the registry write already happened. The
-/// caller therefore never treats this bool as the outcome — it writes, then
-/// reads the speed back (see [`judge`]).
+/// `SendMessageTimeout`. That is the part that can fail on a real gaming
+/// session: an elevated or hung window never answers, the timeout fires, and
+/// the whole call returns FALSE even though the registry write already
+/// happened. The caller therefore never treats this bool as the outcome — it
+/// writes, then reads the speed back (see [`judge`]).
 fn write_speed(speed: u8, broadcast: bool) -> bool {
     let mut flags = SPIF_UPDATEINIFILE;
     if broadcast {
         flags |= SPIF_SENDCHANGE;
     }
-    let ok = unsafe {
-        SystemParametersInfoW(
-            SPI_SETMOUSESPEED,
-            u32::from(speed),
-            std::ptr::null_mut(),
-            flags,
-        )
-    };
-    ok != 0
+    // The value *is* the pointer. Do not take its address: the API reads the
+    // integer out of the argument, it does not dereference it.
+    spi(
+        SPI_SETMOUSESPEED,
+        0,
+        speed as usize as *mut c_void,
+        flags,
+    )
 }
 
 /// Why a `SystemParametersInfoW` call reported failure, in words.
@@ -233,6 +261,11 @@ fn judge(now: Option<u8>, want: u8, wrote: bool) -> Verdict {
 /// refused this change: 操作成功完成 (os error 0)" for a change that had in fact
 /// been applied. The readback is the authority; the bool only decides how much
 /// to retry and what to say when the readback disagrees.
+///
+/// #95: the readback is what caught the real bug — the step was being passed in
+/// `uiParam`, so the write was refused outright and the registry never moved.
+/// A readback that disagrees is therefore not "the OS is lying"; check the call
+/// shape first (see [`write_speed`]).
 pub fn apply_mouse_dpi(dpi: u32) -> Result<AppliedMouse, String> {
     let lowest = SPEED_DPI[0];
     let highest = SPEED_DPI[SPEED_DPI.len() - 1];
@@ -278,10 +311,18 @@ pub fn apply_mouse_dpi(dpi: u32) -> Result<AppliedMouse, String> {
     match judge(current_speed(), speed, wrote_again) {
         Verdict::Applied => ok("no-broadcast"),
         Verdict::Unverified => ok("unverified"),
+        // The write reported success and the host still reports another step:
+        // something else owns this setting (a mouse driver's own profile, a
+        // policy). Saying "reported failure" there would blame the API for a
+        // write it accepted.
         Verdict::Kept(now) => Err(format!(
-            "the host kept pointer speed step {now} instead of {speed} \
-             (SystemParametersInfoW reported failure: {})",
-            refusal_detail()
+            "the host kept pointer speed step {now} instead of {speed} (the \
+             write {})",
+            if wrote_again {
+                String::from("was accepted, so another program is overriding the setting")
+            } else {
+                format!("was refused: {}", refusal_detail())
+            }
         )),
         Verdict::Refused => Err(format!(
             "SPI_SETMOUSESPEED({speed}) had no effect: the host reports no \
@@ -297,15 +338,13 @@ pub fn apply_mouse_dpi(dpi: u32) -> Result<AppliedMouse, String> {
 /// index either way.
 fn read_override() -> Option<i32> {
     let mut value: i32 = 0;
-    let ok = unsafe {
-        SystemParametersInfoW(
-            SPI_GETLOGICALDPIOVERRIDE,
-            0,
-            &mut value as *mut i32 as *mut c_void,
-            0,
-        )
-    };
-    if ok == 0 {
+    let ok = spi(
+        SPI_GETLOGICALDPIOVERRIDE,
+        0,
+        &mut value as *mut i32 as *mut c_void,
+        0,
+    );
+    if !ok {
         return None;
     }
     Some(value)
@@ -328,15 +367,12 @@ pub fn current_scale_dpi() -> Option<u32> {
 fn write_override(ui_param: i32) -> bool {
     // `uiParam` is a WPARAM: a negative offset is passed as its two's-complement
     // bit pattern, which is what the relative form needs for "below recommended".
-    let ok = unsafe {
-        SystemParametersInfoW(
-            SPI_SETLOGICALDPIOVERRIDE,
-            ui_param as u32,
-            std::ptr::null_mut(),
-            SPIF_UPDATEINIFILE | SPIF_SENDCHANGE,
-        )
-    };
-    ok != 0
+    spi(
+        SPI_SETLOGICALDPIOVERRIDE,
+        ui_param as u32,
+        std::ptr::null_mut(),
+        SPIF_UPDATEINIFILE | SPIF_SENDCHANGE,
+    )
 }
 
 /// Set the host's UI scaling to `dpi` (96 = 100 %), then read it back.
@@ -471,6 +507,31 @@ mod tests {
         // Not asserted against the live error — this only pins the shape of the
         // fallback string, which is what the panel showed verbatim.
         assert!(!refusal_detail().contains("os error 0"));
+    }
+
+    /// #95: the step rides in `pvParam`. Nothing in a pure-Rust test can catch a
+    /// wrong parameter slot, so this one talks to the real API — and only when
+    /// asked to, because it writes to the machine it runs on:
+    ///
+    /// ```text
+    /// $env:CLOUD_STREAM_LIVE_SPI = '1'; cargo test -p stream-server live_write
+    /// ```
+    ///
+    /// It writes back the step the host already has, so the pointer speed does
+    /// not move; what it asserts is that the write is *accepted*, which is
+    /// exactly what a step sent in `uiParam` is not. On the #95 host the wrong
+    /// form returned FALSE and left the registry at 10 while claiming nothing.
+    #[test]
+    fn a_live_write_of_the_current_step_is_accepted() {
+        if std::env::var_os("CLOUD_STREAM_LIVE_SPI").is_none() {
+            return;
+        }
+        let now = current_speed().expect("no pointer speed in this session");
+        assert!(
+            write_speed(now, false),
+            "SPI_SETMOUSESPEED rejected writing back step {now}"
+        );
+        assert_eq!(current_speed(), Some(now));
     }
 
     /// The scaling steps are exactly the ones the panel can name, and 275 % is

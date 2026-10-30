@@ -31,32 +31,61 @@
 存储值改成 `applied` —— 存用户填的 777 会在下一次 `server_settings` 同步时
 把 800 顶回 777。
 
-### `SPI_SETMOUSESPEED` 的返回值不可信（#94）
+### 两层故障：参数放错槽位（#95）+ 返回值不可信（#94）
 
-现场报回来的错误是：
+现场先报 `SPI_SETMOUSESPEED(15) refused: 操作成功完成。 (os error 0)`，修完回读
+之后变成
 
 ```
-SPI_SETMOUSESPEED(15) refused: 操作成功完成。 (os error 0)
+the host kept pointer speed step 10 instead of 15
+(SystemParametersInfoW reported failure: no error code was set)
 ```
 
-一句自相矛盾的拒绝。原因有两层：
+两句都是同一个真因的两种说法：**档位放进了 `uiParam`，而 `SPI_SETMOUSESPEED`
+从 `pvParam` 取值**。`SystemParametersInfoW` 是全动作共用一套签名，鼠标速度这条
+把整数当成指针值本身传（`(PVOID)speed`）。放在 `uiParam` 里编译得过、看起来也
+对，但它返回 FALSE 且一个字节都不改。在被控端实测（同会话、同权限）：
 
-1. `SystemParametersInfoW` 的 `BOOL` 说的是**整次调用**，包括
-   `SPIF_SENDCHANGE` 那一半——它要向会话里的每个顶层窗口投
-   `WM_SETTINGCHANGE`（`SendMessageTimeout`）。有个挂死的窗口，或者目标窗口
-   比调用方权限高（UIPI 直接挡掉跨完整性级别的消息），广播就会超时，整次调用
-   返回 FALSE，**而注册表里的指针速度已经写进去了**。
-2. 这类失败路径不设 `GetLastError`，于是读到的是上一次调用留下的 0，格式化成
-   了「操作成功完成」。
+```
+FORM_A(uiParam=15, flags=UPDATE|SENDCHANGE) ok=False err=203 spi=10 reg=10
+FORM_B(pvParam=15, flags=UPDATE|SENDCHANGE) ok=True  err=203 spi=15 reg=15
+FORM_B(pvParam=15, flags=UPDATE)            ok=True  err=203 spi=15 reg=15
+```
 
-所以现在**以回读为准**：写完立刻 `SPI_GETMOUSESPEED`，读回来就是请求的档位
-就是成功（`strategy: "broadcast-failed"` 会在日志里留下这次广播失败）；读回来
-不是，就**去掉广播再写一次**（持久化才是改指针的那一步，通知只是礼貌）；两次
-都不成才报错，并且错误文案里不会再出现「os error 0」。
+`reg` 是 `HKCU\Control Panel\Mouse\MouseSensitivity` —— 它**没变**，所以这不是
+「注册表写进去了只是广播超时」，而是整次调用被拒。现在写的是
+`spi(SPI_SETMOUSESPEED, 0, speed as usize as *mut c_void, flags)`。
+
+顺带修掉 `err=203`（"系统找不到输入的环境选项"）：这些路径不设 last error，读到
+的是**上一次无关调用**留下的码，会被当成这次的原因。新加的 `spi()` 在调用前
+`SetLastError(0)`，于是「没设错误码」就是字面意思。
+
+第二层（#94，仍然成立、也仍然必要）：`SystemParametersInfoW` 的 `BOOL` 涵盖
+**整次调用**，包括 `SPIF_SENDCHANGE` 那一半——它要向会话里每个顶层窗口投
+`WM_SETTINGCHANGE`（`SendMessageTimeout`）。有挂死窗口或更高完整性级别的窗口
+（UIPI 直接挡掉跨级别消息），广播超时 → 整次 FALSE，而注册表那半已经写进去了。
+所以**以回读为准**：写完立刻 `SPI_GETMOUSESPEED`，读回就是请求的档位就算成功
+（`strategy: "broadcast-failed"` 留在日志里）；读回不是，就去掉广播再写一次
+（持久化才是改指针的那一步，通知只是礼貌）；两次都不成才报错。
+`Kept` 的文案现在区分「写被拒」（带 last error）与「写被接受、但有别的程序在
+覆盖这个设置」。
 
 回执多一个字段 `strategy`：`already` / `broadcast` / `broadcast-failed` /
 `no-broadcast` / `unverified`。面板不看它，日志和这里看。
-单测 `a_failed_broadcast_is_still_an_applied_write` 钉住的就是这次回归。
+
+**怎么验**（不靠猜）：
+
+- `toolchain/mouse-probe.ps1` —— 在**被控端**回答「写到底落没落地」。它分别读
+  `MouseSensitivity`（档位）、`MouseSpeed`（"增强指针精确度"开关，名字很像但完全
+  不是一件事）、`SPI_GETMOUSESPEED`，再用两种参数槽位各写一次、每次回读。
+  只读模式不带参数；`-Apply -Restore` 会写入后恢复原值。
+  注意：**必须在会话 1 里跑**。SSH 进来的是会话 0，注册表读得到、SPI 也读得到，
+  但写入的行为和真实桌面不一样（`schtasks` 起一个 `LogonType Interactive` 的
+  一次性任务即可，脚本里就是这么用的）。
+- `CLOUD_STREAM_LIVE_SPI=1 cargo test -p stream-server hostui` —— 跑
+  `a_live_write_of_the_current_step_is_accepted`：把当前档位写回去（指针不动），
+  断言这次写**被接受**。槽位放错时它必挂，这是唯一能钉住 `pvParam` 的测试。
+  默认跳过，因为它会写运行它的机器的注册表。
 
 ## 2. 界面缩放
 
