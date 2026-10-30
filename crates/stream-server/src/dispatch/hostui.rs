@@ -61,10 +61,10 @@ const SPIF_SENDCHANGE: u32 = 0x0002;
 ///
 /// The API reports failure by its `BOOL` and, on most of these paths, does not
 /// touch `GetLastError` at all — so a code left over from an unrelated call gets
-/// reported as this call's reason. #95 saw a stale 203 ("the system cannot find
-/// the environment option that was entered") quoted as the reason a *successful*
-/// write supposedly failed. Clearing first makes "no error code was set" the
-/// truth instead of a guess.
+/// reported as this call's reason. #95's probe had exactly that: the write
+/// succeeded and the last error still read 203 ("the system cannot find the
+/// environment option that was entered"), a leftover from an earlier call.
+/// Clearing first makes "no error code was set" the truth instead of a guess.
 fn spi(action: u32, ui_param: u32, pv_param: *mut c_void, flags: u32) -> bool {
     unsafe {
         SetLastError(0);

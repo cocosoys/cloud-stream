@@ -97,6 +97,11 @@ FORM_B(pvParam=15, flags=UPDATE)            ok=True  err=203 spi=15 reg=15
 **注意历史 bug**：前端原来发的是 `s,<dpi>`，而 `s` 在服务端的忽略组里 ——
 每一次缩放选择都死在网线上，且没有任何日志。现在发 `dd`。
 
+**未验**：缩放的 `uiParam` 槽位**没有**用 §1 那套探针验证过（写一次要么生效、
+要么把显示改掉，代价不对等）。如果这里报 `the host refused the scaling change`，
+先按 §1 的办法确认槽位，别先怀疑权限。回读在 `apply_scale` 里已经是准绳：
+读回来不是请求的档位就不许报成功。
+
 ## 3. 为什么必须在服务进程里调用
 
 `SystemParametersInfo` 是**按会话**生效的。服务跑在交互会话（session 1），
