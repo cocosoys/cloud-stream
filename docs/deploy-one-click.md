@@ -528,6 +528,37 @@ node 的 `rmSync` 包了一层），超过阈值就拒绝执行，构建中断�
 
 代价是多一次"残留扫描"，收益是构建结果与文件数量无关。
 
+### 7.21 `toolchain/` 里堆了几十个一次性探针（已清）
+
+**现象**：`toolchain/` 一度有 90 个文件、123 MB，其中 22 个 `.ps1`、9 个 `.bat`、
+11 个 `.log`、25 个 `.txt`，很难判断哪些是部署必需的。
+
+**先确认一件事**：这些文件**一个都不进部署包**。`deploy.ps1:433` 只打包
+`dashboard/dist/*`；被控机 `C:\dev\stream` 只多收 `start-stream.cmd` 与
+`run-hidden.vbs`（`deploy.ps1:357`）。所以它们不影响线上，只影响"仓库到底该有什么"。
+
+**判据**：按「是否仍被任何文档/脚本引用」逐个查（扫描 4047 个文件），
+49 个被跟踪文件里 27 个全仓库 0 引用。保留的 22 个：
+
+| 类别 | 文件 |
+|---|---|
+| 部署契约（8） | `deploy.ps1` `deploy-remote.ps1` `start-stream.cmd` `start-stream.60fps.cmd` `run-hidden.vbs` `setup-watchdog.bat` `cert-san.cnf` `env-setup.ps1` |
+| 构建（4） | `build-ws.cmd` `build-shell.cmd` `install-vcpkg-libs.cmd` `config.toml` |
+| 长期诊断（6） | `mouse-probe.ps1` `probe-top.py` `cleanup-dev-root.ps1` `logtriage.ps1` `distcheck.ps1` `ps-tree.py` |
+| MC / 密度（4） | `start-mc.ps1` `bench-local.ps1` + 两个 CPU 采样 CSV |
+
+**另一个陷阱**：`toolchain/dist-test/` 是一份 #99 之前的 dist 副本，里面还有已删的
+`selkies.svg`、且没有 `.asset-manifest.json`。它看着像"上一版备份"，一旦被当成
+`--dist` 的来源就会把死文件带回去 —— 已删。真正的上一版在**被控机**的
+`C:\dev\selkies-web.prev`，不在构建机上。
+
+**还有一处漏网**：`dump-triage/stream-server-148.log`（64 KB 运行日志）被跟踪，
+因为 `.gitignore` 在那里只排除了 `*.bmp`/`*.ivf`。现改为整目录忽略 `/dump-triage/`
+（抓帧、临时脚本、SSH 配置都是可重生成的现场），已跟踪的
+`mcbak/launch-remote.ps1` 不受影响。
+
+清理后 `toolchain/` 123 MB → 221 KB。证书私钥、bench CSV、`vendor-backup/` 未动。
+
 ---
 
 ## 8 验收清单
