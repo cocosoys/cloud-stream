@@ -37,9 +37,13 @@ target/
 /toolchain/*.pfx
 *.p12
 
-# ---- 采集/编码诊断原始数据（--dump-frame 可重生成）----
-/dump-triage/*.bmp
-/dump-triage/*.ivf
+# ---- 排查现场：整目录忽略 ----
+# dump-triage/ 是抓帧、临时脚本、SSH 配置、日志的沙盒，产物全部可由
+# --dump-frame / 重新跑一次得到，不属于源码。之前只写了 *.bmp/*.ivf，
+# 于是 stream-server-148.log（64 KB 运行日志）在版本库里躺了半个月，
+# 另外还有 20 多个未跟踪文件天天污染 git status。
+# 已跟踪的 dump-triage/mcbak/launch-remote.ps1 不受影响，仍会正常显示改动。
+/dump-triage/
 
 # ---- 编辑器 / 系统 ----
 Thumbs.db
