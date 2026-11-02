@@ -53,6 +53,9 @@ fn surface_of(route: &Route) -> EventKind {
         // 后者会重开采集器或踢人，将来分级时必须是两道门。
         Route::Health => Endpoint::Health,
         Route::Control { .. } => Endpoint::Control,
+        // #99: 清单把全站的文件名和哈希一次性摊开，属于侦察面，单独一类而不是
+        // 并进 `Static` —— 将来"能拉页面"和"能点出整棵文件树"可以分权。
+        Route::Manifest => Endpoint::Manifest,
         Route::Static(_) => Endpoint::Static,
         Route::NotFound => Endpoint::NotFound,
     })
@@ -334,6 +337,42 @@ where
             return Ok(());
         }
 
+        // #99: the bundle's hash table. Same bytes the build wrote, so a client
+        // can diff its cache against the server instead of re-downloading.
+        crate::http::Route::Manifest => {
+            let inm = header_value(&headers, "If-None-Match")
+                .and_then(|v| std::str::from_utf8(v).ok())
+                .unwrap_or("");
+            match crate::http::manifest::body(&cfg.dist) {
+                Some((_, etag)) if crate::http::etag_matches(inm, &etag) => {
+                    crate::http::write_not_modified(&mut stream, "no-cache", Some(&etag))
+                        .await?;
+                }
+                Some((bytes, etag)) => {
+                    crate::http::write_http_with(
+                        &mut stream,
+                        200,
+                        "OK",
+                        "application/json; charset=utf-8",
+                        bytes.as_slice(),
+                        &[("Cache-Control", "no-cache"), ("ETag", etag.as_str())],
+                    )
+                    .await?;
+                }
+                None => {
+                    crate::http::write_http(
+                        &mut stream,
+                        404,
+                        "Not Found",
+                        "application/json; charset=utf-8",
+                        br#"{"status":"error","message":"this dist has no .asset-manifest.json"}"#,
+                    )
+                    .await?;
+                }
+            }
+            return Ok(());
+        }
+
         // The control surface is POST-only; a GET is a method mismatch.
         crate::http::Route::Control { .. } => {
             write_http(
@@ -415,11 +454,36 @@ where
             let url_path = rel.to_string_lossy();
             match r#static::serve(&cfg.dist, &url_path)? {
                 Some(file) => {
-                    write_http(&mut stream, 200, "OK", &file.mime, file.bytes.as_slice()).await?;
+                    // #99: revalidate instead of re-send. The tag is the file's
+                    // SHA-256 from the build's hash table, so a hit here proves
+                    // the client's copy is byte-identical — 304 carries no body.
+                    let inm = header_value(&headers, "If-None-Match")
+                        .and_then(|v| std::str::from_utf8(v).ok())
+                        .unwrap_or("");
+                    let etag = file.etag.as_deref();
+                    if etag.map(|tag| crate::http::etag_matches(inm, tag)).unwrap_or(false) {
+                        crate::http::write_not_modified(&mut stream, file.cache_control, etag)
+                            .await?;
+                    } else {
+                        let mut extra: Vec<(&str, &str)> =
+                            vec![("Cache-Control", file.cache_control)];
+                        if let Some(tag) = etag {
+                            extra.push(("ETag", tag));
+                        }
+                        crate::http::write_http_with(
+                            &mut stream,
+                            200,
+                            "OK",
+                            &file.mime,
+                            file.bytes.as_slice(),
+                            &extra,
+                        )
+                        .await?;
+                    }
                 }
                 None => {
                     let missing = r#static::not_found();
-                    write_http(
+                    crate::http::write_http(
                         &mut stream,
                         404,
                         "Not Found",

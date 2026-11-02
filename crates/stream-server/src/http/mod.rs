@@ -20,6 +20,9 @@ pub mod server;
 pub mod file_transfer;
 // #93: `GET /api/v1/health` + the two `POST /api/v1/control/*` actions.
 pub mod health;
+// #99: `dist/.asset-manifest.json` — the bundle's hash table, read for ETags and
+// served whole on `GET /api/v1/manifest`.
+pub mod manifest;
 
 pub use server::serve;
 pub use health::HealthProbe;
@@ -43,19 +46,88 @@ pub(crate) async fn write_http<S: tokio::io::AsyncWrite + Unpin>(
     mime: &str,
     body: &[u8],
 ) -> std::io::Result<()> {
+    write_http_with(
+        stream,
+        status,
+        status_text,
+        mime,
+        body,
+        &[("Cache-Control", "no-cache")],
+    )
+    .await
+}
+
+/// Same, with extra response headers. `Cache-Control` is the caller's to set
+/// here — static files pick between `no-cache` and `immutable`, everything else
+/// goes through `write_http` above.
+pub(crate) async fn write_http_with<S: tokio::io::AsyncWrite + Unpin>(
+    stream: &mut S,
+    status: u16,
+    status_text: &str,
+    mime: &str,
+    body: &[u8],
+    extra: &[(&str, &str)],
+) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
-    let head = format!(
+    let mut head = format!(
         "HTTP/1.1 {status} {status_text}\r\nContent-Type: {mime}\r\nContent-Length: {len}\r\n\
-         Connection: close\r\nCache-Control: no-cache\r\n\r\n",
+         Connection: close\r\n",
         status = status,
         status_text = status_text,
         mime = mime,
         len = body.len(),
     );
+    for (name, value) in extra {
+        head.push_str(name);
+        head.push_str(": ");
+        head.push_str(value);
+        head.push_str("\r\n");
+    }
+    head.push_str("\r\n");
     stream.write_all(head.as_bytes()).await?;
     stream.write_all(body).await?;
     let _ = stream.shutdown().await;
     Ok(())
+}
+
+/// `304 Not Modified` for a static file the client already holds. Carries no
+/// body and no `Content-Length`: the point is to skip the transfer, so writing
+/// even `0` invites clients to treat the response as a fresh entity.
+pub(crate) async fn write_not_modified<S: tokio::io::AsyncWrite + Unpin>(
+    stream: &mut S,
+    cache_control: &str,
+    etag: Option<&str>,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut head = String::from("HTTP/1.1 304 Not Modified\r\nConnection: close\r\n");
+    head.push_str("Cache-Control: ");
+    head.push_str(cache_control);
+    head.push_str("\r\n");
+    if let Some(etag) = etag {
+        head.push_str("ETag: ");
+        head.push_str(etag);
+        head.push_str("\r\n");
+    }
+    head.push_str("\r\n");
+    stream.write_all(head.as_bytes()).await?;
+    let _ = stream.shutdown().await;
+    Ok(())
+}
+
+/// Whether an `If-None-Match` value names `etag`.
+///
+/// Comparison is weak: `W/"x"` and `"x"` are the same entity for the purpose of
+/// "did this change", and a client is free to send either form back. `*`
+/// matches anything the server has, which for a single file means the file.
+pub(crate) fn etag_matches(header: &str, etag: &str) -> bool {
+    if header.is_empty() || etag.is_empty() {
+        return false;
+    }
+    let target = etag.trim().trim_start_matches("W/");
+    header.split(',').any(|candidate| {
+        let candidate = candidate.trim();
+        candidate == "*" || candidate.trim_start_matches("W/") == target
+    })
 }
 
 /// Classified request target.
@@ -73,6 +145,12 @@ pub enum Route {
     Upload,
     /// #93: `GET /api/v1/health` — the liveness + telemetry report.
     Health,
+    /// #99: `GET /api/v1/manifest` — the bundle's hash table, as built.
+    ///
+    /// Exposed so a client (or the deploy chain) can learn what the server is
+    /// actually serving without downloading it: which files exist, their
+    /// SHA-256, and which ones are safe to cache forever.
+    Manifest,
     /// #93: `POST /api/v1/control/<action>` — the small write surface. The
     /// action is kept as a raw string here and matched against a whitelist in
     /// the handler, so a typo yields 404 instead of a silent no-op.
@@ -102,6 +180,7 @@ pub fn classify(path: &str, _app_name: &str) -> Route {
         // the deploy wrapper's cheap probe; this one is for machines, not for
         // "did the port open".
         ["api", "v1", "health"] => Route::Health,
+        ["api", "v1", "manifest"] => Route::Manifest,
         ["api", "v1", "control", rest @ ..] => Route::Control {
             action: rest.join("/"),
         },
@@ -176,6 +255,8 @@ mod tests {
         assert!(matches!(classify("/api/v1/health", "webrtc"), Route::Health));
         // A query string must not change the route.
         assert!(matches!(classify("/api/v1/health?x=1", "webrtc"), Route::Health));
+        assert!(matches!(classify("/api/v1/manifest", "webrtc"), Route::Manifest));
+        assert!(matches!(classify("/api/v1/manifest?v=1", "webrtc"), Route::Manifest));
         assert!(matches!(
             classify("/api/v1/control/capture/restart", "webrtc"),
             Route::Control { ref action } if action == "capture/restart"
@@ -192,5 +273,21 @@ mod tests {
         ));
         // Unknown version segments stay 404 rather than falling through to static.
         assert!(matches!(classify("/api/v2/health", "webrtc"), Route::NotFound));
+    }
+
+    #[test]
+    fn etag_matching_is_weak_and_list_aware() {
+        let tag = "\"sha256-abc\"";
+        assert!(etag_matches(tag, tag));
+        // A client may replay the tag as weak, or list several: both mean "mine".
+        assert!(etag_matches("W/\"sha256-abc\"", tag));
+        assert!(etag_matches("\"other\", \"sha256-abc\"", tag));
+        assert!(etag_matches("*", tag));
+        // Whitespace around list members is legal padding, not a different tag.
+        assert!(etag_matches("  \"sha256-abc\"  ", tag));
+        // A different entity, an empty header and an empty tag all miss.
+        assert!(!etag_matches("\"sha256-def\"", tag));
+        assert!(!etag_matches("", tag));
+        assert!(!etag_matches(tag, ""));
     }
 }

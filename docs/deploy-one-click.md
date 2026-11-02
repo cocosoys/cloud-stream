@@ -480,6 +480,56 @@ node 的 `rmSync` 包了一层），超过阈值就拒绝执行，构建中断�
 
 ---
 
+### 7.19 gendb 拉不到 GitHub 时静默产出空 `jsdb`（已修）
+
+**现象**：`npm run build` 全绿、`deploy.ps1` 全绿，zip 却从 1.16 MB 掉到
+0.55 MB，线上 `/jsdb/windows/045e-028e.json` 返回 404 —— 1992 个手柄映射全没了。
+
+**根因**：`selkies-web-core` 的 `postbuild` 是 `node gendb.js`，要从
+`api.github.com` + `raw.githubusercontent.com` 拉 SDL_GameControllerDB。本机到
+`raw.githubusercontent.com` 的 TLS 握手会超时（~14 s 后
+`schannel: failed to receive handshake`）。拉取失败落在 `catch` 里 `return`，
+不写文件、**也不让构建失败**；`copy-assets.js` 于是拷了 0 个文件，残缺包照发。
+再叠上 `deploy.ps1` 构建前会先删 `core/dist`，上一次的 jsdb 也一起没了。
+
+**防**：`gendb.js` 的失败分支改成三级退让 —— ① `dist/jsdb` 已有映射就用它
+（断网单独 `npm run build` 的正常情况）；② 否则从 `selkies-web-core/.cache/jsdb`
+（首次成功构建时播下的一份，**只写一次**，因为刷新它又得删 1992 个文件）恢复并
+告警；③ 两者都没有就 `exit 1`。宁可构建失败，也不发一个"看起来完整"的包。
+
+> 判断有没有踩到：看 zip 体积。完整包 ~1.16 MB，缺 jsdb 的 ~0.55 MB。部署日志
+> 不会告诉你。
+
+---
+
+### 7.20 `copy-assets.js` / `gendb.js` 里的 `fs.rmSync` 也会被批量删除保护拒绝（已修）
+
+**现象**：`npm run build` 报
+
+```
+[safe-delete][SAFE_DELETE_BULK_CONFIRM_REQUIRED] {"count":2006,"threshold":50,...}
+    at emptyDir (vite/dist/node/chunks/node.js)
+```
+
+指向 `vite:prepare-out-dir`；若轮到自己清 `dist/jsdb`，则是
+`[safe-delete] 操作失败: spawnSync ...genie-trash... ETIMEDOUT`，栈顶落在
+`copy-assets.js:24`。
+
+**根因**：和 §7.18 同源 —— 保护是按**删除次数**算的，不是按调用方。`deploy.ps1`
+用 .NET 删掉 `core/dist`/`dashboard/dist` 绕过了 vite 那一侧，但 `copy-assets.js`
+自己还有一次 `fs.rmSync(dist/<name>)`，`gendb.js` 还有一次
+`fs.rmSync(dist/jsdb)`。两者都是 node 进程里的一次上千文件删除。
+
+**防**：两个脚本都不再"先删再写"：
+
+- `copy-assets.js` 的 `syncTree()` 直接 `fs.cpSync(..., {force:true})` 覆盖，
+  然后只对"上游已经没有"的残留文件逐个 `unlinkSync` —— 正常是 0 个。
+- `gendb.js` 覆盖写的同时记录本次写入的路径集合，事后只删不在集合里的残留。
+
+代价是多一次"残留扫描"，收益是构建结果与文件数量无关。
+
+---
+
 ## 8 验收清单
 
 一条命令跑完之后，按顺序核：

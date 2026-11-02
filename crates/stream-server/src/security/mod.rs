@@ -76,6 +76,12 @@ pub enum Endpoint {
     Health,
     /// #93: `POST /api/v1/control/<action>` —— 少量控制（重建采集器、踢会话）。
     Control,
+    /// #99: `GET /api/v1/manifest` —— 前端 bundle 的哈希表。
+    ///
+    /// 单独一类而不是并进 [`Endpoint::Static`]：静态资源是"页面要用什么"，
+    /// 清单是"整个包里有什么、每份的哈希是多少"。后者一次性把整棵文件树摊开，
+    /// 将来分级时可以让匿名访客拿页面却拿不到这份索引。
+    Manifest,
     /// `/api/` 下的未知路径。
     NotFound,
 }
@@ -141,6 +147,8 @@ impl EventKind {
                 Endpoint::Static => "http.static",
                 Endpoint::Signaling => "http.signaling",
                 Endpoint::Health => "http.health",
+                // #99: 追加而不是替换 —— 这些标签是策略与日志的契约。
+                Endpoint::Manifest => "http.manifest",
                 Endpoint::Control => "http.control",
                 Endpoint::NotFound => "http.not-found",
             },
@@ -190,6 +198,8 @@ impl EventKind {
                 // 但同样不改变任何状态 —— 所以归在观测里；与之相邻的
                 // `Control` 故意**不在**这个列表：那条路径会重开采集器、踢会话。
                 | EventKind::Http(Endpoint::Health)
+                // #99: 清单只读 —— 它报的是"包里有什么"，不改变任何状态。
+                | EventKind::Http(Endpoint::Manifest)
                 | EventKind::Http(Endpoint::NotFound)
                 | EventKind::Media(MediaDir::VideoOut)
                 | EventKind::Media(MediaDir::AudioOut)
