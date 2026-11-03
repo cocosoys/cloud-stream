@@ -95,7 +95,12 @@ impl Default for Config {
         Self {
             host: "0.0.0.0".to_owned(),
             port: 8080,
-            dist: PathBuf::from(r"C:\dev\selkies-web"),
+            // Relative on purpose: the runtime directory is wherever the deploy
+            // bundle was unpacked, and the launcher `cd`s into it before starting
+            // this process. A baked `C:\dev\selkies-web` would make the binary
+            // serve a 404-less empty root on any machine that keeps the bundle
+            // somewhere else — the kind of failure that looks like a broken build.
+            dist: PathBuf::from("selkies-web"),
             app_name: "webrtc".to_owned(),
             width: 1920,
             height: 1080,
@@ -285,6 +290,18 @@ mod tests {
 
     fn parse(args: &[&str]) -> Config {
         Config::parse(args.iter().map(|s| (*s).to_owned()).collect())
+    }
+
+    /// The default dist must stay portable. A drive-qualified default would only
+    /// work on the machine it was written on: the bundle is meant to be unpacked
+    /// anywhere, and the launcher already `cd`s into the unpacked directory, so
+    /// a bare relative name is the one form that is correct everywhere.
+    #[test]
+    fn the_default_dist_is_relative_to_the_working_directory() {
+        let dist = parse(&[]).dist;
+        assert_eq!(dist, PathBuf::from("selkies-web"));
+        assert!(!dist.is_absolute(), "dist default must not be absolute");
+        assert_eq!(dist.components().count(), 1, "no parent hops either");
     }
 
     #[test]

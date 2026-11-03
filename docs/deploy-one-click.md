@@ -14,54 +14,68 @@
 pwsh toolchain/deploy.ps1
 ```
 
-输出长这样（真实运行：全量部署 495.6 s，`…` 是省略的无关行）：
+输出长这样（真实运行：2026-11-03 布局迁移那一轮，`-SkipBuild` 全量切换 86.5 s，
+`…` 是省略的无关行）：
 
 ```
 [1] 预检
       OK   ssh / scp / curl.exe 就位
       OK   ssh 可达：client001（mc-admin）
-      …
-[2] 构建后端（cargo build --release -p stream-server）
-      OK   built in …
-      OK   本机 exe 17.7 MB  md5=8DDB6080…
+      OK   sshd 已是自动启动
+      OK   防火墙放行规则已在
+      OK   本机 exe 17.7 MB  md5=468BE201…
       OK   本机 ViGEmClient.dll 140288 B  md5=91BA893E…
-[3] 构建前端（core → dashboard → 打包）
-      OK   core 构建完成
-      OK   dashboard 构建完成
+[2] 前端：跳过构建，按现有 dist 重新打包
       OK   dist（index.html 917 B，core selkies-core-yAvzPWiV.js）
-      OK   打包 1.16 MB  md5=9A9E4CB0…
+      OK   打包 1.16 MB  md5=A49CAD29…
+[3] 汇总产物（target\output\cloud-stream）
+      OK   产物目录 …\target\output\cloud-stream
+      OK     exe 17.7 MB / 前端 2008 文件 3.6 MB / 证书 yes（cert-148）
+      OK     …\target\output\cloud-stream.zip（8.17 MB）
 [4] 上传
       OK   stream-server.new.exe
       OK   ViGEmClient.new.dll
       OK   selkies-web.zip
+      OK   start-stream.cmd / run-hidden.vbs / setup-watchdog.bat
+      OK   cert.pem / key.pem（仅当被控机缺失时安装）
       OK   deploy-remote.ps1
 [5] 传输校验（两端 MD5）
-      OK   exe 8DDB60802E12C7A5CB9990F919F70908
+      OK   exe 468BE201AA98B97E7183858861F29C87
       OK   dll 91BA893E750B2FDCCD142FDA9BA2DE2F
-      OK   zip 9A9E4CB0E4CED4F708B518188446FDF6
+      OK   zip A49CAD294D3AA27554BF5F722AFD89AB
 [6] 切换（停任务 → 换文件 → 起任务）
            STEP preflight
-           OK  new exe 18603008 B md5 8DDB6080…
+           OK  root C:\dev\stream
+           OK  migrated legacy web root C:\dev\selkies-web -> C:\dev\stream\selkies-web
+           OK  copied cert.pem into the runtime root
+           OK  copied key.pem into the runtime root
+           OK  new exe 18607104 B md5 468BE201…
            OK  new dll 140288 B md5 91BA893E…
-           OK  zip 1214640 B md5 9A9E4CB0…
+           OK  zip 1214640 B md5 A49CAD29…
            STEP backend
-           OK  task ended / task disabled / killed pid 8948
+           OK  task ended / task disabled / killed pid 9504
            OK  no stream-server process
-           OK  swapped in 18603008 B md5 8DDB6080…
+           OK  swapped in 18607104 B md5 468BE201…
            OK  dll in place 140288 B md5 91BA893E…
+           OK  start-stream.cmd updated / run-hidden.vbs updated / setup-watchdog.bat updated
            STEP frontend
            OK  web dir 917 B index, 2 js chunks
            OK  staging zip removed
            STEP start
-           OK  task enabled / started pid 9504 session 1
+           OK  task enabled / started pid 4984 session 1
+           DONE swap
 [7] 体检（https://192.168.59.148:8080/api/status）
       OK   HTTP 200
       OK   listening on https://0.0.0.0:8080 (TLS rustls 1.2/1.3)
-      OK   pid=9504 session=1 start=2026-11-03T11:04:51+08:00
+      OK   pid=4984 session=1 start=2026-11-03T12:00:48+08:00
+      OK   看门狗动作 wscript.exe C:\dev\stream\run-hidden.vbs
 [8] 归档（构建端）
       OK   构建端归档：backend + frontend（target\deploy-archive）
-部署完成：495.6s
+部署完成：86.5s
 ```
+
+再跑一次同样的东西时，第 6 步的 `migrated` / `copied` 不再出现，三个启动脚本变成
+`unchanged` —— 那就是幂等。
 
 被控机上没有"备份"这一步：备份归构建端（第 8 步），详见 §6 与 §7.22。
 
@@ -72,23 +86,59 @@ pwsh toolchain/deploy.ps1
 
 ## 1 部署内容清单
 
+### 1.0 一个目录：`target\output\cloud-stream`
+
+脚本在构建完之后，把「被控端需要的全部东西」汇总到
+`target\output\cloud-stream`。这个目录**就是**被控机的运行根：里面的脚本全部
+按自身位置推导路径（`%~dp0` / `WScript.ScriptFullName` / `$PSScriptRoot`），
+所以解压到 `D:\stream`、`C:\dev\stream` 还是移动硬盘上，行为完全一样 —— 没有
+一处写死目录。
+
+```
+target\output\cloud-stream\
+  stream-server.exe      采集 / 编码 / 信令 / HTTP / 文件传输，全在这一个进程
+  ViGEmClient.dll        #17 虚拟手柄客户端（可缺，缺了只降级成"没手柄"）
+  cert.pem  key.pem      TLS 自签证书（SAN 是本机 IP；缺了退回明文 HTTP）
+  selkies-web\           前端静态根
+  logs\                  stream-server.log / watchdog.log（进程起不来先看后者）
+  start-stream.cmd       命令行参数都在这里：分辨率 / 帧率 / 码率 / 证书
+  run-hidden.vbs         计划任务入口，无窗口
+  setup-watchdog.bat     创建 MCStreamSrv 任务（账户密码用参数或用提示输入）
+  README.txt             上机三步 + 目录说明（给拿到包的人看）
+  manifest.json          构建指纹：提交、时间、MD5、前端文件数
+target\output\cloud-stream.zip   整包，拷到新机器用
+```
+
+于是「把一台新设备变成被控设备」是三步：解压 → `setup-watchdog.bat` → 打开
+浏览器。不再逐个 `scp`，也不会漏掉 DLL / 脚本 / 证书。
+
+生产机器上的对应位置是 `<RemoteBase>\stream`（默认 `C:\dev\stream`）。
+`-RemoteBase` 是整台机器换位置时唯一要改的参数 —— 其余路径都是相对推导的。
+
 ### 1.1 每次部署会动的文件
 
 | 本机产物 | 被控机落点 | 干什么 | 要重启服务吗 |
 |---|---|---|---|
-| `target/release/stream-server.exe`（18,603,008 B） | `C:\dev\stream\stream-server.exe` | 采集 / 编码 / 信令 / HTTP 静态 / 文件传输，全部逻辑 | **要** |
-| `vendor/vigem/ViGEmClient.dll`（140,288 B） | `C:\dev\stream\ViGEmClient.dll` | #17 虚拟手柄的客户端 DLL，服务端运行时 `LoadLibraryW` 取；缺了只降级成"没手柄" | **要**（已加载的 DLL 有共享锁，只能在停进程后覆盖） |
-| `addons/selkies-dashboard/dist/`（打包 1,214,640 B） | `C:\dev\selkies-web\` | 前端整页（2008 个文件） | 不要 |
-| `toolchain/start-stream.cmd`（2070 B） | `C:\dev\stream\start-stream.cmd` | **命令行参数全在这** | 下次启动生效 |
-| `toolchain/run-hidden.vbs`（635 B） | `C:\dev\stream\run-hidden.vbs` | 无窗口启动，避免每分钟闪一次黑框 | 下次启动生效 |
-| `toolchain/deploy-remote.ps1` | `C:\dev\deploy\deploy-remote.ps1` | 被控端执行体（`deploy\` 里唯一的常驻文件） | 不要 |
+| `target\output\cloud-stream\stream-server.exe` | `C:\dev\stream\stream-server.exe` | 采集 / 编码 / 信令 / HTTP 静态 / 文件传输，全部逻辑 | **要** |
+| `…\ViGEmClient.dll` | `C:\dev\stream\ViGEmClient.dll` | #17 虚拟手柄的客户端 DLL，服务端运行时 `LoadLibraryW` 取；缺了只降级成"没手柄" | **要**（已加载的 DLL 有共享锁，只能在停进程后覆盖） |
+| `…\selkies-web\`（打包 1,214,640 B） | `C:\dev\stream\selkies-web\` | 前端整页（2008 个文件） | 不要 |
+| `…\start-stream.cmd` | `C:\dev\stream\start-stream.cmd` | **命令行参数全在这**，路径按 `%~dp0` 推导 | 下次启动生效 |
+| `…\run-hidden.vbs` | `C:\dev\stream\run-hidden.vbs` | 无窗口启动，避免每分钟闪一次黑框 | 下次启动生效 |
+| `…\setup-watchdog.bat` | `C:\dev\stream\setup-watchdog.bat` | 建/重建看门狗任务，任务动作按自身位置生成 | 不要 |
+| `…\cert.pem` / `key.pem` | `C:\dev\stream\cert.pem` / `key.pem` | 仅当被控机**没有**证书时安装（SAN 是那台机器的 IP，不能拿构建端覆盖） | 要（`--tls-*` 在启动参数里） |
+| `toolchain\deploy-remote.ps1` | `C:\dev\deploy\deploy-remote.ps1` | 被控端执行体（`deploy\` 里唯一的常驻文件） | 不要 |
+
+上传的三样（exe / DLL / zip）都从汇总目录取，所以"本机检查过的包"和"线上在跑
+的东西"是同一批字节，不是两次各自拼装的结果。
 
 被控机最终只有这些，`selkies-web.zip` 解压成功后即删，不留副本（§6 / §7.22）：
 
 ```
-C:\dev\stream\   stream-server.exe  ViGEmClient.dll  start-stream.cmd  run-hidden.vbs  logs\
-C:\dev\deploy\   deploy-remote.ps1
-C:\dev\selkies-web\   ← 2008 个文件，下面这几项
+C:\dev\stream\   stream-server.exe  ViGEmClient.dll  cert.pem  key.pem
+                 start-stream.cmd  run-hidden.vbs  setup-watchdog.bat
+                 selkies-web\   ← 2008 个文件，下面这几项
+                 logs\          ← stream-server.log / watchdog.log
+C:\dev\deploy\   deploy-remote.ps1（只在部署窗口存在，zip 解压完即删）
 ```
 
 前端的目录内容（`-SkipFrontend` 可以整块跳过）：
@@ -111,10 +161,10 @@ manifest.json / favicon.ico / icon.png / icon-512.png
 |---|---|---|
 | sshd 服务 | `sshd`，启动类型 **Automatic** | 重启后还能连进来；改一次永久生效 |
 | 防火墙 | `OpenSSH SSH Server (sshd)`，TCP 22 入站 | 同上 |
-| 计划任务 | `MCStreamSrv`，每 1 分钟 | 看门狗（#81），创建要账户密码 |
-| TLS 证书 | `C:\dev\cert.pem` / `C:\dev\key.pem` | 自签，静态；脚本只检查存在 |
-| 目录 | `C:\dev\stream\logs`、`C:\dev\deploy`、`C:\dev\selkies-web` | 建一次 |
-| 上传根 | `--upload-dir C:\Users\Administrator\Desktop` | 在 `start-stream.cmd` 里 |
+| 计划任务 | `MCStreamSrv`，每 1 分钟，动作 = `<运行根>\run-hidden.vbs` | 看门狗（#81），创建要账户密码 |
+| TLS 证书 | `C:\dev\stream\cert.pem` / `key.pem` | 自签，静态；脚本只检查存在 |
+| 目录 | `C:\dev\stream\logs`、`C:\dev\stream\selkies-web`、`C:\dev\deploy` | 建一次（幂等） |
+| 上传根 | `--upload-dir %USERPROFILE%\Desktop` | 在 `start-stream.cmd` 里，按运行账户推导 |
 
 ### 1.3 明确**不**进部署链的
 
@@ -143,20 +193,35 @@ pwsh toolchain/deploy.ps1 -WebRoot D:\src\cloud-stream-web
 
 ---
 
-## 2 路径契约：为什么改一处要连带改三处
+## 2 路径契约：只剩两个常量，其余全部自定位
 
 **命令行参数不在部署脚本里，在 `start-stream.cmd` 里。** 这是最容易忘的一条：
-只换 exe 不换启动脚本，参数就永远停在上一次。
+只换 exe 不换启动脚本，参数就永远停在上一次 —— 所以启动脚本每轮都跟着部署走。
 
-| 路径 | 谁在引用 | 改它要连带改 |
+被控机上真正"约定"的只有两个目录：
+
+| 常量 | 默认 | 谁决定 | 里面有什么 |
+|---|---|---|---|
+| `<RemoteBase>\stream` | `C:\dev\stream` | `deploy.ps1 -RemoteBase` | 运行根：exe、DLL、证书、`selkies-web\`、`logs\`、三个脚本 |
+| `<RemoteBase>\deploy` | `C:\dev\deploy` | 同上 | 部署暂存：`deploy-remote.ps1`、传输中的 exe/zip/脚本 |
+
+运行根内部的路径全是相对的，谁也没有"必须放在 C 盘"的假设：
+
+| 路径 | 谁在引用 | 怎么来的 |
 |---|---|---|
-| `C:\dev\stream\stream-server.exe` | `start-stream.cmd` 最后一行 | — |
-| `C:\dev\selkies-web` | `start-stream.cmd` 的 `--dist` | 部署脚本 `$RemoteWeb` |
-| `C:\dev\cert.pem` / `key.pem` | `--tls-cert` / `--tls-key` | — |
-| `C:\dev\stream\logs\stream-server.log` | `--log` | 部署脚本 `$RemoteLog`（体检读它） |
-| `C:\dev\stream\run-hidden.vbs` | 计划任务的 `/TR` | `setup-watchdog.bat` |
+| `<根>\stream-server.exe` | `start-stream.cmd` | `%~dp0` |
+| `<根>\selkies-web` | `start-stream.cmd` 的 `--dist` | `%~dp0`；`config.rs` 的默认值也是相对的 `selkies-web` |
+| `<根>\cert.pem` / `key.pem` | `--tls-cert` / `--tls-key` | `%~dp0`；两个都在才启用 TLS |
+| `<根>\logs\stream-server.log` | `--log` | `%~dp0`；体检读它 |
+| `<根>\run-hidden.vbs` | 计划任务的 `/TR` | `setup-watchdog.bat` 用 `%~dp0` 生成；`run-hidden.vbs` 自己再用 `WScript.ScriptFullName` 找同级目录 |
+| `<base>\deploy\selkies-web.zip` | `deploy-remote.ps1` 的 `-WebZip` | `$PSScriptRoot` |
+| `<base>\stream` | `deploy-remote.ps1` 的 `-Root` 默认值 | `$PSScriptRoot` 的上一级 + `stream` |
 
-所以引导阶段会把两个启动脚本一起推上去，并且**覆盖** `C:\dev\stream\` 下的同名文件。
+**为什么值得这么改**：上一版把 `C:\dev\stream`、`C:\dev\selkies-web`、
+`C:\dev\cert.pem`、`C:\Users\Administrator\Desktop` 写死在脚本里。把整包解压到
+`D:\games\stream` 之后，任务照样"启动成功"，然后：`--dist` 指向一个不存在的
+目录（首页 404）、日志写不进旧目录、剪贴板因为证书找不到退回明文。三处症状
+互不相干，谁也不指向真正的原因。§7.23 记了这一轮。
 
 ---
 
@@ -169,14 +234,18 @@ pwsh toolchain/deploy.ps1 -Bootstrap
 做四件事，全部幂等，可以反复跑：
 
 1. **sshd 开机自启**（见 §3.1）
-2. **建目录**：`C:\dev\stream\logs`、`C:\dev\deploy`、`C:\dev\selkies-web`
-3. **推启动脚本**：`start-stream.cmd`、`run-hidden.vbs` → `C:\dev\deploy\` 再落到 `C:\dev\stream\`
-4. **核对**三样东西并打印结果：exe 在不在、计划任务在不在（`Running`）、证书在不在
+2. **建目录**：`C:\dev\stream\logs`、`C:\dev\stream\selkies-web`、`C:\dev\deploy`
+3. **推启动脚本并安装**：三个脚本 → `C:\dev\deploy\`，再由
+   `deploy-remote.ps1 -OnlyLaunchers` 按哈希装进运行根（正在被看门狗执行的那个
+   会跳过并提示"下次重启生效"）
+4. **核对**四样东西并打印结果：exe 在不在、计划任务在不在（`Running`）、证书在
+   不在、旧布局（`<base>\selkies-web`）有没有残留
 
 ```
-..   exe 18144256
+..   exe 18603008
 ..   task Running
 ..   tls OK
+..   layout ok
 ```
 
 ### 3.1 为什么单独强调「ssh 自动开启」
@@ -197,17 +266,23 @@ New-NetFirewallRule -DisplayName 'OpenSSH SSH Server (sshd)' -Direction Inbound 
 
 ### 3.2 计划任务需要密码，脚本不碰
 
-`MCStreamSrv` 要用 `Administrator` 的**交互式**会话跑（见 §7 的会话隔离），
-`schtasks` 建它必须带 `/RU` + `/RP`。把密码写进新脚本里没有意义，所以这一步
-留给人：
+`MCStreamSrv` 要用能看见桌面的那个**交互式**账户跑（见 §7.8 的会话隔离），
+`schtasks` 建它必须带 `/RU` + `/RP`。密码不写进仓库（每台机器都不一样，写进去
+既是泄漏也是假的），所以这一步留给人，脚本只负责把它送上门：
 
 ```bat
-:: 在被控机上执行一次
-C:\dev\deploy\setup-watchdog.bat
+:: 在被控机上，运行根目录里执行一次；账户默认是当前登录用户
+C:\dev\stream\setup-watchdog.bat
+:: 或者把账户密码一次给全
+C:\dev\stream\setup-watchdog.bat Administrator S3cr3t
 ```
 
-脚本只负责核对它存在且是 `Running`。不存在就报 `task MISSING` 并随后在切换
-阶段失败（比静默跑起来好）。
+任务动作由 `%~dp0` 生成（`wscript.exe "<运行根>\run-hidden.vbs"`），所以整包
+换个目录解压也能用。建完会回读一次动作字符串，读不到 `run-hidden.vbs` 就打
+`WARNING` —— 引号写坏时任务照样"创建成功"，但永远不会真的拉起进程。
+
+部署脚本只负责核对任务存在、`Running`、且动作路径在运行根下（不在就提示搬过
+位置后要重建）。不存在就报 `task MISSING` 并随后在切换阶段失败（比静默跑起来好）。
 
 ---
 
@@ -223,14 +298,15 @@ C:\dev\deploy\setup-watchdog.bat
 | `pwsh toolchain/deploy.ps1 -Bootstrap` | 补一次性的东西 | — |
 
 其他参数：`-Target mc-admin`（ssh 别名）、`-HostName 192.168.59.148`、
-`-Port 8080`、`-HealthTimeoutSec 90`。
+`-Port 8080`、`-RemoteBase C:\dev`（被控机安装根 → 运行根 `<base>\stream`）、
+`-HealthTimeoutSec 90`。
 
 `-DryRun` 是排查「到底是构建坏了还是部署坏了」时最有用的一个：它把文件送到
 位、两端 MD5 对上，然后停手。
 
 ---
 
-## 5 八个步骤分别做什么、判断依据是什么
+## 5 十个步骤分别做什么、判断依据是什么
 
 步号只增不减、不印分母：`-SkipBackend` 这类开关会让某几步不占号，印了分母
 就会出现 `[4/8]` 之后直接 `[6/8]`。所以看输出时以标题为准，不要数编号。
@@ -240,14 +316,16 @@ C:\dev\deploy\setup-watchdog.bat
 | 1 预检 | 本机要 `ssh`/`scp`/`curl.exe`；远端要能 `hostname` | 连不上 → 打印修 sshd 的三行 |
 | 2 构建后端 | `cargo build --release -p stream-server`（`-SkipBackend` 跳过） | 编译失败 → 不进入下一步 |
 | 3 构建前端 | core → dashboard → `selkies-web.zip`（`-SkipFrontend` 跳过） | `dist` 缺失 / gendb 失败 → 抛错 |
-| 4 上传 | `scp` 到 `stream-server.new.exe` / `ViGEmClient.new.dll` / `selkies-web.zip` / `deploy-remote.ps1`；带 `BatchMode=yes`，缺密钥立刻失败而不是卡在密码提示 | — |
-| 5 校验 | 两端 MD5 比对 | 不一致就停，**不切换** |
-| 6 切换 | 远端：停任务 → **禁用任务** → 杀进程 → 换 exe/DLL → 前端解压到暂存目录并校验后换名 → 删 zip → 启任务 | 每一步失败即中止 |
-| 7 体检 | 轮询 `/api/status` | 见下 |
-| 8 归档 | 构建端把这一轮真正发出去的部件写进 `target\deploy-archive\` | 失败不影响线上 |
+| 4 汇总产物 | 把 exe / DLL / 前端 / 证书 / 三个脚本装进 `target\output\cloud-stream`，写 `manifest.json`，压同名 zip | 前端 `assets\` 缺失即抛错；本轮没有前端产物时跳过并回退成单件上传 |
+| 5 上传 | `scp` **从汇总目录**取：`stream-server.new.exe` / `ViGEmClient.new.dll` / `selkies-web.zip` / 三个启动脚本 / 证书 / `deploy-remote.ps1`；带 `BatchMode=yes`，缺密钥立刻失败而不是卡在密码提示 | — |
+| 6 校验 | 两端 MD5 比对 | 不一致就停，**不切换** |
+| 7 切换 | 远端：装证书（仅当缺失）→ 停任务 → **禁用任务** → 杀进程 → 换 exe/DLL → **装启动脚本**（此刻文件才不被占用）→ 前端解压到暂存目录并校验后换名 → 删 zip → 启任务 | 每一步失败即中止 |
+| 8 体检 | 轮询 `/api/status` | 见下 |
+| 9 体检补充 | 进程 pid / 启动时间、日志尾部、**计划任务的动作路径** | 动作路径不在运行根下只提示不失败（§7.23） |
+| 10 归档 | 构建端把这一轮真正发出去的部件写进 `target\deploy-archive\`（含三个启动脚本） | 失败不影响线上 |
 
 前四步里 2 和 3 是可以单独跳过的，因为"只换前端"和"只换后端"都很常见；
-**5 之后就没有可以单独跳过的步骤了** —— 校验、切换、体检是一条链，缺一环
+**6 之后就没有可以单独跳过的步骤了** —— 校验、切换、体检是一条链，缺一环
 就等于"不知道线上跑的是什么"。
 
 体检是**三重**判据，缺一不可：
@@ -656,7 +734,75 @@ DLL / zip 覆盖进 `target\deploy-archive\`（gitignore），失败或 `-Rollba
 `mc\start-mc.ps1` 与 `mc\launch-remote.ps1`（`MCGame` 任务链）。
 
 **边界**：`deploy\` 目录本身保留（空目录），因为 `scp` 需要它存在；跑完一次部署后
-里面只会有 `deploy-remote.ps1`（8.7 KB），zip 已被远端删掉。
+里面只会有 `deploy-remote.ps1`（16 KB）与三个启动脚本的副本（每轮重传，
+装进运行根之后就只是暂存），zip 与上传的证书都在装好后立刻删掉。
+
+### 7.23 上机脚本写死绝对路径 + 非 ASCII 注释（已修）
+
+**现象**：把整包解压到 `D:\games\stream` 后跑一次看门狗，任务显示"运行过"，
+浏览器打开是 404 或目录列表，`logs\` 是空的，剪贴板同步也没了。换回 `C:\dev`
+一切正常。
+
+**根因**（三个独立的硬编码，症状互不相干）：
+
+1. `start-stream.cmd` 里 `cd /d C:\dev\stream`、`--dist C:\dev\selkies-web`、
+   `--log C:\dev\stream\logs\...`、`--tls-cert C:\dev\cert.pem`；
+   `run-hidden.vbs` 里 `sh.Run "cmd /c ""C:\dev\stream\start-stream.cmd"""`；
+   `setup-watchdog.bat` 里 `/TR "wscript.exe C:\dev\stream\run-hidden.vbs"`；
+   `deploy-remote.ps1` 的 `-Root` / `-WebDir` / `-WebZip` 默认值。
+   于是"解压到别处"等于让四个脚本同时指向一个不存在的目录。
+2. `crates/stream-server/src/config.rs` 的 `dist` 默认值还是
+   `PathBuf::from(r"C:\dev\selkies-web")` —— 连 exe 自己也带着绝对路径。
+3. `--upload-dir C:\Users\Administrator\Desktop`：换一台机器、换一个交互用户就
+   指到一个不存在的目录（文件传输直接报错）。
+
+**改法**：
+
+- 运行根内所有路径由脚本自身位置推导：`%~dp0`（cmd/bat）、
+  `WScript.ScriptFullName`（vbs）、`$PSScriptRoot`（ps1）。整包搬到哪都能跑。
+- 证书改成**按存在性启用**：`cert.pem` + `key.pem` 都在才加 `--tls-*`，缺了就写
+  一行 `plain HTTP, clipboard off` 进 `watchdog.log` 再起来 —— 起不来比降级更糟。
+- `--upload-dir` 用 `%USERPROFILE%\Desktop`（不存在则退回 `%USERPROFILE%`）。
+- `config.rs` 的 `dist` 默认值改成相对名 `selkies-web`，并加了一条断言"默认值
+  不含盘符"的测试（`the_default_dist_is_relative_to_the_working_directory`）。
+- 被控机安装位置收成一个参数：`deploy.ps1 -RemoteBase C:\dev`，运行根
+  `<base>\stream`、暂存 `<base>\deploy`，其余全部相对推导。
+- 旧布局自动迁移：`deploy-remote.ps1` 发现 `<base>\selkies-web` 还在、运行根里
+  没有 `selkies-web\` 时，**rename** 进运行根（同盘、只动元数据），证书从
+  `<base>\cert.pem` 复制进去；所以已经上线的机器不需要手工搬目录。
+- 启动脚本改成**停进程之后**才安装：看门狗正在执行 `start-stream.cmd`，先装会
+  撞共享冲突，而"只换 exe 不换脚本"正是参数卡在上一版的经典原因。装的时候按
+  MD5 跳过相同内容，忙则重试 10 次 × 200 ms，仍忙就写"下次重启生效"（前端-only
+  部署的正常情况）。
+
+**另一条更隐蔽的**：`.cmd` / `.bat` 里写中文破折号（U+2014）会**打断解析**。
+cmd 按当前代码页（GBK）逐字节读文件，UTF-8 的 `E2 80 94` 被当成两个 GBK 字符，
+把下一个引号吃掉，于是
+
+```
+rem ... dies on "/I" — the guard ...
+```
+
+这一行之后整个 `if` 块错位，运行时报 `'m' 不是内部或外部命令`。所以
+`start-stream.cmd` / `start-stream.60fps.cmd` / `setup-watchdog.bat` /
+`run-hidden.vbs` 四个文件保持**纯 ASCII**（`deploy-remote.ps1` 早就这么要求，
+因为 PowerShell 5.1 读无 BOM 的 .ps1 也是 ANSI）。
+
+**同批还踩到两条部署链上的**：
+
+1. `param([string]$DeployDir = $PSScriptRoot)` 在 PowerShell 5.1 里绑到**空串** ——
+   `$PSScriptRoot` 在参数默认值求值时还没填。远端第一行 `Split-Path -Parent ""` 于是
+   报 `cannot bind argument to parameter 'Path'`，整次切换在**动手之前**就停了
+   （fail-safe，但白等一轮）。现在默认值改在函数体里取，并留一条 `if (-not $Root)`
+   兜底。
+2. `ssh` 只设了 `ConnectTimeout` —— 那管的是 TCP 握手。连上了而对端不说话（sshd
+   卡在某个会话、机器被挂起）时会**无限等**：本轮就停在第一条 `hostname` 上十分钟。
+   现在加 `ServerAliveInterval=15` / `ServerAliveCountMax=4`，60 秒没响应就断开，
+   `scp` 用同一组参数。
+
+**顺带**：`tasklist | find` 改成
+`"%SystemRoot%\System32\find.exe"`。构建机上 PATH 里的 MSYS `find.exe` 不认
+`/I`，一报错就等价于"没在运行"，看门狗于是每分钟多起一个实例。
 
 ---
 
@@ -665,16 +811,21 @@ DLL / zip 覆盖进 `target\deploy-archive\`（gitignore），失败或 `-Rollba
 一条命令跑完之后，按顺序核：
 
 - [ ] 退出码 0，末尾打印 `部署完成`
-- [ ] `[7] 体检` 三行全绿：`HTTP 200` / `listening on ...` / `pid=... session=1 start=...`
+- [ ] `[8]`/`[9] 体检` 三行全绿：`HTTP 200` / `listening on ...` / `pid=... session=1 start=...`
       （只换前端时中间一行是 `pid=...（未重启，会话保持）`，这是正常的，见 §7.15；
       全量部署时中间一行可能是 `pid=...（新进程）` 加一条说明 —— 指针日志刷屏会把
       启动行挤出日志尾部，端口通即视为在监听，见 §7.17）
+- [ ] 体检里 `看门狗动作` 指向 `<运行根>\run-hidden.vbs`（不是旧目录）
 - [ ] `curl -sk https://192.168.59.148:8080/ | grep -o 'assets/[^"]*'` 有两行
 - [ ] 浏览器强刷后**左侧有工具栏**（没有 = 服务成 core 构建了，§7.1）
 - [ ] 右上角有统计面板，右边缘有粉色胶囊
 - [ ] 故意失败一次能回滚：`-SkipFrontend` 上传一个坏 zip，或直接跑 `-Rollback`
 - [ ] 被控机上只有正式产物：`C:\dev\stream` 里没有 `*.prev` / `*.new.*`，
-      `C:\dev\deploy` 只剩 `deploy-remote.ps1`（zip 解压完即删）
+      `C:\dev\deploy` 只剩 `deploy-remote.ps1` 与三个启动脚本（zip 解压完即删）
+- [ ] `C:\dev` 下不再有 `selkies-web\`（已 rename 进运行根）；旧的 `cert.pem` /
+      `key.pem` 是**复制**过去的，脚本不动旧副本，可以手工删
+- [ ] `target\output\cloud-stream\manifest.json` 的 `built_at` 是本次时间，
+      且 `tls` / `web.files` 与预期一致
 - [ ] `target\deploy-archive\meta.json` 的 `saved_at` 是本次部署时间
 
 ---
@@ -684,18 +835,22 @@ DLL / zip 覆盖进 `target\deploy-archive\`（gitignore），失败或 `-Rollba
 ```powershell
 # 构建（从仓库根目录开始）
 cargo build --release -p stream-server
-cd ..\selkies-webclient\addons\selkies-web-core ; npm run build
+cd ..\cloud-stream-web\addons\selkies-web-core ; npm run build
 cd ..\selkies-dashboard ; npm run build
 cd C:\Users\user\Desktop\cloud-stream
-Compress-Archive -Path ..\selkies-webclient\addons\selkies-dashboard\dist\* `
-                 -DestinationPath target\deploy-selkies-web.zip -Force
 
-# 上传
-scp target\release\stream-server.exe mc-admin:C:/dev/stream/stream-server.new.exe
+# 汇总产物（也是"手工拼一个运行根"的唯一正确做法）
+#   exe + DLL + 三个启动脚本 + cert/key 拷进 target\output\cloud-stream\
+#   再把 dashboard\dist\* 拷进 target\output\cloud-stream\selkies-web\
+#   —— 顺序无所谓，脚本全部按自身位置找同级文件
+
+# 上传（只发后端时）
+scp target\output\cloud-stream\stream-server.exe mc-admin:C:/dev/stream/stream-server.new.exe
 scp target\deploy-selkies-web.zip mc-admin:C:/dev/deploy/selkies-web.zip
 scp toolchain\deploy-remote.ps1 mc-admin:C:/dev/deploy/deploy-remote.ps1
+scp toolchain\start-stream.cmd toolchain\run-hidden.vbs toolchain\setup-watchdog.bat mc-admin:C:/dev/deploy/
 
-# 切换（唯一需要记住的一条）
+# 切换（唯一需要记住的一条；-Root 默认就是 <base>\stream，可不传）
 ssh mc-admin 'powershell -NoProfile -ExecutionPolicy Bypass -File C:\dev\deploy\deploy-remote.ps1'
 
 # 体检
@@ -713,9 +868,10 @@ curl.exe -sk -o NUL -w '%{http_code}' https://192.168.59.148:8080/api/status
 | ssh 通 | `ssh mc-admin hostname` | 主机名 |
 | sshd 自启 | `ssh mc-admin 'powershell -c "Get-Service sshd \| Select Status,StartType"'` | `Running Automatic` |
 | 看门狗起了没 | `ssh mc-admin 'powershell -c "(Get-ScheduledTask -TaskName MCStreamSrv).State"'` | `Running` |
+| 看门狗指向哪 | `ssh mc-admin 'powershell -c "(Get-ScheduledTask -TaskName MCStreamSrv).Actions \| % { $_.Arguments }"'` | `<运行根>\run-hidden.vbs` |
 | 服务在跑 | `curl.exe -sk https://192.168.59.148:8080/api/status` | `ok` |
 | 进程会话 | `ssh mc-admin 'powershell -c "Get-Process stream-server \| Select Id,SessionId"'` | `SessionId=1` |
-| 证书 | `ssh mc-admin 'powershell -c "Get-ChildItem C:\dev\cert.pem \| Select LastWriteTime"'` | 自查是否过期 |
+| 证书 | `ssh mc-admin 'powershell -c "Get-ChildItem C:\dev\stream\cert.pem \| Select LastWriteTime"'` | 自查是否过期 |
 | 磁盘 | `ssh mc-admin 'powershell -c "Get-PSDrive C \| Select @{n=\"FreeGB\";e={[math]::Round($_.Free/1GB,1)}}"'` | 现在是 27.8 GB |
 
 前两项挂了都会让**后续所有部署都做不了**，所以它们的修复方法（§3.1 的三行）

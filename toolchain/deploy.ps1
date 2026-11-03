@@ -10,18 +10,25 @@
       1. 预检（工具链、ssh 可达、cargo / npm）
       2. 构建后端 release
       3. 构建前端（core → dashboard 两级，顺序不能反）
-      4. scp 上传（exe / zip / 两个启动脚本，内容一样就跳过）
-      5. MD5 双向核对
+      4. 汇总产物到 target\output\cloud-stream（+ 同名 zip），上传从这里取
+      5. scp 上传（exe / DLL / zip / 三个启动脚本 / 证书，内容一样就跳过）
+      6. MD5 双向核对
 
     被控机做的事（由 deploy-remote.ps1 执行，脚本随包上传）：
-      6. 停任务 → 杀进程 → 换 exe → 解压前端（暂存目录校验后换名）→ 起任务
-      7. 本机轮询 /api/status 直到 200，并核对进程启动时间与日志
-      8. 成功后把这次真正发上去的产物归档到 target\deploy-archive
-      9. 失败时用归档里的上一版重发，并把原因打出来
+      7. 装启动脚本 → 停任务 → 杀进程 → 换 exe → 解压前端（暂存目录校验后
+         换名）→ 起任务
+      8. 本机轮询 /api/status 直到 200，并核对进程启动时间与日志
+      9. 成功后把这次真正发上去的产物归档到 target\deploy-archive
+     10. 失败时用归档里的上一版重发，并把原因打出来
 
     被控机上不保留任何备份（没有 .exe.prev，也没有 web 目录副本）：那里只放
     正在运行的正式产物。回滚材料留在构建端 —— 需要回滚的人坐在这台机器前，
     而被控机上的 .prev 只会越积越多，没人会去轮转它。
+
+    被控机上的路径全部由脚本自定位：运行根 <RemoteBase>\stream 里的
+    start-stream.cmd 用 %~dp0、run-hidden.vbs 用 WScript.ScriptFullName、
+    deploy-remote.ps1 用 $PSScriptRoot。没有任何一处写死 C:\dev —— 整包解压到
+    别的盘、别的目录同样能跑，这对"快速把新设备变成被控设备"是硬要求。
 
     为什么用「上传远端脚本」而不是 ssh 里塞内联命令：PowerShell 内联字符串要
     穿过 bash → ssh → cmd → powershell 四层引号，`$p=C:\dev\x` 这类赋值会被
@@ -29,6 +36,11 @@
 
 .PARAMETER Target
     ~/.ssh/config 里的主机别名。默认 mc-admin（Administrator，游戏所在的交互用户）。
+
+.PARAMETER RemoteBase
+    被控机上的安装根，默认 C:\dev。运行根是 <base>\stream，部署暂存是
+    <base>\deploy。运行根内部的脚本全部自定位，所以这条是"整台机器换位置"时
+    唯一需要改的参数。
 
 .PARAMETER SkipBackend
     只发前端。静态文件按请求读取，不需要重启服务。
@@ -68,6 +80,9 @@ param(
     [string]$Target = 'mc-admin',
     [string]$HostName = '192.168.59.148',
     [int]$Port = 8080,
+    # 被控机上的安装根。运行根是 <base>\stream，部署暂存是 <base>\deploy；
+    # 内部所有路径都由脚本自定位，所以换盘符 / 换目录只需要改这一个参数。
+    [string]$RemoteBase = 'C:\dev',
     [switch]$SkipBackend,
     [switch]$SkipFrontend,
     [switch]$SkipBuild,
@@ -91,14 +106,24 @@ Set-StrictMode -Version Latest
 # UTF-8 套 GBK 的二次编码。npm/cargo 的输出已经整条重定向进文件了，不受影响。
 
 # ---------------------------------------------------------------- 常量：与被控机一致
-# 这些路径写死在 start-stream.cmd 与计划任务里，改这里等于改部署契约，
-# 两边必须同时改（文档 §2 有对照表）。
-$RemoteRoot = 'C:\dev\stream'
-$RemoteDeploy = 'C:\dev\deploy'
-$RemoteWeb = 'C:\dev\selkies-web'
+# 被控机上只有两个路径是"约定"，其余全部由脚本自定位推导：
+#
+#   <base>\stream\   运行根，与构建端 target\output\cloud-stream 一一对应
+#   <base>\deploy\   部署暂存（deploy-remote.ps1 + 传输中的文件）
+#
+# 运行根内部一律相对：start-stream.cmd 用 %~dp0、run-hidden.vbs 用
+# WScript.ScriptFullName、deploy-remote.ps1 用 $PSScriptRoot。所以把整包解压到
+# D:\games\stream 也能直接跑，这正是 -RemoteBase 存在的意义（整台机器换位置时
+# 只需要改这一个参数）。
+$RemoteBase = 'C:\dev'
+$RemoteRoot = Join-Path $RemoteBase 'stream'
+$RemoteDeploy = Join-Path $RemoteBase 'deploy'
 $RemoteTask = 'MCStreamSrv'
 $RemoteExe = "$RemoteRoot\stream-server.exe"
 $RemoteLog = "$RemoteRoot\logs\stream-server.log"
+# 上机脚本：跟着每次部署走（命令行参数写在 start-stream.cmd 里，只换 exe
+# 不换它，参数就永远停在上一次）。
+$LauncherNames = @('start-stream.cmd', 'run-hidden.vbs', 'setup-watchdog.bat')
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $LocalExe = Join-Path $RepoRoot 'target\release\stream-server.exe'
@@ -132,6 +157,16 @@ $DashDir = Join-Path $WebRepoRoot 'addons\selkies-dashboard'
 # 产物放 target\（已 gitignore）：toolchain\ 里只放脚本，不放每次构建都变的二进制。
 $ZipPath = Join-Path $RepoRoot 'target\deploy-selkies-web.zip'
 $RemoteScript = Join-Path $PSScriptRoot 'deploy-remote.ps1'
+
+# 统一产物目录。target\output\cloud-stream **就是**被控机的运行根：把这个目录
+# 原样拷到任何一台机器（或解压同名 zip），里面的 exe / DLL / 前端 / 证书 /
+# 三个启动脚本就是全部所需，不需要再手工拼路径。上传也从这里取，所以「本地能
+# 跑」与「线上在跑」是同一批字节。
+$OutputDir = Join-Path $RepoRoot 'target\output'
+$BundleDir = Join-Path $OutputDir 'cloud-stream'
+$BundleZip = Join-Path $OutputDir 'cloud-stream.zip'
+$BundleManifest = Join-Path $BundleDir 'manifest.json'
+$BundleReadme = Join-Path $BundleDir 'README.txt'
 
 # 构建端备份：成功部署后把「这次真正发上去的产物」覆盖到这里，失败或 -Rollback
 # 时从这里重发。放在 target\ 下（已 gitignore），和别的构建产物一起被忽略。
@@ -213,7 +248,14 @@ function Remove-LocalPath([string]$Path) {
 }
 
 # SSH 一律 BatchMode：缺密钥时立刻失败，而不是卡在密码提示上等一个人来敲。
-$SshOpts = @('-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', '-o', 'StrictHostKeyChecking=accept-new')
+# ServerAlive* 是给"连上了但对面不说话"用的：ConnectTimeout 只管 TCP 握手，
+# 一端被挂起 / sshd 卡在某个会话上时，ssh 会一直等下去（本轮踩过一次，
+# 整整 10 分钟停在第一条 `hostname` 上）。现在 15 s × 4 次没响应就断开。
+$SshOpts = @(
+    '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8',
+    '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=4',
+    '-o', 'StrictHostKeyChecking=accept-new'
+)
 
 function Invoke-Ssh([string]$Command, [switch]$AllowFail) {
     $out = & ssh @SshOpts $Target $Command 2>&1
@@ -225,7 +267,14 @@ function Invoke-Ssh([string]$Command, [switch]$AllowFail) {
 }
 
 function Send-File([string]$Local, [string]$Remote) {
-    Invoke-Native -Exe 'scp' -Arguments (@('-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', $Local, "${Target}:$Remote") -replace '\\', '/') -Quiet
+    # 和 Invoke-Ssh 用同一组保活选项：scp 卡住和 ssh 卡住是同一类故障，而且
+    # 传 18.6 MB 时更难判断是慢还是死了。
+    $scpArgs = @(
+        '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8',
+        '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=4',
+        $Local, "${Target}:$Remote"
+    )
+    Invoke-Native -Exe 'scp' -Arguments ($scpArgs -replace '\\', '/') -Quiet
 }
 
 # ---------------------------------------------------------------- 构建环境
@@ -306,6 +355,163 @@ function Test-Health([int]$TimeoutSec) {
     return $false
 }
 
+# ---------------------------------------------------------------- 统一产物目录
+<#
+    把所有"要放到被控端"的东西汇总到一个目录：target\output\cloud-stream。
+
+    为什么值得单开一步：在这之前，被控机需要的五样东西散在三个地方 —— exe 在
+    target\release、DLL 在 vendor\vigem、前端在另一个仓库的 dist、启动脚本在
+    toolchain\、证书只在被控机本地。于是"把一台新机器变成被控机"变成一串手工
+    scp，漏一个就得到"能连上但没画面 / 有画面但没手柄 / 有手柄但剪贴板废掉"。
+    汇总之后，这个目录**就是**运行根：拷过去、跑一次 setup-watchdog.bat，完事。
+
+    约定：运行根 <base>\stream 与本目录一一对应（相对路径全部自定位），所以
+    "本地这份能跑"与"线上在跑"是同一批字节，不是两次拼装的结果。
+#>
+function Resolve-CertPair {
+    # 证书是按机器签的（SAN 里是这台机器的 IP），构建端用文件名区分：
+    # toolchain\cert-<最后一个八位组>.pem + key-<同号>.pem；没有就退回
+    # toolchain\cert.pem + key.pem。都没有不算失败 —— 包照样能跑，只是明文
+    # HTTP（剪贴板要安全上下文），所以这里只返回 $null，由调用方说明。
+    $octet = ($HostName -split '\.')[-1]
+    foreach ($stem in @("cert-$octet", 'cert')) {
+        $c = Join-Path $PSScriptRoot "$stem.pem"
+        $k = Join-Path $PSScriptRoot ("key" + $stem.Substring(4) + '.pem')
+        if ((Test-Path $c) -and (Test-Path $k)) {
+            return [pscustomobject]@{ Cert = $c; Key = $k; Stem = $stem }
+        }
+    }
+    return $null
+}
+
+function Write-BundleReadme([string]$Path, [bool]$Tls) {
+    $tlsLine = if ($Tls) { 'cert.pem / key.pem  TLS 自签证书（浏览器会提示不受信任）' } else {
+        '本包未附带证书 -> 明文 HTTP，剪贴板同步不可用（需要安全上下文）'
+    }
+    $text = @"
+cloud-stream 被控端整包
+=======================
+
+这个目录就是被控机的运行根。位置随意：D:\stream、C:\dev\stream 都行，
+里面的脚本全部按自身位置推导路径，没有任何写死的目录。
+
+怎么用
+  1) 整包拷到目标机器（或解压同目录下的 cloud-stream.zip）。
+  2) 建看门狗计划任务（需要该账户密码，任务跑在交互式会话里）：
+         setup-watchdog.bat
+     也可以直接给参数：setup-watchdog.bat Administrator <密码>
+  3) 任务每分钟触发一次，进程挂了 60 秒内自己回来。
+     想手工起一次：start-stream.cmd
+  4) 浏览器打开 https://<本机IP>:8080/
+
+目录说明
+  stream-server.exe   采集 / 编码 / 信令 / HTTP / 文件传输，全在这一个进程
+  ViGEmClient.dll     虚拟手柄客户端；缺了只降级成"没手柄"，其余照常
+  selkies-web\        前端静态根（--dist 指向这里）
+  logs\               stream-server.log 与 watchdog.log（进程起不来先看后者）
+  start-stream.cmd    命令行参数都在这里：分辨率 / 帧率 / 码率 / 证书
+  run-hidden.vbs      计划任务的实际入口，无窗口，避免每分钟闪一次黑框
+  setup-watchdog.bat  创建 MCStreamSrv 任务
+  manifest.json       本次构建的指纹：提交、时间、各文件 MD5、前端文件数
+  $tlsLine
+
+注意
+  * 计划任务的 /RU 必须是"能看见桌面"的那个登录用户；换成服务账户会抓到空桌面。
+  * 换机器要重签证书（SAN 里是 IP），否则浏览器报警、剪贴板不工作。
+  * 换分辨率 / 码率改 start-stream.cmd，不要改计划任务。
+"@
+    # UTF-8 带 BOM：记事本与 PowerShell 5.1 都按 BOM 判编码，中文才不会乱码。
+    [System.IO.File]::WriteAllText($Path, $text, (New-Object System.Text.UTF8Encoding($true)))
+}
+
+function New-DeployBundle {
+    $webSrc = Join-Path $DashDir 'dist'
+    if (-not (Test-Path (Join-Path $webSrc 'index.html'))) {
+        throw "没有 $webSrc\index.html，先构建前端（去掉 -SkipBuild）"
+    }
+    if (-not (Test-Path $LocalExe)) {
+        # 只在 -SkipBackend 时可能走到这里（没构建过后端却只发前端）。包里缺 exe
+        # 就不能算完整运行根，但这一轮本来也不发后端，所以降级成提示。
+        if (-not $SkipBackend) { throw "没有 $LocalExe，先构建后端（去掉 -SkipBuild）" }
+        Write-Note "本机没有 stream-server.exe，包里只会有前端与脚本"
+    }
+
+    # 每次重建而不是增量覆盖：上一个包里的残留文件（改名后的 chunk、删掉的
+    # 资源）留在目录里，拷到新机器就是一个"看起来正常、实际带着死文件"的根。
+    if (Test-Path $BundleDir) { Remove-LocalPath $BundleDir }
+    foreach ($d in @($BundleDir, (Join-Path $BundleDir 'logs'), (Join-Path $BundleDir 'selkies-web'))) {
+        New-Item -ItemType Directory -Force -Path $d | Out-Null
+    }
+
+    $exePath = Join-Path $BundleDir 'stream-server.exe'
+    $dllPath = Join-Path $BundleDir 'ViGEmClient.dll'
+    if (Test-Path $LocalExe) { Copy-Item $LocalExe $exePath -Force }
+    if (Test-Path $LocalVigem) { Copy-Item $LocalVigem $dllPath -Force }
+    foreach ($name in $LauncherNames) {
+        Copy-Item (Join-Path $PSScriptRoot $name) (Join-Path $BundleDir $name) -Force
+    }
+
+    $cert = Resolve-CertPair
+    if ($cert) {
+        Copy-Item $cert.Cert (Join-Path $BundleDir 'cert.pem') -Force
+        Copy-Item $cert.Key (Join-Path $BundleDir 'key.pem') -Force
+    }
+
+    # 前端直接拷 dist：zip 是同一个 dist 的快照，解开再拷只是多一次压缩/解压。
+    Copy-Item -Path (Join-Path $webSrc '*') -Destination (Join-Path $BundleDir 'selkies-web') -Recurse -Force
+    if (-not (Test-Path (Join-Path $BundleDir 'selkies-web\assets'))) {
+        throw '打包出来的 selkies-web 没有 assets\：dist 是不是空的？'
+    }
+
+    Write-BundleReadme $BundleReadme ([bool]$cert)
+
+    $web = Get-ChildItem (Join-Path $BundleDir 'selkies-web') -Recurse -File
+    $webBytes = ($web | Measure-Object Length -Sum).Sum
+    if (-not $webBytes) { $webBytes = 0 }
+    $commit = $(try { (& git -C $RepoRoot rev-parse --short HEAD 2>$null) } catch { $null })
+    $dirty = $(try { [bool](& git -C $RepoRoot status --porcelain 2>$null) } catch { $true })
+
+    $manifest = [ordered]@{
+        bundle   = 'cloud-stream'
+        layout   = 'this directory IS the runtime root; all scripts self-locate'
+        built_at = (Get-Date).ToString('o')
+        commit   = $commit
+        dirty    = $dirty
+        exe      = $(if (Test-Path $exePath) {
+                [ordered]@{ bytes = (Get-Item $exePath).Length; md5 = (Get-Md5 $exePath) }
+            } else { $null })
+        dll      = $(if (Test-Path $dllPath) {
+                [ordered]@{ bytes = (Get-Item $dllPath).Length; md5 = (Get-Md5 $dllPath) }
+            } else { $null })
+        web      = [ordered]@{
+            files     = $web.Count
+            bytes     = $webBytes
+            index_md5 = (Get-Md5 (Join-Path $BundleDir 'selkies-web\index.html'))
+        }
+        launchers = $LauncherNames
+        tls      = [bool]$cert
+        cert     = $(if ($cert) { $cert.Stem } else { $null })
+    }
+    $manifest | ConvertTo-Json -Depth 6 | Set-Content -Path $BundleManifest -Encoding UTF8
+
+    # 整包 zip：给"拷一台新机器"用。放在 output\ 而不是包内 —— 把包自己压进
+    # 包内会在第二次运行时把上一次的 zip 也装进去。
+    if (Test-Path $BundleZip) { Remove-LocalPath $BundleZip }
+    Compress-Archive -Path (Join-Path $BundleDir '*') -DestinationPath $BundleZip -CompressionLevel Optimal
+
+    $zipBytes = (Get-Item $BundleZip).Length
+    $exeMb = $(if (Test-Path $exePath) { (Get-Item $exePath).Length / 1MB } else { 0 })
+    Write-Ok ("产物目录 {0}" -f $BundleDir)
+    Write-Ok ("  exe {0:N1} MB / 前端 {1} 文件 {2:N1} MB / 证书 {3}" -f $exeMb, $web.Count, ($webBytes / 1MB),
+        $(if ($cert) { "yes（$($cert.Stem)）" } else { 'NO（明文 HTTP）' }))
+    Write-Ok ("  {0}（{1:N2} MB）" -f $BundleZip, ($zipBytes / 1MB))
+    if (-not $exeMb) { Write-Note '包里没有 stream-server.exe（-SkipBackend 且本机没构建过）' }
+    if (-not $cert) {
+        Write-Note "包里没有 cert.pem/key.pem：部署后是明文 HTTP，剪贴板同步不可用。把证书放到 $PSScriptRoot\cert-<IP末位>.pem 与 key-<IP末位>.pem 可自动带上。"
+    }
+}
+
+
 # ---------------------------------------------------------------- 构建端备份
 <#
     被控机上不留 .prev，回滚材料在这里。为什么不「部署前从被控机把当前 exe 拉
@@ -320,8 +526,8 @@ function Save-DeployArchive {
     New-Item -ItemType Directory -Force -Path $ArchiveDir | Out-Null
     $parts = @()
     if (-not $SkipBackend) {
-        Copy-Item $LocalExe $ArchiveExe -Force
-        if (Test-Path $LocalVigem) { Copy-Item $LocalVigem $ArchiveDll -Force }
+        Copy-Item $srcExe $ArchiveExe -Force
+        if (Test-Path $srcDll) { Copy-Item $srcDll $ArchiveDll -Force }
         $parts += 'backend'
     }
     if (-not $SkipFrontend) {
@@ -330,6 +536,11 @@ function Save-DeployArchive {
     }
 
     $exeMd5 = $(if (Test-Path $ArchiveExe) { Get-Md5 $ArchiveExe } else { $null })
+    # 启动脚本也进归档：参数在 start-stream.cmd 里，回滚只退 exe 会让旧二进制
+    # 跑新参数（--dist 指到不存在的目录、证书路径换了 …）。一起退才叫回滚。
+    foreach ($name in $LauncherNames) {
+        Copy-Item (Join-Path $PSScriptRoot $name) (Join-Path $ArchiveDir $name) -Force
+    }
     $dllMd5 = $(if (Test-Path $ArchiveDll) { Get-Md5 $ArchiveDll } else { $null })
     $zipMd5 = $(if (Test-Path $ArchiveZip) { Get-Md5 $ArchiveZip } else { $null })
     $commit = $(try { (& git -C $RepoRoot rev-parse --short HEAD 2>$null) } catch { $null })
@@ -367,6 +578,10 @@ function Send-Archived([string[]]$Parts) {
     if ($sent.Count -eq 0) { return $false }
 
     Send-File $RemoteScript "$RemoteDeploy/deploy-remote.ps1"
+    foreach ($name in $LauncherNames) {
+        $src = Join-Path $ArchiveDir $name
+        if (Test-Path $src) { Send-File $src "$RemoteDeploy/$name" }
+    }
     $argList = "powershell -NoProfile -ExecutionPolicy Bypass -File $RemoteDeploy\deploy-remote.ps1"
     if ($sent -notcontains 'backend') { $argList += ' -SkipBackend' }
     if ($sent -notcontains 'frontend') { $argList += ' -SkipFrontend' }
@@ -462,10 +677,11 @@ try {
         Enable-RemoteSsh
 
         $bootstrapCmd = @(
-            "New-Item -ItemType Directory -Force '$RemoteRoot','$RemoteRoot\logs','$RemoteDeploy','$RemoteWeb' | Out-Null;"
+            "New-Item -ItemType Directory -Force '$RemoteRoot','$RemoteRoot\logs','$RemoteDeploy','$RemoteRoot\selkies-web' | Out-Null;"
             "if (Test-Path '$RemoteExe') { Write-Output ('exe ' + (Get-Item '$RemoteExe').Length) } else { Write-Output 'exe MISSING' };"
             "if (Get-ScheduledTask -TaskName $RemoteTask -ErrorAction SilentlyContinue) { Write-Output ('task ' + (Get-ScheduledTask -TaskName $RemoteTask).State) } else { Write-Output 'task MISSING' };"
-            "if ((Test-Path 'C:\dev\cert.pem') -and (Test-Path 'C:\dev\key.pem')) { Write-Output 'tls OK' } else { Write-Output 'tls MISSING' }"
+            "if ((Test-Path '$RemoteRoot\cert.pem') -and (Test-Path '$RemoteRoot\key.pem')) { Write-Output 'tls OK' } else { Write-Output 'tls MISSING' };"
+            "if (Test-Path '$(Split-Path -Parent $RemoteRoot)\selkies-web') { Write-Output 'legacy web dir still at the old location' } else { Write-Output 'layout ok' }"
         ) -join ' '
         $r = Invoke-Ssh "powershell -NoProfile -Command `"$bootstrapCmd`""
         foreach ($line in ($r.Output -split "`r?`n")) {
@@ -473,13 +689,19 @@ try {
         }
 
         # 启动脚本要跟着部署走：命令行参数（--dist / --tls-cert / --repeat-every）
-        # 全写在里面，只换 exe 不换它，参数就会永远停在上一次。
-        foreach ($f in @('start-stream.cmd', 'run-hidden.vbs')) {
-            Send-File (Join-Path $PSScriptRoot $f) "$RemoteDeploy/$f"
-            Write-Ok "推送 $f"
+        # 全写在里面，只换 exe 不换它，参数就会永远停在上一次。装的时候按哈希
+        # 跳过同名内容，并容忍"正在被看门狗执行的 .cmd"这种共享冲突 —— 那个
+        # 文件要等进程重启才能覆盖，不能因为它是忙的就把整次引导判失败。
+        foreach ($name in $LauncherNames) {
+            Send-File (Join-Path $PSScriptRoot $name) "$RemoteDeploy/$name"
         }
-        $r = Invoke-Ssh "powershell -NoProfile -Command `"Copy-Item '$RemoteDeploy\start-stream.cmd','$RemoteDeploy\run-hidden.vbs' '$RemoteRoot' -Force`""
-        Write-Ok '启动脚本落到 C:\dev\stream'
+        Write-Ok "推送启动脚本（$($LauncherNames -join ' / ')）"
+        $install = Invoke-Ssh ("powershell -NoProfile -ExecutionPolicy Bypass -File " +
+            "$RemoteDeploy\deploy-remote.ps1 -OnlyLaunchers") -AllowFail
+        foreach ($line in ($install.Output -split "`r?`n")) {
+            if ($line.Trim()) { Write-Info $line.Trim() }
+        }
+        if ($install.Code -ne 0) { Write-Note '启动脚本安装有异常，见上面的输出' }
 
         if ($r.Code -ne 0) { Write-Note '目录核对有异常，见上面的输出' }
     } else {
@@ -562,13 +784,36 @@ try {
         Write-Ok ("打包 $([math]::Round((Get-Item $ZipPath).Length / 1MB, 2)) MB  md5=$zipMd5")
     }
 
-    # ---- 5 上传
+    # ---- 5 汇总产物（被控端运行根）
+    <#
+        上传的三样东西全部从这一步的产物里取，所以"我检查过的那个包"和"线上正在
+        跑的东西"是同一批字节，而不是两次各自拼装的结果。
+
+        -SkipFrontend 且本机从来没有构建过前端 dist 时，整包不完整 —— 这时跳过
+        汇总并退回按单件上传，让"只换后端"仍然可用，而不是为了一次后端改动去
+        逼人构建前端。
+    #>
+    $packaged = $false
+    if (-not (Test-Path (Join-Path $DashDir 'dist\index.html'))) {
+        Write-Step '汇总产物：跳过（本机没有 dashboard dist，整包不完整）'
+        Write-Note '这一轮只发后端；下一次带前端的部署会把 target\output\cloud-stream 补齐'
+    } else {
+        Write-Step '汇总产物（target\output\cloud-stream）'
+        New-DeployBundle
+        $packaged = $true
+    }
+    $srcExe = $(if ($packaged) { Join-Path $BundleDir 'stream-server.exe' } else { $LocalExe })
+    $srcDll = $(if ($packaged -and (Test-Path (Join-Path $BundleDir 'ViGEmClient.dll'))) {
+            Join-Path $BundleDir 'ViGEmClient.dll'
+        } else { $LocalVigem })
+
+    # ---- 6 上传
     Write-Step '上传'
     if (-not $SkipBackend) {
-        Send-File $LocalExe "$RemoteRoot/stream-server.new.exe"
+        Send-File $srcExe "$RemoteRoot/stream-server.new.exe"
         Write-Ok 'stream-server.new.exe'
-        if (Test-Path $LocalVigem) {
-            Send-File $LocalVigem "$RemoteRoot/ViGEmClient.new.dll"
+        if (Test-Path $srcDll) {
+            Send-File $srcDll "$RemoteRoot/ViGEmClient.new.dll"
             Write-Ok 'ViGEmClient.new.dll'
         }
     }
@@ -577,14 +822,28 @@ try {
         Send-File $ZipPath "$RemoteDeploy/selkies-web.zip"
         Write-Ok 'selkies-web.zip'
     }
+    # 启动脚本上传到 deploy\，由被控端的 deploy-remote.ps1 在切换窗口里装进运行根。
+    # 每轮都发：参数在 start-stream.cmd 里，只换 exe 会让参数停在上一次。
+    foreach ($name in $LauncherNames) {
+        Send-File (Join-Path $PSScriptRoot $name) "$RemoteDeploy/$name"
+    }
+    Write-Ok ($LauncherNames -join ' / ')
+    # 证书只传到暂存区：被控端已有证书时不覆盖（SAN 里是那台机器的 IP），没有才装。
+    foreach ($name in @('cert.pem', 'key.pem')) {
+        $c = Join-Path $BundleDir $name
+        if ($packaged -and (Test-Path $c)) {
+            Send-File $c "$RemoteDeploy/$name"
+        }
+    }
+    if ($packaged -and (Test-Path (Join-Path $BundleDir 'cert.pem'))) { Write-Ok 'cert.pem / key.pem（仅当被控机缺失时安装）' }
     Send-File $RemoteScript "$RemoteDeploy/deploy-remote.ps1"
     Write-Ok 'deploy-remote.ps1'
 
-    # ---- 6 传输校验
+    # ---- 7 传输校验
     $verify = @()
     if (-not $SkipBackend) {
-        $verify += "exe=$(Get-Md5 $LocalExe)"
-        if (Test-Path $LocalVigem) { $verify += "dll=$(Get-Md5 $LocalVigem)" }
+        $verify += "exe=$(Get-Md5 $srcExe)"
+        if (Test-Path $srcDll) { $verify += "dll=$(Get-Md5 $srcDll)" }
     }
     if (-not $SkipFrontend) { $verify += "zip=$(Get-Md5 $ZipPath)" }
     if ($verify.Count -eq 0) {
@@ -619,7 +878,7 @@ try {
         return
     }
 
-    # ---- 7 切换
+    # ---- 8 切换
     Write-Step '切换（停任务 → 换文件 → 起任务）'
 
     # 从这里起，被控机上的文件随时可能已经被换掉：先立好"这一轮动了什么"，
@@ -650,7 +909,7 @@ try {
     if ($swapCode -ne 0) { throw "远端切换失败（退出码 $swapCode）" }
     Write-Ok '切换完成'
 
-    # ---- 8 体检
+    # ---- 9 体检
     Write-Step "体检（https://${HostName}:$Port/api/status）"
     if (-not (Test-Health $HealthTimeoutSec)) {
         throw '健康检查未通过'
@@ -710,13 +969,35 @@ try {
         Write-Note '没看到 stream-server 进程，但端口是通的 —— 检查是不是有别的实例'
     }
 
-    # ---- 9 归档（构建端唯一的备份）
+    <#
+        再核一条与"路径可搬"直接相关的：计划任务的动作路径。包可以整目录搬走，
+        任务里存的绝对路径不会自己跟着搬 —— 搬完之后看门狗依然去启动旧位置那份
+        （或者干脆什么都不启动），而端口还通（旧进程还在），日志一句话都不说。
+        这里只提示不失败：有人手工改过任务动作是合法的。
+    #>
+    $taskProbe = "Get-ScheduledTask -TaskName $RemoteTask -ErrorAction SilentlyContinue | " +
+        "ForEach-Object { `$_.Actions | ForEach-Object { 'act=' + `$_.Execute + ' ' + `$_.Arguments } }"
+    $t = Invoke-Ssh "powershell -NoProfile -Command `"$taskProbe`"" -AllowFail
+    $actLine = ($t.Output -split "`r?`n" | Where-Object { $_ -like 'act=*' } | Select-Object -First 1)
+    $expectVbs = Join-Path $RemoteRoot 'run-hidden.vbs'
+    if ($actLine -and $actLine.ToLower().Contains($expectVbs.ToLower())) {
+        Write-Ok ("看门狗动作 {0}" -f ($actLine -replace '^act=', ''))
+    } elseif ($actLine) {
+        Write-Note ("看门狗动作指向别处：{0}" -f ($actLine -replace '^act=', ''))
+        Write-Note "  期望包含 $expectVbs；整包搬过位置后要重跑一次 setup-watchdog.bat"
+    } else {
+        Write-Note "查不到计划任务 $RemoteTask 的动作 —— 先在被控机跑一次 setup-watchdog.bat"
+    }
+
+    # ---- 10 归档（构建端唯一的备份）
     Write-Step '归档（构建端）'
     Save-DeployArchive
 
     Write-Host ""
     Write-Host ("部署完成：{0:N1}s" -f ((Get-Date) - $DeployStartedAt).TotalSeconds) -ForegroundColor Green
     Write-Host "  页面    https://${HostName}:$Port/   （强刷 Ctrl+F5：index.html 换了）"
+    Write-Host "  运行根  $RemoteRoot（被控机上全部产物都在这里，脚本自定位）"
+    Write-Host "  整包    $BundleDir（+ cloud-stream.zip，拷到新机器即可）"
     Write-Host "  日志    $RemoteLog"
     Write-Host "  回滚    pwsh toolchain/deploy.ps1 -Rollback（重发 $ArchiveDir）"
 }

@@ -2,7 +2,7 @@
     deploy-remote.ps1 - the controlled-machine half of #34.
 
     Runs ON the target (Windows PowerShell 5.1). Never run it from the repo
-    checkout: deploy.ps1 uploads it to C:\dev\deploy and invokes it by path.
+    checkout: deploy.ps1 uploads it to <base>\deploy and invokes it by path.
 
     Why a separate file instead of an inline `ssh powershell -Command "..."`:
     an inline command has to survive bash -> ssh -> cmd -> powershell quoting.
@@ -12,8 +12,22 @@
     Everything here is ASCII on purpose: PowerShell 5.1 reads a BOM-less .ps1
     as ANSI, so non-ASCII comments would turn to mojibake.
 
-    Steps: stop task (and disable its 1-minute trigger) -> kill -> swap ->
-    re-enable -> start -> wait for the process.
+    NO HARDCODED PATHS. -Root and -DeployDir default to positions derived from
+    this script's own directory (deploy.ps1 uploads it to <base>\deploy, so the
+    runtime root is <base>\stream), and everything else - web dir, launchers,
+    zip, log - hangs off those two. That is what makes a bundle unpacked at
+    D:\games\stream behave exactly like C:\dev\stream: the launcher starts the
+    exe next to itself, serves <root>\selkies-web, and logs under <root>\logs.
+
+    Runtime layout - identical to the build machine's target\output\cloud-stream:
+
+        <root>\stream-server.exe  ViGEmClient.dll
+        <root>\cert.pem  key.pem
+        <root>\selkies-web\  logs\
+        <root>\start-stream.cmd  run-hidden.vbs  setup-watchdog.bat
+
+    Steps: install launchers -> stop task (and disable its 1-minute trigger) ->
+    kill -> swap -> re-enable -> start -> wait for the process.
 
     NO BACKUPS LIVE HERE. The controlled machine carries only the artifact
     that is supposed to run: one exe, one DLL, one web directory. Rollback
@@ -29,25 +43,154 @@
 param(
     [switch]$SkipBackend,
     [switch]$SkipFrontend,
+    # Do not touch the launcher scripts. Used when the operator deliberately
+    # hand-edited start-stream.cmd on this box (resolution, upload root).
+    [switch]$SkipLauncher,
+    # Bootstrap mode: create the directories, install the launchers and stop.
+    # No stop/start, no swap - this is the "first contact with a fresh machine"
+    # entry point, and it must be safe to run against a live one.
+    [switch]$OnlyLaunchers,
 
-    [string]$Root = 'C:\dev\stream',
-    [string]$WebDir = 'C:\dev\selkies-web',
-    [string]$WebZip = 'C:\dev\deploy\selkies-web.zip',
-    [string]$TaskName = 'MCStreamSrv',
-    [string]$LogPath = 'C:\dev\stream\logs\stream-server.log'
+    # Defaults are resolved in the body below, not here: PowerShell 5.1 leaves
+    # $PSScriptRoot empty while it evaluates parameter defaults, so
+    # `[string]$DeployDir = $PSScriptRoot` binds "" and the first Join-Path dies
+    # with "cannot bind argument to parameter 'Path' because it is an empty
+    # string" -- before anything is touched, which is how this was caught.
+    [string]$Root,
+    [string]$DeployDir,
+    [string]$TaskName = 'MCStreamSrv'
 )
 
 $ErrorActionPreference = 'Stop'
 
-$LiveExe = Join-Path $Root 'stream-server.exe'
-$NewExe = Join-Path $Root 'stream-server.new.exe'
+if (-not $DeployDir) {
+    # $PSScriptRoot is populated once the body runs.
+    $DeployDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+}
+$DeployDir = $DeployDir.TrimEnd('\')
+
+if (-not $Root) {
+    # Split-Path on a trailing separator returns the parent of the wrong level,
+    # so normalise first: <base>\deploy -> <base>\stream.
+    $base = Split-Path -Parent $DeployDir
+    $Root = Join-Path $base 'stream'
+}
+if (-not $Root) {
+    # Fail() is defined below, so this one cannot call it yet.
+    Write-Output 'FAIL cannot derive -Root; pass it explicitly (e.g. -Root C:\dev\stream)'
+    exit 1
+}
+$Root = $Root.TrimEnd('\')
+
+$WebDir = Join-Path $Root 'selkies-web'
+$WebZip = Join-Path $DeployDir 'selkies-web.zip'
+$LogDir = Join-Path $Root 'logs'
+
 # #17: the virtual-gamepad client DLL. It is optional: without it the server
 # runs and simply has no gamepad, so a missing upload is a note, never a failure.
+$LiveExe = Join-Path $Root 'stream-server.exe'
+$NewExe = Join-Path $Root 'stream-server.new.exe'
 $LiveDll = Join-Path $Root 'ViGEmClient.dll'
 $NewDll = Join-Path $Root 'ViGEmClient.new.dll'
 
+# Launchers travel with every deploy: the command line (--dist / --tls-cert /
+# --repeat-every) lives in start-stream.cmd, so replacing only the exe leaves the
+# flags frozen at the previous release. Installed by hash comparison, because
+# rewriting a .cmd that the watchdog is currently executing is a sharing
+# violation on a frontend-only deploy (nothing stops the batch in that path).
+$Launchers = @('start-stream.cmd', 'run-hidden.vbs', 'setup-watchdog.bat')
+
 function Say([string]$Text) { Write-Output $Text }
 function Fail([string]$Text) { Write-Output "FAIL $Text"; exit 1 }
+
+function Get-Sha([string]$Path) { (Get-FileHash -Path $Path -Algorithm MD5).Hash }
+
+# ------------------------------------------------------------- legacy layout
+<#
+    Until 2026-11 the web root and the certificates lived next to the runtime
+    directory instead of inside it (<base>\selkies-web, <base>\cert.pem), because
+    those paths were literals in the launcher. They are now relative, so a bundle
+    unpacked anywhere is self-contained - but a machine deployed before that
+    change still has the old shape. Migrate it once, in place, instead of
+    forcing a hand-run migration on every box.
+
+    The web directory is *renamed*, not copied: same volume, metadata only, and
+    it guarantees the old tree cannot linger as a second copy nobody rotates.
+#>
+function Repair-LegacyLayout {
+    $parent = Split-Path -Parent $Root
+    if ($parent -and $parent -ne $Root) {
+        if (-not (Test-Path $WebDir)) {
+            $legacyWeb = Join-Path $parent 'selkies-web'
+            if (Test-Path $legacyWeb) {
+                Move-Item -LiteralPath $legacyWeb -Destination $WebDir
+                Say "OK  migrated legacy web root $legacyWeb -> $WebDir"
+            }
+        }
+        foreach ($name in @('cert.pem', 'key.pem')) {
+            $legacy = Join-Path $parent $name
+            $live = Join-Path $Root $name
+            if ((Test-Path $legacy) -and -not (Test-Path $live)) {
+                Copy-Item -LiteralPath $legacy -Destination $live -Force
+                Say "OK  copied $name into the runtime root"
+            }
+        }
+    }
+
+    # Certificates uploaded by deploy.ps1 are only installed when the machine
+    # has none: a certificate carries this host's IP in its SAN, so overwriting
+    # one that was issued here with the build machine's copy would trade a
+    # working HTTPS endpoint for a browser warning.
+    foreach ($name in @('cert.pem', 'key.pem')) {
+        $staged = Join-Path $DeployDir $name
+        $live = Join-Path $Root $name
+        if (-not (Test-Path $staged)) { continue }
+        if (-not (Test-Path $live)) {
+            Copy-Item -LiteralPath $staged -Destination $live -Force
+            Say "OK  installed $name from the deploy bundle"
+        }
+        # The uploaded copy is transfer staging, and one of these two files is a
+        # private key: leave exactly one copy on the disk. deploy.ps1 re-uploads
+        # them on every run, so nothing is lost by deleting this one.
+        Remove-Item -LiteralPath $staged -Force
+    }
+}
+
+function Install-Launchers {
+    if ($SkipLauncher) { Say 'SKIP launchers (-SkipLauncher)'; return }
+    if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Force -Path $LogDir | Out-Null }
+
+    foreach ($name in $Launchers) {
+        $src = Join-Path $DeployDir $name
+        if (-not (Test-Path $src)) { Say "NOTE  $name not uploaded; keeping the one on disk"; continue }
+        $dst = Join-Path $Root $name
+        if ((Test-Path $dst) -and (Get-Sha $src) -eq (Get-Sha $dst)) {
+            Say "OK  $name unchanged"
+            continue
+        }
+        # cmd.exe closes start-stream.cmd a moment after the exe it launched
+        # exits, so retry briefly instead of declaring the file unusable.
+        $copied = $false
+        $err = ''
+        for ($i = 0; $i -lt 10; $i++) {
+            try {
+                Copy-Item -LiteralPath $src -Destination $dst -Force
+                $copied = $true
+                break
+            } catch {
+                Start-Sleep -Milliseconds 200
+                $err = $_.Exception.Message
+            }
+        }
+        if ($copied) {
+            Say "OK  $name updated"
+        } else {
+            # On a frontend-only deploy this is expected, not an error: the file
+            # is in use until the next restart.
+            Say "NOTE  $name busy ($err); new copy applies at next restart"
+        }
+    }
+}
 
 function Stop-Server {
     # The task fires every minute. Stop it first, then disable it: between the
@@ -93,14 +236,30 @@ function Start-Server {
             return
         }
     }
-    Fail 'task ran but stream-server.exe never appeared (see logs\watchdog.log)'
+    Fail "task ran but stream-server.exe never appeared (see $(Join-Path $LogDir 'watchdog.log'))"
 }
-
-function Get-Sha([string]$Path) { (Get-FileHash -Path $Path -Algorithm MD5).Hash }
 
 # ---------------------------------------------------------------- preflight
 Say 'STEP preflight'
-if (-not (Test-Path $Root)) { Fail "missing $Root" }
+# Create rather than require: a fresh machine gets the bundle unzipped into the
+# directory and deploy.ps1 uploads into deploy\ first. Both are idempotent.
+foreach ($dir in @($Root, $LogDir, $DeployDir)) {
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+}
+Say "OK  root $Root"
+
+# Launchers and certificates first: the certificates decide whether the server
+# comes up with TLS, and the launchers are installed later - see the note there.
+Repair-LegacyLayout
+
+if ($OnlyLaunchers) {
+    # Bootstrap path: install what we can and stop. The watchdog may be running
+    # start-stream.cmd right now, so a busy file is reported, never fatal.
+    Install-Launchers
+    Say 'DONE launchers only'
+    exit 0
+}
+
 if (-not $SkipBackend -and -not (Test-Path $NewExe)) { Fail "missing $NewExe (upload did not land)" }
 if (-not $SkipFrontend -and -not (Test-Path $WebZip)) { Fail "missing $WebZip" }
 if (-not $SkipBackend) {
@@ -134,6 +293,12 @@ if (-not $SkipBackend) {
         Remove-Item $NewDll -Force
         Say "OK  dll in place $((Get-Item $LiveDll).Length) B md5 $(Get-Sha $LiveDll)"
     }
+    # The launchers go in HERE, not in preflight: while the watchdog runs, its
+    # cmd.exe holds start-stream.cmd open and the copy is a sharing violation.
+    # Stop-Server has just released it, so this is the only reliable window.
+    # Order matters for a layout change too - the new exe must be started by the
+    # new launcher (it is the launcher that knows --dist moved into the root).
+    Install-Launchers
 }
 
 # ---------------------------------------------------------------- swap frontend
@@ -176,6 +341,11 @@ if (-not $SkipFrontend) {
     Remove-Item $WebZip -Force
     Say 'OK  staging zip removed'
 }
+
+# Frontend-only deploy never stopped the process, so the watchdog still has
+# start-stream.cmd open. Update what is free and say so; the rest takes effect
+# at the next restart, which is exactly the semantics of this switch.
+if ($SkipBackend) { Install-Launchers }
 
 # ---------------------------------------------------------------- start
 Say 'STEP start'

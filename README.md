@@ -81,19 +81,31 @@ cargo build --release -p stream-server
 
 ## 运行
 
+日常不用手敲参数：部署脚本会把“被控端需要的全部东西”汇总成
+`target\output\cloud-stream`（运行根），里面的 `start-stream.cmd` 按自身位置
+推导所有路径，命令行参数也在那里：
+
 ```powershell
-target\release\stream-server.exe `
-  --dist      C:\dev\selkies-web `
-  --port      8080 `
-  --width     1920 --height 1080 --fps 60 --bitrate 12000 `
-  --tls-cert  C:\dev\cert.pem --tls-key C:\dev\key.pem `
-  --upload-dir C:\Users\Public\Desktop
+target\output\cloud-stream\start-stream.cmd
+```
+
+整包（含前端、证书、启动脚本）还有一个同名 zip，拷到新设备解压即可跑，见
+`docs/deploy-one-click.md` §1.1。手工调试时才需要自己拼参数：
+
+```powershell
+cd target\output\cloud-stream
+..\..\release\stream-server.exe `
+  --dist       selkies-web `
+  --port       8080 `
+  --width      1920 --height 1080 --fps 60 --bitrate 12000 `
+  --tls-cert   cert.pem --tls-key key.pem `
+  --upload-dir "$env:USERPROFILE\Desktop"
 ```
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `--host` / `--port` | `0.0.0.0` / `8080` | HTTP(S) 与信令监听地址 |
-| `--dist` | — | 前端静态目录（`cloud-stream-web` 的构建产物） |
+| `--dist` | `selkies-web`（相对工作目录） | 前端静态目录（`cloud-stream-web` 的构建产物） |
 | `--app` | `app` | 信令路径 `/api/<app>/signaling/` |
 | `--width` `--height` | 屏幕原生 | 输出分辨率 |
 | `--fps` | `60` | 采集/编码帧率上限 |

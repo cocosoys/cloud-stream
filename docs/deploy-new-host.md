@@ -14,6 +14,7 @@
 | 你要做的事 | 需要的设备数 |
 |---|---|
 | 只**运行**一整套推流 | **1 台**（被控机） |
+| 把构建好的整包拷过去跑 | **1 台**（被控机），见 §3.0 |
 | 用现成的 `deploy.ps1` 一条命令部署 | **2 台**（构建机 + 被控机） |
 | 再增加一台被控机 | **+1 台**，构建机不加 |
 | 观众 / 玩家端 | **0 台**（任意设备开浏览器，不装东西） |
@@ -37,11 +38,11 @@
 | 运行时要什么 | 谁提供 | 是否依赖构建机 |
 |---|---|---|
 | 采集（DXGI）+ 编码（libvpx/opus）+ WebRTC 推流 | `stream-server.exe`，本机 | 否 |
-| HTTPS 8080 + 静态前端 + 信令 + 文件传输 | 同一个进程，静态根写死 `C:\dev\selkies-web`（`config.rs`） | 否 |
+| HTTPS 8080 + 静态前端 + 信令 + 文件传输 | 同一个进程，静态根是 `<运行根>\selkies-web`（相对工作目录，`config.rs`） | 否 |
 | 输入注入（`SendInput`） | 同一进程，跑在会话 1 | 否 |
-| 证书 | 本机 `C:\dev\cert.pem` / `key.pem`（自签） | 否 |
+| 证书 | 本机 `<运行根>\cert.pem` / `key.pem`（自签） | 否 |
 | 进程自愈 | 本机计划任务 `MCStreamSrv`，每分钟一次 | 否 |
-| 前端构建产物 | 已解压到被控机 `C:\dev\selkies-web` | 否 |
+| 前端构建产物 | 已在 `<运行根>\selkies-web\` | 否 |
 
 代码里没有指向 `.142` 的地址、没有远程配置源、没有 CDN 依赖（`grep 192.168`
 只命中 `health.rs` 的测试字面量）。所以构建机可以关机、可以搬走、可以换人。
@@ -72,14 +73,15 @@
 | 5 | **开机自动登录**（可选但强烈建议） | `AutoAdminLogon=1` 或手工登录后再离开 | 重启后没人登录 → 1 分钟看门狗每次空跑，`/api/status` 不通 |
 | 6 | VC++ 运行库 | `Test-Path C:\Windows\System32\vcruntime140.dll` | exe 起不来（缺 `VCRUNTIME140.dll`） |
 | 7 | OpenSSH Server | 装 → `Set-Service sshd -StartupType Automatic` → `Start-Service sshd` → 放行 TCP 22 | 部署脚本第一步就超时（脚本会把这三行打出来） |
-| 8 | 目录 | `C:\dev\stream\logs`、`C:\dev\deploy`、`C:\dev\selkies-web` | `-Bootstrap` 会建，但 exe/前端仍要落位 |
-| 9 | TLS 证书 | `C:\dev\cert.pem` + `C:\dev\key.pem`，**SAN 里要有这台机器的新 IP** | 浏览器证书不匹配；剪贴板 API 直接不可用（非安全上下文） |
-| 10 | 计划任务 `MCStreamSrv` | 在被控机跑一次 `C:\dev\deploy\setup-watchdog.bat`（**先把里面的 `/RP` 密码改成这台机器的**） | `task MISSING`，切换阶段失败 |
+| 8 | 目录 | `C:\dev\stream\logs`、`C:\dev\deploy`、`C:\dev\stream\selkies-web` | `-Bootstrap` 会建，但 exe/前端仍要落位 |
+| 9 | TLS 证书 | `C:\dev\stream\cert.pem` + `C:\dev\key.pem`，**SAN 里要有这台机器的新 IP** | 浏览器证书不匹配；剪贴板 API 直接不可用（非安全上下文） |
+| 10 | 计划任务 `MCStreamSrv` | 在运行根里跑一次 `setup-watchdog.bat`（账户密码用参数给，或按提示输入） | `task MISSING`，切换阶段失败 |
 
 额外两条只跟游戏有关，不属于推流链：
 
 - 游戏本体 / Java / 服务端各自启动，推流重启不该碰它们（`deploy-notes-mc-coexist.md`）。
-- 上传根 `--upload-dir` 写死在 `start-stream.cmd` 里（现网是 `C:\Users\Administrator\Desktop`），换机器要改这一行再跑 `-Bootstrap`。
+- 上传根 `--upload-dir` 现在是 `%USERPROFILE%\Desktop`（按运行账户推导，Desktop
+  不存在则退回账户主目录），换机器一般不用改。
 
 ### 1.1 证书
 
@@ -87,7 +89,11 @@
 `.148` 和 `.143`）。换机器有两步：
 
 1. 改 `CN=` 和 `subjectAltName=IP:<新IP>`；
-2. 重新签发，产物放 `C:\dev\cert.pem` / `C:\dev\key.pem`。
+2. 重新签发，产物放 `<运行根>\cert.pem` / `key.pem`（默认 `C:\dev\stream\`）。
+
+构建端也留一份、文件名为 `toolchain\cert-<IP末位>.pem` + `key-<IP末位>.pem`，部署
+时会自动打进整包；装到被控机时**只在被控机没有证书时**才落地（SAN 是那台机器的
+IP，拿构建端的覆盖等于把 HTTPS 换成浏览器报警）。
 
 脚本只检查文件在不在，**不检查是否过期、是否匹配这台机器的 IP**。
 
@@ -146,21 +152,46 @@ Host mc-admin-2
 
 ## 3 部署到新机器：命令
 
+### 3.0 只有一台机器时：拷整包
+
+构建端跑一次部署（或只跑到「汇总产物」）就会得到 `target\output\cloud-stream`
+—— 这个目录本身就是运行根，脚本全部按自身位置推导路径，没有写死的 `C:\dev`：
+
+```powershell
+# 构建端：整包（也可以直接把目录拷走）
+#   target\output\cloud-stream\        ← 目录
+#   target\output\cloud-stream.zip     ← 同名压缩包
+
+# 被控机（U 盘 / 共享目录 / scp 都行）：
+#   1. 解压到任意位置，例如 D:\stream
+#   2. 在该目录里建看门狗任务（账户密码用参数或提示输入）
+D:\stream\setup-watchdog.bat Administrator <密码>
+#   3. 浏览器打开 https://<本机IP>:8080/
+```
+
+这一路不需要构建机、不需要 ssh、不需要工具链。包里的 `README.txt` 就是这三步。
+
+### 3.1 有构建机时：一条命令
+
 ```powershell
 # 第一次搬上一台新被控机
 pwsh toolchain/deploy.ps1 -Target mc-admin-2 -HostName 192.168.59.15x -Bootstrap
 
 # 之后日常（后端 + 前端）
 pwsh toolchain/deploy.ps1 -Target mc-admin-2 -HostName 192.168.59.15x
+
+# 装到别的盘 / 别的目录
+pwsh toolchain/deploy.ps1 -RemoteBase D:\cloud
 ```
 
-远端路径是**常量**（`C:\dev\stream`、`C:\dev\selkies-web`、`C:\dev\deploy`），
-写成别的目录要同时改 `deploy.ps1` 的 `$Remote*`、`start-stream.cmd`、
-`setup-watchdog.bat` —— 三处，别只改一处。
+被控机上只有**一个**常量：安装根 `-RemoteBase`（默认 `C:\dev`）。运行根是
+`<base>\stream`，部署暂存是 `<base>\deploy`；运行根内部的脚本、exe 默认值
+（`--dist selkies-web`）、计划任务动作全部相对推导，所以换了 `-RemoteBase`
+之后不需要再改任何脚本。
 
-`-Bootstrap` 只做四件事：sshd 自启、建目录、推 `start-stream.cmd` /
-`run-hidden.vbs`、核对 exe / 任务 / 证书。**它不建计划任务、不签证书、不动密码**
-——那三件是人做的（见 §1 的第 9、10 项和 §1.3）。
+`-Bootstrap` 只做四件事：sshd 自启、建目录、推三个启动脚本并装进运行根、核对
+exe / 任务 / 证书 / 旧布局。**它不建计划任务、不签证书、不动密码** —— 那三件是
+人做的（见 §1 的第 9、10 项和 §1.3）。
 
 ---
 
@@ -178,7 +209,7 @@ ssh <别名> "powershell -c \"(Get-Process stream-server).SessionId\""     # 1�
 
 ---
 
-## 5 换设备最容易踩的 6 条
+## 5 换设备最容易踩的 7 条
 
 | 现象 | 原因 | 处置 |
 |---|---|---|
@@ -188,13 +219,15 @@ ssh <别名> "powershell -c \"(Get-Process stream-server).SessionId\""     # 1�
 | 证书报警、剪贴板失灵 | SAN 还是旧 IP；或根本没配证书（退回明文 http） | 按 §1.1 重签；剪贴板 API 要求安全上下文 |
 | 信令连上、视频不出 | 跨网段/跨 NAT，`ice_servers=[]` 只有 host candidate | 同网段部署，或后续接 STUN/TURN |
 | 指针灵敏度/界面缩放改了没反应还报错 | 服务用**非游戏账号**跑，改的是另一个 HKCU | `/RU` 必须是游戏所在的交互用户（现网 `Administrator`） |
+| 任务显示"运行过"，但页面 404 / 日志空 | 整包被搬到了别的目录，计划任务里还存着旧路径 | 在新目录重跑一次 `setup-watchdog.bat`；部署体检会把动作路径打出来 |
 
 ---
 
 ## 6 多台被控机怎么管
 
-- 同一份 `stream-server.exe` 和前端 zip 可以发到所有机器（`-SkipBuild` 复用产物）。
-- 每台机器各自的：证书（IP 不同）、计划任务（密码不同）、`start-stream.cmd` 里的
-  `--upload-dir` 与分辨率参数。
+- 同一份整包（`target\output\cloud-stream.zip`）可以发到所有机器；`-SkipBuild`
+  时也能直接复用上一轮的产物。
+- 每台机器各自的：证书（IP 不同）、计划任务（账户密码不同）、`start-stream.cmd`
+  里的分辨率 / 码率参数（`--upload-dir` 已按账户推导，通常不用改）。
 - 现在**没有**集中管理面：每台一套 `-Target`，靠 ssh 别名区分；`/api/v1/health`
   是单机自述，不做聚合。

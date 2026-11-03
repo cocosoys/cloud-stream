@@ -11,17 +11,22 @@
 # and it matters precisely because it is a stale duplicate of an older build.
 #
 # Deliberately NOT touched:
-#   cert.pem / key.pem            --tls-cert / --tls-key for start-stream.cmd
-#   mc-game-task.xml              scheduled-task definitions for the Minecraft
-#   mc-launch.cmd                 service that shares this machine
+#   <root>\stream				runtime root since the bundle refactor: exe, dll,
+#							cert.pem, key.pem, selkies-web\, logs\, 3 launchers
+#   cert.pem / key.pem			--tls-cert / --tls-key for start-stream.cmd
+#   mc-game-task.xml				scheduled-task definitions for the Minecraft
+#   mc-launch.cmd				service that shares this machine
 #   mc-stream-task.xml
-#   stream\  (exe, dll, two launcher scripts, logs)
-#   selkies-web\                  the served web root
-#   jdk8\  mc\start-mc.ps1  mc\launch-remote.ps1    the game's own runtime
+#   jdk8\  mc\start-mc.ps1  mc\launch-remote.ps1		the game's own runtime
+#
+# Legacy shape (before the bundle refactor) put the served web root and the
+# certificates directly under the base directory. deploy-remote.ps1 moves those
+# into the runtime root on its next run; a stray copy left here is safe to drop
+# once `selkies-web\` exists under the root.
 #
 # After this runs, C:\dev\deploy still exists but is empty: deploy.ps1 uploads
-# deploy-remote.ps1 and selkies-web.zip into it on every deploy, and the remote
-# half deletes the zip once it has been extracted.
+# deploy-remote.ps1, the three launcher scripts and selkies-web.zip into it on
+# every deploy, and the remote half deletes the zip once it has been extracted.
 #
 # Re-runnable: missing paths are skipped.
 
