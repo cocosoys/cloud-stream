@@ -63,7 +63,7 @@
 | 10 | Unicode 文本注入（中文 / 日文 / emoji / BMP 外代理对） | ✅ | #76 `749c8d8`，`keysym_to_unicode` |
 | 11 | 绝对指针 `m`（seq 去重、frame→screen 映射） | ✅ | #72 `bd5cf0e` |
 | 12 | 相对指针 `m2`（1:1 直通，不再按 screen/frame 缩放） | ✅ | #74 `6999a3c` |
-| 13 | 按键 mask 同步 / 滚轮脉冲 / `kr` 全释放 | ✅ | `sync_buttons` / `sync_scroll` |
+| 13 | 按键 mask 同步 / 滚轮脉冲 / `kr` 全释放 | ✅ | `sync_buttons` / `sync_scroll`。#101 修：`SCROLL_BITS` 曾写成 `0b1100_1000`（漏 bit 4），滚轮**向上**永远没有上升沿 → 上滚无效、下滚正常；现为 `0b1101_1000`，方向表与掩码由 `scroll_edges_cover_both_vertical_directions` 逐位钉住 |
 | 14 | 游戏模式光标合成（锁定指针时把 OS 光标画进帧） | ✅ | #70 `976edd6` |
 | 15 | 指针渲染权交接（`SET_NATIVE_CURSOR_RENDERING`） | ✅ | #57 |
 | 16 | 剪贴板文本双向（`REQUEST_CLIPBOARD` / `cw-cwe`） | ✅ | #55 `dispatch/clipboard.rs` |
@@ -338,9 +338,12 @@ IDR 约 100–200 KB，等于持续付出 0.4–0.8 Mbps。若要的是「长静
 ### 2.11 一键部署（#34，P2，L4）— 已实现
 
 **落地**：`toolchain/deploy.ps1`（本机）+ `toolchain/deploy-remote.ps1`（被控机）。
-一次 `pwsh toolchain/deploy.ps1` 走完：预检 → 上传 → 两端 MD5 → 停任务并**禁用**
-触发器 → 杀进程 → 备份 `.prev` → 换 exe / 解压前端 → 启任务 → 三重体检。
-失败自动调 `-Rollback`。
+一次 `pwsh toolchain/deploy.ps1` 走完八个步骤：预检 → 构建后端 → 构建前端 →
+上传 → 两端 MD5 → 停任务并**禁用**触发器 → 杀进程 → 换 exe/DLL → 前端解压到
+暂存目录校验后换名 → 启任务 → 三重体检 → **归档到构建端**。
+被控机上**不留 `.prev`**（每台一份 18.6 MB exe + 2000+ 文件目录副本、没人轮转）；
+失败时按"这一轮动过哪些部件"从构建端 `target\deploy-archive\` 重发，也可以
+`-Rollback` 手工发回上一版。
 
 **三个设计决定**（都是为了少一类失败）：
 
@@ -351,9 +354,11 @@ IDR 约 100–200 KB，等于持续付出 0.4–0.8 Mbps。若要的是「长静
 3. 体检不只查端口：还比对**进程启动时间晚于部署开始时间**与日志里的
    `listening on`。只看 200 会把"新 exe 没起来、旧进程被看门狗拉起"判成成功。
 
-**已实测**：两次全量部署（48.7 s）、一次 `-Rollback`、一次 `-Bootstrap`、
-一次 `-DryRun`。文档 `deploy-one-click.md` 含部署内容清单、路径契约、
-12 条踩坑记录、手工等价命令与重启后自检表。
+**已实测**：全量部署 495.6 s（含 `cargo build --release` 与前端构建）、
+`-Rollback` 59 s 不编译、`-SkipBackend -SkipBuild` 只换前端且**不重启进程**
+（会话保持），另有 `-Bootstrap` / `-DryRun` 各一次。文档
+`deploy-one-click.md` 含部署内容清单、路径契约、22 条踩坑记录、手工等价命令
+与重启后自检表。
 
 **残余**：`sshd` 自启由脚本幂等保证，但**拿到一台新机器时第一次仍要人**到控制台
 执行三行（脚本连不上就只能打印它们）。这一条无法自动化，写进了文档 §3.1。

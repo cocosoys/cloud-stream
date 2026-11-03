@@ -4,7 +4,7 @@
 > 上一个能跑的状态。本文是这条命令的说明书，也是它为什么长这样的原因。
 >
 > 脚本：`toolchain/deploy.ps1`（本机）、`toolchain/deploy-remote.ps1`（被控机）。
-> 最后核对：2026-10-29，部署机 `192.168.59.148`，`ssh mc-admin`。
+> 最后核对：2026-11-03，部署机 `192.168.59.148`，`ssh mc-admin`。
 
 ---
 
@@ -14,29 +14,56 @@
 pwsh toolchain/deploy.ps1
 ```
 
-输出长这样（真实运行，48.7 s）：
+输出长这样（真实运行：全量部署 495.6 s，`…` 是省略的无关行）：
 
 ```
 [1] 预检
       OK   ssh / scp / curl.exe 就位
       OK   ssh 可达：client001（mc-admin）
-      OK   sshd 已是自动启动
-      OK   防火墙放行规则已在
-      OK   本机 exe 17.3 MB  md5=AA37E0EF...
-[2] 上传
+      …
+[2] 构建后端（cargo build --release -p stream-server）
+      OK   built in …
+      OK   本机 exe 17.7 MB  md5=8DDB6080…
+      OK   本机 ViGEmClient.dll 140288 B  md5=91BA893E…
+[3] 构建前端（core → dashboard → 打包）
+      OK   core 构建完成
+      OK   dashboard 构建完成
+      OK   dist（index.html 917 B，core selkies-core-yAvzPWiV.js）
+      OK   打包 1.16 MB  md5=9A9E4CB0…
+[4] 上传
       OK   stream-server.new.exe
+      OK   ViGEmClient.new.dll
       OK   selkies-web.zip
       OK   deploy-remote.ps1
-[3] 传输校验（两端 MD5）
-[4] 切换（停任务 → 备份 → 换文件 → 起任务）
-           OK  task disabled / killed pid 1888 / swapped in ...
-           OK  started pid 5956 session 1
-[5] 体检（https://192.168.59.148:8080/api/status）
+[5] 传输校验（两端 MD5）
+      OK   exe 8DDB60802E12C7A5CB9990F919F70908
+      OK   dll 91BA893E750B2FDCCD142FDA9BA2DE2F
+      OK   zip 9A9E4CB0E4CED4F708B518188446FDF6
+[6] 切换（停任务 → 换文件 → 起任务）
+           STEP preflight
+           OK  new exe 18603008 B md5 8DDB6080…
+           OK  new dll 140288 B md5 91BA893E…
+           OK  zip 1214640 B md5 9A9E4CB0…
+           STEP backend
+           OK  task ended / task disabled / killed pid 8948
+           OK  no stream-server process
+           OK  swapped in 18603008 B md5 8DDB6080…
+           OK  dll in place 140288 B md5 91BA893E…
+           STEP frontend
+           OK  web dir 917 B index, 2 js chunks
+           OK  staging zip removed
+           STEP start
+           OK  task enabled / started pid 9504 session 1
+[7] 体检（https://192.168.59.148:8080/api/status）
       OK   HTTP 200
       OK   listening on https://0.0.0.0:8080 (TLS rustls 1.2/1.3)
-      OK   pid=5956 session=1 start=2026-10-29T10:45:07+08:00
-部署完成：48.7s
+      OK   pid=9504 session=1 start=2026-11-03T11:04:51+08:00
+[8] 归档（构建端）
+      OK   构建端归档：backend + frontend（target\deploy-archive）
+部署完成：495.6s
 ```
+
+被控机上没有"备份"这一步：备份归构建端（第 8 步），详见 §6 与 §7.22。
 
 页面 `https://192.168.59.148:8080/`，**记得 Ctrl+F5**：资产名变了，`index.html`
 本身也可能还在缓存里。
@@ -49,23 +76,33 @@ pwsh toolchain/deploy.ps1
 
 | 本机产物 | 被控机落点 | 干什么 | 要重启服务吗 |
 |---|---|---|---|
-| `target/release/stream-server.exe`（17.3 MB） | `C:\dev\stream\stream-server.exe` | 采集 / 编码 / 信令 / HTTP 静态 / 文件传输，全部逻辑 | **要** |
-| `vendor/vigem/ViGEmClient.dll`（140 KB） | `C:\dev\stream\ViGEmClient.dll` | #17 虚拟手柄的客户端 DLL，服务端运行时 `LoadLibraryW` 取；缺了只降级成"没手柄" | **要**（已加载的 DLL 有共享锁，只能在停进程后覆盖） |
-| `addons/selkies-dashboard/dist/`（打包 1.17 MB） | `C:\dev\selkies-web\` | 前端整页 | 不要 |
+| `target/release/stream-server.exe`（18,603,008 B） | `C:\dev\stream\stream-server.exe` | 采集 / 编码 / 信令 / HTTP 静态 / 文件传输，全部逻辑 | **要** |
+| `vendor/vigem/ViGEmClient.dll`（140,288 B） | `C:\dev\stream\ViGEmClient.dll` | #17 虚拟手柄的客户端 DLL，服务端运行时 `LoadLibraryW` 取；缺了只降级成"没手柄" | **要**（已加载的 DLL 有共享锁，只能在停进程后覆盖） |
+| `addons/selkies-dashboard/dist/`（打包 1,214,640 B） | `C:\dev\selkies-web\` | 前端整页（2008 个文件） | 不要 |
 | `toolchain/start-stream.cmd`（2070 B） | `C:\dev\stream\start-stream.cmd` | **命令行参数全在这** | 下次启动生效 |
 | `toolchain/run-hidden.vbs`（635 B） | `C:\dev\stream\run-hidden.vbs` | 无窗口启动，避免每分钟闪一次黑框 | 下次启动生效 |
-| `toolchain/deploy-remote.ps1` | `C:\dev\deploy\deploy-remote.ps1` | 被控端执行体 | 不要 |
+| `toolchain/deploy-remote.ps1` | `C:\dev\deploy\deploy-remote.ps1` | 被控端执行体（`deploy\` 里唯一的常驻文件） | 不要 |
+
+被控机最终只有这些，`selkies-web.zip` 解压成功后即删，不留副本（§6 / §7.22）：
+
+```
+C:\dev\stream\   stream-server.exe  ViGEmClient.dll  start-stream.cmd  run-hidden.vbs  logs\
+C:\dev\deploy\   deploy-remote.ps1
+C:\dev\selkies-web\   ← 2008 个文件，下面这几项
+```
 
 前端的目录内容（`-SkipFrontend` 可以整块跳过）：
 
 ```
-index.html                  786 B   ← 判定「是不是 dashboard 构建」的唯一凭据
-assets/index-*.js         727 KB   React + 侧边栏 + 面板
-assets/index-*.css         38 KB
-assets/selkies-core-*.js  527 KB   核心：信令、解码、输入、统计浮层
-jsdb/                    1992 个   手柄映射库，按 VID/PID 分文件
-codecs/                      4 个   可选编解码器
-manifest.json / icon*.png / selkies.svg
+index.html                    917 B   ← 判定「是不是 dashboard 构建」的唯一凭据；#97 起内含 streaming-mode 注入
+.asset-manifest.json        3,275 B   ← #99 全站指纹（2007 条登记，不含自身）
+assets/index-*.js      738,508 B   React + 侧边栏 + 面板
+assets/index-*.css      39,323 B
+assets/selkies-core-*.js 535,115 B  核心：信令、解码、输入、统计浮层
+jsdb/                    1994 个   手柄映射库，按 VID/PID 分文件（五平台，清单里聚合成 5 条单元）
+codecs/libopus-wasm/         4 个   AudioWorklet 解码器
+brand/logo.svg           1,641 B   侧边栏品牌图
+manifest.json / favicon.ico / icon.png / icon-512.png
 ```
 
 ### 1.2 只在引导（`-Bootstrap`）时管一次的东西
@@ -193,15 +230,25 @@ C:\dev\deploy\setup-watchdog.bat
 
 ---
 
-## 5 五个阶段分别做什么、判断依据是什么
+## 5 八个步骤分别做什么、判断依据是什么
 
-| 阶段 | 动作 | 判据 |
+步号只增不减、不印分母：`-SkipBackend` 这类开关会让某几步不占号，印了分母
+就会出现 `[4/8]` 之后直接 `[6/8]`。所以看输出时以标题为准，不要数编号。
+
+| 步 | 动作 | 判据 |
 |---|---|---|
 | 1 预检 | 本机要 `ssh`/`scp`/`curl.exe`；远端要能 `hostname` | 连不上 → 打印修 sshd 的三行 |
-| 2 上传 | `scp` 到 `stream-server.new.exe` / `selkies-web.zip`；带 `BatchMode=yes`，缺密钥立刻失败而不是卡在密码提示 | — |
-| 3 校验 | 两端 MD5 比对 | 不一致就停，**不切换** |
-| 4 切换 | 远端：停任务 → **禁用任务** → 杀进程 → 换文件 → 前端解压到暂存目录并校验后换名 → 启任务 | 每一步失败即中止 |
-| 5 体检 | 轮询 `/api/status` | 见下 |
+| 2 构建后端 | `cargo build --release -p stream-server`（`-SkipBackend` 跳过） | 编译失败 → 不进入下一步 |
+| 3 构建前端 | core → dashboard → `selkies-web.zip`（`-SkipFrontend` 跳过） | `dist` 缺失 / gendb 失败 → 抛错 |
+| 4 上传 | `scp` 到 `stream-server.new.exe` / `ViGEmClient.new.dll` / `selkies-web.zip` / `deploy-remote.ps1`；带 `BatchMode=yes`，缺密钥立刻失败而不是卡在密码提示 | — |
+| 5 校验 | 两端 MD5 比对 | 不一致就停，**不切换** |
+| 6 切换 | 远端：停任务 → **禁用任务** → 杀进程 → 换 exe/DLL → 前端解压到暂存目录并校验后换名 → 删 zip → 启任务 | 每一步失败即中止 |
+| 7 体检 | 轮询 `/api/status` | 见下 |
+| 8 归档 | 构建端把这一轮真正发出去的部件写进 `target\deploy-archive\` | 失败不影响线上 |
+
+前四步里 2 和 3 是可以单独跳过的，因为"只换前端"和"只换后端"都很常见；
+**5 之后就没有可以单独跳过的步骤了** —— 校验、切换、体检是一条链，缺一环
+就等于"不知道线上跑的是什么"。
 
 体检是**三重**判据，缺一不可：
 
@@ -257,7 +304,7 @@ pwsh toolchain/deploy.ps1 -Rollback
 
 **根因**：服务的是 **core 构建**（`addons/selkies-web-core/dist`，`index.html`
 185 B，只有 `#app` + `selkies-core.js`），不是 **dashboard 构建**
-（`addons/selkies-dashboard/dist`，`index.html` 786 B，带 `#root` + `assets/`）。
+（`addons/selkies-dashboard/dist`，`index.html` 917 B，带 `#root` + `assets/`）。
 工具栏住在 dashboard 的 React 侧边栏里，那个页面根本没被服务。
 
 **防**：部署脚本只打包 `selkies-dashboard/dist`，并且远端解压后**检查
@@ -410,7 +457,7 @@ Error: [safe-delete][SAFE_DELETE_BULK_CONFIRM_REQUIRED] {"count":1998,"threshold
 报错指向 vite 插件，看不出跟项目有什么关系。
 
 **根因**：`selkies-web-core` 的 `postbuild` 是 `node gendb.js`，每次往 `dist/jsdb`
-写 **1992 个**小手柄映射 JSON（`<vendor>-<product>.json`）。下一次 `vite build`
+写 **1994 个**小手柄映射 JSON（`<vendor>-<product>.json`）。下一次 `vite build`
 的 `emptyOutDir` 会一次性删掉它们 —— 在带批量删除保护的运行环境里（工作区把
 node 的 `rmSync` 包了一层），超过阈值就拒绝执行，构建中断。
 
@@ -499,7 +546,7 @@ node 的 `rmSync` 包了一层），超过阈值就拒绝执行，构建中断�
 ### 7.19 gendb 拉不到 GitHub 时静默产出空 `jsdb`（已修）
 
 **现象**：`npm run build` 全绿、`deploy.ps1` 全绿，zip 却从 1.16 MB 掉到
-0.55 MB，线上 `/jsdb/windows/045e-028e.json` 返回 404 —— 1992 个手柄映射全没了。
+0.55 MB，线上 `/jsdb/windows/045e-028e.json` 返回 404 —— 1994 个手柄映射全没了。
 
 **根因**：`selkies-web-core` 的 `postbuild` 是 `node gendb.js`，要从
 `api.github.com` + `raw.githubusercontent.com` 拉 SDL_GameControllerDB。本机到
@@ -510,7 +557,7 @@ node 的 `rmSync` 包了一层），超过阈值就拒绝执行，构建中断�
 
 **防**：`gendb.js` 的失败分支改成三级退让 —— ① `dist/jsdb` 已有映射就用它
 （断网单独 `npm run build` 的正常情况）；② 否则从 `selkies-web-core/.cache/jsdb`
-（首次成功构建时播下的一份，**只写一次**，因为刷新它又得删 1992 个文件）恢复并
+（首次成功构建时播下的一份，**只写一次**，因为刷新它又得删 1994 个文件）恢复并
 告警；③ 两者都没有就 `exit 1`。宁可构建失败，也不发一个"看起来完整"的包。
 
 > 判断有没有踩到：看 zip 体积。完整包 ~1.16 MB，缺 jsdb 的 ~0.55 MB。部署日志
@@ -618,7 +665,7 @@ DLL / zip 覆盖进 `target\deploy-archive\`（gitignore），失败或 `-Rollba
 一条命令跑完之后，按顺序核：
 
 - [ ] 退出码 0，末尾打印 `部署完成`
-- [ ] `[6] 体检` 三行全绿：`HTTP 200` / `listening on ...` / `pid=... session=1 start=...`
+- [ ] `[7] 体检` 三行全绿：`HTTP 200` / `listening on ...` / `pid=... session=1 start=...`
       （只换前端时中间一行是 `pid=...（未重启，会话保持）`，这是正常的，见 §7.15；
       全量部署时中间一行可能是 `pid=...（新进程）` 加一条说明 —— 指针日志刷屏会把
       启动行挤出日志尾部，端口通即视为在监听，见 §7.17）

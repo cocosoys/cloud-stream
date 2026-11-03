@@ -25,14 +25,14 @@ Windows 上的**云游戏 / 远程桌面串流服务端**：DXGI 采集 → 视�
 | VP8 软件编码 | ✅ | vendored `scrap` + libvpx/libyuv；H.264 / VP9 / AV1 未接协商 |
 | WebRTC 推流（offer/answer/ICE） | ✅ | 单个视频 track + 两条 DataChannel |
 | 键鼠注入 | ✅ | `SendInput` / `SetCursorPos`，含扫描码与修饰键状态 |
-| 触屏 / 虚拟摇杆 | 部分 | 触控事件已通，手柄注入缺驱动（见下） |
+| 触屏 / 虚拟摇杆 | ✅ | 触控走 `m`/`m2`，屏幕虚拟摇杆走 `js,a`（#17） |
 | 剪贴板 | ✅ | 文本双向 + 图片（二进制）双向 |
 | 文件传输 | ✅ | `POST /api/upload`、目录列表、下载 |
 | 音频 | ✅ | WASAPI 环回采集下行 + 麦克风上行，音画同步已钉墙钟 |
 | QoS 自适应 | ✅ | 链路跟不上时降档，恢复后自行爬回 |
 | 周期关键帧 | ✅ | `--keyframe-secs`，按墙钟计时而非帧数 |
 | 监听面鉴权骨架 | ✅ | 22 个入口全部插桩，默认 `allow-all`；令牌解析待做 |
-| 手柄注入 | ❌ | Windows 无用户态手柄注入 API，需 ViGEmBus 驱动 |
+| 手柄注入 | ✅ | #17：ViGEmBus 虚拟 Xbox 360 手柄 + vendored `ViGEmClient.dll`，含震动回程 |
 | 截图 / 录屏 | ❌ | 未实现 |
 
 逐项总账与缺口拆解在 [`docs/roadmap-l2-l3-gaps.md`](docs/roadmap-l2-l3-gaps.md)。

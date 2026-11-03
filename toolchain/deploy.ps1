@@ -523,7 +523,7 @@ try {
 
         if (-not $SkipBuild) {
             # 先自己清 dist，别交给 vite 的 emptyOutDir。core 的 postbuild（gendb.js）
-            # 每次往 dist/jsdb 写 1992 个小 JSON，于是下一次构建的「清空输出目录」
+            # 每次往 dist/jsdb 写 1994 个小 JSON，于是下一次构建的「清空输出目录」
             # 就变成一次上千文件的批量删除；在带批量删除保护的 shell 里（例如
             # 工作区沙箱把 node 的 rmSync 包了一层）会直接让构建失败，
             # 而且报错信息指向 vite 插件，看不出是文件数量的问题。
