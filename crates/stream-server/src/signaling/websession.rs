@@ -39,8 +39,8 @@ use tokio_tungstenite::{
 use crate::config::Config;
 use crate::dispatch::{
     classify, connection, cursor, display, hostui, pipeline, server_settings, stream_info,
-    stream_stats, system, Action, ClipboardSink, InputSinkRef, StreamInfo, StreamStats,
-    WinInputSink, read_clipboard_update,
+    stream_stats, system, Action, ClipboardSink, GamepadHub, InputSinkRef, StreamInfo,
+    StreamStats, WinInputSink, read_clipboard_update,
 };
 use crate::pipeline::{spawn_loop, PipelineEvent, PipelineHandle, StreamSettings};
 use crate::platform::{HostSample, Sampler};
@@ -189,6 +189,10 @@ struct SessionCtx {
     /// `SETTINGS` and re-read by the capture worker every beat.
     settings: StreamSettings,
     input: InputSinkRef,
+    /// #17: the session's virtual gamepad bus. Session-scoped rather than
+    /// process-wide: the pads are OS devices that must disappear with the page
+    /// they belong to, and the rumble pump is per control channel.
+    gamepad: Arc<GamepadHub>,
     /// #55: Windows clipboard bridge for REQUEST_CLIPBOARD / cw-cwe uplink.
     clipboard: Arc<ClipboardSink>,
     stats_on: Arc<AtomicBool>,
@@ -228,7 +232,12 @@ impl SessionCtx {
         // #62: the sink needs the live frame size so it can map the frontend's
         // frame-space pointer coordinates onto the physical screen.
         let settings = StreamSettings::from_config(&cfg);
-        let input: InputSinkRef = Arc::new(WinInputSink::new(settings.clone()));
+        // #17: the gamepad bus loads ViGEmClient.dll and connects to ViGEmBus on
+        // its own thread, so a machine without the driver connects normally and
+        // simply has no virtual pads. The reason lands in the log once.
+        let gamepad = GamepadHub::spawn();
+        let input: InputSinkRef =
+            Arc::new(WinInputSink::with_gamepad(settings.clone(), Some(gamepad.clone())));
         // #80: the audio switches are process-wide (the audio thread is not
         // tied to the select loop), so a fresh connection resets them. Without
         // this, a reload while muted would come back silent with the panel
@@ -240,6 +249,7 @@ impl SessionCtx {
             pipeline: PipelineHandle::new(),
             settings,
             input,
+            gamepad,
             clipboard: Arc::new(ClipboardSink::default()),
             stats_on: Arc::new(AtomicBool::new(false)),
             latency: Arc::new(LatencyProbe::new()),
@@ -293,6 +303,21 @@ where
     // away — a vanished tab used to leave WASD held on the host until someone
     // physically touched the keyboard.
     ctx.input.reset();
+    // #17: a closed tab never sends `js,d`, and a virtual pad is an OS device
+    // that outlives the page. Without this the next connection finds a ghost
+    // "Xbox 360 Controller" holding XInput slot 0 and the game reads nothing.
+    // The unplug itself happens on the gamepad thread; `Drop` joins it.
+    ctx.gamepad.release_all();
+    // #17: `release_all` only clears `want`; the thread and the bus client end
+    // in `Drop`, and `Drop` waits for the *last* `Arc<GamepadHub>` — which the
+    // data-channel closures also hold (they close over the input sink, and the
+    // sink owns one). A teardown path that leaves a DC behind therefore leaves
+    // the pad thread and the ViGEm client running until that clone goes.
+    // Measured on the target host: four `connected` lines against two
+    // `bus disconnected`, and one extra thread per reload. Stopping here makes
+    // the release unconditional — a lingering `Arc` afterwards is an idle
+    // struct, not a thread with a driver connection.
+    ctx.gamepad.shutdown();
     // #96: a game-mode pin moves the *host's* pointer settings, so it outlives
     // the page that asked for it unless the release runs here. A tab closed
     // while locked away from pointer lock would otherwise leave the desktop at
@@ -547,6 +572,7 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
     let watcher_input = ctx.input.clone();
     let watcher_clipboard = ctx.clipboard.clone();
     let watcher_settings = ctx.settings.clone();
+    let watcher_gamepad = ctx.gamepad.clone();
     let watcher_tasks = ctx.tasks.clone();
     let watcher_registry = ctx.registry.clone();
     let watcher_audio_stop = ctx.audio_stop.clone();
@@ -574,6 +600,7 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
                             &watcher_input,
                             &watcher_clipboard,
                             &watcher_settings,
+                            &watcher_gamepad,
                             &watcher_tasks,
                             &watcher_registry,
                         )
@@ -869,6 +896,9 @@ async fn arm_connected_notices(
     input: &InputSinkRef,
     clipboard: &Arc<ClipboardSink>,
     settings: &StreamSettings,
+    // #17: the session's virtual gamepad bus. Only the rumble receiver is taken
+    // from it here; input already reaches it through `input`.
+    gamepad: &Arc<GamepadHub>,
     tasks: &SessionTasks,
     // #94: a codec pick has to restart the session, and the restart is this
     // registry's close notice — the same one `/api/v1/control/session/kick`
@@ -918,6 +948,38 @@ async fn arm_connected_notices(
             }
         }),
     );
+
+    // #17: rumble downlink. ViGEm notifies us when a game moves the motors, and
+    // the client's pad plays it. The receiver is handed out once per session —
+    // an ICE reconnect re-arms these notices and must not install a second
+    // consumer (it would halve the messages between two pumps).
+    //
+    // 5000 ms is the frontend's own ceiling (`RUMBLE_MAX_MS`, gamepad.js:71):
+    // `playEffect` is replace semantics, so giving each edge the full window
+    // means a game that re-issues "rumble" every frame never sees it lapse, and
+    // the stop edge (`0,0`) is what actually ends it.
+    if let Some(mut rumble_rx) = gamepad.take_rumble_rx() {
+        const RUMBLE_MS: u32 = 5000;
+        let rumble_control = control.clone();
+        push_task(
+            tasks,
+            tokio::spawn(async move {
+                while let Some(rumble) = rumble_rx.recv().await {
+                    if rumble_control.ready_state() != RTCDataChannelState::Open {
+                        continue;
+                    }
+                    let line = system(&format!(
+                        "rumble,{},{:.3},{:.3},{}",
+                        rumble.slot, rumble.large, rumble.small, RUMBLE_MS
+                    ));
+                    if let Err(err) = rumble_control.send_text(&line).await {
+                        log::debug!("rumble send skipped: {err:#}");
+                        break;
+                    }
+                }
+            }),
+        );
+    }
 
     // One-shot downstream notices, queued as plain lines for the open handler.
     // #50: `server_settings` is re-announced on every client settings request so

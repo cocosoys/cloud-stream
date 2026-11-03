@@ -92,6 +92,9 @@ $RemoteLog = "$RemoteRoot\logs\stream-server.log"
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $LocalExe = Join-Path $RepoRoot 'target\release\stream-server.exe'
+# #17: 虚拟手柄的 DLL。必须和 exe 同目录（LoadLibraryW 先查应用目录），并且
+# 必须在进程停下之后才能覆盖 —— 已加载的 DLL 被持有，运行中覆盖是共享冲突。
+$LocalVigem = Join-Path $RepoRoot 'vendor\vigem\ViGEmClient.dll'
 
 # 前端是独立仓库（cloud-stream-web）。同级目录下两种常见名字都认：
 # - 按仓库名克隆：cloud-stream-web
@@ -379,6 +382,13 @@ try {
         if (-not (Test-Path $LocalExe)) { throw "没有 $LocalExe，去掉 -SkipBuild 重新构建" }
         $localExeMd5 = Get-Md5 $LocalExe
         Write-Ok "本机 exe $([math]::Round((Get-Item $LocalExe).Length / 1MB, 1)) MB  md5=$localExeMd5"
+        # 缺 DLL 不算失败：手柄不可用，其余功能完全不受影响（服务端会降级并
+        # 在日志里说明原因）。但这里必须说出来，不能让"部署成功"盖住它。
+        if (Test-Path $LocalVigem) {
+            Write-Ok "本机 ViGEmClient.dll $((Get-Item $LocalVigem).Length) B  md5=$(Get-Md5 $LocalVigem)"
+        } else {
+            Write-Note "缺 $LocalVigem —— 部署后手柄不可用（其余功能正常）"
+        }
     }
 
     # ---- 4 构建前端
@@ -440,6 +450,10 @@ try {
     if (-not $SkipBackend) {
         Send-File $LocalExe "$RemoteRoot/stream-server.new.exe"
         Write-Ok 'stream-server.new.exe'
+        if (Test-Path $LocalVigem) {
+            Send-File $LocalVigem "$RemoteRoot/ViGEmClient.new.dll"
+            Write-Ok 'ViGEmClient.new.dll'
+        }
     }
     if (-not $SkipFrontend) {
         if (-not (Test-Path $ZipPath)) { throw "没有 $ZipPath：这是打包步骤失败，检查 dashboard\dist 是否存在" }
@@ -451,7 +465,10 @@ try {
 
     # ---- 6 传输校验
     $verify = @()
-    if (-not $SkipBackend) { $verify += "exe=$(Get-Md5 $LocalExe)" }
+    if (-not $SkipBackend) {
+        $verify += "exe=$(Get-Md5 $LocalExe)"
+        if (Test-Path $LocalVigem) { $verify += "dll=$(Get-Md5 $LocalVigem)" }
+    }
     if (-not $SkipFrontend) { $verify += "zip=$(Get-Md5 $ZipPath)" }
     if ($verify.Count -eq 0) {
         Write-Step '传输校验：跳过（后端与前端都没发了）'
@@ -459,6 +476,7 @@ try {
     Write-Step '传输校验（两端 MD5）'
     $check = @(
         "if (Test-Path '$RemoteRoot\stream-server.new.exe') { Write-Output ('exe=' + (Get-FileHash '$RemoteRoot\stream-server.new.exe' -Algorithm MD5).Hash) }"
+        "if (Test-Path '$RemoteRoot\ViGEmClient.new.dll') { Write-Output ('dll=' + (Get-FileHash '$RemoteRoot\ViGEmClient.new.dll' -Algorithm MD5).Hash) }"
         "if (Test-Path '$RemoteDeploy\selkies-web.zip') { Write-Output ('zip=' + (Get-FileHash '$RemoteDeploy\selkies-web.zip' -Algorithm MD5).Hash) }"
     ) -join '; '
     $remote = Invoke-Ssh "powershell -NoProfile -Command `"$check`""

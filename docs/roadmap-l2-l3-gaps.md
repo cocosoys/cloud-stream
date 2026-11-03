@@ -15,6 +15,11 @@
 > 本轮订正两处此前误判：**#27 周期关键帧其实早已由编码器 `kf_max_dist=60` 覆盖**
 > （见 §1.3），**#32 服务自恢复已由 #81 完成并实测**。新增 §2.12「音频无观测」。
 >
+> **2026-11-02 第五批**：#17 手柄注入落地（`dispatch/gamepad.rs` + vendored
+> `ViGEmClient.dll` + `toolchain/install-vigem.ps1`），#19 触屏虚拟摇杆随其一并可用，
+> §1.2 全部闭合。硬件回环在被控机通过；浏览器侧仍待人工验收。顶部总数未逐节重算，
+> **以各分节标题的计数为准**。
+>
 > **「完成」不等于「已验收」**：`#21 麦克风上行`、`#24 音量/静音/码率`、
 > `#23 统计浮层`、`#79 前端按钮` 四项代码已部署，但服务端日志里
 > `findstr "mic uplink|render open|uplink playing"` 命中数为 **0** —— 也就是
@@ -50,7 +55,7 @@
 | 7 | 静态托管 + TLS + 文件传输（列目录 / 下载 / 分片上传） | ✅ | `http/server.rs`、`http/file_transfer.rs` |
 | 8 | PC 状态机与断线恢复 | ✅ | `stage1-signaling-session.md` |
 
-### 1.2 L2 输入面 — 8 完成 / 1 部分 / 2 未做
+### 1.2 L2 输入面 — 10 完成 / 0 部分 / 1 未做
 
 | # | 能力 | 状态 | 证据与断点 |
 | --- | --- | --- | --- |
@@ -62,9 +67,9 @@
 | 14 | 游戏模式光标合成（锁定指针时把 OS 光标画进帧） | ✅ | #70 `976edd6` |
 | 15 | 指针渲染权交接（`SET_NATIVE_CURSOR_RENDERING`） | ✅ | #57 |
 | 16 | 剪贴板文本双向（`REQUEST_CLIPBOARD` / `cw-cwe`） | ✅ | #55 `dispatch/clipboard.rs` |
-| 17 | 手柄（`js,c/d/b/a/h` + `rumble` 下行） | ❌ | 前端 `input.js:5190-5193` 全套已发；服务端 `win_input.rs:737` 当 informational 丢弃，`grep rumble` 在整个 Rust 侧零命中 |
+| 17 | 手柄（`js,c/d/b/a/h` + `rumble` 下行） | ✅ | #17 `dispatch/gamepad.rs`：ViGEmBus + vendored `ViGEmClient.dll`（动态加载、独占线程、状态量合并、震动去重回程 `system→rumble,<slot>,<strong>,<weak>,<ms>`）。`cargo test ... hardware_roundtrip --ignored` 在被控机上读到 `XInput index 0: buttons 4096 / lt 64 / rt 128 / lx 32767 / ly 32767` |
 | 18 | 二进制剪贴板（`cb/cbs/cbd/cbe`） | ✅ | #85，`dispatch/clipboard_image.rs`（PNG/BMP → DIB）+ `clipboard.rs` 上下行；顺带修正下行消息族（旧 `clipboardContentUpdate` 本页根本不收） |
-| 19 | 触控 | 🟡 | 单指拖动走 `m`/`m2` 已通；**屏幕虚拟摇杆走 `js,a`**（`gamepad.js:125` 监听 `touchgamepadinput`），因此随 #17 一起被挡 |
+| 19 | 触控 | ✅ | 单指拖动走 `m`/`m2` 已通；**屏幕虚拟摇杆**走 `js,a`（`gamepad.js:125` 监听 `touchgamepadinput`），随 #17 一并可用 |
 
 ### 1.3 L3 画质与体验 — 6 完成 / 3 未做
 
@@ -134,7 +139,7 @@
 **验收**（尚未发生）：`audio: render open` / `mic uplink: remote track` /
 `audio: uplink playing` 三行日志目前命中数为 0，说明还没人真正开过麦。
 
-### 2.2 手柄（#17，P1，L2）
+### 2.2 手柄（#17，P1，L2）— 已实现，#17
 
 **现象**：插手柄、按任意键，游戏无反应。前端 `navigator.getGamepads()` 能读到设备。
 
@@ -143,19 +148,37 @@
 游戏读的是 XInput / Raw Input 设备栈。业界做法是 ViGEmBus（签名内核驱动，
 虚拟出 Xbox 360 手柄），Moonlight/Sunshine 走的正是这条路。
 
-**改动点**：
-- `dispatch/win_input.rs`：解析 `js,c,<idx>,<b64id>,<axes>,<buttons>` /
-  `js,d,<idx>` / `js,b,<idx>,<btn>,<val>` / `js,a,<idx>,<axis>,<val>` / `js,h,...`，
-  维护每个 slot 的状态机。
-- 新增 `dispatch/vgamepad.rs`：ViGEmBus client（`vigemclient` crate 或直接调
-  `ViGEmClient.dll`）。**需要先在被控机装驱动**（ViGEmBus Setup，一次即可）。
-- 下行 `rumble` 消息：从 `IGamepad::notification` 回调转成 control 通道 JSON。
+**落地形态**：
+- `dispatch/gamepad.rs`（新增）：`GamepadHub`。DLL **动态加载**
+  （`LoadLibraryW` + `GetProcAddress`，不引新 crate，只加 `Win32_System_LibraryLoader`
+  feature），失败即降级；ViGEm 句柄只在一条独占线程上用；输入路径只写
+  `Mutex<[Pad;4]>` + `Condvar`，**持锁不进 DLL**（回调可能同步发生在 `update` 内）；
+  回调去重（`AtomicU16` 打包 large/small）+ 限流 50 ms，停止边沿永不丢。
+- `dispatch/win_input.rs:737`：`js` 从 informational 分支取出，
+  `Some(hub) => hub.handle_js(rest)`，`None => debug 一行`（无驱动的旧行为）。
+- `signaling/websession.rs`：会话持有 hub，teardown 调 `release_all()`
+  （关页签不发 `js,d`，虚拟手柄是 OS 设备，不清会留下占着 XInput 0 号位的幽灵手柄）；
+  `arm_connected_notices` 里装一条震动泵 → `system("rumble,…")`，每会话只取一次接收端。
+- `vendor/vigem/`：vendored `ViGEmClient.dll`（140,288 B，x64，`/MT`，11 个导出），
+  由 `toolchain/build-vigem-client.ps1` 从 pinned 提交构建并校验导出符号。
+- `toolchain/install-vigem.ps1`：被控机一次性装驱动 + 预置 `xusb22.inf`。
+- 部署链：`deploy.ps1` 上传 `ViGEmClient.new.dll`，`deploy-remote.ps1` 在**停进程之后**
+  覆盖（已加载的 DLL 是共享锁）。
 
-**风险 / 前置**：装内核驱动属于环境变更，且 ViGEmBus 已停止维护（上游 2023 归档）。
-若不愿引入驱动，本项应转入 `roadmap-future.md`，明确"不装驱动就不支持手柄"。
+**环境前置（踩过的坑，见 `vendor/vigem/README.md`）**：Windows 11 把 Xbox 360 手柄的
+驱动 `xusb22.inf` 改成按需下发，没外网的虚拟机永远拿不到 → 子设备停在
+"需要进一步安装" → `vigem_target_add` 返回 `VIGEM_ERROR_TARGET_NOT_PLUGGED_IN`。
+这个码是**二次错误**（子设备未就绪后 ViGEmClient 顺手 `remove`，而 `remove` 在未连接
+状态返回的正是它），真因被盖住。`pnputil /add-driver C:\Windows\INF\xusb22.inf /install`
+预置后子设备创建即绑定，**不需要重启**（安装器报的 `0x00000bc3` 是总线驱动包的状态）。
 
-**验收**：Xbox 手柄插在被控机或客户端任一侧（客户端侧经浏览器转发）都能驱动游戏；
-摇杆走位连续无跳变；扳机是模拟量不是开关；`rumble` 能让手柄震动。
+**验收**：
+- 硬件回环（不需要浏览器、不需要前端）：`cargo test --release -p stream-server
+  hardware_roundtrip -- --ignored --nocapture` → 2026-11-02 在 192.168.59.148 通过，
+  读回 `buttons 4096(A) / left_trigger 64 / right_trigger 128 / lx 32767 / ly 32767`，
+  即 12 字节 `XUSB_REPORT` 按值传递的 ABI 与映射都正确。
+- 浏览器侧（**待人工验收**）：插手柄 → 游戏能动；摇杆连续无跳变；扳机是模拟量；
+  双马达震动可复现；关页签后 `joy.cpl` 里设备消失；重连后只有一个手柄。
 
 ### 2.3 音量 / 静音 / 音频码率（#24，P1，L3）— 已实现，#80
 
@@ -375,11 +398,10 @@ IDR 约 100–200 KB，等于持续付出 0.4–0.8 Mbps。若要的是「长静
 | ~~P2~~ | ~~2.11 一键部署~~ | — | **已实现 #34**，`deploy.ps1` + `deploy-remote.ps1`，两次全量 + 一次回滚实测 |
 | **P1** | **2.12 音频观测** | — | 仍是 #79/#80 的验收工具；不做就只能靠耳朵 |
 | P1 | 2.5 鉴权 | — | **只剩 token 解析 + 一个 `impl Policy`**（#88 把入口全接好了） |
-| P2 | 2.2 手柄 | ← 需先决定是否装 ViGEmBus 驱动 | 前端全套已就绪，卡在驱动 |
+| ~~P2~~ | ~~2.2 手柄~~ | — | **已实现 #17**，`dispatch/gamepad.rs` + vendored `ViGEmClient.dll`；硬件回环在被控机通过，浏览器侧待人工验收 |
 | P3 | 2.10 截图 | ← 2.5（鉴权） | 纯增量为先不碰 |
 
-**剩下的 1 项未做 + 3 项部分**，按建议顺序：2.12 音频观测 → 2.5 鉴权 →
-2.2 手柄（需先决定驱动）→ 2.10 截图。
+**剩下的 1 项未做 + 2 项部分**，按建议顺序：2.12 音频观测 → 2.5 鉴权 → 2.10 截图。
 2.12 是唯一"不做就没法验收已做完的东西"的一项；2.5 是唯一的安全债，而 #88
 已经把它的架子搭完了 —— 剩下的全是填写，不是接线。
 2.11 落地之后，剩下的每一项验收都只要一条命令，摩擦不再是理由。

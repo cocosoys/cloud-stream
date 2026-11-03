@@ -50,6 +50,7 @@ pwsh toolchain/deploy.ps1
 | 本机产物 | 被控机落点 | 干什么 | 要重启服务吗 |
 |---|---|---|---|
 | `target/release/stream-server.exe`（17.3 MB） | `C:\dev\stream\stream-server.exe` | 采集 / 编码 / 信令 / HTTP 静态 / 文件传输，全部逻辑 | **要** |
+| `vendor/vigem/ViGEmClient.dll`（140 KB） | `C:\dev\stream\ViGEmClient.dll` | #17 虚拟手柄的客户端 DLL，服务端运行时 `LoadLibraryW` 取；缺了只降级成"没手柄" | **要**（已加载的 DLL 有共享锁，只能在停进程后覆盖） |
 | `addons/selkies-dashboard/dist/`（打包 1.17 MB） | `C:\dev\selkies-web\` | 前端整页 | 不要 |
 | `toolchain/start-stream.cmd`（2070 B） | `C:\dev\stream\start-stream.cmd` | **命令行参数全在这** | 下次启动生效 |
 | `toolchain/run-hidden.vbs`（635 B） | `C:\dev\stream\run-hidden.vbs` | 无窗口启动，避免每分钟闪一次黑框 | 下次启动生效 |

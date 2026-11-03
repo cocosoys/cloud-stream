@@ -38,6 +38,10 @@ $ErrorActionPreference = 'Stop'
 $LiveExe = Join-Path $Root 'stream-server.exe'
 $NewExe = Join-Path $Root 'stream-server.new.exe'
 $PrevExe = Join-Path $Root 'stream-server.exe.prev'
+# #17: the virtual-gamepad client DLL. It is optional: without it the server
+# runs and simply has no gamepad, so a missing upload is a note, never a failure.
+$LiveDll = Join-Path $Root 'ViGEmClient.dll'
+$NewDll = Join-Path $Root 'ViGEmClient.new.dll'
 $PrevWeb = "$WebDir.prev"
 # `-CycleOnly` is what a frontend-only failure passes: nothing in that cycle
 # touched the exe, so rolling it back would silently downgrade a binary that had
@@ -143,6 +147,10 @@ if (-not $SkipBackend) {
     # hash matched nothing because nobody compared, and the exe will not start.
     if ($len -lt 5MB) { Fail "new exe is only $len bytes" }
     Say "OK  new exe $len B md5 $(Get-Sha $NewExe)"
+    # The DLL is swapped after the process stops, for the same reason the exe is:
+    # a loaded DLL is held open and cannot be overwritten in place.
+    if (Test-Path $NewDll) { Say "OK  new dll $((Get-Item $NewDll).Length) B md5 $(Get-Sha $NewDll)" }
+    else { Say 'WARN no ViGEmClient.new.dll: gamepad stays unavailable' }
 }
 if (-not $SkipFrontend) {
     $zipLen = (Get-Item $WebZip).Length
@@ -160,6 +168,12 @@ if (-not $SkipBackend) {
     Say 'OK  backed up to stream-server.exe.prev'
     Move-Item $NewExe $LiveExe -Force
     Say "OK  swapped in $((Get-Item $LiveExe).Length) B md5 $(Get-Sha $LiveExe)"
+    # Same window as the exe: Stop-Server has already released the image.
+    if (Test-Path $NewDll) {
+        Copy-Item $NewDll $LiveDll -Force
+        Remove-Item $NewDll -Force
+        Say "OK  dll in place $((Get-Item $LiveDll).Length) B md5 $(Get-Sha $LiveDll)"
+    }
 }
 
 # ---------------------------------------------------------------- swap frontend

@@ -9,6 +9,10 @@ pub mod clipboard_image;
 pub mod commands;
 // #89: host display-mode control (the "match my viewport" toolbar switch).
 pub mod display;
+// #17: virtual gamepad (ViGEmBus). The frontend has sent `js,*` since the WR
+// core was written; this is the missing injection half, plus the rumble uplink
+// that carries motor state back to the client's pad.
+pub mod gamepad;
 // #96: how long the game-mode ghost pointer stays on screen (a number to
 // announce; the page runs the timer).
 pub mod ghost;
@@ -20,6 +24,7 @@ pub mod win_input;
 
 pub use clipboard::{ClipboardSink, read_clipboard_update};
 pub use commands::{Action, classify};
+pub use gamepad::GamepadHub;
 pub use input_stub::InputSinkRef;
 pub use win_input::WinInputSink;
 pub use output::{

@@ -19,12 +19,15 @@
 //! * `p,0|1`                            pointer-lock state (informational)
 //! * `SET_NATIVE_CURSOR_RENDERING,0|1`  cursor mode switch (informational)
 //! * `sf,<dx>,<dy>` / `sfe`             smooth-wheel fallback
-//! * `js,...`                           joystick (ignored)
+//! * `js,...`                           joystick; forwarded to `dispatch::gamepad`
+//!   (#17), which owns the ViGEmBus handles. Dropped at debug level when no
+//!   hub was supplied.
 //!
 //! Button mask bits: 0=left, 1=middle, 2=right; 3/4 vertical wheel rising
 //! edge, 6/7 horizontal wheel rising edge.
 
 use std::os::raw::c_int;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
@@ -293,6 +296,10 @@ pub struct WinInputSink {
     /// Only `m` is filtered. Relative `m2` deltas are summed, so their arrival
     /// order carries no information and dropping one would lose real motion.
     last_abs_seq: std::sync::atomic::AtomicU64,
+    /// #17: the virtual gamepad. `None` keeps the pre-#17 behavior for `js`
+    /// (debug log, drop) — which is what a build without ViGEmBus, and the unit
+    /// tests, get.
+    gamepad: Option<Arc<super::gamepad::GamepadHub>>,
 }
 
 impl Default for WinInputSink {
@@ -305,12 +312,24 @@ impl WinInputSink {
     /// Build a sink that maps frame-space pointer input onto the real screen
     /// using the live `StreamSettings` (which the pipeline re-seeds to the
     /// native display size and the client may override).
+    ///
+    /// No virtual gamepad: `js` lines are logged and dropped. The session uses
+    /// [`WinInputSink::with_gamepad`] instead.
     pub fn new(frame: StreamSettings) -> Self {
+        Self::with_gamepad(frame, None)
+    }
+
+    /// #17: the session's sink, with the virtual gamepad bus it should feed.
+    pub fn with_gamepad(
+        frame: StreamSettings,
+        gamepad: Option<Arc<super::gamepad::GamepadHub>>,
+    ) -> Self {
         Self {
             state: Mutex::new(InputState::default()),
             frame,
             mapping_logged: std::sync::atomic::AtomicBool::new(false),
             last_abs_seq: std::sync::atomic::AtomicU64::new(0),
+            gamepad,
         }
     }
 
@@ -733,8 +752,17 @@ impl WinInputSink {
                 }
                 st.held_keys.clear();
             }
+            // #17: gamepad. Parsed here because this module owns the wire
+            // grammar; injected in `gamepad` because that module owns the
+            // ViGEm handles, which may only be touched from its own thread.
+            // No hub (driver missing, or a caller that did not want one): keep
+            // the pre-#17 behavior at debug level — nothing else changes.
+            "js" => match &self.gamepad {
+                Some(hub) => hub.handle_js(rest),
+                None => log::debug!("[input] gamepad line dropped (no ViGEmBus): {line}"),
+            },
             // Informational / no-op on the injection side.
-            "p" | "SET_NATIVE_CURSOR_RENDERING" | "js" | "sf" | "sfe" | "pointer" => {
+            "p" | "SET_NATIVE_CURSOR_RENDERING" | "sf" | "sfe" | "pointer" => {
                 log::debug!("[input] informational line: {line}");
             }
             _ => {

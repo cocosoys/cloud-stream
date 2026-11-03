@@ -41,12 +41,16 @@ rustls-pki-types = "1.11"
 # MapVirtualKeyW for the real injection sink (WinInputSink).
 # #55 clipboard: DataExchange adds Open/Close/Empty/Get/SetClipboardData and
 # Memory adds GlobalAlloc/Lock/Unlock for the host clipboard bridge.
+# #17 gamepad: LibraryLoader adds LoadLibraryW/GetProcAddress for the vendored
+# ViGEmClient.dll. Dynamic on purpose — the deploy machine must not need a C++
+# toolchain, and a missing DLL has to degrade to "no gamepad", not "no server".
 windows-sys = { version = "0.52", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_Media",
 ] }
