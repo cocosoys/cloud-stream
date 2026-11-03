@@ -538,17 +538,28 @@ fn sync_buttons(state: &mut InputState, mask: u32) {
     }
 }
 
-/// Diff the scroll bits (3/4 vertical, 6/7 horizontal) against the previous
-/// mask; each 0->1 rising edge emits one wheel pulse of `mag` notches.
-fn sync_scroll(state: &mut InputState, mask: u32, mag: i32) {
-    const SCROLL_BITS: u32 = 0b1100_1000;
-    let changed = (state.scroll_bits_prev ^ mask) & SCROLL_BITS;
+/// The four scroll bits: 3 = down, 4 = up, 6 = left, 7 = right.
+///
+/// #101: this used to be `0b1100_1000`, which covers 3/6/7 and silently drops
+/// bit 4. Scrolling up therefore never produced a rising edge — the pointer
+/// moved, the mask was recorded, and no wheel event was ever injected, while
+/// scrolling down worked. Both vertical bits have to be here for the diff
+/// below to see them at all.
+const SCROLL_BITS: u32 = 0b1101_1000;
+
+/// Rising edges of `SCROLL_BITS` between `prev` and `mask`, as
+/// `(vertical, notches)` pulses; a negative count scrolls down/left.
+///
+/// Split out of `sync_scroll` so the bit/direction table can be asserted
+/// without injecting input — a wrong entry here is invisible everywhere else,
+/// because the injection itself still "succeeds" and just scrolls nothing.
+fn scroll_pulses(prev: u32, mask: u32, mag: i32) -> Vec<(bool, i32)> {
+    let changed = (prev ^ mask) & SCROLL_BITS;
     let rising = changed & mask;
+    let mut pulses = Vec::with_capacity(4);
     if rising == 0 {
-        state.scroll_bits_prev = mask & SCROLL_BITS;
-        return;
+        return pulses;
     }
-    let mut inputs = Vec::with_capacity(4);
     for (bit, vertical) in [
         (3u32, true),
         (4, true),
@@ -558,13 +569,25 @@ fn sync_scroll(state: &mut InputState, mask: u32, mag: i32) {
         if rising & (1 << bit) != 0 {
             // bit3/6 = down/left (negative delta), bit4/7 = up/right (positive).
             let dir = if bit == 3 || bit == 6 { -1 } else { 1 };
-            inputs.push(mouse_wheel_event(vertical, dir * mag.max(1)));
+            pulses.push((vertical, dir * mag.max(1)));
         }
     }
+    pulses
+}
+
+/// Diff the scroll bits (3/4 vertical, 6/7 horizontal) against the previous
+/// mask; each 0->1 rising edge emits one wheel pulse of `mag` notches.
+fn sync_scroll(state: &mut InputState, mask: u32, mag: i32) {
+    let pulses = scroll_pulses(state.scroll_bits_prev, mask, mag);
     state.scroll_bits_prev = mask & SCROLL_BITS;
-    if !inputs.is_empty() {
-        send_inputs(&mut inputs);
+    if pulses.is_empty() {
+        return;
     }
+    let mut inputs: Vec<INPUT> = pulses
+        .iter()
+        .map(|&(vertical, notches)| mouse_wheel_event(vertical, notches))
+        .collect();
+    send_inputs(&mut inputs);
 }
 
 /// Press or release one key. A printable char that needs Shift emits a
@@ -928,5 +951,41 @@ mod tests {
         assert_eq!(sink.transmitted_frame(), (3840, 2160));
         s.set_output(1718, 926);
         assert_eq!(sink.transmitted_frame(), (1718, 926));
+    }
+
+    /// #101: scrolling up did nothing while scrolling down worked, because
+    /// `SCROLL_BITS` omitted bit 4. Pin the exact bit set the protocol uses, so
+    /// a typo in this constant can never again cost one whole direction
+    /// without failing a test.
+    #[test]
+    fn scroll_edges_cover_both_vertical_directions() {
+        assert_eq!(SCROLL_BITS, (1 << 3) | (1 << 4) | (1 << 6) | (1 << 7));
+        // Each direction on a fresh mask is one pulse, signed as the wire
+        // contract says: down/left negative, up/right positive.
+        assert_eq!(scroll_pulses(0, 0x10, 1), vec![(true, 1)]); // up
+        assert_eq!(scroll_pulses(0, 0x08, 1), vec![(true, -1)]); // down
+        assert_eq!(scroll_pulses(0, 0x80, 1), vec![(false, 1)]); // right
+        assert_eq!(scroll_pulses(0, 0x40, 1), vec![(false, -1)]); // left
+        // `mag` rides through as notches, and is never zero.
+        assert_eq!(scroll_pulses(0, 0x10, 3), vec![(true, 3)]);
+        assert_eq!(scroll_pulses(0, 0x10, 0), vec![(true, 1)]);
+    }
+
+    /// The client sends cleared → set → restored around one pulse. Only the
+    /// middle message may inject: a held bit must not repeat, or one notch of
+    /// scroll would become three.
+    #[test]
+    fn a_scroll_pulse_fires_once_between_clear_and_release() {
+        // Cleared baseline with nothing held: no edge.
+        assert!(scroll_pulses(0, 0, 1).is_empty());
+        // Rising edge: exactly one pulse.
+        assert_eq!(scroll_pulses(0, 0x10, 1).len(), 1);
+        // Still set (a second message on the held bit): nothing.
+        assert!(scroll_pulses(0x10, 0x10, 1).is_empty());
+        // Release: falling edge, nothing.
+        assert!(scroll_pulses(0x10, 0, 1).is_empty());
+        // Both vertical bits at once would be a broken client, but it must not
+        // panic or drop one silently.
+        assert_eq!(scroll_pulses(0, 0x18, 1), vec![(true, -1), (true, 1)]);
     }
 }
