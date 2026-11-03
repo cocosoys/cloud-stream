@@ -2,10 +2,11 @@
 rem ---------------------------------------------------------------------------
 rem Open the two inbound paths a controlled machine needs, from its own console.
 rem
-rem Run it as administrator (right-click -> Run as administrator). The rules go
-rem into the machine-wide store, so a non-elevated run fails with "access is
-rem denied" and changes nothing -- which is why this checks first instead of
-rem printing a wall of errors.
+rem Run it as administrator (right-click -> Run as administrator). The work is
+rem done by open-inbound.cmd, the same helper start-stream.cmd and
+rem setup-watchdog.bat call -- this file is the interactive wrapper: it shows
+rem the profile, the resulting rules and a loopback self-test, then pauses so
+rem the window does not vanish before anybody reads it.
 rem
 rem Why this file exists: on a fresh Windows every inbound packet is dropped on
 rem the Public profile, ICMP included. The controlled machine then looks dead
@@ -15,12 +16,12 @@ rem start only helps if somebody sits at that machine and clicks "allow".
 rem
 rem   8080 TCP   HTTPS page, WS signalling, file transfer
 rem   ICMP echo  so "ping <ip>" answers, which is what everyone tries first
-rem
-rem Rules are added with profile=any on purpose: a VMware NAT / host-only
-rem adapter is often classified as "public", and a rule limited to Private will
-rem silently do nothing there.
 rem ---------------------------------------------------------------------------
 setlocal EnableExtensions
+
+set "ROOT=%~dp0"
+if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
+set "HELPER=%ROOT%\open-inbound.cmd"
 
 net session >nul 2>&1
 if errorlevel 1 (
@@ -32,19 +33,24 @@ if errorlevel 1 (
     exit /b 1
 )
 
+if not exist "%HELPER%" (
+    echo MISSING %HELPER% -- the bundle was not unpacked completely.
+    pause
+    exit /b 1
+)
+
 echo -- current firewall profile --
 netsh advfirewall show currentprofile state
 
 echo.
-echo -- dropping old rules of the same name ^(silently, they may not exist^) --
-netsh advfirewall firewall delete rule name="cloud-stream 8080" >nul 2>&1
-netsh advfirewall firewall delete rule name="cloud-stream ICMPv4" >nul 2>&1
-
-echo -- adding rules for ALL profiles --
-netsh advfirewall firewall add rule name="cloud-stream 8080" dir=in action=allow protocol=TCP localport=8080 profile=any
-netsh advfirewall firewall add rule name="cloud-stream ICMPv4" dir=in action=allow protocol=icmpv4:8,any profile=any
-
+echo -- adding rules ^(old ones of the same name are replaced^) --
+call "%HELPER%"
+if errorlevel 2 (
+    echo   netsh refused to add the rules. A third-party firewall or a domain
+    echo   policy is probably in charge; allow stream-server.exe there as well.
+)
 echo.
+
 echo -- rules now in place --
 netsh advfirewall firewall show rule name="cloud-stream 8080"
 netsh advfirewall firewall show rule name="cloud-stream ICMPv4"

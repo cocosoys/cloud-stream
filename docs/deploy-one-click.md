@@ -74,7 +74,7 @@ pwsh toolchain/deploy.ps1
 部署完成：86.5s
 ```
 
-再跑一次同样的东西时，第 6 步的 `migrated` / `copied` 不再出现，六个上机脚本变成
+再跑一次同样的东西时，第 6 步的 `migrated` / `copied` 不再出现，八个上机脚本变成
 `unchanged` —— 那就是幂等。
 
 被控机上没有"备份"这一步：备份归构建端（第 8 步），详见 §6 与 §7.22。
@@ -107,13 +107,16 @@ target\output\cloud-stream\
   setup-watchdog.bat     创建 MCStreamSrv 任务（账户密码用参数或用提示输入）
   collect-launch-facts.cmd  起不来时双击它，生成一份事实清单（只读，不启动 exe）
   setup-inbound.cmd     管理员身份运行：放行 8080 与 ping（新机器必须做一次）
+  open-inbound.cmd      上面那条规则的执行者，被启动脚本自动调用（幂等、静默）
+  probe-listen.cmd      启动后 30 秒内把"到底有没有监听"写进 watchdog.log
   README.txt             上机三步 + 目录说明（给拿到包的人看）
   manifest.json          构建指纹：提交、时间、MD5、前端文件数
 target\output\cloud-stream.zip   整包，拷到新机器用
 ```
 
-于是「把一台新设备变成被控设备」是三步：解压 → `setup-watchdog.bat` → 打开
-浏览器。不再逐个 `scp`，也不会漏掉 DLL / 脚本 / 证书。
+于是「把一台新设备变成被控设备」是三步：解压 → 右键 `setup-watchdog.bat`
+以管理员身份运行（它会放行入站、建任务、立刻起一次并打印 `[ok]` / `[fail]`）
+→ 打开浏览器。不再逐个 `scp`，也不会漏掉 DLL / 脚本 / 证书。
 
 生产机器上的对应位置是 `<RemoteBase>\stream`（默认 `C:\dev\stream`）。
 `-RemoteBase` 是整台机器换位置时唯一要改的参数 —— 其余路径都是相对推导的。
@@ -131,6 +134,8 @@ target\output\cloud-stream.zip   整包，拷到新机器用
 | `…\setup-watchdog.bat` | `C:\dev\stream\setup-watchdog.bat` | 建/重建看门狗任务，任务动作按自身位置生成 | 不要 |
 | `…\collect-launch-facts.cmd` | `C:\dev\stream\collect-launch-facts.cmd` | 起不来时的第一个动作：双击生成事实清单（只读） | 不要 |
 | `…\setup-inbound.cmd` | `C:\dev\stream\setup-inbound.cmd` | 管理员运行一次：放行 TCP 8080 + ICMP，否则外部一概连不上 | 不要 |
+| `…\open-inbound.cmd` | `C:\dev\stream\open-inbound.cmd` | 上面那条规则的幂等实现，`start-stream.cmd` 每次真启动时调用；无输出，只回退出码 | 下次启动生效 |
+| `…\probe-listen.cmd` | `C:\dev\stream\probe-listen.cmd` | 启动后另起一个进程探 loopback，把判决写进 `watchdog.log` 的 `PREFLIGHT` 行 | 下次启动生效 |
 | `…\cert.pem` / `key.pem` | `C:\dev\stream\cert.pem` / `key.pem` | 仅当被控机**没有**证书时安装（SAN 是那台机器的 IP，不能拿构建端覆盖） | 要（`--tls-*` 在启动参数里） |
 | `toolchain\deploy-remote.ps1` | `C:\dev\deploy\deploy-remote.ps1` | 被控端执行体（`deploy\` 里唯一的常驻文件） | 不要 |
 
@@ -209,7 +214,7 @@ pwsh toolchain/deploy.ps1 -WebRoot D:\src\cloud-stream-web
 
 | 常量 | 默认 | 谁决定 | 里面有什么 |
 |---|---|---|---|
-| `<RemoteBase>\stream` | `C:\dev\stream` | `deploy.ps1 -RemoteBase` | 运行根：exe、DLL、证书、`selkies-web\`、`logs\`、六个脚本 |
+| `<RemoteBase>\stream` | `C:\dev\stream` | `deploy.ps1 -RemoteBase` | 运行根：exe、DLL、证书、`selkies-web\`、`logs\`、八个脚本 |
 | `<RemoteBase>\deploy` | `C:\dev\deploy` | 同上 | 部署暂存：`deploy-remote.ps1`、传输中的 exe/zip/脚本 |
 
 运行根内部的路径全是相对的，谁也没有"必须放在 C 盘"的假设：
@@ -242,7 +247,7 @@ pwsh toolchain/deploy.ps1 -Bootstrap
 
 1. **sshd 开机自启**（见 §3.1）
 2. **建目录**：`C:\dev\stream\logs`、`C:\dev\stream\selkies-web`、`C:\dev\deploy`
-3. **推启动脚本并安装**：六个脚本 → `C:\dev\deploy\`，再由
+3. **推启动脚本并安装**：八个脚本 → `C:\dev\deploy\`，再由
    `deploy-remote.ps1 -OnlyLaunchers` 按哈希装进运行根（正在被看门狗执行的那个
    会跳过并提示"下次重启生效"）
 4. **核对**四样东西并打印结果：exe 在不在、计划任务在不在（`Running`）、证书在
@@ -323,13 +328,13 @@ C:\dev\stream\setup-watchdog.bat Administrator S3cr3t
 | 1 预检 | 本机要 `ssh`/`scp`/`curl.exe`；远端要能 `hostname` | 连不上 → 打印修 sshd 的三行 |
 | 2 构建后端 | `cargo build --release -p stream-server`（`-SkipBackend` 跳过） | 编译失败 → 不进入下一步 |
 | 3 构建前端 | core → dashboard → `selkies-web.zip`（`-SkipFrontend` 跳过） | `dist` 缺失 / gendb 失败 → 抛错 |
-| 4 汇总产物 | 把 exe / DLL / 前端 / 证书 / 六个脚本装进 `target\output\cloud-stream`，写 `manifest.json`，压同名 zip | 前端 `assets\` 缺失即抛错；本轮没有前端产物时跳过并回退成单件上传 |
-| 5 上传 | `scp` **从汇总目录**取：`stream-server.new.exe` / `ViGEmClient.new.dll` / `selkies-web.zip` / 六个上机脚本 / 证书 / `deploy-remote.ps1`；带 `BatchMode=yes`，缺密钥立刻失败而不是卡在密码提示 | — |
+| 4 汇总产物 | 把 exe / DLL / 前端 / 证书 / 八个脚本装进 `target\output\cloud-stream`，写 `manifest.json`，压同名 zip | 前端 `assets\` 缺失即抛错；本轮没有前端产物时跳过并回退成单件上传 |
+| 5 上传 | `scp` **从汇总目录**取：`stream-server.new.exe` / `ViGEmClient.new.dll` / `selkies-web.zip` / 八个上机脚本 / 证书 / `deploy-remote.ps1`；带 `BatchMode=yes`，缺密钥立刻失败而不是卡在密码提示 | — |
 | 6 校验 | 两端 MD5 比对 | 不一致就停，**不切换** |
 | 7 切换 | 远端：装证书（仅当缺失）→ 停任务 → **禁用任务** → 杀进程 → 换 exe/DLL → **装启动脚本**（此刻文件才不被占用）→ 前端解压到暂存目录并校验后换名 → 删 zip → 启任务 | 每一步失败即中止 |
 | 8 体检 | 轮询 `/api/status` | 见下 |
 | 9 体检补充 | 进程 pid / 启动时间、日志尾部、**计划任务的动作路径** | 动作路径不在运行根下只提示不失败（§7.23） |
-| 10 归档 | 构建端把这一轮真正发出去的部件写进 `target\deploy-archive\`（含六个上机脚本） | 失败不影响线上 |
+| 10 归档 | 构建端把这一轮真正发出去的部件写进 `target\deploy-archive\`（含八个上机脚本） | 失败不影响线上 |
 
 前四步里 2 和 3 是可以单独跳过的，因为"只换前端"和"只换后端"都很常见；
 **6 之后就没有可以单独跳过的步骤了** —— 校验、切换、体检是一条链，缺一环
@@ -741,7 +746,7 @@ DLL / zip 覆盖进 `target\deploy-archive\`（gitignore），失败或 `-Rollba
 `mc\start-mc.ps1` 与 `mc\launch-remote.ps1`（`MCGame` 任务链）。
 
 **边界**：`deploy\` 目录本身保留（空目录），因为 `scp` 需要它存在；跑完一次部署后
-里面只会有 `deploy-remote.ps1`（16 KB）与六个上机脚本的副本（每轮重传，
+里面只会有 `deploy-remote.ps1`（16 KB）与八个上机脚本的副本（每轮重传，
 装进运行根之后就只是暂存），zip 与上传的证书都在装好后立刻删掉。
 
 ### 7.23 上机脚本写死绝对路径 + 非 ASCII 注释（已修）
@@ -757,7 +762,7 @@ DLL / zip 覆盖进 `target\deploy-archive\`（gitignore），失败或 `-Rollba
    `run-hidden.vbs` 里 `sh.Run "cmd /c ""C:\dev\stream\start-stream.cmd"""`；
    `setup-watchdog.bat` 里 `/TR "wscript.exe C:\dev\stream\run-hidden.vbs"`；
    `deploy-remote.ps1` 的 `-Root` / `-WebDir` / `-WebZip` 默认值。
-   于是"解压到别处"等于让六个脚本同时指向一个不存在的目录。
+   于是"解压到别处"等于让八个脚本同时指向一个不存在的目录。
 2. `crates/stream-server/src/config.rs` 的 `dist` 默认值还是
    `PathBuf::from(r"C:\dev\selkies-web")` —— 连 exe 自己也带着绝对路径。
 3. `--upload-dir C:\Users\Administrator\Desktop`：换一台机器、换一个交互用户就
@@ -850,6 +855,66 @@ rem ... dies on "/I" — the guard ...
 
 ---
 
+### 7.25 "启动了但没效果"：把排查前置到启动流程里（已改成自动）
+
+**现象**：新机器上解压、双击、等一分钟，然后从浏览器打开 —— 一直转圈。回到那台
+机器看：任务显示"正在运行"，`tasklist` 里 `stream-server.exe` 也在，日志里
+`starting stream-server.exe` 一行都不缺。**没有任何一处写"失败"**，能查的只有
+"它觉得自己成功了"。用户只能来问"为什么没效果"，而手上没有可回传的东西。
+
+根因是三个"看不见"叠在一起：
+
+1. **入站被整档丢弃**。新 Windows 在 Public 配置文件上默认丢所有入站包（含
+   ICMP），而 VMware NAT / host-only 网卡常被判成 Public。外部 `ping` 无响应、
+   8080 TIMEOUT（注意是 TIMEOUT 不是 REFUSED —— 连 RST 都不回），服务本身却是
+   好的。首次启动的 Windows 弹窗只有人坐在那台机器前点"允许"才算数。
+2. **端口没起来也没人记**。exe 若因 8080 被占用、DLL 缺失、panic 而没监听，
+   `watchdog.log` 里只有 `starting`，没有后半句；下一分钟的触发又写一遍
+   `starting`，日志看上去很忙，但没有任何判决。
+3. **建完任务窗口就关了**。`setup-watchdog.bat` 原来以 `schtasks /Query` 结尾，
+   操作者看到任务存在就以为成了 —— 而任务能不能真的跑起来、跑起来能不能被访问，
+   一个字都没验证。
+
+**改法（三层都堵上）**：
+
+| 层 | 改动 | 失败时留下什么 |
+|---|---|---|
+| 启动前 | `start-stream.cmd` 每次**真启动**前 `call open-inbound.cmd`（幂等：查询两条规则，缺了才加）。提权才加得动；UAC 过滤令牌下加不上就记一行 | `PREFLIGHT inbound 8080/ICMP still blocked -- run setup-inbound.cmd as administrator once` |
+| 启动后 | `start "" /b probe-listen.cmd`：每 5 秒探一次 loopback（先 https 再 http），最多 6 轮 | `PREFLIGHT listening on 8080 after N probe(s): local health 200` 或 `PREFLIGHT NOT listening on 8080 ...` + 8080 被占用 / panic / 加载器失败三选一 + 下一步 |
+| 建任务时 | `setup-watchdog.bat` 结尾改成：`schtasks /Run` → 最多等 60 秒 → 打印 `[ok]` / `[fail]`，失败时直接给出要看哪两个日志；最后 `pause`，窗口停在结论上 | 屏幕上的 `[fail]`，不会随窗口消失 |
+| 收证据时 | `collect-launch-facts.cmd` 新增第 9 节：网络配置文件、本机 IPv4、两条规则的实际参数、最近 12 条 `PREFLIGHT` 行 | `cloud-stream-facts.txt` 直接可回传 |
+
+**探针自己的四个坑**（都实测踩过）：
+
+- `-w "%{http_code}"` 在 cmd 的括号块里会被变量展开吃掉，curl 报
+  `no URL specified` —— 改用 `-f` 的**退出码**（0 = 2xx，22 = 4xx/5xx，
+  7 = 没人监听），不再拼格式串。
+- 环境里有 `http_proxy`（企业镜像常见，也会出现在任何装过开发代理的机器上）时，
+  loopback 请求会被送到那个代理，代理对够不着的端口回 502 —— 探针于是报告
+  "服务没起"。必须 `--noproxy "*"`。
+- `for /l` 块里的 `%time%` 只在解析整块时展开一次，判决行的时间戳会停在循环开始
+  那一刻（实测差 5 秒，30 秒上限时会差到 30 秒）—— 用 `!time!`（延迟展开按次
+  求值）。
+- 探测必须在**另一个进程**里跑：`start-stream.cmd` 是阻塞在 exe 上的（这正是
+  看门狗"任务保持 Running、后续触发被忽略"的机制），它自己没有线程去轮询。
+
+**取舍**：探针只回答"服务起没起"，不回答"别的机器能不能连"。这两件事必须分开
+报，否则一旦 loopback 正常而外部不通，还是回到"没有线索"。所以成功那条日志后面
+紧跟一句：`loopback works. If another machine still cannot open the page, ...`。
+
+**实测**（`-SkipBuild` 全量 138.9 s，pid 3340，session 1）：
+
+```
+15:32:30.64 starting stream-server.exe from C:\dev\stream
+15:32:30.71 PREFLIGHT listening on 8080 after 1 probe(s): local health 200
+15:32:35.35 PREFLIGHT   loopback works. If another machine still cannot open ...
+```
+
+第一条时间戳 30.71 偏早是上面第三个坑，已改成 `!time!`；第二条是修好后应有的
+形态（探测完成时刻）。
+
+---
+
 ## 8 验收清单
 
 一条命令跑完之后，按顺序核：
@@ -865,12 +930,16 @@ rem ... dies on "/I" — the guard ...
 - [ ] 右上角有统计面板，右边缘有粉色胶囊
 - [ ] 故意失败一次能回滚：`-SkipFrontend` 上传一个坏 zip，或直接跑 `-Rollback`
 - [ ] 被控机上只有正式产物：`C:\dev\stream` 里没有 `*.prev` / `*.new.*`，
-      `C:\dev\deploy` 只剩 `deploy-remote.ps1` 与六个上机脚本（zip 解压完即删）
-- [ ] 运行根里六个上机脚本都在：`start-stream.cmd` / `start-stream.60fps.cmd` /
+      `C:\dev\deploy` 只剩 `deploy-remote.ps1` 与八个上机脚本（zip 解压完即删）
+- [ ] 运行根里八个上机脚本都在：`start-stream.cmd` / `start-stream.60fps.cmd` /
       `run-hidden.vbs` / `setup-watchdog.bat` / `collect-launch-facts.cmd` /
-      `setup-inbound.cmd`
+      `setup-inbound.cmd` / `open-inbound.cmd` / `probe-listen.cmd`
       （少一个就是有人改了 `$LauncherNames` 而没改 `$Launchers`，打包与安装用的是
       两份列表）
+- [ ] `logs\watchdog.log` 的尾部有一次启动的**完整三行**：`starting ...`、
+      `PREFLIGHT listening on 8080 after N probe(s)`、`loopback works. ...`
+      （缺第二行 = 包里少了 `probe-listen.cmd`，或 `start-stream.cmd` 是旧版；
+      三行里出现 `NOT listening` = 服务真的没起来，日志同处会给出三个候选原因）
 - [ ] `C:\dev` 下不再有 `selkies-web\`（已 rename 进运行根）；旧的 `cert.pem` /
       `key.pem` 是**复制**过去的，脚本不动旧副本，可以手工删
 - [ ] `target\output\cloud-stream\manifest.json` 的 `built_at` 是本次时间，
@@ -889,7 +958,7 @@ cd ..\selkies-dashboard ; npm run build
 cd C:\Users\user\Desktop\cloud-stream
 
 # 汇总产物（也是"手工拼一个运行根"的唯一正确做法）
-#   exe + DLL + 六个上机脚本 + cert/key 拷进 target\output\cloud-stream\
+#   exe + DLL + 八个上机脚本 + cert/key 拷进 target\output\cloud-stream\
 #   再把 dashboard\dist\* 拷进 target\output\cloud-stream\selkies-web\
 #   —— 顺序无所谓，脚本全部按自身位置找同级文件
 
@@ -897,7 +966,10 @@ cd C:\Users\user\Desktop\cloud-stream
 scp target\output\cloud-stream\stream-server.exe mc-admin:C:/dev/stream/stream-server.new.exe
 scp target\deploy-selkies-web.zip mc-admin:C:/dev/deploy/selkies-web.zip
 scp toolchain\deploy-remote.ps1 mc-admin:C:/dev/deploy/deploy-remote.ps1
-scp toolchain\start-stream.cmd toolchain\run-hidden.vbs toolchain\setup-watchdog.bat mc-admin:C:/dev/deploy/
+scp toolchain\start-stream.cmd toolchain\start-stream.60fps.cmd toolchain\run-hidden.vbs `
+    toolchain\setup-watchdog.bat toolchain\collect-launch-facts.cmd `
+    toolchain\setup-inbound.cmd toolchain\open-inbound.cmd toolchain\probe-listen.cmd `
+    mc-admin:C:/dev/deploy/
 
 # 切换（唯一需要记住的一条；-Root 默认就是 <base>\stream，可不传）
 ssh mc-admin 'powershell -NoProfile -ExecutionPolicy Bypass -File C:\dev\deploy\deploy-remote.ps1'

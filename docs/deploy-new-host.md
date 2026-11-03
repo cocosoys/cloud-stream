@@ -60,9 +60,9 @@
 
 ---
 
-## 1 被控机：一次性准备（10 项）
+## 1 被控机：一次性准备（11 项）
 
-做完这 10 项，这台机器就能被 `pwsh toolchain/deploy.ps1 -Target <别名> -Hostname <IP> -Bootstrap` 接管。
+做完这 11 项，这台机器就能被 `pwsh toolchain/deploy.ps1 -Target <别名> -Hostname <IP> -Bootstrap` 接管。
 
 | # | 项 | 怎么确认 / 怎么做 | 漏了会怎样 |
 |---|---|---|---|
@@ -75,7 +75,8 @@
 | 7 | OpenSSH Server | 装 → `Set-Service sshd -StartupType Automatic` → `Start-Service sshd` → 放行 TCP 22 | 部署脚本第一步就超时（脚本会把这三行打出来） |
 | 8 | 目录 | `C:\dev\stream\logs`、`C:\dev\deploy`、`C:\dev\stream\selkies-web` | `-Bootstrap` 会建，但 exe/前端仍要落位 |
 | 9 | TLS 证书 | `C:\dev\stream\cert.pem` + `C:\dev\key.pem`，**SAN 里要有这台机器的新 IP** | 浏览器证书不匹配；剪贴板 API 直接不可用（非安全上下文） |
-| 10 | 计划任务 `MCStreamSrv` | 在运行根里跑一次 `setup-watchdog.bat`（账户密码用参数给，或按提示输入） | `task MISSING`，切换阶段失败 |
+| 10 | 计划任务 `MCStreamSrv` | 在运行根里**以管理员身份**跑一次 `setup-watchdog.bat`（账户密码用参数给，或按提示输入）：它会顺手放行入站、建任务、立刻启动并打印 `[ok]` / `[fail]` | `task MISSING`，切换阶段失败 |
+| 11 | **入站放行** | 管理员跑一次 `setup-inbound.cmd`，或让第 10 项代劳；判据是从别的机器 `ping <IP>` 有回、`curl -k https://<IP>:8080` 不是 TIMEOUT | 服务跑得好好的，但外部一律连不上：ping 无响应、8080 TIMEOUT（连 RST 都不回）。`start-stream.cmd` 每次启动会尝试补，但提权失败时只能记一行日志 |
 
 额外两条只跟游戏有关，不属于推流链：
 
@@ -168,7 +169,7 @@ Host mc-admin-2
 | 真实显示输出 | VMware SVGA 3D 或物理显示器，分辨率设成要推的尺寸 | 黑屏，或退化成 1024×768 |
 | **入站已放行** | 从别的机器 `ping <IP>`、`curl -k https://<IP>:8080` | 全部 TIMEOUT（连 RST 都不返回）就是整档被丢：服务跑得再好也连不上。管理员跑一次 `setup-inbound.cmd` |
 
-**七步**（0–2 是包与解压，3–6 在新机器上做）：
+**五步**（0–1 是包与解压，2–4 在新机器上做）：
 
 ```powershell
 # 0. 取包：target\output\cloud-stream\（目录）或 cloud-stream.zip（8.17 MB）
@@ -189,25 +190,33 @@ Unblock-File .\cloud-stream.zip
 #    注意：删掉 cert.pem/key.pem 不是捷径 —— 那会退回明文 HTTP，剪贴板**照样**
 #    不可用（Clipboard API 要安全上下文），只是少了一个告警。
 
-# 3. 建看门狗任务（推荐）。双击也可以，会提示输密码
-#    要指定别的账户（需要管理员 cmd）：setup-watchdog.bat Administrator <密码>
+# 3. 初始化：右键 setup-watchdog.bat -> "以管理员身份运行"
+#    它一次做三件事，全都在这个窗口里给出结果：
+#      a) 放行 8080/TCP 与 ICMP echo（提权才做得到）
+#      b) 建 MCStreamSrv 任务：wscript.exe "D:\stream\run-hidden.vbs"
+#      c) 立刻 schtasks /Run 一次，最多等 60 秒，然后打印 [ok] 或 [fail]
+#    也可以给参数：setup-watchdog.bat Administrator <密码>
 #    密码是这台机器**该账户的登录密码**，不是这里新设的什么密码
-#    成功后核对「要运行的任务」= wscript.exe "D:\stream\run-hidden.vbs"
-cmd /c "cd /d D:\stream && setup-watchdog.bat"
 
-# 5. 起服务：最多等 1 分钟（任务每分钟触发），或立刻推一把
-schtasks /Run /TN MCStreamSrv
-
-# 6. 浏览器打开 https://<新IP>:8080/
+# 4. 浏览器打开 https://<本机IP>:8080/
+#    窗口里已经告诉你 [ok] 了；若还要复核，见下面的三条命令
 ```
 
-第 4 步（放行 8080 + ping）最省事的做法是**以管理员身份运行**运行根里的
-`setup-inbound.cmd`：它按名称重建规则、对所有配置文件生效、顺手把 ICMP 打开，
-最后 `curl` 自测一次本机 8080。等价的手工命令（管理员 PowerShell）是：
+第 3 步的 `[ok]` 意味着**本机 loopback 上的健康检查已返回 200**，也就是服务真的
+起来了。若它说 `[fail]`，窗口里会直接给出下一步（看哪两个日志、跑哪个脚本），
+不用猜。
+
+**如果第 3 步是以普通权限双击的**（没有"以管理员身份运行"）：任务多半建得出来，
+但入站规则加不上，脚本会打印 `[inbound]` 警告并在 `[ok]` 后面提醒。补一次即可：
 
 ```powershell
-# 4. 放行 8080 与 ICMP（首次启动时 Windows 的弹窗勾"专用网络"等效，但只有弹窗
-#    被点过"允许"才算数；被点过"取消"会留下一条阻止规则，所以先删同名旧规则）
+# 管理员 PowerShell 或右键"以管理员身份运行"
+D:\stream\setup-inbound.cmd
+```
+
+等价的单行命令（管理员）：
+
+```powershell
 Remove-NetFirewallRule -DisplayName 'cloud-stream*' -ErrorAction SilentlyContinue
 New-NetFirewallRule -DisplayName 'cloud-stream 8080' -Direction Inbound `
   -Protocol TCP -LocalPort 8080 -Action Allow -Profile Any
@@ -222,8 +231,24 @@ New-NetFirewallRule -DisplayName 'cloud-stream ICMPv4' -Direction Inbound `
 Get-NetConnectionProfile | Select-Object InterfaceAlias, NetworkCategory
 ```
 
+### 3.0.1 之后每次启动，脚本自己会做这些
+
+不需要人守在那里，也不需要记得"先放行再启动"：
+
+| 时机 | 动作 | 结果写在哪 |
+|---|---|---|
+| `start-stream.cmd` 跑起来（看门狗每分钟一次，但只在真的要起进程时执行） | 查 `cloud-stream 8080` / `ICMPv4` 两条规则，缺了就补（提权才有权限；没权限只记一行） | `logs\watchdog.log` 的 `PREFLIGHT` 行 |
+| exe 启动后 | 另起 `probe-listen.cmd`，每 5 秒探一次 loopback，最多 30 秒 | 同上：`PREFLIGHT listening on 8080 after N probe(s)` 或 `PREFLIGHT NOT listening ...` + 三条最可能原因 + 下一步 |
+| `setup-watchdog.bat` 跑完 | 建任务 → 立刻 `/Run` → 最多等 60 秒 → 打印 `[ok]` / `[fail]` | 屏幕上，窗口就是结果 |
+| `collect-launch-facts.cmd` | 第 9 节专门列入站：网络配置文件、本机 IPv4、两条规则的实际参数、最近 12 条 `PREFLIGHT` 行 | `cloud-stream-facts.txt` |
+
+所以"启动后发现没效果"必然留下痕迹：先看 `logs\watchdog.log` 里最后一条
+`PREFLIGHT`，它要么说 `listening on 8080`（那就是网络/防火墙），要么直接给出
+"8080 被占用 / 进程 panic / 加载器失败"三选一。
+
 **不建任务的最小路径**：双击 `start-stream.cmd`。它开一个黑窗口跑
-`stream-server.exe`（关窗口 = 停服务），崩溃不会自愈。适合先验证画面，再回头
+`stream-server.exe`（关窗口 = 停服务），崩溃不会自愈。它同样会做上面那套
+preflight，所以窗口里看不到异常时，日志里也有判决。适合先验证画面，再回头
 建任务。
 
 **账户没有密码时**：计划任务这条路走不通（策略层限制，不是脚本问题）。
@@ -242,20 +267,22 @@ $s.Save()
 
 **起不来先双击 `collect-launch-facts.cmd`**：它生成 `cloud-stream-facts.txt`
 （桌面也放一份），把 OS/会话/账户策略/包完整性/VC 运行库/端口/任务状态/
-`LastTaskResult`/两份日志尾部/任务计划事件/Defender 一次收全。它不启动 exe，
-只给你一行手工复现的命令。
+`LastTaskResult`/两份日志尾部/任务计划事件/Defender/入站规则一次收全。它不启动
+exe，只给你一行手工复现的命令。
 
 **跑起来之后核这三条**：
 
 ```powershell
 curl.exe -sk -o NUL -w '%{http_code}' https://<新IP>:8080/api/v1/health   # 200
-Get-Content D:\stream\logs\watchdog.log -Tail 5                            # starting ... from D:\stream
+Get-Content D:\stream\logs\watchdog.log -Tail 6                            # PREFLIGHT listening ... / starting ... from D:\stream
 Get-Content D:\stream\logs\stream-server.log | Select-String 'listening on' # https://0.0.0.0:8080
 ```
 
 页面 404 → `selkies-web\` 没解压全（`selkies-web\index.html` 必须在）；
 页面能开但黑屏 → 进程在 session 0，重跑 `setup-watchdog.bat`；
-任务"运行过"但端口不通 → 任务动作指向别的目录，重跑 `setup-watchdog.bat`。
+任务"运行过"但端口不通 → 任务动作指向别的目录，重跑 `setup-watchdog.bat`；
+本机 `PREFLIGHT listening` 但别的机器打不开 → 入站规则或网络配置文件，
+`setup-inbound.cmd`。
 
 要改分辨率 / 帧率 / 码率：编辑运行根里的 `start-stream.cmd`（默认
 1920×1080 / 60 fps / 2500 kbps），然后重启任务。改完别动计划任务本身。
@@ -281,7 +308,7 @@ pwsh toolchain/deploy.ps1 -RemoteBase D:\cloud
 （`--dist selkies-web`）、计划任务动作全部相对推导，所以换了 `-RemoteBase`
 之后不需要再改任何脚本。
 
-`-Bootstrap` 只做四件事：sshd 自启、建目录、推六个上机脚本并装进运行根、核对
+`-Bootstrap` 只做四件事：sshd 自启、建目录、推八个上机脚本并装进运行根、核对
 exe / 任务 / 证书 / 旧布局。**它不建计划任务、不签证书、不动密码** —— 那三件是
 人做的（见 §1 的第 9、10 项和 §1.3）。
 
@@ -301,13 +328,16 @@ ssh <别名> "powershell -c \"(Get-Process stream-server).SessionId\""     # 1�
 
 ---
 
-## 5 换设备最容易踩的 7 条
+## 5 换设备最容易踩的 10 条
 
 | 现象 | 原因 | 处置 |
 |---|---|---|
 | 页面能开、画面全黑 | 进程跑在 session 0（服务/schtasks 没加 `/IT`），抓的是空桌面 | 部署体检打印 `session=0` 就是这条；用 `setup-watchdog.bat` 建任务 |
 | 重启之后 8080 不通 | 没人登录 → `/IT` 任务不启动；或 `sshd` 是「手动」 | 开自动登录；`Set-Service sshd -StartupType Automatic` |
-| 页面打不开但 ssh 正常 | 新机器防火墙是开的，8080 没放行 | 放行 TCP 8080（22 也要） |
+| 页面打不开但 ssh 正常 | 新机器防火墙是开的，8080 没放行 | 管理员跑 `setup-inbound.cmd`（22 也要放行） |
+| **服务在跑、日志也写了 `starting`，但外部完全连不上** | 入站被整档丢弃：Public 配置文件默认丢全部入站（含 ICMP），VMware NAT / host-only 网卡常被判成 Public。表现是 `ping` 无响应、8080 **TIMEOUT**（不是 REFUSED） | 先看 `logs\watchdog.log` 最后一条 `PREFLIGHT`：若是 `listening on 8080`，问题就在网络层 —— 管理员跑 `setup-inbound.cmd`；`Get-NetConnectionProfile` 确认不是被 `Private` 规则挡在 Public 上 |
+| 日志里只有 `starting`，没有后半句 | 包内缺 `probe-listen.cmd`（旧包），或 `start-stream.cmd` 是旧版 | 用当前整包覆盖运行根；新版每次启动都会写 `PREFLIGHT` 判决 |
+| `setup-watchdog.bat` 打印 `[fail] nothing listening ... after 60 s` | 8080 被占用 / exe panic / 缺 VC++，三者之一 | 窗口里已列出要看的两份日志；或跑 `collect-launch-facts.cmd` |
 | 证书报警、剪贴板失灵 | SAN 还是旧 IP；或根本没配证书（退回明文 http） | 按 §1.1 重签；剪贴板 API 要求安全上下文 |
 | 信令连上、视频不出 | 跨网段/跨 NAT，`ice_servers=[]` 只有 host candidate | 同网段部署，或后续接 STUN/TURN |
 | 指针灵敏度/界面缩放改了没反应还报错 | 服务用**非游戏账号**跑，改的是另一个 HKCU | `/RU` 必须是游戏所在的交互用户（现网 `Administrator`） |

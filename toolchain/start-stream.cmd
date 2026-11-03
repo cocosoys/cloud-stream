@@ -56,6 +56,26 @@ if not exist "%EXE%" (
     exit /b 1
 )
 
+rem ---------------------------------------------------------------------------
+rem Preflight, every real start: inbound firewall, then a listening probe.
+rem
+rem Both exist because "I started it and nothing happens" was unanswerable from
+rem the controlled machine. The task fires, the exe comes up, and the only
+rem symptom is a page that never loads in a browser on another machine -- no
+rem timestamp, no hint, nothing to send back. These two lines fix that.
+rem
+rem The guard above already returned when an instance is alive, so this runs
+rem once per start, not 1440 times a day.
+rem ---------------------------------------------------------------------------
+if not exist "%ROOT%\open-inbound.cmd" goto :inbound_done
+call "%ROOT%\open-inbound.cmd" >nul 2>&1
+if errorlevel 2 (
+    echo [%date% %time%] PREFLIGHT netsh refused the inbound rules -- a third-party firewall or a policy owns the profile; allow stream-server.exe there too>> "%WLOG%"
+    goto :inbound_done
+)
+if errorlevel 1 echo [%date% %time%] PREFLIGHT inbound 8080/ICMP still blocked -- run setup-inbound.cmd as administrator once; a browser on another machine will time out until then>> "%WLOG%"
+:inbound_done
+
 echo [%date% %time%] starting stream-server.exe from %ROOT%>> "%WLOG%"
 
 rem #65/#66: 60fps target; capture runs on its own thread; a client resolution
@@ -89,6 +109,11 @@ rem C:\Users\Administrator: a new machine has a different interactive user.
 set "UPLOAD=%USERPROFILE%\Desktop"
 if not exist "%UPLOAD%" set "UPLOAD=%USERPROFILE%"
 set "ARGS=%ARGS% --upload-dir "%UPLOAD%""
+
+rem The probe must be its own process: this script is about to block on the exe
+rem on purpose (that is what keeps the watchdog task Running, see the header),
+rem so there is no thread left to poll the port.
+if exist "%ROOT%\probe-listen.cmd" start "cloud-stream probe" /b "%ROOT%\probe-listen.cmd"
 
 "%EXE%" %ARGS%
 set "CODE=%errorlevel%"

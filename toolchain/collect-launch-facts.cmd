@@ -68,7 +68,7 @@ chcp 65001 >nul 2>&1
 >> "%OUT%" dir /a "%ROOT%" 2>&1
 >> "%OUT%" echo.
 >> "%OUT%" echo -- files that must exist --
-for %%F in (stream-server.exe ViGEmClient.dll start-stream.cmd run-hidden.vbs setup-watchdog.bat) do (
+for %%F in (stream-server.exe ViGEmClient.dll start-stream.cmd start-stream.60fps.cmd run-hidden.vbs setup-watchdog.bat setup-inbound.cmd open-inbound.cmd probe-listen.cmd collect-launch-facts.cmd) do (
     if exist "%ROOT%\%%F" (
         >> "%OUT%" echo OK      %%F
     ) else (
@@ -126,7 +126,7 @@ netstat -ano 2>nul | "%SystemRoot%\System32\find.exe" ":8080" >> "%OUT%"
 >> "%OUT%" echo ==== 6. logs (tail 40 each) ====
 if exist "%ROOT%\logs\watchdog.log" (
     >> "%OUT%" echo -- logs\watchdog.log --
-    >> "%OUT%" "%PS%" -NoProfile -Command "Get-Content -LiteralPath '%ROOT%\logs\watchdog.log' -Tail 40 -Encoding UTF8" 2>&1
+    >> "%OUT%" "%PS%" -NoProfile -Command "Get-Content -LiteralPath '%ROOT%\logs\watchdog.log' -Tail 40" 2>&1
 ) else (
     >> "%OUT%" echo no watchdog.log -- start-stream.cmd never ran from this folder
 )
@@ -145,6 +145,23 @@ if exist "%ROOT%\logs\stream-server.log" (
 
 >> "%OUT%" echo ==== 8. defender ====
 >> "%OUT%" "%PS%" -NoProfile -Command "try { $d = Get-MpComputerStatus -ErrorAction Stop; 'RealTimeProtection ' + $d.RealTimeProtectionEnabled; Get-MpThreatDetection -ErrorAction SilentlyContinue | Select-Object -Last 3 | ForEach-Object { 'threat ' + $_.InitialDetectionTime.ToString() + ' id ' + $_.ThreatID } } catch { 'defender query failed: ' + $_.Exception.Message }" 2>&1
+>> "%OUT%" echo.
+
+>> "%OUT%" echo ==== 9. inbound reachability ====
+>> "%OUT%" echo -- network profile (a Public profile drops every inbound packet) --
+>> "%OUT%" "%PS%" -NoProfile -Command "try { Get-NetConnectionProfile | ForEach-Object { $_.InterfaceAlias + '  ' + $_.NetworkCategory } } catch { 'Get-NetConnectionProfile failed: ' + $_.Exception.Message }" 2>&1
+>> "%OUT%" echo.
+>> "%OUT%" echo -- this machine ipv4 (the address a browser on another machine needs) --
+>> "%OUT%" "%PS%" -NoProfile -Command "try { Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -ne '127.0.0.1' } | ForEach-Object { $_.InterfaceAlias + '  ' + $_.IPAddress } } catch { 'Get-NetIPAddress failed: ' + $_.Exception.Message }" 2>&1
+>> "%OUT%" echo.
+>> "%OUT%" echo -- rule "cloud-stream 8080" --
+>> "%OUT%" "%PS%" -NoProfile -Command "try { $r = Get-NetFirewallRule -DisplayName 'cloud-stream 8080' -ErrorAction Stop; $r | ForEach-Object { 'enabled=' + $_.Enabled + '  direction=' + $_.Direction + '  action=' + $_.Action + '  profile=' + $_.Profile }; $r | Get-NetFirewallPortFilter | ForEach-Object { 'protocol=' + $_.Protocol + '  localport=' + $_.LocalPort } } catch { 'NOT FOUND -- run setup-inbound.cmd as administrator' }" 2>&1
+>> "%OUT%" echo.
+>> "%OUT%" echo -- rule "cloud-stream ICMPv4" --
+>> "%OUT%" "%PS%" -NoProfile -Command "try { $r = Get-NetFirewallRule -DisplayName 'cloud-stream ICMPv4' -ErrorAction Stop; $r | ForEach-Object { 'enabled=' + $_.Enabled + '  direction=' + $_.Direction + '  action=' + $_.Action + '  profile=' + $_.Profile } } catch { 'NOT FOUND -- ping will time out even when the server is fine' }" 2>&1
+>> "%OUT%" echo.
+>> "%OUT%" echo -- startup verdicts from start-stream.cmd (PREFLIGHT lines) --
+>> "%OUT%" "%PS%" -NoProfile -Command "if (Test-Path -LiteralPath '%ROOT%\logs\watchdog.log') { $l = Select-String -LiteralPath '%ROOT%\logs\watchdog.log' -Pattern 'PREFLIGHT' | Select-Object -Last 12; if ($l) { $l | ForEach-Object { $_.Line } } else { 'no PREFLIGHT lines -- this bundle predates the startup check' } } else { 'no watchdog.log -- start-stream.cmd never ran from this folder' }" 2>&1
 >> "%OUT%" echo.
 
 >> "%OUT%" echo ==== done ====

@@ -27,6 +27,7 @@
         <root>\start-stream.cmd  start-stream.60fps.cmd
         <root>\run-hidden.vbs  setup-watchdog.bat
         <root>\collect-launch-facts.cmd  setup-inbound.cmd
+        <root>\open-inbound.cmd  probe-listen.cmd
 
     Steps: install launchers -> stop task (and disable its 1-minute trigger) ->
     kill -> swap -> re-enable -> start -> wait for the process.
@@ -107,7 +108,11 @@ $NewDll = Join-Path $Root 'ViGEmClient.new.dll'
 # so the person at the machine does not need the repo to answer the question.
 # setup-inbound.cmd opens 8080 + ICMP; without it a fresh Windows drops every
 # inbound packet and the machine looks dead from the build machine.
-$Launchers = @('start-stream.cmd', 'start-stream.60fps.cmd', 'run-hidden.vbs', 'setup-watchdog.bat', 'collect-launch-facts.cmd', 'setup-inbound.cmd')
+# open-inbound.cmd and probe-listen.cmd are the automated half of the same
+# lesson: start-stream.cmd calls the first on every real start, and spawns the
+# second to write one PREFLIGHT verdict into watchdog.log. Ship them or the
+# launcher silently skips its own preflight.
+$Launchers = @('start-stream.cmd', 'start-stream.60fps.cmd', 'run-hidden.vbs', 'setup-watchdog.bat', 'collect-launch-facts.cmd', 'setup-inbound.cmd', 'open-inbound.cmd', 'probe-listen.cmd')
 
 function Say([string]$Text) { Write-Output $Text }
 function Fail([string]$Text) { Write-Output "FAIL $Text"; exit 1 }

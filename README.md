@@ -90,7 +90,16 @@ target\output\cloud-stream\start-stream.cmd
 ```
 
 整包（含前端、证书、启动脚本）还有一个同名 zip，拷到新设备解压即可跑，见
-`docs/deploy-one-click.md` §1.1。手工调试时才需要自己拼参数：
+`docs/deploy-one-click.md` §1.1。在**新设备**上第一次用，是右键
+`setup-watchdog.bat` → “以管理员身份运行”：它一次做完放行入站、建看门狗任务、
+立刻启动并验证（打印 `[ok]` / `[fail]`），细节见 `docs/deploy-new-host.md` §3.0。
+
+启动脚本自己也会做两件事，不需要人守着：真启动前补入站规则（提权时），启动后
+另起 `probe-listen.cmd` 探 loopback，把结果写成 `logs\watchdog.log` 里的一行
+`PREFLIGHT listening on 8080 after N probe(s)` 或 `PREFLIGHT NOT listening ...`
+加三条候选原因。所以“启动了但打不开”永远有带时间戳的一行可查。
+
+手工调试时才需要自己拼参数：
 
 ```powershell
 cd target\output\cloud-stream

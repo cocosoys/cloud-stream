@@ -23,4 +23,21 @@ goto :run
 echo [watchdog] no cert.pem/key.pem in %ROOT% -- plain HTTP, clipboard off
 
 :run
+
+rem Same preflight as start-stream.cmd. A hand-run test that skips the firewall
+rem check reproduces the symptom it was called in to explain: server up,
+rem loopback fine, browser on another machine times out.
+if not exist "%ROOT%\open-inbound.cmd" goto :pf_done
+call "%ROOT%\open-inbound.cmd"
+if errorlevel 2 goto :pf_refused
+if errorlevel 1 goto :pf_blocked
+goto :pf_done
+:pf_refused
+echo  [preflight] netsh refused the inbound rules -- a third-party firewall or a policy owns the profile
+goto :pf_done
+:pf_blocked
+echo  [preflight] inbound 8080/ICMP still blocked -- run setup-inbound.cmd as administrator once
+:pf_done
+
+if exist "%ROOT%\probe-listen.cmd" start "cloud-stream probe" /b "%ROOT%\probe-listen.cmd"
 "%ROOT%\stream-server.exe" %ARGS%

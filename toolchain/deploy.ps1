@@ -11,7 +11,7 @@
       2. 构建后端 release
       3. 构建前端（core → dashboard 两级，顺序不能反）
       4. 汇总产物到 target\output\cloud-stream（+ 同名 zip），上传从这里取
-      5. scp 上传（exe / DLL / zip / 六个上机脚本 / 证书，内容一样就跳过）
+      5. scp 上传（exe / DLL / zip / 八个上机脚本 / 证书，内容一样就跳过）
       6. MD5 双向核对
 
     被控机做的事（由 deploy-remote.ps1 执行，脚本随包上传）：
@@ -130,13 +130,18 @@ $RemoteLog = "$RemoteRoot\logs\stream-server.log"
 # （空密码 / 缺 VC++ / zip 没解压）都不写日志、窗口一闪就关，它一次收全。
 # setup-inbound.cmd 是第二课：Windows 防火墙在新机器上把所有入站（含 ICMP）
 # 都丢掉，于是"ping 不通、8080 超时"，而服务其实跑得好好的。
+# open-inbound.cmd 与 probe-listen.cmd 是同一课的自动化部分，被 start-stream.cmd
+# 和 setup-watchdog.bat 调用：前者幂等地补规则，后者在启动后 30 秒内把
+# "到底有没有监听"写成一行 PREFLIGHT 日志。少了它们，启动失败仍然没有痕迹。
 $LauncherNames = @(
     'start-stream.cmd',
     'start-stream.60fps.cmd',
     'run-hidden.vbs',
     'setup-watchdog.bat',
     'collect-launch-facts.cmd',
-    'setup-inbound.cmd'
+    'setup-inbound.cmd',
+    'open-inbound.cmd',
+    'probe-listen.cmd'
 )
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
@@ -174,7 +179,7 @@ $RemoteScript = Join-Path $PSScriptRoot 'deploy-remote.ps1'
 
 # 统一产物目录。target\output\cloud-stream **就是**被控机的运行根：把这个目录
 # 原样拷到任何一台机器（或解压同名 zip），里面的 exe / DLL / 前端 / 证书 /
-# 六个上机脚本就是全部所需，不需要再手工拼路径。上传也从这里取，所以「本地能
+# 八个上机脚本就是全部所需，不需要再手工拼路径。上传也从这里取，所以「本地能
 # 跑」与「线上在跑」是同一批字节。
 $OutputDir = Join-Path $RepoRoot 'target\output'
 $BundleDir = Join-Path $OutputDir 'cloud-stream'
@@ -412,8 +417,10 @@ cloud-stream 被控端整包
 怎么用
   1) 整包拷到目标机器（或解压同目录下的 cloud-stream.zip）。
   2) 建看门狗计划任务（需要该账户密码，任务跑在交互式会话里）：
-         setup-watchdog.bat
+         右键 setup-watchdog.bat -> "以管理员身份运行"
      也可以直接给参数：setup-watchdog.bat Administrator <密码>
+     提权运行时它会顺手放行 8080 与 ping，并在建完任务后立刻启动一次、
+     等最多 60 秒，直接告诉你 [ok] 还是 [fail]。
   3) 任务每分钟触发一次，进程挂了 60 秒内自己回来。
      想手工起一次：start-stream.cmd
   4) 浏览器打开 https://<本机IP>:8080/
@@ -426,15 +433,28 @@ cloud-stream 被控端整包
   start-stream.cmd    命令行参数都在这里：分辨率 / 帧率 / 码率 / 证书
   start-stream.60fps.cmd 手工起一次用（同一个命令行，不进计划任务）
   run-hidden.vbs      计划任务的实际入口，无窗口，避免每分钟闪一次黑框
-  setup-watchdog.bat  创建 MCStreamSrv 任务
+  setup-watchdog.bat  创建 MCStreamSrv 任务并验证一次启动
   collect-launch-facts.cmd  起不来时双击它，生成一份事实清单（只读）
   setup-inbound.cmd   管理员身份运行：放行 8080 与 ping（否则外部一概连不上）
+  open-inbound.cmd    上面那条规则的实际执行者，被启动脚本自动调用（幂等）
+  probe-listen.cmd    启动后 30 秒内把"有没有监听"写进 watchdog.log
   manifest.json       本次构建的指纹：提交、时间、各文件 MD5、前端文件数
   $tlsLine
+
+每次启动会自动做的事（不需要人守在那里）
+  * 查 8080 / ICMP 入站规则，缺了就补（当前进程提权时）；补不上会把原因写进
+    logs\watchdog.log 的 PREFLIGHT 行，而不是安静地少一条规则
+  * 起 exe 之后另起一个探针，最多 30 秒，把结果写成
+        PREFLIGHT listening on 8080 after N probe(s): local health 200
+    或者
+        PREFLIGHT NOT listening on 8080 ... + 三条最可能的原因 + 下一步
+    所以"启动后没反应"永远有带时间戳的一行可以看，不用猜。
 
 注意
   * 计划任务的 /RU 必须是"能看见桌面"的那个登录用户；换成服务账户会抓到空桌面。
   * 换机器要重签证书（SAN 里是 IP），否则浏览器报警、剪贴板不工作。
+  * 外部机器连不上、本机 loopback 正常，多半是入站规则或网络配置文件
+    （VMware 的网卡常被判成"公用"）：管理员身份跑一次 setup-inbound.cmd。
   * 换分辨率 / 码率改 start-stream.cmd，不要改计划任务。
 "@
     # UTF-8 带 BOM：记事本与 PowerShell 5.1 都按 BOM 判编码，中文才不会乱码。
