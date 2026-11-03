@@ -46,7 +46,23 @@ if not defined ACCOUNT (
 set "PASSWORD=%~2"
 if not defined PASSWORD set /p "PASSWORD=Password for %ACCOUNT%: "
 if not defined PASSWORD (
+    rem A blank password is not "no password needed" -- it is the single most
+    rem common reason this script looks dead on a fresh machine. Windows blocks
+    rem blank-password accounts from batch logon (LimitBlankPasswordUse=1), so
+    rem schtasks would fail with "the password is invalid" even if it got that
+    rem far, and the task it created (if any) would never start. Say so out
+    rem loud instead of exiting with six characters nobody can read.
     echo NO_PASSWORD
+    echo.
+    echo A scheduled task cannot run for an account that has no password:
+    echo Windows bars blank-password accounts from batch logon.
+    echo Two ways forward:
+    echo   a^) give %ACCOUNT% a password, then run this script again:
+    echo         net user %ACCOUNT% *
+    echo   b^) keep the blank password and skip the task: put a shortcut to
+    echo      run-hidden.vbs into  shell:startup  instead ^(needs auto logon^).
+    echo.
+    echo docs\deploy-new-host.md section 3.0 covers both paths.
     exit /b 1
 )
 

@@ -25,7 +25,7 @@
         <root>\cert.pem  key.pem
         <root>\selkies-web\  logs\
         <root>\start-stream.cmd  start-stream.60fps.cmd
-        <root>\run-hidden.vbs  setup-watchdog.bat
+        <root>\run-hidden.vbs  setup-watchdog.bat  collect-launch-facts.cmd
 
     Steps: install launchers -> stop task (and disable its 1-minute trigger) ->
     kill -> swap -> re-enable -> start -> wait for the process.
@@ -102,7 +102,9 @@ $NewDll = Join-Path $Root 'ViGEmClient.new.dll'
 # start-stream.60fps.cmd travels as well: a hand-run on this box has to use the
 # same flags as the watchdog, and the bundle is the only copy the person sitting
 # at that machine has. Nothing executes it, so it is never busy.
-$Launchers = @('start-stream.cmd', 'start-stream.60fps.cmd', 'run-hidden.vbs', 'setup-watchdog.bat')
+# collect-launch-facts.cmd is the "it will not start" first responder; it ships
+# so the person at the machine does not need the repo to answer the question.
+$Launchers = @('start-stream.cmd', 'start-stream.60fps.cmd', 'run-hidden.vbs', 'setup-watchdog.bat', 'collect-launch-facts.cmd')
 
 function Say([string]$Text) { Write-Output $Text }
 function Fail([string]$Text) { Write-Output "FAIL $Text"; exit 1 }

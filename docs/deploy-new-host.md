@@ -164,6 +164,7 @@ Host mc-admin-2
 | Windows 10/11 **x64** | `systeminfo` | 无法运行：DXGI / WASAPI / `SendInput` 都是 Windows API，且只有 Windows 构建 |
 | VC++ 运行库 | `Test-Path C:\Windows\System32\vcruntime140.dll` | 双击后窗口一闪即退；`stream-server.exe` 导入表里有 `VCRUNTIME140.dll`，缺了加载器就拒绝启动（日志里一行都没有） |
 | **交互式已登录会话** | `quser` 看到 `console 1 运行中` | 计划任务的 `/IT` 任务不启动；从服务/session 0 起进程抓到空桌面 |
+| **账户有密码** | `net user %USERNAME%` 看 `Password required` | 看门狗建不出来或永远不启动：Windows 默认禁止空密码账户**批处理登录**（`LimitBlankPasswordUse=1`），`schtasks /RP ""` 直接失败。无密码机器见本节末尾的启动文件夹方案 |
 | 真实显示输出 | VMware SVGA 3D 或物理显示器，分辨率设成要推的尺寸 | 黑屏，或退化成 1024×768 |
 
 **七步**（0–2 是包与解压，3–6 在新机器上做）：
@@ -212,6 +213,25 @@ New-NetFirewallRule -DisplayName 'cloud-stream 8080' -Direction Inbound `
 `stream-server.exe`（关窗口 = 停服务），崩溃不会自愈。适合先验证画面，再回头
 建任务。
 
+**账户没有密码时**：计划任务这条路走不通（策略层限制，不是脚本问题）。
+要么先 `net user Admin *` 给账户设个密码再建任务；要么放弃看门狗，把
+`run-hidden.vbs` 的快捷方式丢进 `shell:startup`（需要开自动登录，否则重启后
+没人登录，什么都起不来）：
+
+```powershell
+# 无密码机器的替代方案：登录后自动起（不是服务，挂了不会自愈）
+$lnk = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\cloud-stream.lnk"
+$s = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
+$s.TargetPath = 'D:\stream\run-hidden.vbs'
+$s.WorkingDirectory = 'D:\stream'
+$s.Save()
+```
+
+**起不来先双击 `collect-launch-facts.cmd`**：它生成 `cloud-stream-facts.txt`
+（桌面也放一份），把 OS/会话/账户策略/包完整性/VC 运行库/端口/任务状态/
+`LastTaskResult`/两份日志尾部/任务计划事件/Defender 一次收全。它不启动 exe，
+只给你一行手工复现的命令。
+
 **跑起来之后核这三条**：
 
 ```powershell
@@ -248,7 +268,7 @@ pwsh toolchain/deploy.ps1 -RemoteBase D:\cloud
 （`--dist selkies-web`）、计划任务动作全部相对推导，所以换了 `-RemoteBase`
 之后不需要再改任何脚本。
 
-`-Bootstrap` 只做四件事：sshd 自启、建目录、推四个上机脚本并装进运行根、核对
+`-Bootstrap` 只做四件事：sshd 自启、建目录、推五个上机脚本并装进运行根、核对
 exe / 任务 / 证书 / 旧布局。**它不建计划任务、不签证书、不动密码** —— 那三件是
 人做的（见 §1 的第 9、10 项和 §1.3）。
 
