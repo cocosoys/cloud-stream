@@ -155,21 +155,77 @@ Host mc-admin-2
 ### 3.0 只有一台机器时：拷整包
 
 构建端跑一次部署（或只跑到「汇总产物」）就会得到 `target\output\cloud-stream`
-—— 这个目录本身就是运行根，脚本全部按自身位置推导路径，没有写死的 `C:\dev`：
+—— 这个目录本身就是运行根，脚本全部按自身位置推导路径，没有写死的 `C:\dev`。
+
+**新机器上先确认四件事**（缺了不是"跑不起来"，是"看起来跑起来了但没人能用"）：
+
+| 项 | 怎么查 | 缺了会怎样 |
+|---|---|---|
+| Windows 10/11 **x64** | `systeminfo` | 无法运行：DXGI / WASAPI / `SendInput` 都是 Windows API，且只有 Windows 构建 |
+| VC++ 运行库 | `Test-Path C:\Windows\System32\vcruntime140.dll` | 双击后窗口一闪即退；`stream-server.exe` 导入表里有 `VCRUNTIME140.dll`，缺了加载器就拒绝启动（日志里一行都没有） |
+| **交互式已登录会话** | `quser` 看到 `console 1 运行中` | 计划任务的 `/IT` 任务不启动；从服务/session 0 起进程抓到空桌面 |
+| 真实显示输出 | VMware SVGA 3D 或物理显示器，分辨率设成要推的尺寸 | 黑屏，或退化成 1024×768 |
+
+**七步**（0–2 是包与解压，3–6 在新机器上做）：
 
 ```powershell
-# 构建端：整包（也可以直接把目录拷走）
-#   target\output\cloud-stream\        ← 目录
-#   target\output\cloud-stream.zip     ← 同名压缩包
+# 0. 取包：target\output\cloud-stream\（目录）或 cloud-stream.zip（8.17 MB）
+#    从网上 / IM 拿到的 zip 先解锁，否则 SmartScreen 会拦 exe 与 .cmd：
+Unblock-File .\cloud-stream.zip
 
-# 被控机（U 盘 / 共享目录 / scp 都行）：
-#   1. 解压到任意位置，例如 D:\stream
-#   2. 在该目录里建看门狗任务（账户密码用参数或提示输入）
-D:\stream\setup-watchdog.bat Administrator <密码>
-#   3. 浏览器打开 https://<本机IP>:8080/
+# 1. 解压到任意位置，例如 D:\stream（纯 ASCII 短路径最省事）
+#    判据：stream-server.exe 与 start-stream.cmd 在同一层
+
+# 2. 证书 —— 包里那对 PEM 的 SAN 是 192.168.59.148 / .143
+#    a) 新机器 IP 就是这两个之一：不用动
+#    b) 只是先看看画面、不介意告警：留着，浏览器点"继续前往"（剪贴板不可用）
+#    c) 要剪贴板：在构建机重签，两份 PEM 覆盖运行根里的同名文件
+#         openssl req -x509 -newkey rsa:2048 -nodes -days 825 ^
+#           -keyout key.pem -out cert.pem -config toolchain\cert-san.cnf
+#       （先把 cert-san.cnf 的 CN 与 subjectAltName 改成新 IP。签出来仍会提示
+#        "不受信任"——自签就是这样，点继续即可，但上下文已是安全的，剪贴板可用）
+#    注意：删掉 cert.pem/key.pem 不是捷径 —— 那会退回明文 HTTP，剪贴板**照样**
+#    不可用（Clipboard API 要安全上下文），只是少了一个告警。
+
+# 3. 建看门狗任务（推荐）。双击也可以，会提示输密码
+cd /d D:\stream
+setup-watchdog.bat
+#    要指定别的账户（需要管理员 cmd）：setup-watchdog.bat Administrator <密码>
+#    密码是这台机器**该账户的登录密码**，不是这里新设的什么密码
+#    成功后核对「要运行的任务」= wscript.exe "D:\stream\run-hidden.vbs"
+
+# 4. 放行 8080（管理员 PowerShell；首次启动时 Windows 的弹窗勾"专用网络"等效）
+#    网络被识别成"公用"时把 -Profile 换成 Any，否则规则不生效
+New-NetFirewallRule -DisplayName 'cloud-stream 8080' -Direction Inbound `
+  -Protocol TCP -LocalPort 8080 -Action Allow -Profile Private,Domain
+
+# 5. 起服务：最多等 1 分钟（任务每分钟触发），或立刻推一把
+schtasks /Run /TN MCStreamSrv
+
+# 6. 浏览器打开 https://<新IP>:8080/
 ```
 
-这一路不需要构建机、不需要 ssh、不需要工具链。包里的 `README.txt` 就是这三步。
+**不建任务的最小路径**：双击 `start-stream.cmd`。它开一个黑窗口跑
+`stream-server.exe`（关窗口 = 停服务），崩溃不会自愈。适合先验证画面，再回头
+建任务。
+
+**跑起来之后核这三条**：
+
+```powershell
+curl.exe -sk -o NUL -w '%{http_code}' https://<新IP>:8080/api/v1/health   # 200
+Get-Content D:\stream\logs\watchdog.log -Tail 5                            # starting ... from D:\stream
+Get-Content D:\stream\logs\stream-server.log | Select-String 'listening on' # https://0.0.0.0:8080
+```
+
+页面 404 → `selkies-web\` 没解压全（`selkies-web\index.html` 必须在）；
+页面能开但黑屏 → 进程在 session 0，重跑 `setup-watchdog.bat`；
+任务"运行过"但端口不通 → 任务动作指向别的目录，重跑 `setup-watchdog.bat`。
+
+要改分辨率 / 帧率 / 码率：编辑运行根里的 `start-stream.cmd`（默认
+1920×1080 / 60 fps / 2500 kbps），然后重启任务。改完别动计划任务本身。
+
+这一路不需要构建机、不需要 ssh、不需要工具链。包里的 `README.txt` 就是三步版
+（解压 → `setup-watchdog.bat` → 浏览器）。
 
 ### 3.1 有构建机时：一条命令
 
