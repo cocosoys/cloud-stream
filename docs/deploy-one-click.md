@@ -200,7 +200,7 @@ C:\dev\deploy\setup-watchdog.bat
 | 1 预检 | 本机要 `ssh`/`scp`/`curl.exe`；远端要能 `hostname` | 连不上 → 打印修 sshd 的三行 |
 | 2 上传 | `scp` 到 `stream-server.new.exe` / `selkies-web.zip`；带 `BatchMode=yes`，缺密钥立刻失败而不是卡在密码提示 | — |
 | 3 校验 | 两端 MD5 比对 | 不一致就停，**不切换** |
-| 4 切换 | 远端：停任务 → **禁用任务** → 杀进程 → 备份 `.prev` → 换文件 → 解压 → 启任务 | 每一步失败即中止 |
+| 4 切换 | 远端：停任务 → **禁用任务** → 杀进程 → 换文件 → 前端解压到暂存目录并校验后换名 → 启任务 | 每一步失败即中止 |
 | 5 体检 | 轮询 `/api/status` | 见下 |
 
 体检是**三重**判据，缺一不可：
@@ -216,26 +216,36 @@ C:\dev\deploy\setup-watchdog.bat
 
 ## 6 失败与回滚
 
-脚本 `catch` 到任何异常都会自动调：
+**被控机上没有任何备份。** 那里只放正在运行的正式产物：一个 exe、一个 DLL、
+一个 web 目录。回滚材料在构建端的 `target\deploy-archive\`（已 gitignore），由
+每次**成功**部署后写入，只覆盖这一轮真正发出去的部件 —— 所以 `-SkipBackend`
+的部署不会把归档里的 exe 抹掉。
+
+失败时脚本自己恢复：先看这一轮动过什么（`backend` / `frontend`），把归档里对应
+的部件当"新版本"再发一次，走的还是同一条 上传 → 校验 → 停止 → 更换 → 起任务
+路径，所以恢复本身也会被体检。若失败发生在切换之前，被控机一个字节都没改，
+脚本只打印一句"没有被改动"。
+
+手工回滚（人也想退一版时）：
 
 ```powershell
-ssh mc-admin 'powershell -ExecutionPolicy Bypass -File C:\dev\deploy\deploy-remote.ps1 -Rollback'
+pwsh toolchain/deploy.ps1 -Rollback
 ```
 
-远端回滚的动作：停任务 → 杀进程 → `stream-server.exe.prev` 覆盖回 live →
-`selkies-web.prev` 换回目录 → 启任务。
+它不编译、不重新打包，直接把 `target\deploy-archive\` 里的上一份产物发上去，
+再做健康检查。归档里有什么发什么（`meta.json` 会打印时间、部件、提交）。
 
-手工回滚（脚本本身坏了时）：
+**回滚的边界**：只回滚 exe、DLL 和 web 目录。配置（`start-stream.cmd`）、证书、
+日志都不动 —— 它们不是"上一版/这一版"的关系。
 
-```powershell
-ssh mc-admin 'powershell -ExecutionPolicy Bypass -File C:\dev\deploy\deploy-remote.ps1 -Rollback'
-```
+**归档只有一份**，是"上一次成功部署的状态"，不是历史栈。要长期保留某个版本，
+自己把 `target\deploy-archive\` 复制到别处。另外：如果有人在被控机上手工换过 exe，
+归档与被控机的实际状态就会分叉 —— 这时 `-Rollback` 回到的是"上次部署的版本"，
+不是"手工换上的那一版"。
 
-**回滚的边界**：只回滚 exe 和 web 目录。配置（`start-stream.cmd`）、证书、日志
-都不动 —— 它们不是「上一版/这一版」的关系。
-
-`.prev` 是**一份**，不是历史栈：连续部署两次之后，`.prev` 是倒数第二版。要长期
-保留某个版本，自己 `Copy-Item` 到 `C:\dev\stream\archive\`。
+> 为什么不再留 `.prev`：被控机上每台一份 18.6 MB 的 exe 副本、加一份 2000+ 文件
+> 的 web 目录副本，部署十次就是十份没人轮转的残留；而真正需要回滚的人坐在构建端。
+> 详见 §7.22。
 
 ---
 
@@ -441,6 +451,11 @@ node 的 `rmSync` 包了一层），超过阈值就拒绝执行，构建中断�
 > 回滚时于是留下新 exe 不还原，日志还振振有词地写
 > `exe untouched (this deploy did not swap it)`。现在只看调用方已经传进来的
 > `-CycleOnly`，没有状态可以不同步，marker 一并删掉。
+>
+> **2026-11-03 修订（§7.22）**：`-CycleOnly` 本身有个更根本的毛病 —— 它的实现是
+> 「不动 exe」，于是**后端部署失败时 exe 从来没被还原过**。现在远端没有 `.prev`，
+> 也没有 `-Rollback` / `-CycleOnly`：恢复改成「本轮动过哪几个部件，就从构建端归档
+> 重发哪几个」，判断依据在构建端(`$attempted`)，不依赖远端留下的任何状态。
 
 ### 7.17 全量部署被判「日志尾部没有 listening on」（已修）
 
@@ -550,8 +565,9 @@ node 的 `rmSync` 包了一层），超过阈值就拒绝执行，构建中断�
 
 **另一个陷阱**：`toolchain/dist-test/` 是一份 #99 之前的 dist 副本，里面还有已删的
 `selkies.svg`、且没有 `.asset-manifest.json`。它看着像"上一版备份"，一旦被当成
-`--dist` 的来源就会把死文件带回去 —— 已删。真正的上一版在**被控机**的
-`C:\dev\selkies-web.prev`，不在构建机上。
+`--dist` 的来源就会把死文件带回去 —— 已删。上一版 dist 现在只在构建端的
+`target\deploy-archive\selkies-web.zip`（每次成功部署后归档）；被控机上不再留
+web 目录副本（§7.22）。
 
 **还有一处漏网**：`dump-triage/stream-server-148.log`（64 KB 运行日志）被跟踪，
 因为 `.gitignore` 在那里只排除了 `*.bmp`/`*.ivf`。现改为整目录忽略 `/dump-triage/`
@@ -559,6 +575,41 @@ node 的 `rmSync` 包了一层），超过阈值就拒绝执行，构建中断�
 `mcbak/launch-remote.ps1` 不受影响。
 
 清理后 `toolchain/` 123 MB → 221 KB。证书私钥、bench CSV、`vendor-backup/` 未动。
+
+### 7.22 被控机上堆着构建端的东西（已清，回滚改到构建端）
+
+**现象**：`C:\dev` 从"能跑起来的最小集合"长成了现场仓库 —— `deploy\` 里 30 个文件
+（探针、日志拉取、诊断脚本、测试 zip），`bench\` 里 4 MB 的抓帧工具和它的输出，
+`mc\` 里 14 个调试 dump，`stream\` 里 18.6 MB 的 `stream-server.exe.prev`，还有
+一个 Python 原型留下的 `__pycache__`。其中真正被运行时引用的只有
+`deploy-remote.ps1`（每次部署都重传）和 `selkies-web.zip`（解压完就没用了）。
+
+**根因**：部署链把"备份"理解成"在被控机留一份上一版"。它有两个后果，第二个更糟：
+
+1. 每台每次部署多 18.6 MB exe + 2000+ 文件的 web 目录副本，且没人轮转；
+2. 这些文件和构建端推过来的临时脚本混在同一个目录里，时间一长就分不清
+   "哪个是正式产物、哪个是某次调试留下的"。
+
+**改成**：备份归构建端。`deploy.ps1` 在**成功**部署后把这次真正发上去的 exe /
+DLL / zip 覆盖进 `target\deploy-archive\`（gitignore），失败或 `-Rollback` 时从
+那里重发。被控机侧 `deploy-remote.ps1` 删掉 `-Rollback` / `-CycleOnly` 与整个
+`.prev` 逻辑，前端改为**解压到暂存目录 → 在暂存目录里校验 → 两次 rename 换名**，
+失败时活目录一个字节都没动；解压成功后删掉上传的 zip。
+
+顺带修掉一处旧缺陷：`catch` 以前固定传 `-CycleOnly`，而 `-CycleOnly` 的实现是
+"不动 exe"，于是**后端部署失败时 exe 从来没被还原过**。现在按"这一轮动过哪些
+部件"恢复，换过就恢复，没换过就不碰（也就不会为一个失败的前端部署重启后端）。
+
+**清掉的 57 个文件 / 22.93 MB**：`stream\*.prev`、`deploy\*`（30）、`bench\`（9）、
+`mc\` 的 14 个 dump、`__pycache__\`、`mcjson.txt`。脚本：
+`toolchain/cleanup-remote-artifacts.ps1`（`-WhatIf` 可预演，逐条列路径、不用通配符）。
+
+**保留**：`cert.pem` `key.pem` `mc-launch.cmd` 两个 task xml；`stream\`（exe、DLL、
+`start-stream.cmd`、`run-hidden.vbs`、`logs\`）；`selkies-web\`；`jdk8\`；
+`mc\start-mc.ps1` 与 `mc\launch-remote.ps1`（`MCGame` 任务链）。
+
+**边界**：`deploy\` 目录本身保留（空目录），因为 `scp` 需要它存在；跑完一次部署后
+里面只会有 `deploy-remote.ps1`（8.7 KB），zip 已被远端删掉。
 
 ---
 
@@ -575,6 +626,9 @@ node 的 `rmSync` 包了一层），超过阈值就拒绝执行，构建中断�
 - [ ] 浏览器强刷后**左侧有工具栏**（没有 = 服务成 core 构建了，§7.1）
 - [ ] 右上角有统计面板，右边缘有粉色胶囊
 - [ ] 故意失败一次能回滚：`-SkipFrontend` 上传一个坏 zip，或直接跑 `-Rollback`
+- [ ] 被控机上只有正式产物：`C:\dev\stream` 里没有 `*.prev` / `*.new.*`，
+      `C:\dev\deploy` 只剩 `deploy-remote.ps1`（zip 解压完即删）
+- [ ] `target\deploy-archive\meta.json` 的 `saved_at` 是本次部署时间
 
 ---
 

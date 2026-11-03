@@ -14,9 +14,14 @@
       5. MD5 双向核对
 
     被控机做的事（由 deploy-remote.ps1 执行，脚本随包上传）：
-      6. 停任务 → 杀进程 → 备份 → 换 exe → 解压前端 → 起任务
+      6. 停任务 → 杀进程 → 换 exe → 解压前端（暂存目录校验后换名）→ 起任务
       7. 本机轮询 /api/status 直到 200，并核对进程启动时间与日志
-      8. 失败自动回滚到 .prev，并把原因打出来
+      8. 成功后把这次真正发上去的产物归档到 target\deploy-archive
+      9. 失败时用归档里的上一版重发，并把原因打出来
+
+    被控机上不保留任何备份（没有 .exe.prev，也没有 web 目录副本）：那里只放
+    正在运行的正式产物。回滚材料留在构建端 —— 需要回滚的人坐在这台机器前，
+    而被控机上的 .prev 只会越积越多，没人会去轮转它。
 
     为什么用「上传远端脚本」而不是 ssh 里塞内联命令：PowerShell 内联字符串要
     穿过 bash → ssh → cmd → powershell 四层引号，`$p=C:\dev\x` 这类赋值会被
@@ -54,6 +59,9 @@
 .EXAMPLE
     pwsh toolchain/deploy.ps1 -SkipBackend
     只改了前端样式时用，不重启服务、不断会话。
+.EXAMPLE
+    pwsh toolchain/deploy.ps1 -Rollback
+    回滚：把 target\deploy-archive 里上一份成功的产物重新发上去。不编译、不重新打包。
 #>
 [CmdletBinding()]
 param(
@@ -65,6 +73,8 @@ param(
     [switch]$SkipBuild,
     [switch]$DryRun,
     [switch]$Bootstrap,
+    # 回滚入口：把构建端归档的上一版重新发上去（不编译、不打包）。
+    [switch]$Rollback,
     [int]$HealthTimeoutSec = 90,
     # 前端仓库的位置。默认在仓库的同级目录里按名字找（cloud-stream-web /
     # selkies-webclient），找不到就报错停下 —— 前端与后端是两个仓库，
@@ -122,6 +132,15 @@ $DashDir = Join-Path $WebRepoRoot 'addons\selkies-dashboard'
 # 产物放 target\（已 gitignore）：toolchain\ 里只放脚本，不放每次构建都变的二进制。
 $ZipPath = Join-Path $RepoRoot 'target\deploy-selkies-web.zip'
 $RemoteScript = Join-Path $PSScriptRoot 'deploy-remote.ps1'
+
+# 构建端备份：成功部署后把「这次真正发上去的产物」覆盖到这里，失败或 -Rollback
+# 时从这里重发。放在 target\ 下（已 gitignore），和别的构建产物一起被忽略。
+# 只覆盖本次发出去的部件，所以 -SkipBackend 的部署不会把上次的 exe 抹掉。
+$ArchiveDir = Join-Path $RepoRoot 'target\deploy-archive'
+$ArchiveExe = Join-Path $ArchiveDir 'stream-server.exe'
+$ArchiveDll = Join-Path $ArchiveDir 'ViGEmClient.dll'
+$ArchiveZip = Join-Path $ArchiveDir 'selkies-web.zip'
+$ArchiveMeta = Join-Path $ArchiveDir 'meta.json'
 
 $script:StepNo = 0
 $script:DeployStartedAt = Get-Date
@@ -287,6 +306,77 @@ function Test-Health([int]$TimeoutSec) {
     return $false
 }
 
+# ---------------------------------------------------------------- 构建端备份
+<#
+    被控机上不留 .prev，回滚材料在这里。为什么不「部署前从被控机把当前 exe 拉
+    回来」：那要多传 18.6 MB，而拉到的正是上一份成功部署发出去的东西 —— 与归档
+    等价。唯一不等价的情形是有人手工换过被控机上的 exe，那种情况两个来源都不准，
+    文档里写明就够了。
+
+    只覆盖本次发出去的部件：`-SkipBackend` 的部署不会把归档里的 exe 抹掉，所以
+    归档始终是「最近一次成功部署后的完整状态」。
+#>
+function Save-DeployArchive {
+    New-Item -ItemType Directory -Force -Path $ArchiveDir | Out-Null
+    $parts = @()
+    if (-not $SkipBackend) {
+        Copy-Item $LocalExe $ArchiveExe -Force
+        if (Test-Path $LocalVigem) { Copy-Item $LocalVigem $ArchiveDll -Force }
+        $parts += 'backend'
+    }
+    if (-not $SkipFrontend) {
+        Copy-Item $ZipPath $ArchiveZip -Force
+        $parts += 'frontend'
+    }
+
+    $exeMd5 = $(if (Test-Path $ArchiveExe) { Get-Md5 $ArchiveExe } else { $null })
+    $dllMd5 = $(if (Test-Path $ArchiveDll) { Get-Md5 $ArchiveDll } else { $null })
+    $zipMd5 = $(if (Test-Path $ArchiveZip) { Get-Md5 $ArchiveZip } else { $null })
+    $commit = $(try { (& git -C $RepoRoot rev-parse --short HEAD 2>$null) } catch { $null })
+    # 工作区脏的时候，归档里的 exe 不对应任何提交 —— 回滚到它的人需要知道这件事。
+    $dirty = $(try { [bool](& git -C $RepoRoot status --porcelain 2>$null) } catch { $true })
+    [ordered]@{
+        saved_at = (Get-Date).ToString('o')
+        parts    = $parts
+        exe      = $exeMd5
+        dll      = $dllMd5
+        zip      = $zipMd5
+        commit   = $commit
+        dirty    = $dirty
+    } | ConvertTo-Json | Set-Content -Path $ArchiveMeta -Encoding UTF8
+    Write-Ok "构建端归档：$($parts -join ' + ')（$ArchiveDir）"
+}
+
+<#
+    把归档里的部件重新发上去并切换一次。`$Parts` 决定发哪几件 —— 失败路径只恢复
+    本次动过的部分，`-Rollback` 恢复全部。
+#>
+function Send-Archived([string[]]$Parts) {
+    $sent = @()
+    if ($Parts -contains 'backend') {
+        if (-not (Test-Path $ArchiveExe)) { throw "归档里没有 stream-server.exe：$ArchiveDir" }
+        Send-File $ArchiveExe "$RemoteRoot/stream-server.new.exe"
+        if (Test-Path $ArchiveDll) { Send-File $ArchiveDll "$RemoteRoot/ViGEmClient.new.dll" }
+        $sent += 'backend'
+    }
+    if ($Parts -contains 'frontend') {
+        if (-not (Test-Path $ArchiveZip)) { throw "归档里没有 selkies-web.zip：$ArchiveDir" }
+        Send-File $ArchiveZip "$RemoteDeploy/selkies-web.zip"
+        $sent += 'frontend'
+    }
+    if ($sent.Count -eq 0) { return $false }
+
+    Send-File $RemoteScript "$RemoteDeploy/deploy-remote.ps1"
+    $argList = "powershell -NoProfile -ExecutionPolicy Bypass -File $RemoteDeploy\deploy-remote.ps1"
+    if ($sent -notcontains 'backend') { $argList += ' -SkipBackend' }
+    if ($sent -notcontains 'frontend') { $argList += ' -SkipFrontend' }
+    $out = & ssh @SshOpts $Target $argList 2>&1
+    $code = $LASTEXITCODE
+    foreach ($line in $out) { Write-Host "           $line" -ForegroundColor DarkGray }
+    if ($code -ne 0) { throw "远端切换失败（退出码 $code）" }
+    return $true
+}
+
 <#
     sshd 必须开机自启。这台机器上它是 Automatic，但那是上一次手工设的；
     重装 OpenSSH、或者换了台机器，默认可能是 Manual —— 表现就是「重启以后
@@ -312,6 +402,9 @@ powershell -NoProfile -Command "$s = Get-Service sshd -ErrorAction SilentlyConti
 }
 
 # ---------------------------------------------------------------- 主流程
+# 本轮动过被控机的哪几个部件。只有走到切换那一步才会往里填，catch 靠它决定
+# 「恢复什么」，以及「什么都没换过就别去重启进程」。
+$attempted = @()
 try {
     # ---- 1 预检
     Write-Step '预检'
@@ -338,6 +431,30 @@ try {
     Write-Ok "ssh 可达：$($ssh.Output.Trim())（$Target）"
 
     if (-not (Test-Path $RemoteScript)) { throw "缺少 $RemoteScript" }
+
+    # ---- 0 回滚（人工入口，不需要编译、不重新打包）
+    <#
+        被控机上不再有 .prev，所以回滚 = 把构建端归档的上一版当成"新版本"再发一次，
+        走的还是同一条 上传 → 校验 → 停止 → 更换 → 起任务 → 体检 的路径。回滚因此
+        也被体检，而不是"发完就算数"。
+    #>
+    if ($Rollback) {
+        Write-Step '回滚：把构建端归档的上一版发回去'
+        if (-not (Test-Path $ArchiveExe) -and -not (Test-Path $ArchiveZip)) {
+            throw "没有可用的归档：$ArchiveDir（这台机器上还没成功部署过）"
+        }
+        $parts = @()
+        if (Test-Path $ArchiveExe) { $parts += 'backend' }
+        if (Test-Path $ArchiveZip) { $parts += 'frontend' }
+        if (Test-Path $ArchiveMeta) {
+            $meta = Get-Content $ArchiveMeta -Raw | ConvertFrom-Json
+            Write-Note "归档 $($meta.saved_at)  部件 $($meta.parts -join '+')  提交 $($meta.commit)"
+        }
+        if (-not (Send-Archived -Parts $parts)) { throw '归档里没有可发的部件' }
+        if (-not (Test-Health $HealthTimeoutSec)) { throw '回滚后健康检查未通过' }
+        Write-Ok '回滚完成（来源：构建端归档）'
+        return
+    }
 
     # ---- 2 引导（可选）
     if ($Bootstrap) {
@@ -503,7 +620,12 @@ try {
     }
 
     # ---- 7 切换
-    Write-Step '切换（停任务 → 备份 → 换文件 → 起任务）'
+    Write-Step '切换（停任务 → 换文件 → 起任务）'
+
+    # 从这里起，被控机上的文件随时可能已经被换掉：先立好"这一轮动了什么"，
+    # 失败时按它恢复。换前端失败却去重启后端，会白踢掉一个活会话。
+    if (-not $SkipBackend) { $attempted += 'backend' }
+    if (-not $SkipFrontend) { $attempted += 'frontend' }
 
     <#
         只换前端时进程不该被重启（这正是 -SkipBackend 的意义：不断会话）。
@@ -588,24 +710,38 @@ try {
         Write-Note '没看到 stream-server 进程，但端口是通的 —— 检查是不是有别的实例'
     }
 
+    # ---- 9 归档（构建端唯一的备份）
+    Write-Step '归档（构建端）'
+    Save-DeployArchive
+
     Write-Host ""
     Write-Host ("部署完成：{0:N1}s" -f ((Get-Date) - $DeployStartedAt).TotalSeconds) -ForegroundColor Green
     Write-Host "  页面    https://${HostName}:$Port/   （强刷 Ctrl+F5：index.html 换了）"
     Write-Host "  日志    $RemoteLog"
-    Write-Host "  回滚    在被控机执行 C:\dev\deploy\deploy-remote.ps1 -Rollback（文档 §6）"
+    Write-Host "  回滚    pwsh toolchain/deploy.ps1 -Rollback（重发 $ArchiveDir）"
 }
 catch {
     Write-Host ""
     Write-Host "部署失败：$($_.Exception.Message)" -ForegroundColor Red
-    if (-not $DryRun) {
-        Write-Host "尝试回滚…" -ForegroundColor Yellow
-        $rb = Invoke-Ssh "powershell -NoProfile -ExecutionPolicy Bypass -File $RemoteDeploy\deploy-remote.ps1 -Rollback -CycleOnly" -AllowFail
-        Write-Host $rb.Output -ForegroundColor DarkGray
-        if ($rb.Code -eq 0) {
-            Write-Host "已回滚到上一版（stream-server.exe.prev / selkies-web.prev）" -ForegroundColor Yellow
-        } else {
-            Write-Host "回滚也失败了 —— 到被控机上手工执行 deploy-remote.ps1 -Rollback" -ForegroundColor Red
+    if ($attempted.Count -gt 0) {
+        <#
+            只恢复本轮动过的部件。恢复本身也可能失败（比如被控机连不上），那时
+            要把"下一步该做什么"说清楚，而不是只留一条红色错误。
+        #>
+        Write-Host "从构建端归档恢复（$($attempted -join ' + ')）…" -ForegroundColor Yellow
+        try {
+            if (Send-Archived -Parts $attempted) {
+                Write-Host "已恢复：$ArchiveDir 里的上一份产物" -ForegroundColor Yellow
+                if (Test-Health 30) { Write-Host "  端口已通" -ForegroundColor Yellow }
+            } else {
+                Write-Host "归档里没有本次动过的部件，被控机没有被改过" -ForegroundColor Yellow
+            }
+        } catch {
+            Write-Host "恢复失败：$($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "  手工处理：pwsh toolchain/deploy.ps1 -Rollback" -ForegroundColor Red
         }
+    } else {
+        Write-Host "被控机没有被改动（失败发生在切换之前）" -ForegroundColor Yellow
     }
     exit 1
 }

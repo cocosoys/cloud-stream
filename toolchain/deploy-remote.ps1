@@ -12,19 +12,23 @@
     Everything here is ASCII on purpose: PowerShell 5.1 reads a BOM-less .ps1
     as ANSI, so non-ASCII comments would turn to mojibake.
 
-    Steps: stop task (and disable its 1-minute trigger) -> kill -> back up ->
-    swap -> re-enable -> start -> wait for the process. Any failure after the
-    swap is left to the caller, which calls -Rollback.
+    Steps: stop task (and disable its 1-minute trigger) -> kill -> swap ->
+    re-enable -> start -> wait for the process.
+
+    NO BACKUPS LIVE HERE. The controlled machine carries only the artifact
+    that is supposed to run: one exe, one DLL, one web directory. Rollback
+    material is kept on the build machine (target\deploy-archive), because that
+    is where the person doing the rollback sits. The old scheme left
+    stream-server.exe.prev (18.6 MB) and selkies-web.prev (2000+ files) on every
+    machine, and they accumulated faster than anyone rotated them.
+
+    The frontend is expanded into a staging directory and swapped by rename, so
+    a truncated zip fails while the live directory is still untouched.
 #>
 [CmdletBinding()]
 param(
     [switch]$SkipBackend,
     [switch]$SkipFrontend,
-    [switch]$Rollback,
-    # Undo only what the current deploy cycle replaced, instead of the classic
-    # "go back one version". The caller uses this on its own failure path; a
-    # human running -Rollback gets the full restore.
-    [switch]$CycleOnly,
 
     [string]$Root = 'C:\dev\stream',
     [string]$WebDir = 'C:\dev\selkies-web',
@@ -37,22 +41,10 @@ $ErrorActionPreference = 'Stop'
 
 $LiveExe = Join-Path $Root 'stream-server.exe'
 $NewExe = Join-Path $Root 'stream-server.new.exe'
-$PrevExe = Join-Path $Root 'stream-server.exe.prev'
 # #17: the virtual-gamepad client DLL. It is optional: without it the server
 # runs and simply has no gamepad, so a missing upload is a note, never a failure.
 $LiveDll = Join-Path $Root 'ViGEmClient.dll'
 $NewDll = Join-Path $Root 'ViGEmClient.new.dll'
-$PrevWeb = "$WebDir.prev"
-# `-CycleOnly` is what a frontend-only failure passes: nothing in that cycle
-# touched the exe, so rolling it back would silently downgrade a binary that had
-# nothing to do with the failure, and restarting it would drop the live session.
-# A bare `-Rollback` (a human undoing a whole deploy) restores everything.
-#
-# This used to be inferred from a marker file the swap wrote and cleared, which
-# never worked: the swap clears it on success, so the caller that rolls back
-# after a failed health check always found it gone and reported "exe untouched"
-# even when it had just swapped it. The flag the caller already passes says the
-# same thing without any state to get out of step.
 
 function Say([string]$Text) { Write-Output $Text }
 function Fail([string]$Text) { Write-Output "FAIL $Text"; exit 1 }
@@ -106,36 +98,6 @@ function Start-Server {
 
 function Get-Sha([string]$Path) { (Get-FileHash -Path $Path -Algorithm MD5).Hash }
 
-# ---------------------------------------------------------------- rollback
-if ($Rollback) {
-    Say 'STEP rollback'
-    $swappedExe = -not $CycleOnly
-
-    if ($swappedExe) {
-        Stop-Server
-        if (Test-Path $PrevExe) {
-            Copy-Item $PrevExe $LiveExe -Force
-            Say "OK  exe restored $((Get-Item $LiveExe).Length) B"
-        } else { Say 'WARN no stream-server.exe.prev' }
-    } else {
-        Say 'OK  exe untouched (this deploy did not swap it)'
-    }
-
-    if (Test-Path $PrevWeb) {
-        if (Test-Path $WebDir) { Remove-Item $WebDir -Recurse -Force }
-        Rename-Item $PrevWeb $WebDir
-        Say 'OK  web dir restored'
-    } else { Say 'WARN no selkies-web.prev' }
-
-    if ($swappedExe) {
-        Start-Server
-    } else {
-        Say 'OK  server left running (no restart)'
-    }
-    Say 'DONE rollback'
-    exit 0
-}
-
 # ---------------------------------------------------------------- preflight
 Say 'STEP preflight'
 if (-not (Test-Path $Root)) { Fail "missing $Root" }
@@ -162,10 +124,8 @@ if (-not $SkipFrontend) {
 if (-not $SkipBackend) {
     Say 'STEP backend'
     Stop-Server
-    # Copy, not Move: if the process fails to start we still have a live image
-    # on disk, and .prev doubles as the rollback source.
-    Copy-Item $LiveExe $PrevExe -Force
-    Say 'OK  backed up to stream-server.exe.prev'
+    # Overwrite in place. No .prev: the build machine holds the rollback copy,
+    # and a copy here is the thing nobody ever rotates.
     Move-Item $NewExe $LiveExe -Force
     Say "OK  swapped in $((Get-Item $LiveExe).Length) B md5 $(Get-Sha $LiveExe)"
     # Same window as the exe: Stop-Server has already released the image.
@@ -179,20 +139,42 @@ if (-not $SkipBackend) {
 # ---------------------------------------------------------------- swap frontend
 if (-not $SkipFrontend) {
     Say 'STEP frontend'
-    if (Test-Path $PrevWeb) { Remove-Item $PrevWeb -Recurse -Force }
-    if (Test-Path $WebDir) { Rename-Item $WebDir $PrevWeb }
-    New-Item -ItemType Directory -Path $WebDir | Out-Null
-    Expand-Archive -Path $WebZip -DestinationPath $WebDir -Force
+    # Expand into staging and validate *there*. The live directory is only
+    # touched once a complete tree is on disk, so a short or wrong-shaped zip
+    # leaves the running site exactly as it was.
+    $Stage = "$WebDir.staging"
+    if (Test-Path $Stage) { Remove-Item $Stage -Recurse -Force }
+    New-Item -ItemType Directory -Path $Stage | Out-Null
+    Expand-Archive -Path $WebZip -DestinationPath $Stage -Force
 
     # The archive must have been built from inside dist/. If it carries a
     # top-level folder, index.html ends up one level down and the server's
     # root serves a directory listing / 404 -- silently, because the files
     # are all there.
-    $index = Join-Path $WebDir 'index.html'
-    if (-not (Test-Path $index)) { Fail 'index.html not at web root: zip has a top-level folder' }
-    $assets = Get-ChildItem (Join-Path $WebDir 'assets') -Filter '*.js' -ErrorAction SilentlyContinue
-    if (-not $assets) { Fail 'no js under assets\: wrong build (core instead of dashboard?)' }
-    Say "OK  web dir $((Get-Item $index).Length) B index, $($assets.Count) js chunks"
+    $index = Join-Path $Stage 'index.html'
+    if (-not (Test-Path $index)) {
+        Remove-Item $Stage -Recurse -Force
+        Fail 'index.html not at web root: zip has a top-level folder (live site untouched)'
+    }
+    $assets = Get-ChildItem (Join-Path $Stage 'assets') -Filter '*.js' -ErrorAction SilentlyContinue
+    if (-not $assets) {
+        Remove-Item $Stage -Recurse -Force
+        Fail 'no js under assets\: wrong build, core instead of dashboard (live site untouched)'
+    }
+    $indexLen = (Get-Item $index).Length
+
+    # Rename twice instead of delete-then-create: both are metadata operations,
+    # so the window where the web root does not exist is microseconds.
+    $Old = "$WebDir.old"
+    if (Test-Path $Old) { Remove-Item $Old -Recurse -Force }
+    if (Test-Path $WebDir) { Rename-Item $WebDir $Old }
+    Rename-Item $Stage $WebDir
+    Say "OK  web dir $indexLen B index, $($assets.Count) js chunks"
+    if (Test-Path $Old) { Remove-Item $Old -Recurse -Force }
+    # The zip is transfer staging, not an artifact. Leaving it behind is exactly
+    # the pile-up this script exists to avoid.
+    Remove-Item $WebZip -Force
+    Say 'OK  staging zip removed'
 }
 
 # ---------------------------------------------------------------- start
