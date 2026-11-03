@@ -825,6 +825,9 @@ rem ... dies on "/I" — the guard ...
 - [ ] 故意失败一次能回滚：`-SkipFrontend` 上传一个坏 zip，或直接跑 `-Rollback`
 - [ ] 被控机上只有正式产物：`C:\dev\stream` 里没有 `*.prev` / `*.new.*`，
       `C:\dev\deploy` 只剩 `deploy-remote.ps1` 与四个上机脚本（zip 解压完即删）
+- [ ] 运行根里四个上机脚本都在：`start-stream.cmd` / `start-stream.60fps.cmd` /
+      `run-hidden.vbs` / `setup-watchdog.bat`（少一个就是有人改了 `$LauncherNames`
+      而没改 `$Launchers`，打包与安装用的是两份列表）
 - [ ] `C:\dev` 下不再有 `selkies-web\`（已 rename 进运行根）；旧的 `cert.pem` /
       `key.pem` 是**复制**过去的，脚本不动旧副本，可以手工删
 - [ ] `target\output\cloud-stream\manifest.json` 的 `built_at` 是本次时间，
