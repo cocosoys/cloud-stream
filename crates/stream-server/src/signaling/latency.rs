@@ -36,6 +36,21 @@ const LOST_AFTER: Duration = Duration::from_secs(5);
 /// moves the number by more than one sample of noise would).
 const EMA_ALPHA: f32 = 0.3;
 
+/// One step of the exponential average: the first sample is taken verbatim,
+/// every later one moves the average by `EMA_ALPHA` of the gap.
+///
+/// Pure on purpose. The end-to-end test below measures a *real* round trip, and
+/// a preempted thread turns ~0 ms into a few ms, so a bound there asserted the
+/// scheduler rather than this arithmetic (it failed at 1.2 ms whenever the rest
+/// of the 161-test suite ran in parallel). The math is pinned here instead.
+fn ema_step(prev_ms: f32, samples: u64, sample_ms: f32) -> f32 {
+    if samples == 0 {
+        sample_ms
+    } else {
+        prev_ms + EMA_ALPHA * (sample_ms - prev_ms)
+    }
+}
+
 #[derive(Debug, Default)]
 struct Inner {
     /// Send time of the ping waiting for its reply; `None` between sending and
@@ -115,11 +130,7 @@ impl LatencyProbe {
             return None;
         }
         let sample = now.duration_since(sent).as_secs_f32() * 1000.0;
-        guard.rtt_ms = if guard.samples == 0 {
-            sample
-        } else {
-            guard.rtt_ms + EMA_ALPHA * (sample - guard.rtt_ms)
-        };
+        guard.rtt_ms = ema_step(guard.rtt_ms, guard.samples, sample);
         guard.samples += 1;
         // One line on the first reply settles "is the probe alive at all"
         // without a per-second log; the figure itself lives in `stream_stats`.
@@ -174,14 +185,31 @@ mod tests {
         // state machine (a sample was taken), not about the value.
         assert!(probe.on_reply().is_some());
         let first = probe.rtt_ms().expect("one sample folded");
-        assert!(first < 1.0, "first sample read {first} ms for a local reply");
+        // Sanity bound only, not a latency budget: the value is a wall-clock
+        // delta, and a preemption between ping and pong can legitimately make it
+        // a few ms on a loaded machine. Anything approaching the timeout means
+        // the sample was folded when it should have been counted as lost.
+        assert!(
+            first.is_finite() && first < LOST_AFTER.as_secs_f32() * 1000.0,
+            "first sample read {first} ms for a local reply"
+        );
         let _ = probe.ping_line();
         assert!(probe.on_reply().is_some());
-        let second = probe.rtt_ms().expect("two samples folded");
-        // Both samples are ~0 ms, so the average stays near zero rather than
-        // drifting; this pins that the EMA does not accumulate a bias.
-        assert!(second < 1.0, "average drifted to {second} from {first}");
         assert_eq!(probe.counters(), (2, 0));
+    }
+
+    /// The average itself, with the clock taken out: first sample verbatim, then
+    /// 30 % of the gap, converging without overshoot in either direction.
+    #[test]
+    fn the_average_takes_the_first_sample_then_moves_toward_the_new_one() {
+        assert_eq!(ema_step(0.0, 0, 40.0), 40.0);
+        let after = ema_step(40.0, 1, 80.0);
+        assert!(
+            (after - 52.0).abs() < 0.001,
+            "expected 40 + 0.3*40 = 52, got {after}"
+        );
+        assert!(ema_step(52.0, 2, 80.0) < 80.0, "must not overshoot upwards");
+        assert!(ema_step(52.0, 2, 0.0) > 0.0, "must not overshoot downwards");
     }
 
     #[test]
