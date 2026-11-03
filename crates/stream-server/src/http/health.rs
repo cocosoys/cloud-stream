@@ -321,6 +321,22 @@ fn build(
     sample: &ProbeSample,
     session: Option<&SessionInfo>,
 ) -> (bool, Value) {
+    build_at(cfg, probe, sample, session, Instant::now())
+}
+
+/// [`build`]，但"现在"由调用方给。
+///
+/// 报告里所有 age 都是 `now - 某个时刻`，而整个响应必须只用**一个**参考点。
+/// 如果每个字段各自 `Instant::now()`，被调度器挂起过的线程会在同一份响应里同时
+/// 看到"刚写过"和"3.2 秒前写过"——健康的管线就这样被判成 `stalled`。
+/// 测试把 `now` 钉死，也是同一个理由。
+fn build_at(
+    cfg: &Config,
+    probe: &HealthProbe,
+    sample: &ProbeSample,
+    session: Option<&SessionInfo>,
+    now: Instant,
+) -> (bool, Value) {
     let pipeline = session.and_then(|s| s.pipeline.clone());
     let settings = session.and_then(|s| s.settings.clone());
 
@@ -351,7 +367,7 @@ fn build(
             ) = {
                 let stats = handle.stats();
                 let g = stats.lock().unwrap_or_else(|p| p.into_inner());
-                snapshot_fields(&g)
+                snapshot_fields(&g, now)
             };
 
             if !on {
@@ -365,7 +381,7 @@ fn build(
                 verdict = Verdict::Starting;
                 let waited = session
                     .and_then(|s| s.connected_at)
-                    .map(|at| at.elapsed())
+                    .map(|at| now.saturating_duration_since(at))
                     .unwrap_or_default();
                 if waited > FIRST_FRAME_BUDGET {
                     flags.push("no_first_frame_after_15s");
@@ -450,7 +466,7 @@ fn build(
         Some(info) => {
             let connected_s = info
                 .connected_at
-                .map(|at| at.elapsed().as_secs())
+                .map(|at| now.saturating_duration_since(at).as_secs())
                 .unwrap_or(0);
             json!({
                 "count": 1,
@@ -510,7 +526,10 @@ fn build(
 }
 
 #[allow(clippy::type_complexity)]
-fn snapshot_fields(g: &PipelineStats) -> (u64, u64, u64, u64, u64, u64, f32, f32, f32, u32, u64, bool, bool, Option<Duration>) {
+fn snapshot_fields(
+    g: &PipelineStats,
+    now: Instant,
+) -> (u64, u64, u64, u64, u64, u64, f32, f32, f32, u32, u64, bool, bool, Option<Duration>) {
     (
         g.counters.new_frames,
         g.counters.repeat_ok,
@@ -525,7 +544,7 @@ fn snapshot_fields(g: &PipelineStats) -> (u64, u64, u64, u64, u64, u64, f32, f32
         g.pli_requests,
         g.warmed_up,
         g.first_frame_seen,
-        g.last_sample_at.map(|at| at.elapsed()),
+        g.last_sample_at.map(|at| now.saturating_duration_since(at)),
     )
 }
 
@@ -708,17 +727,21 @@ mod tests {
     fn a_live_pipeline_reports_streaming() {
         let cfg = cfg();
         let handle = PipelineHandle::new();
+        // 「刚写过」和「现在读」必须是同一个时刻。以前这里取了两次
+        // `Instant::now()`，满负荷并行跑时线程被挂起 3 秒以上，就变成
+        // 「3 秒没写过 = 管线卡住」（5 次全量跑里挂过 2 次）。
+        let now = Instant::now();
         {
             let stats = handle.stats();
             let mut g = stats.lock().unwrap();
             g.first_frame_seen = true;
             g.warmed_up = true;
-            g.last_sample_at = Some(Instant::now());
+            g.last_sample_at = Some(now);
             g.counters.new_frames = 30;
         }
         let info = SessionInfo {
             id: 7,
-            connected_at: Some(Instant::now()),
+            connected_at: Some(now),
             peer_ip: "192.168.1.5".to_owned(),
             user_agent: "Mozilla/5.0".to_owned(),
             device_id: "dev-uuid".to_owned(),
@@ -727,13 +750,42 @@ mod tests {
             pipeline: Some(handle),
             settings: Some(crate::pipeline::StreamSettings::from_config(&cfg)),
         };
-        let (ok, body) = build(&cfg, &probe(), &sample(), Some(&info));
+        let (ok, body) = build_at(&cfg, &probe(), &sample(), Some(&info), now);
         assert!(ok);
         assert_eq!(body["verdict"], "streaming");
         assert_eq!(body["clients"]["count"], 1);
         assert_eq!(body["clients"]["items"][0]["ip"], "192.168.1.5");
         assert_eq!(body["clients"]["items"][0]["device_id"], "dev-uuid");
-        assert!(body["stream"]["last_sample_age_ms"].as_u64().is_some());
+        assert_eq!(body["stream"]["last_sample_age_ms"].as_u64(), Some(0));
+    }
+
+    /// 判据必须建立在**传进来的**那个时刻上。如果 `build_at` 自己再取一次
+    /// `Instant::now()`，同一份快照就会在两个参考点之间摇摆：延迟读到的时刻
+    /// 说「3 秒没写」，新取的时刻说「刚写过」，结论随机。
+    #[test]
+    fn the_verdict_is_computed_against_the_supplied_instant() {
+        let cfg = cfg();
+        let handle = PipelineHandle::new();
+        let written = Instant::now();
+        {
+            let stats = handle.stats();
+            let mut g = stats.lock().unwrap();
+            g.first_frame_seen = true;
+            g.last_sample_at = Some(written);
+        }
+        let info = SessionInfo {
+            id: 9,
+            connected_at: Some(written),
+            pipeline: Some(handle),
+            settings: Some(crate::pipeline::StreamSettings::from_config(&cfg)),
+            ..Default::default()
+        };
+        // 同一份快照，读取时刻晚 4 秒 → 必须判 stalled，尽管墙钟几乎没走。
+        let late = written + Duration::from_secs(4);
+        let (ok, body) = build_at(&cfg, &probe(), &sample(), Some(&info), late);
+        assert!(!ok, "four seconds of silence is a stall");
+        assert_eq!(body["verdict"], "stalled");
+        assert_eq!(body["flags"][0], "no_frame_for_over_3s");
     }
 
     /// 核心判据：管线开着、出过帧，但 track 已经静了很久 → `stalled`，并且
