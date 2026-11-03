@@ -25,7 +25,8 @@
         <root>\cert.pem  key.pem
         <root>\selkies-web\  logs\
         <root>\start-stream.cmd  start-stream.60fps.cmd
-        <root>\run-hidden.vbs  setup-watchdog.bat  collect-launch-facts.cmd
+        <root>\run-hidden.vbs  setup-watchdog.bat
+        <root>\collect-launch-facts.cmd  setup-inbound.cmd
 
     Steps: install launchers -> stop task (and disable its 1-minute trigger) ->
     kill -> swap -> re-enable -> start -> wait for the process.
@@ -104,7 +105,9 @@ $NewDll = Join-Path $Root 'ViGEmClient.new.dll'
 # at that machine has. Nothing executes it, so it is never busy.
 # collect-launch-facts.cmd is the "it will not start" first responder; it ships
 # so the person at the machine does not need the repo to answer the question.
-$Launchers = @('start-stream.cmd', 'start-stream.60fps.cmd', 'run-hidden.vbs', 'setup-watchdog.bat', 'collect-launch-facts.cmd')
+# setup-inbound.cmd opens 8080 + ICMP; without it a fresh Windows drops every
+# inbound packet and the machine looks dead from the build machine.
+$Launchers = @('start-stream.cmd', 'start-stream.60fps.cmd', 'run-hidden.vbs', 'setup-watchdog.bat', 'collect-launch-facts.cmd', 'setup-inbound.cmd')
 
 function Say([string]$Text) { Write-Output $Text }
 function Fail([string]$Text) { Write-Output "FAIL $Text"; exit 1 }

@@ -166,6 +166,7 @@ Host mc-admin-2
 | **交互式已登录会话** | `quser` 看到 `console 1 运行中` | 计划任务的 `/IT` 任务不启动；从服务/session 0 起进程抓到空桌面 |
 | **账户有密码** | `net user %USERNAME%` 看 `Password required` | 看门狗建不出来或永远不启动：Windows 默认禁止空密码账户**批处理登录**（`LimitBlankPasswordUse=1`），`schtasks /RP ""` 直接失败。无密码机器见本节末尾的启动文件夹方案 |
 | 真实显示输出 | VMware SVGA 3D 或物理显示器，分辨率设成要推的尺寸 | 黑屏，或退化成 1024×768 |
+| **入站已放行** | 从别的机器 `ping <IP>`、`curl -k https://<IP>:8080` | 全部 TIMEOUT（连 RST 都不返回）就是整档被丢：服务跑得再好也连不上。管理员跑一次 `setup-inbound.cmd` |
 
 **七步**（0–2 是包与解压，3–6 在新机器上做）：
 
@@ -200,13 +201,25 @@ schtasks /Run /TN MCStreamSrv
 # 6. 浏览器打开 https://<新IP>:8080/
 ```
 
-第 4 步在**管理员 PowerShell** 里做（cmd 里没有 `New-NetFirewallRule`；网络被
-识别成"公用"时把 `-Profile` 换成 `Any`，否则规则不生效）：
+第 4 步（放行 8080 + ping）最省事的做法是**以管理员身份运行**运行根里的
+`setup-inbound.cmd`：它按名称重建规则、对所有配置文件生效、顺手把 ICMP 打开，
+最后 `curl` 自测一次本机 8080。等价的手工命令（管理员 PowerShell）是：
 
 ```powershell
-# 4. 放行 8080（首次启动时 Windows 的弹窗勾"专用网络"等效）
+# 4. 放行 8080 与 ICMP（首次启动时 Windows 的弹窗勾"专用网络"等效，但只有弹窗
+#    被点过"允许"才算数；被点过"取消"会留下一条阻止规则，所以先删同名旧规则）
+Remove-NetFirewallRule -DisplayName 'cloud-stream*' -ErrorAction SilentlyContinue
 New-NetFirewallRule -DisplayName 'cloud-stream 8080' -Direction Inbound `
-  -Protocol TCP -LocalPort 8080 -Action Allow -Profile Private,Domain
+  -Protocol TCP -LocalPort 8080 -Action Allow -Profile Any
+New-NetFirewallRule -DisplayName 'cloud-stream ICMPv4' -Direction Inbound `
+  -Protocol ICMPv4 -IcmpType 8 -Action Allow -Profile Any
+```
+
+`-Profile Any` 不是偷懒：VMware NAT / host-only 网卡经常被识别成"公用"，
+限定 `Private` 的规则在那里**静默不生效**。判断依据：
+
+```powershell
+Get-NetConnectionProfile | Select-Object InterfaceAlias, NetworkCategory
 ```
 
 **不建任务的最小路径**：双击 `start-stream.cmd`。它开一个黑窗口跑
@@ -268,7 +281,7 @@ pwsh toolchain/deploy.ps1 -RemoteBase D:\cloud
 （`--dist selkies-web`）、计划任务动作全部相对推导，所以换了 `-RemoteBase`
 之后不需要再改任何脚本。
 
-`-Bootstrap` 只做四件事：sshd 自启、建目录、推五个上机脚本并装进运行根、核对
+`-Bootstrap` 只做四件事：sshd 自启、建目录、推六个上机脚本并装进运行根、核对
 exe / 任务 / 证书 / 旧布局。**它不建计划任务、不签证书、不动密码** —— 那三件是
 人做的（见 §1 的第 9、10 项和 §1.3）。
 
