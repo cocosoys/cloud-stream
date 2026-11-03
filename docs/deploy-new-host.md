@@ -188,21 +188,24 @@ Unblock-File .\cloud-stream.zip
 #    不可用（Clipboard API 要安全上下文），只是少了一个告警。
 
 # 3. 建看门狗任务（推荐）。双击也可以，会提示输密码
-cd /d D:\stream
-setup-watchdog.bat
 #    要指定别的账户（需要管理员 cmd）：setup-watchdog.bat Administrator <密码>
 #    密码是这台机器**该账户的登录密码**，不是这里新设的什么密码
 #    成功后核对「要运行的任务」= wscript.exe "D:\stream\run-hidden.vbs"
-
-# 4. 放行 8080（管理员 PowerShell；首次启动时 Windows 的弹窗勾"专用网络"等效）
-#    网络被识别成"公用"时把 -Profile 换成 Any，否则规则不生效
-New-NetFirewallRule -DisplayName 'cloud-stream 8080' -Direction Inbound `
-  -Protocol TCP -LocalPort 8080 -Action Allow -Profile Private,Domain
+cmd /c "cd /d D:\stream && setup-watchdog.bat"
 
 # 5. 起服务：最多等 1 分钟（任务每分钟触发），或立刻推一把
 schtasks /Run /TN MCStreamSrv
 
 # 6. 浏览器打开 https://<新IP>:8080/
+```
+
+第 4 步在**管理员 PowerShell** 里做（cmd 里没有 `New-NetFirewallRule`；网络被
+识别成"公用"时把 `-Profile` 换成 `Any`，否则规则不生效）：
+
+```powershell
+# 4. 放行 8080（首次启动时 Windows 的弹窗勾"专用网络"等效）
+New-NetFirewallRule -DisplayName 'cloud-stream 8080' -Direction Inbound `
+  -Protocol TCP -LocalPort 8080 -Action Allow -Profile Private,Domain
 ```
 
 **不建任务的最小路径**：双击 `start-stream.cmd`。它开一个黑窗口跑
