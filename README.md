@@ -123,6 +123,7 @@ cd target\output\cloud-stream
 | `--repeat-every` | — | 静态画面时重复送帧的间隔 |
 | `--tls-cert` `--tls-key` | — | 给了就走 HTTPS/wss，否则明文（除 `127.0.0.1` 外不建议） |
 | `--upload-dir` | — | 文件传输允许访问的根目录 |
+| `--auth-token` | — | 访问口令。设了之后 `/api/*` 全部要求它（Bearer / cookie / `?token=` / WS subprotocol）；静态资源与 `/api/status` 豁免 |
 | `--dump-frame` | — | 把采集帧导成 bmp 便于排查 |
 | `--policy` | `allow-all` | 监听面策略，`deny-all` 用于覆盖率探针 |
 | `--log` | `logs\stream-server.log` | 日志落盘路径 |

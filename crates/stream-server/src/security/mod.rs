@@ -24,8 +24,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 pub mod policy;
+// #101: 口令校验（Bearer / cookie / query / WS subprotocol），与前端
+// `session-token.js` 的四种载体一一对应。
+pub mod token;
 
 pub use policy::{AllowAll, DenyAll};
+pub use token::TokenGate;
 
 /// 外部可达的入口分类。
 ///

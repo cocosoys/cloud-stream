@@ -39,5 +39,21 @@ goto :pf_done
 echo  [preflight] inbound 8080/ICMP still blocked -- run setup-inbound.cmd as administrator once
 :pf_done
 
+rem #101: same file, same rule as start-stream.cmd -- the long explanation is
+rem there. Kept identical on purpose: a hand-run test that passes different
+rem flags than the watchdog is not a test of the watchdog.
+if not exist "%ROOT%\auth-token.txt" goto :no_auth
+set "AUTH="
+for /f "usebackq delims=" %%T in ("%ROOT%\auth-token.txt") do if not defined AUTH set "AUTH=%%T"
+if not defined AUTH goto :no_auth
+set "ARGS=%ARGS% --auth-token "%AUTH%""
+echo  [auth] token enabled from auth-token.txt -- browsers must append it to the page URL
+goto :probe
+
+:no_auth
+echo  [auth] no auth-token.txt -- /api/* is open to anyone who can reach the port
+
+:probe
+
 if exist "%ROOT%\probe-listen.cmd" start "cloud-stream probe" /b "%ROOT%\probe-listen.cmd"
 "%ROOT%\stream-server.exe" %ARGS%

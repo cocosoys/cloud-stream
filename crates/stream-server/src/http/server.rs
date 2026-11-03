@@ -34,7 +34,7 @@ use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 
 use crate::config::Config;
 use crate::http::{classify, file_transfer, header_value, r#static, write_http, Route};
-use crate::security::{self, Endpoint, EventKind};
+use crate::security::{self, Credential, Endpoint, EventKind, TokenGate};
 use crate::signaling::websession;
 use crate::signaling::SessionRegistry;
 
@@ -226,7 +226,42 @@ where
     //
     // 注意 `Route::Files` 同时承载"列目录"和"下载"，两者都是读，所以统一映射
     // 到 `Endpoint::Files`；真正的写入口只有 `Endpoint::Upload`。
-    let principal = crate::security::Principal::from_peer(peer);
+    // #101: 口令先于策略。顺序是有意的 —— 没出示凭据的人不该先收到
+    // "403 Forbidden"，那等于告诉他"这里有东西，只是你没被允许"。
+    //
+    // 两类豁免：
+    //   * `Static` —— 前端 bundle 本身。Selkies 前端是 MPL 开源的，代码里没有
+    //     秘密；而且页面必须能打开，否则用户连"这机器要口令"都看不到，只能
+    //     看到一片空白 —— 那正是本项目花了几轮才消掉的"启动了但没效果"。
+    //   * `Status` —— 部署脚本的探活口径，正文只有 `ok` 两个字。
+    let credential = match cfg.auth_token.as_deref().and_then(TokenGate::new) {
+        Some(gate) if !matches!(route, Route::Static(_) | Route::Status) => {
+            match gate.check_request(&headers, path) {
+                Some(cred) => cred,
+                None => {
+                    // `WWW-Authenticate` 必须带 `Bearer realm="Selkies"`：前端的
+                    // `auth-guard.js` 按这个前缀区分"令牌不匹配"（重载也没用，
+                    // 所以不重载）和"Basic 墙"（重载才能重新登录）。少了它，
+                    // 输错口令的页面会每 30 秒自刷一次且永远好不了。
+                    let challenge =
+                        format!("Bearer realm=\"{}\"", crate::security::token::REALM);
+                    crate::http::write_http_with(
+                        &mut stream,
+                        401,
+                        "Unauthorized",
+                        "text/plain; charset=utf-8",
+                        b"401 Unauthorized: this server requires a token; append ?token=<token> to the page URL\n",
+                        &[("WWW-Authenticate", challenge.as_str())],
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+        }
+        _ => Credential::None,
+    };
+
+    let principal = crate::security::token::principal(peer, credential);
     if !crate::security::allow(surface_of(&route), &principal) {
         write_http(
             &mut stream,

@@ -110,6 +110,36 @@ set "UPLOAD=%USERPROFILE%\Desktop"
 if not exist "%UPLOAD%" set "UPLOAD=%USERPROFILE%"
 set "ARGS=%ARGS% --upload-dir "%UPLOAD%""
 
+rem #101: the password lives in its own file, not in this script.
+rem
+rem Two reasons. A .cmd is read byte by byte in the OEM code page, so a password
+rem containing a Chinese character would be mangled before the exe ever sees it
+rem (same class of bug as the em dash that broke the if-blocks). And a file can
+rem be replaced without touching a script that the watchdog may be executing.
+rem
+rem Missing or empty file means no password -- the behaviour every machine that
+rem has not opted in already has, so this changes nothing by default.
+rem
+rem `for /f` rather than `set /p <file`: set /p treats a file without a trailing
+rem newline as empty, which would silently drop a password written by `echo`
+rem without one (that trap was already paid for once in probe-listen.cmd).
+rem
+rem No angle brackets in the log line below: cmd reads `<` as input redirection
+rem even inside an echo, so `?token=<token>` would eat the rest of the line and
+rem leave a stray file named after the redirect.
+if not exist "%ROOT%\auth-token.txt" goto :no_auth
+set "AUTH="
+for /f "usebackq delims=" %%T in ("%ROOT%\auth-token.txt") do if not defined AUTH set "AUTH=%%T"
+if not defined AUTH goto :no_auth
+set "ARGS=%ARGS% --auth-token "%AUTH%""
+echo [%date% %time%] auth token enabled from auth-token.txt -- browsers must append the token to the page URL>> "%WLOG%"
+goto :probe
+
+:no_auth
+echo [%date% %time%] no auth-token.txt -- /api/* answers anyone who can reach the port>> "%WLOG%"
+
+:probe
+
 rem The probe must be its own process: this script is about to block on the exe
 rem on purpose (that is what keeps the watchdog task Running, see the header),
 rem so there is no thread left to poll the port.

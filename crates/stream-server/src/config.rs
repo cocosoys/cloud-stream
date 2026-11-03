@@ -88,6 +88,18 @@ pub struct Config {
     /// 还能用的入口就是漏插桩的地方。真正的策略由上层项目实现 `Policy`
     /// 后注入。
     pub policy: String,
+    /// #101: 会话口令。`Some` 且非空时，`/api/` 下的每个请求（含信令握手）
+    /// 都必须出示它，否则 401；`None` 保持本项目原来的"局域网不鉴权"。
+    ///
+    /// 载体见 [`crate::security::token`]：`Authorization: Bearer`、cookie
+    /// `selkies_token`、`?token=`、以及信令握手的 `selkies.token.*`
+    /// subprotocol。四条都是前端 `session-token.js` 已经在用的，所以这个
+    /// 开关打开后前端不需要任何改动。
+    ///
+    /// 刻意**不**做 `auto` 生成：随机口令需要一个密码学随机源，而本项目的
+    /// 依赖表里没有（现成可用的只有 SipHash 的随机种子，拿它当 CSPRNG 是
+    /// 错的）。口令是运维输入，不是程序猜出来的。
+    pub auth_token: Option<String>,
 }
 
 impl Default for Config {
@@ -119,6 +131,7 @@ impl Default for Config {
             video_codec: "vp8".to_owned(),
             ghost_cursor_idle_secs: crate::dispatch::ghost::DEFAULT_IDLE_SECS,
             policy: "allow-all".to_owned(),
+            auth_token: None,
         }
     }
 }
@@ -237,6 +250,13 @@ impl Config {
                         // 未知名保留默认并在 main 里告警，不在这里吞掉 ——
                         // "策略名拼错了" 必须看得见，否则会以为鉴权已经生效。
                         cfg.policy = v;
+                    }
+                }
+                // #101: 空串等于关掉（`--auth-token ""` 不该把机器锁死），
+                // 与 `TokenGate::new` 的判定是同一套规则。
+                "--auth-token" => {
+                    if let Some(v) = iter.next() {
+                        cfg.auth_token = if v.trim().is_empty() { None } else { Some(v) };
                     }
                 }
                 "--upload-dir" => {

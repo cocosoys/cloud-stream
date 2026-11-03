@@ -35,7 +35,7 @@ for /l %%I in (1,1,6) do (
         rem !time! not %time%: cmd expands %time% once when it parses the whole
         rem for block, so the verdict would carry the timestamp from before the
         rem first 5 s wait. Delayed expansion is evaluated per iteration.
-        echo [!date! !time!] PREFLIGHT listening on 8080 after %%I probe^(s^): local health 200 >> "%WLOG%"
+        echo [!date! !time!] PREFLIGHT listening on 8080 after %%I probe^(s^): local status 200 >> "%WLOG%"
         call :hint
         exit /b 0
     )
@@ -68,12 +68,20 @@ rem images, and present on anything that also runs a dev proxy -- sends the
 rem loopback request to that proxy, which answers 502 for a port it cannot
 rem reach. The probe would then announce a dead server on a perfectly healthy
 rem machine.
-"%CURL%" -sk -m 3 -f --noproxy "*" -o NUL https://127.0.0.1:8080/api/v1/health >nul 2>&1
+rem
+rem /api/status, not /api/v1/health: #101 put the health report behind the
+rem password (it names every connected client), while status stays open because
+rem the deploy wrapper probes it too. The probe's question is "is anything
+rem answering on this port", not "is the pipeline healthy" -- so the open route
+rem is both the right question and the one that keeps working after somebody
+rem sets a password. Using health here would turn every password-protected
+rem machine into a "PREFLIGHT NOT listening" false alarm.
+"%CURL%" -sk -m 3 -f --noproxy "*" -o NUL https://127.0.0.1:8080/api/status >nul 2>&1
 if not errorlevel 1 (
     set "CODE=200"
     exit /b 0
 )
-"%CURL%" -sk -m 3 -f --noproxy "*" -o NUL http://127.0.0.1:8080/api/v1/health >nul 2>&1
+"%CURL%" -sk -m 3 -f --noproxy "*" -o NUL http://127.0.0.1:8080/api/status >nul 2>&1
 if not errorlevel 1 (
     set "CODE=200"
     exit /b 0

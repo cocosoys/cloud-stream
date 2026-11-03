@@ -74,7 +74,7 @@ pwsh toolchain/deploy.ps1
 部署完成：86.5s
 ```
 
-再跑一次同样的东西时，第 6 步的 `migrated` / `copied` 不再出现，八个上机脚本变成
+再跑一次同样的东西时，第 6 步的 `migrated` / `copied` 不再出现，九个上机脚本变成
 `unchanged` —— 那就是幂等。
 
 被控机上没有"备份"这一步：备份归构建端（第 8 步），详见 §6 与 §7.22。
@@ -109,6 +109,7 @@ target\output\cloud-stream\
   setup-inbound.cmd     管理员身份运行：放行 8080 与 ping（新机器必须做一次）
   open-inbound.cmd      上面那条规则的执行者，被启动脚本自动调用（幂等、静默）
   probe-listen.cmd      启动后 30 秒内把"到底有没有监听"写进 watchdog.log
+  set-password.cmd      设 / 改 / 清访问口令，写 auth-token.txt（重启任务生效）
   README.txt             上机三步 + 目录说明（给拿到包的人看）
   manifest.json          构建指纹：提交、时间、MD5、前端文件数
 target\output\cloud-stream.zip   整包，拷到新机器用
@@ -136,6 +137,7 @@ target\output\cloud-stream.zip   整包，拷到新机器用
 | `…\setup-inbound.cmd` | `C:\dev\stream\setup-inbound.cmd` | 管理员运行一次：放行 TCP 8080 + ICMP，否则外部一概连不上 | 不要 |
 | `…\open-inbound.cmd` | `C:\dev\stream\open-inbound.cmd` | 上面那条规则的幂等实现，`start-stream.cmd` 每次真启动时调用；无输出，只回退出码 | 下次启动生效 |
 | `…\probe-listen.cmd` | `C:\dev\stream\probe-listen.cmd` | 启动后另起一个进程探 loopback，把判决写进 `watchdog.log` 的 `PREFLIGHT` 行 | 下次启动生效 |
+| `…\set-password.cmd` | `C:\dev\stream\set-password.cmd` | 设 / 改 / 清访问口令，结果写入 `auth-token.txt` | 下次启动生效 |
 | `…\cert.pem` / `key.pem` | `C:\dev\stream\cert.pem` / `key.pem` | 仅当被控机**没有**证书时安装（SAN 是那台机器的 IP，不能拿构建端覆盖） | 要（`--tls-*` 在启动参数里） |
 | `toolchain\deploy-remote.ps1` | `C:\dev\deploy\deploy-remote.ps1` | 被控端执行体（`deploy\` 里唯一的常驻文件） | 不要 |
 
@@ -214,7 +216,7 @@ pwsh toolchain/deploy.ps1 -WebRoot D:\src\cloud-stream-web
 
 | 常量 | 默认 | 谁决定 | 里面有什么 |
 |---|---|---|---|
-| `<RemoteBase>\stream` | `C:\dev\stream` | `deploy.ps1 -RemoteBase` | 运行根：exe、DLL、证书、`selkies-web\`、`logs\`、八个脚本 |
+| `<RemoteBase>\stream` | `C:\dev\stream` | `deploy.ps1 -RemoteBase` | 运行根：exe、DLL、证书、`selkies-web\`、`logs\`、九个脚本 |
 | `<RemoteBase>\deploy` | `C:\dev\deploy` | 同上 | 部署暂存：`deploy-remote.ps1`、传输中的 exe/zip/脚本 |
 
 运行根内部的路径全是相对的，谁也没有"必须放在 C 盘"的假设：
@@ -247,7 +249,7 @@ pwsh toolchain/deploy.ps1 -Bootstrap
 
 1. **sshd 开机自启**（见 §3.1）
 2. **建目录**：`C:\dev\stream\logs`、`C:\dev\stream\selkies-web`、`C:\dev\deploy`
-3. **推启动脚本并安装**：八个脚本 → `C:\dev\deploy\`，再由
+3. **推启动脚本并安装**：九个脚本 → `C:\dev\deploy\`，再由
    `deploy-remote.ps1 -OnlyLaunchers` 按哈希装进运行根（正在被看门狗执行的那个
    会跳过并提示"下次重启生效"）
 4. **核对**四样东西并打印结果：exe 在不在、计划任务在不在（`Running`）、证书在
@@ -328,13 +330,13 @@ C:\dev\stream\setup-watchdog.bat Administrator S3cr3t
 | 1 预检 | 本机要 `ssh`/`scp`/`curl.exe`；远端要能 `hostname` | 连不上 → 打印修 sshd 的三行 |
 | 2 构建后端 | `cargo build --release -p stream-server`（`-SkipBackend` 跳过） | 编译失败 → 不进入下一步 |
 | 3 构建前端 | core → dashboard → `selkies-web.zip`（`-SkipFrontend` 跳过） | `dist` 缺失 / gendb 失败 → 抛错 |
-| 4 汇总产物 | 把 exe / DLL / 前端 / 证书 / 八个脚本装进 `target\output\cloud-stream`，写 `manifest.json`，压同名 zip | 前端 `assets\` 缺失即抛错；本轮没有前端产物时跳过并回退成单件上传 |
-| 5 上传 | `scp` **从汇总目录**取：`stream-server.new.exe` / `ViGEmClient.new.dll` / `selkies-web.zip` / 八个上机脚本 / 证书 / `deploy-remote.ps1`；带 `BatchMode=yes`，缺密钥立刻失败而不是卡在密码提示 | — |
+| 4 汇总产物 | 把 exe / DLL / 前端 / 证书 / 九个脚本装进 `target\output\cloud-stream`，写 `manifest.json`，压同名 zip | 前端 `assets\` 缺失即抛错；本轮没有前端产物时跳过并回退成单件上传 |
+| 5 上传 | `scp` **从汇总目录**取：`stream-server.new.exe` / `ViGEmClient.new.dll` / `selkies-web.zip` / 九个上机脚本 / 证书 / `deploy-remote.ps1`；带 `BatchMode=yes`，缺密钥立刻失败而不是卡在密码提示 | — |
 | 6 校验 | 两端 MD5 比对 | 不一致就停，**不切换** |
 | 7 切换 | 远端：装证书（仅当缺失）→ 停任务 → **禁用任务** → 杀进程 → 换 exe/DLL → **装启动脚本**（此刻文件才不被占用）→ 前端解压到暂存目录并校验后换名 → 删 zip → 启任务 | 每一步失败即中止 |
 | 8 体检 | 轮询 `/api/status` | 见下 |
 | 9 体检补充 | 进程 pid / 启动时间、日志尾部、**计划任务的动作路径** | 动作路径不在运行根下只提示不失败（§7.23） |
-| 10 归档 | 构建端把这一轮真正发出去的部件写进 `target\deploy-archive\`（含八个上机脚本） | 失败不影响线上 |
+| 10 归档 | 构建端把这一轮真正发出去的部件写进 `target\deploy-archive\`（含九个上机脚本） | 失败不影响线上 |
 
 前四步里 2 和 3 是可以单独跳过的，因为"只换前端"和"只换后端"都很常见；
 **6 之后就没有可以单独跳过的步骤了** —— 校验、切换、体检是一条链，缺一环
@@ -746,7 +748,7 @@ DLL / zip 覆盖进 `target\deploy-archive\`（gitignore），失败或 `-Rollba
 `mc\start-mc.ps1` 与 `mc\launch-remote.ps1`（`MCGame` 任务链）。
 
 **边界**：`deploy\` 目录本身保留（空目录），因为 `scp` 需要它存在；跑完一次部署后
-里面只会有 `deploy-remote.ps1`（16 KB）与八个上机脚本的副本（每轮重传，
+里面只会有 `deploy-remote.ps1`（16 KB）与九个上机脚本的副本（每轮重传，
 装进运行根之后就只是暂存），zip 与上传的证书都在装好后立刻删掉。
 
 ### 7.23 上机脚本写死绝对路径 + 非 ASCII 注释（已修）
@@ -762,7 +764,7 @@ DLL / zip 覆盖进 `target\deploy-archive\`（gitignore），失败或 `-Rollba
    `run-hidden.vbs` 里 `sh.Run "cmd /c ""C:\dev\stream\start-stream.cmd"""`；
    `setup-watchdog.bat` 里 `/TR "wscript.exe C:\dev\stream\run-hidden.vbs"`；
    `deploy-remote.ps1` 的 `-Root` / `-WebDir` / `-WebZip` 默认值。
-   于是"解压到别处"等于让八个脚本同时指向一个不存在的目录。
+   于是"解压到别处"等于让九个脚本同时指向一个不存在的目录。
 2. `crates/stream-server/src/config.rs` 的 `dist` 默认值还是
    `PathBuf::from(r"C:\dev\selkies-web")` —— 连 exe 自己也带着绝对路径。
 3. `--upload-dir C:\Users\Administrator\Desktop`：换一台机器、换一个交互用户就
@@ -880,7 +882,7 @@ rem ... dies on "/I" — the guard ...
 | 层 | 改动 | 失败时留下什么 |
 |---|---|---|
 | 启动前 | `start-stream.cmd` 每次**真启动**前 `call open-inbound.cmd`（幂等：查询两条规则，缺了才加）。提权才加得动；UAC 过滤令牌下加不上就记一行 | `PREFLIGHT inbound 8080/ICMP still blocked -- run setup-inbound.cmd as administrator once` |
-| 启动后 | `start "" /b probe-listen.cmd`：每 5 秒探一次 loopback（先 https 再 http），最多 6 轮 | `PREFLIGHT listening on 8080 after N probe(s): local health 200` 或 `PREFLIGHT NOT listening on 8080 ...` + 8080 被占用 / panic / 加载器失败三选一 + 下一步 |
+| 启动后 | `start "" /b probe-listen.cmd`：每 5 秒探一次 loopback（先 https 再 http），最多 6 轮 | `PREFLIGHT listening on 8080 after N probe(s): local status 200` 或 `PREFLIGHT NOT listening on 8080 ...` + 8080 被占用 / panic / 加载器失败三选一 + 下一步 |
 | 建任务时 | `setup-watchdog.bat` 结尾改成：`schtasks /Run` → 最多等 60 秒 → 打印 `[ok]` / `[fail]`，失败时直接给出要看哪两个日志；最后 `pause`，窗口停在结论上 | 屏幕上的 `[fail]`，不会随窗口消失 |
 | 收证据时 | `collect-launch-facts.cmd` 新增第 9 节：网络配置文件、本机 IPv4、两条规则的实际参数、最近 12 条 `PREFLIGHT` 行 | `cloud-stream-facts.txt` 直接可回传 |
 
@@ -906,12 +908,77 @@ rem ... dies on "/I" — the guard ...
 
 ```
 15:32:30.64 starting stream-server.exe from C:\dev\stream
-15:32:30.71 PREFLIGHT listening on 8080 after 1 probe(s): local health 200
+15:32:30.71 PREFLIGHT listening on 8080 after 1 probe(s): local status 200
 15:32:35.35 PREFLIGHT   loopback works. If another machine still cannot open ...
 ```
 
 第一条时间戳 30.71 偏早是上面第三个坑，已改成 `!time!`；第二条是修好后应有的
 形态（探测完成时刻）。
+
+---
+
+### 7.26 访问口令：`--auth-token` 与前端五种载体（#101）
+
+在 7.25 之前，这套东西的默认状态是**同网段任何人打开地址就能操作键鼠**。口令是
+一条真实欠账，不是可选项。
+
+**怎么开**：运行根里双击 `set-password.cmd`，输一个口令（只限 ASCII），它会写
+`auth-token.txt`；`start-stream.cmd` 每次启动读这个文件并传 `--auth-token`。删掉
+文件（或在脚本里留空）就恢复开放。
+
+**为什么要一个文件而不是写进 `.cmd`**：`.cmd` 按 OEM 代码页逐字节解析，口令里
+只要有一个中文字符，到 exe 手上就变了（和 §7.23 那个破折号同一类问题）。文件
+还可以在不改脚本的前提下替换 —— 而脚本可能正被看门狗执行着。
+
+**前端不需要任何改动**，因为 `lib/session-token.js` 已经把五种载体都实现了，
+服务端按同样的五种读：
+
+| 载体 | 前端函数 | 服务端 |
+|---|---|---|
+| `Authorization: Bearer <t>` | `sessionAuthHeaders` | `security/token.rs` |
+| `Cookie: selkies_token=<t>` | `installSessionCookie` | 同上（按 `;` 切段比对名字，不做子串匹配） |
+| `?token=<t>` | `withSessionToken` | 同上（解 `%XX`） |
+| `Sec-WebSocket-Protocol: selkies.token.<b64url>` | `sessionTokenProtocols` | 同上（base64url 解码） |
+| `#token=<t>`（fragment） | `readUrlFragment` | 不需要：fragment 不出现在请求里，前端把它转成上面第 4、2 条 |
+
+第一次访问要带 token：`https://<IP>:8080/?token=<口令>`。页面里的
+`installSessionCookie` 会把它写进 `selkies_token` cookie（`path=/api/`），
+之后同一个浏览器直接输地址就行。想让它不进浏览器历史，用 `#token=` 代替
+`?token=` —— fragment 不会被发出去。
+
+**401 必须带 `WWW-Authenticate: Bearer realm="Selkies"`**。前端的
+`auth-guard.js` 靠这个前缀区分两种 401：Basic 墙（重载页面才能重新登录）和
+令牌不匹配（重载还是同一个令牌，所以不重载）。少了这个头，输错口令的页面会
+每 30 秒自刷一次且永远好不了 —— 这是我实现时最先盯住的一条契约。
+
+**豁免两类路径**，理由不是省事：
+
+* `Route::Static` —— 前端 bundle。Selkies 前端是 MPL 开源的，代码里没有秘密；
+  而且页面必须能打开，否则用户连"这机器要口令"都看不到，只会看到一片空白，
+  那正是 7.25 花了一整轮才消掉的"启动了但没效果"。
+* `Route::Status` —— 正文只有 `ok`，部署脚本和 `probe-listen.cmd` 都靠它。
+
+**连带改了探针**：`probe-listen.cmd` 和 `setup-watchdog.bat` 原来探
+`/api/v1/health`，而 health 现在受口令保护（它会报出谁连着、从哪来）。不改的话，
+每台设了口令的机器都会打印 `PREFLIGHT NOT listening` / `[fail]` —— 一个比原问题
+更误导的假警报。两处都改成 `/api/status`：探针要问的是"这个端口上有人应答吗"，
+不是"管道健康吗"。
+
+**实测**（本机 `--auth-token test123`，端口 18080）：
+
+```
+无令牌              -> 401  WWW-Authenticate: Bearer realm="Selkies"
+错误 Bearer         -> 401
+正确 Bearer         -> 200
+?token=test123      -> 200
+Cookie: selkies_token=test123 -> 200
+静态 / 无令牌       -> 200（豁免）
+/api/status 无令牌  -> 200（豁免）
+/api/upload 无令牌  -> 401
+信令 无令牌         -> 401
+信令 subprotocol 正确 -> 101（握手成功）
+信令 subprotocol 错误 -> 401
+```
 
 ---
 
@@ -930,10 +997,11 @@ rem ... dies on "/I" — the guard ...
 - [ ] 右上角有统计面板，右边缘有粉色胶囊
 - [ ] 故意失败一次能回滚：`-SkipFrontend` 上传一个坏 zip，或直接跑 `-Rollback`
 - [ ] 被控机上只有正式产物：`C:\dev\stream` 里没有 `*.prev` / `*.new.*`，
-      `C:\dev\deploy` 只剩 `deploy-remote.ps1` 与八个上机脚本（zip 解压完即删）
-- [ ] 运行根里八个上机脚本都在：`start-stream.cmd` / `start-stream.60fps.cmd` /
+      `C:\dev\deploy` 只剩 `deploy-remote.ps1` 与九个上机脚本（zip 解压完即删）
+- [ ] 运行根里九个上机脚本都在：`start-stream.cmd` / `start-stream.60fps.cmd` /
       `run-hidden.vbs` / `setup-watchdog.bat` / `collect-launch-facts.cmd` /
-      `setup-inbound.cmd` / `open-inbound.cmd` / `probe-listen.cmd`
+      `setup-inbound.cmd` / `open-inbound.cmd` / `probe-listen.cmd` /
+      `set-password.cmd`
       （少一个就是有人改了 `$LauncherNames` 而没改 `$Launchers`，打包与安装用的是
       两份列表）
 - [ ] `logs\watchdog.log` 的尾部有一次启动的**完整三行**：`starting ...`、
@@ -958,7 +1026,7 @@ cd ..\selkies-dashboard ; npm run build
 cd C:\Users\user\Desktop\cloud-stream
 
 # 汇总产物（也是"手工拼一个运行根"的唯一正确做法）
-#   exe + DLL + 八个上机脚本 + cert/key 拷进 target\output\cloud-stream\
+#   exe + DLL + 九个上机脚本 + cert/key 拷进 target\output\cloud-stream\
 #   再把 dashboard\dist\* 拷进 target\output\cloud-stream\selkies-web\
 #   —— 顺序无所谓，脚本全部按自身位置找同级文件
 

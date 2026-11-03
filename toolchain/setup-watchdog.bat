@@ -200,12 +200,18 @@ rem
 rem --noproxy "*": an http_proxy in the environment (common on company images)
 rem routes the loopback request to that proxy, which answers 502 for a port it
 rem cannot reach, and a healthy server gets reported as dead.
-"%SystemRoot%\System32\curl.exe" -sk -m 3 -f --noproxy "*" -o NUL https://127.0.0.1:8080/api/v1/health >nul 2>&1
+rem
+rem /api/status, not /api/v1/health: #101 put the health report behind the
+rem password, so probing it here would print "[fail] nothing listening" on a
+rem machine that set a password and is running perfectly. status stays open on
+rem purpose (the deploy wrapper uses it) and answers the only question this
+rem check asks: is anything on that port.
+"%SystemRoot%\System32\curl.exe" -sk -m 3 -f --noproxy "*" -o NUL https://127.0.0.1:8080/api/status >nul 2>&1
 if not errorlevel 1 (
     set "CODE=200"
     exit /b 0
 )
-"%SystemRoot%\System32\curl.exe" -sk -m 3 -f --noproxy "*" -o NUL http://127.0.0.1:8080/api/v1/health >nul 2>&1
+"%SystemRoot%\System32\curl.exe" -sk -m 3 -f --noproxy "*" -o NUL http://127.0.0.1:8080/api/status >nul 2>&1
 if not errorlevel 1 (
     set "CODE=200"
     exit /b 0

@@ -206,6 +206,25 @@ Unblock-File .\cloud-stream.zip
 起来了。若它说 `[fail]`，窗口里会直接给出下一步（看哪两个日志、跑哪个脚本），
 不用猜。
 
+**要不要口令**（默认没有：同网段任何人打开地址就能操作键鼠）：
+
+```cmd
+:: 在运行根里双击 set-password.cmd 更省事；等价的单行是
+cd /d D:\stream
+set-password.cmd
+```
+
+它写 `auth-token.txt`，`start-stream.cmd` 下次启动读它并传 `--auth-token`。之后
+浏览器必须带 token 打开一次：
+
+```
+https://<本机IP>:8080/?token=<口令>
+```
+
+前端会把它存进 cookie，同一浏览器之后直接输地址就行。口令限 ASCII —— `.cmd`
+按 OEM 代码页逐字节解析，中文口令到 exe 手上就变了。细节见
+`deploy-one-click.md` §7.26。
+
 **如果第 3 步是以普通权限双击的**（没有"以管理员身份运行"）：任务多半建得出来，
 但入站规则加不上，脚本会打印 `[inbound]` 警告并在 `[ok]` 后面提醒。补一次即可：
 
@@ -237,7 +256,7 @@ Get-NetConnectionProfile | Select-Object InterfaceAlias, NetworkCategory
 
 | 时机 | 动作 | 结果写在哪 |
 |---|---|---|
-| `start-stream.cmd` 跑起来（看门狗每分钟一次，但只在真的要起进程时执行） | 查 `cloud-stream 8080` / `ICMPv4` 两条规则，缺了就补（提权才有权限；没权限只记一行） | `logs\watchdog.log` 的 `PREFLIGHT` 行 |
+| `start-stream.cmd` 跑起来（看门狗每分钟一次，但只在真的要起进程时执行） | 查 `cloud-stream 8080` / `ICMPv4` 两条规则，缺了就补（提权才有权限；没权限只记一行）；有 `auth-token.txt` 就把口令传给 exe | `logs\watchdog.log` 的 `PREFLIGHT` 行 |
 | exe 启动后 | 另起 `probe-listen.cmd`，每 5 秒探一次 loopback，最多 30 秒 | 同上：`PREFLIGHT listening on 8080 after N probe(s)` 或 `PREFLIGHT NOT listening ...` + 三条最可能原因 + 下一步 |
 | `setup-watchdog.bat` 跑完 | 建任务 → 立刻 `/Run` → 最多等 60 秒 → 打印 `[ok]` / `[fail]` | 屏幕上，窗口就是结果 |
 | `collect-launch-facts.cmd` | 第 9 节专门列入站：网络配置文件、本机 IPv4、两条规则的实际参数、最近 12 条 `PREFLIGHT` 行 | `cloud-stream-facts.txt` |
@@ -308,7 +327,7 @@ pwsh toolchain/deploy.ps1 -RemoteBase D:\cloud
 （`--dist selkies-web`）、计划任务动作全部相对推导，所以换了 `-RemoteBase`
 之后不需要再改任何脚本。
 
-`-Bootstrap` 只做四件事：sshd 自启、建目录、推八个上机脚本并装进运行根、核对
+`-Bootstrap` 只做四件事：sshd 自启、建目录、推九个上机脚本并装进运行根、核对
 exe / 任务 / 证书 / 旧布局。**它不建计划任务、不签证书、不动密码** —— 那三件是
 人做的（见 §1 的第 9、10 项和 §1.3）。
 

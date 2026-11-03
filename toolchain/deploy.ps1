@@ -11,7 +11,7 @@
       2. 构建后端 release
       3. 构建前端（core → dashboard 两级，顺序不能反）
       4. 汇总产物到 target\output\cloud-stream（+ 同名 zip），上传从这里取
-      5. scp 上传（exe / DLL / zip / 八个上机脚本 / 证书，内容一样就跳过）
+      5. scp 上传（exe / DLL / zip / 九个上机脚本 / 证书，内容一样就跳过）
       6. MD5 双向核对
 
     被控机做的事（由 deploy-remote.ps1 执行，脚本随包上传）：
@@ -141,7 +141,8 @@ $LauncherNames = @(
     'collect-launch-facts.cmd',
     'setup-inbound.cmd',
     'open-inbound.cmd',
-    'probe-listen.cmd'
+    'probe-listen.cmd',
+    'set-password.cmd'
 )
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
@@ -179,7 +180,7 @@ $RemoteScript = Join-Path $PSScriptRoot 'deploy-remote.ps1'
 
 # 统一产物目录。target\output\cloud-stream **就是**被控机的运行根：把这个目录
 # 原样拷到任何一台机器（或解压同名 zip），里面的 exe / DLL / 前端 / 证书 /
-# 八个上机脚本就是全部所需，不需要再手工拼路径。上传也从这里取，所以「本地能
+# 九个上机脚本就是全部所需，不需要再手工拼路径。上传也从这里取，所以「本地能
 # 跑」与「线上在跑」是同一批字节。
 $OutputDir = Join-Path $RepoRoot 'target\output'
 $BundleDir = Join-Path $OutputDir 'cloud-stream'
@@ -438,14 +439,23 @@ cloud-stream 被控端整包
   setup-inbound.cmd   管理员身份运行：放行 8080 与 ping（否则外部一概连不上）
   open-inbound.cmd    上面那条规则的实际执行者，被启动脚本自动调用（幂等）
   probe-listen.cmd    启动后 30 秒内把"有没有监听"写进 watchdog.log
+  set-password.cmd    设/改/清除访问口令（写 auth-token.txt，重启任务生效）
   manifest.json       本次构建的指纹：提交、时间、各文件 MD5、前端文件数
   $tlsLine
+
+要不要口令
+  默认没有：同一网段任何人都能打开页面并操作键鼠。
+  要的话双击 set-password.cmd 输一个（只限 ASCII），然后重启任务，之后
+  浏览器必须带 token 打开一次：
+        https://<本机IP>:8080/?token=<口令>
+  前端会把它写进 cookie，同一浏览器之后直接输地址就行。
+  口令存在 auth-token.txt；删掉它（或 set-password.cmd 里留空）就恢复开放。
 
 每次启动会自动做的事（不需要人守在那里）
   * 查 8080 / ICMP 入站规则，缺了就补（当前进程提权时）；补不上会把原因写进
     logs\watchdog.log 的 PREFLIGHT 行，而不是安静地少一条规则
   * 起 exe 之后另起一个探针，最多 30 秒，把结果写成
-        PREFLIGHT listening on 8080 after N probe(s): local health 200
+        PREFLIGHT listening on 8080 after N probe(s): local status 200
     或者
         PREFLIGHT NOT listening on 8080 ... + 三条最可能的原因 + 下一步
     所以"启动后没反应"永远有带时间戳的一行可以看，不用猜。

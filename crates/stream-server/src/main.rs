@@ -129,6 +129,23 @@ async fn main() -> anyhow::Result<()> {
         security::policy_name()
     );
 
+    // #101: 口令状态必须每次都写进日志，且两种状态各写一句。
+    // "没开"和"开了但你没带 token"在浏览器里长得一模一样（一片空白），
+    // 唯一的区分点就是这两行。
+    match cfg.auth_token.as_deref().and_then(security::TokenGate::new) {
+        Some(_) => log::info!(
+            "auth token REQUIRED on /api/* | open the page as {}://<host>:{}?token=<token> \
+             (static assets and /api/status stay open)",
+            if cfg.tls_enabled() { "https" } else { "http" },
+            cfg.port,
+        ),
+        None => log::info!(
+            "auth token disabled | anyone who can reach port {} can drive this machine \
+             (set --auth-token <password> to require one)",
+            cfg.port,
+        ),
+    }
+
     log::info!(
         "stream-server stage1 | listen={}:{} tls={} dist={} app={} video={}x{}@{}fps bitrate={}kbps codec={}",
         cfg.host,

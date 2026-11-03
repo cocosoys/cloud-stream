@@ -112,7 +112,7 @@ $NewDll = Join-Path $Root 'ViGEmClient.new.dll'
 # lesson: start-stream.cmd calls the first on every real start, and spawns the
 # second to write one PREFLIGHT verdict into watchdog.log. Ship them or the
 # launcher silently skips its own preflight.
-$Launchers = @('start-stream.cmd', 'start-stream.60fps.cmd', 'run-hidden.vbs', 'setup-watchdog.bat', 'collect-launch-facts.cmd', 'setup-inbound.cmd', 'open-inbound.cmd', 'probe-listen.cmd')
+$Launchers = @('start-stream.cmd', 'start-stream.60fps.cmd', 'run-hidden.vbs', 'setup-watchdog.bat', 'collect-launch-facts.cmd', 'setup-inbound.cmd', 'open-inbound.cmd', 'probe-listen.cmd', 'set-password.cmd')
 
 function Say([string]$Text) { Write-Output $Text }
 function Fail([string]$Text) { Write-Output "FAIL $Text"; exit 1 }
