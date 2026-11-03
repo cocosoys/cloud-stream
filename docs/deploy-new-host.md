@@ -189,7 +189,7 @@ pwsh toolchain/deploy.ps1 -RemoteBase D:\cloud
 （`--dist selkies-web`）、计划任务动作全部相对推导，所以换了 `-RemoteBase`
 之后不需要再改任何脚本。
 
-`-Bootstrap` 只做四件事：sshd 自启、建目录、推三个启动脚本并装进运行根、核对
+`-Bootstrap` 只做四件事：sshd 自启、建目录、推四个上机脚本并装进运行根、核对
 exe / 任务 / 证书 / 旧布局。**它不建计划任务、不签证书、不动密码** —— 那三件是
 人做的（见 §1 的第 9、10 项和 §1.3）。
 

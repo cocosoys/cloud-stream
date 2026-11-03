@@ -11,7 +11,7 @@
       2. 构建后端 release
       3. 构建前端（core → dashboard 两级，顺序不能反）
       4. 汇总产物到 target\output\cloud-stream（+ 同名 zip），上传从这里取
-      5. scp 上传（exe / DLL / zip / 三个启动脚本 / 证书，内容一样就跳过）
+      5. scp 上传（exe / DLL / zip / 四个上机脚本 / 证书，内容一样就跳过）
       6. MD5 双向核对
 
     被控机做的事（由 deploy-remote.ps1 执行，脚本随包上传）：
@@ -123,7 +123,15 @@ $RemoteExe = "$RemoteRoot\stream-server.exe"
 $RemoteLog = "$RemoteRoot\logs\stream-server.log"
 # 上机脚本：跟着每次部署走（命令行参数写在 start-stream.cmd 里，只换 exe
 # 不换它，参数就永远停在上一次）。
-$LauncherNames = @('start-stream.cmd', 'run-hidden.vbs', 'setup-watchdog.bat')
+# start-stream.60fps.cmd 是同一个命令行的"手工版"（不进计划任务），它的存在
+# 意义就是让人在被控机上用和看门狗完全一致的参数跑一次 —— 包里缺了它，
+# 那台机器就只能从仓库里翻，而拿到包的人手里没有仓库。
+$LauncherNames = @(
+    'start-stream.cmd',
+    'start-stream.60fps.cmd',
+    'run-hidden.vbs',
+    'setup-watchdog.bat'
+)
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $LocalExe = Join-Path $RepoRoot 'target\release\stream-server.exe'
@@ -160,7 +168,7 @@ $RemoteScript = Join-Path $PSScriptRoot 'deploy-remote.ps1'
 
 # 统一产物目录。target\output\cloud-stream **就是**被控机的运行根：把这个目录
 # 原样拷到任何一台机器（或解压同名 zip），里面的 exe / DLL / 前端 / 证书 /
-# 三个启动脚本就是全部所需，不需要再手工拼路径。上传也从这里取，所以「本地能
+# 四个上机脚本就是全部所需，不需要再手工拼路径。上传也从这里取，所以「本地能
 # 跑」与「线上在跑」是同一批字节。
 $OutputDir = Join-Path $RepoRoot 'target\output'
 $BundleDir = Join-Path $OutputDir 'cloud-stream'
@@ -410,6 +418,7 @@ cloud-stream 被控端整包
   selkies-web\        前端静态根（--dist 指向这里）
   logs\               stream-server.log 与 watchdog.log（进程起不来先看后者）
   start-stream.cmd    命令行参数都在这里：分辨率 / 帧率 / 码率 / 证书
+  start-stream.60fps.cmd 手工起一次用（同一个命令行，不进计划任务）
   run-hidden.vbs      计划任务的实际入口，无窗口，避免每分钟闪一次黑框
   setup-watchdog.bat  创建 MCStreamSrv 任务
   manifest.json       本次构建的指纹：提交、时间、各文件 MD5、前端文件数

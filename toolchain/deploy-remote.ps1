@@ -24,7 +24,8 @@
         <root>\stream-server.exe  ViGEmClient.dll
         <root>\cert.pem  key.pem
         <root>\selkies-web\  logs\
-        <root>\start-stream.cmd  run-hidden.vbs  setup-watchdog.bat
+        <root>\start-stream.cmd  start-stream.60fps.cmd
+        <root>\run-hidden.vbs  setup-watchdog.bat
 
     Steps: install launchers -> stop task (and disable its 1-minute trigger) ->
     kill -> swap -> re-enable -> start -> wait for the process.
@@ -98,7 +99,10 @@ $NewDll = Join-Path $Root 'ViGEmClient.new.dll'
 # flags frozen at the previous release. Installed by hash comparison, because
 # rewriting a .cmd that the watchdog is currently executing is a sharing
 # violation on a frontend-only deploy (nothing stops the batch in that path).
-$Launchers = @('start-stream.cmd', 'run-hidden.vbs', 'setup-watchdog.bat')
+# start-stream.60fps.cmd travels as well: a hand-run on this box has to use the
+# same flags as the watchdog, and the bundle is the only copy the person sitting
+# at that machine has. Nothing executes it, so it is never busy.
+$Launchers = @('start-stream.cmd', 'start-stream.60fps.cmd', 'run-hidden.vbs', 'setup-watchdog.bat')
 
 function Say([string]$Text) { Write-Output $Text }
 function Fail([string]$Text) { Write-Output "FAIL $Text"; exit 1 }

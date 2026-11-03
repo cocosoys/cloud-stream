@@ -36,7 +36,7 @@ pwsh toolchain/deploy.ps1
       OK   stream-server.new.exe
       OK   ViGEmClient.new.dll
       OK   selkies-web.zip
-      OK   start-stream.cmd / run-hidden.vbs / setup-watchdog.bat
+      OK   start-stream.cmd / start-stream.60fps.cmd / run-hidden.vbs / setup-watchdog.bat
       OK   cert.pem / key.pem（仅当被控机缺失时安装）
       OK   deploy-remote.ps1
 [5] 传输校验（两端 MD5）
@@ -57,7 +57,7 @@ pwsh toolchain/deploy.ps1
            OK  no stream-server process
            OK  swapped in 18607104 B md5 468BE201…
            OK  dll in place 140288 B md5 91BA893E…
-           OK  start-stream.cmd updated / run-hidden.vbs updated / setup-watchdog.bat updated
+           OK  start-stream.cmd unchanged / start-stream.60fps.cmd updated / run-hidden.vbs unchanged / setup-watchdog.bat unchanged
            STEP frontend
            OK  web dir 917 B index, 2 js chunks
            OK  staging zip removed
@@ -74,7 +74,7 @@ pwsh toolchain/deploy.ps1
 部署完成：86.5s
 ```
 
-再跑一次同样的东西时，第 6 步的 `migrated` / `copied` 不再出现，三个启动脚本变成
+再跑一次同样的东西时，第 6 步的 `migrated` / `copied` 不再出现，四个上机脚本变成
 `unchanged` —— 那就是幂等。
 
 被控机上没有"备份"这一步：备份归构建端（第 8 步），详见 §6 与 §7.22。
@@ -102,6 +102,7 @@ target\output\cloud-stream\
   selkies-web\           前端静态根
   logs\                  stream-server.log / watchdog.log（进程起不来先看后者）
   start-stream.cmd       命令行参数都在这里：分辨率 / 帧率 / 码率 / 证书
+  start-stream.60fps.cmd 手工起一次用（同一个命令行，不进计划任务）
   run-hidden.vbs         计划任务入口，无窗口
   setup-watchdog.bat     创建 MCStreamSrv 任务（账户密码用参数或用提示输入）
   README.txt             上机三步 + 目录说明（给拿到包的人看）
@@ -123,6 +124,7 @@ target\output\cloud-stream.zip   整包，拷到新机器用
 | `…\ViGEmClient.dll` | `C:\dev\stream\ViGEmClient.dll` | #17 虚拟手柄的客户端 DLL，服务端运行时 `LoadLibraryW` 取；缺了只降级成"没手柄" | **要**（已加载的 DLL 有共享锁，只能在停进程后覆盖） |
 | `…\selkies-web\`（打包 1,214,640 B） | `C:\dev\stream\selkies-web\` | 前端整页（2008 个文件） | 不要 |
 | `…\start-stream.cmd` | `C:\dev\stream\start-stream.cmd` | **命令行参数全在这**，路径按 `%~dp0` 推导 | 下次启动生效 |
+| `…\start-stream.60fps.cmd` | `C:\dev\stream\start-stream.60fps.cmd` | 同一命令行的"手工版"，让人在被控机上用和看门狗一致的参数跑一次；任务不执行它 | 不要 |
 | `…\run-hidden.vbs` | `C:\dev\stream\run-hidden.vbs` | 无窗口启动，避免每分钟闪一次黑框 | 下次启动生效 |
 | `…\setup-watchdog.bat` | `C:\dev\stream\setup-watchdog.bat` | 建/重建看门狗任务，任务动作按自身位置生成 | 不要 |
 | `…\cert.pem` / `key.pem` | `C:\dev\stream\cert.pem` / `key.pem` | 仅当被控机**没有**证书时安装（SAN 是那台机器的 IP，不能拿构建端覆盖） | 要（`--tls-*` 在启动参数里） |
@@ -135,7 +137,8 @@ target\output\cloud-stream.zip   整包，拷到新机器用
 
 ```
 C:\dev\stream\   stream-server.exe  ViGEmClient.dll  cert.pem  key.pem
-                 start-stream.cmd  run-hidden.vbs  setup-watchdog.bat
+                 start-stream.cmd  start-stream.60fps.cmd
+                 run-hidden.vbs  setup-watchdog.bat
                  selkies-web\   ← 2008 个文件，下面这几项
                  logs\          ← stream-server.log / watchdog.log
 C:\dev\deploy\   deploy-remote.ps1（只在部署窗口存在，zip 解压完即删）
@@ -202,7 +205,7 @@ pwsh toolchain/deploy.ps1 -WebRoot D:\src\cloud-stream-web
 
 | 常量 | 默认 | 谁决定 | 里面有什么 |
 |---|---|---|---|
-| `<RemoteBase>\stream` | `C:\dev\stream` | `deploy.ps1 -RemoteBase` | 运行根：exe、DLL、证书、`selkies-web\`、`logs\`、三个脚本 |
+| `<RemoteBase>\stream` | `C:\dev\stream` | `deploy.ps1 -RemoteBase` | 运行根：exe、DLL、证书、`selkies-web\`、`logs\`、四个脚本 |
 | `<RemoteBase>\deploy` | `C:\dev\deploy` | 同上 | 部署暂存：`deploy-remote.ps1`、传输中的 exe/zip/脚本 |
 
 运行根内部的路径全是相对的，谁也没有"必须放在 C 盘"的假设：
@@ -235,7 +238,7 @@ pwsh toolchain/deploy.ps1 -Bootstrap
 
 1. **sshd 开机自启**（见 §3.1）
 2. **建目录**：`C:\dev\stream\logs`、`C:\dev\stream\selkies-web`、`C:\dev\deploy`
-3. **推启动脚本并安装**：三个脚本 → `C:\dev\deploy\`，再由
+3. **推启动脚本并安装**：四个脚本 → `C:\dev\deploy\`，再由
    `deploy-remote.ps1 -OnlyLaunchers` 按哈希装进运行根（正在被看门狗执行的那个
    会跳过并提示"下次重启生效"）
 4. **核对**四样东西并打印结果：exe 在不在、计划任务在不在（`Running`）、证书在
@@ -316,13 +319,13 @@ C:\dev\stream\setup-watchdog.bat Administrator S3cr3t
 | 1 预检 | 本机要 `ssh`/`scp`/`curl.exe`；远端要能 `hostname` | 连不上 → 打印修 sshd 的三行 |
 | 2 构建后端 | `cargo build --release -p stream-server`（`-SkipBackend` 跳过） | 编译失败 → 不进入下一步 |
 | 3 构建前端 | core → dashboard → `selkies-web.zip`（`-SkipFrontend` 跳过） | `dist` 缺失 / gendb 失败 → 抛错 |
-| 4 汇总产物 | 把 exe / DLL / 前端 / 证书 / 三个脚本装进 `target\output\cloud-stream`，写 `manifest.json`，压同名 zip | 前端 `assets\` 缺失即抛错；本轮没有前端产物时跳过并回退成单件上传 |
-| 5 上传 | `scp` **从汇总目录**取：`stream-server.new.exe` / `ViGEmClient.new.dll` / `selkies-web.zip` / 三个启动脚本 / 证书 / `deploy-remote.ps1`；带 `BatchMode=yes`，缺密钥立刻失败而不是卡在密码提示 | — |
+| 4 汇总产物 | 把 exe / DLL / 前端 / 证书 / 四个脚本装进 `target\output\cloud-stream`，写 `manifest.json`，压同名 zip | 前端 `assets\` 缺失即抛错；本轮没有前端产物时跳过并回退成单件上传 |
+| 5 上传 | `scp` **从汇总目录**取：`stream-server.new.exe` / `ViGEmClient.new.dll` / `selkies-web.zip` / 四个上机脚本 / 证书 / `deploy-remote.ps1`；带 `BatchMode=yes`，缺密钥立刻失败而不是卡在密码提示 | — |
 | 6 校验 | 两端 MD5 比对 | 不一致就停，**不切换** |
 | 7 切换 | 远端：装证书（仅当缺失）→ 停任务 → **禁用任务** → 杀进程 → 换 exe/DLL → **装启动脚本**（此刻文件才不被占用）→ 前端解压到暂存目录并校验后换名 → 删 zip → 启任务 | 每一步失败即中止 |
 | 8 体检 | 轮询 `/api/status` | 见下 |
 | 9 体检补充 | 进程 pid / 启动时间、日志尾部、**计划任务的动作路径** | 动作路径不在运行根下只提示不失败（§7.23） |
-| 10 归档 | 构建端把这一轮真正发出去的部件写进 `target\deploy-archive\`（含三个启动脚本） | 失败不影响线上 |
+| 10 归档 | 构建端把这一轮真正发出去的部件写进 `target\deploy-archive\`（含四个上机脚本） | 失败不影响线上 |
 
 前四步里 2 和 3 是可以单独跳过的，因为"只换前端"和"只换后端"都很常见；
 **6 之后就没有可以单独跳过的步骤了** —— 校验、切换、体检是一条链，缺一环
@@ -734,7 +737,7 @@ DLL / zip 覆盖进 `target\deploy-archive\`（gitignore），失败或 `-Rollba
 `mc\start-mc.ps1` 与 `mc\launch-remote.ps1`（`MCGame` 任务链）。
 
 **边界**：`deploy\` 目录本身保留（空目录），因为 `scp` 需要它存在；跑完一次部署后
-里面只会有 `deploy-remote.ps1`（16 KB）与三个启动脚本的副本（每轮重传，
+里面只会有 `deploy-remote.ps1`（16 KB）与四个上机脚本的副本（每轮重传，
 装进运行根之后就只是暂存），zip 与上传的证书都在装好后立刻删掉。
 
 ### 7.23 上机脚本写死绝对路径 + 非 ASCII 注释（已修）
@@ -821,7 +824,7 @@ rem ... dies on "/I" — the guard ...
 - [ ] 右上角有统计面板，右边缘有粉色胶囊
 - [ ] 故意失败一次能回滚：`-SkipFrontend` 上传一个坏 zip，或直接跑 `-Rollback`
 - [ ] 被控机上只有正式产物：`C:\dev\stream` 里没有 `*.prev` / `*.new.*`，
-      `C:\dev\deploy` 只剩 `deploy-remote.ps1` 与三个启动脚本（zip 解压完即删）
+      `C:\dev\deploy` 只剩 `deploy-remote.ps1` 与四个上机脚本（zip 解压完即删）
 - [ ] `C:\dev` 下不再有 `selkies-web\`（已 rename 进运行根）；旧的 `cert.pem` /
       `key.pem` 是**复制**过去的，脚本不动旧副本，可以手工删
 - [ ] `target\output\cloud-stream\manifest.json` 的 `built_at` 是本次时间，
@@ -840,7 +843,7 @@ cd ..\selkies-dashboard ; npm run build
 cd C:\Users\user\Desktop\cloud-stream
 
 # 汇总产物（也是"手工拼一个运行根"的唯一正确做法）
-#   exe + DLL + 三个启动脚本 + cert/key 拷进 target\output\cloud-stream\
+#   exe + DLL + 四个上机脚本 + cert/key 拷进 target\output\cloud-stream\
 #   再把 dashboard\dist\* 拷进 target\output\cloud-stream\selkies-web\
 #   —— 顺序无所谓，脚本全部按自身位置找同级文件
 
