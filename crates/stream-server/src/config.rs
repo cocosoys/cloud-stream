@@ -6,6 +6,41 @@
 
 use std::path::PathBuf;
 
+/// #105: who may inject input into a program (see [`Config::input_policy`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputPolicy {
+    /// Every session attached to the program may type and move the pointer.
+    Shared,
+    /// Only the session holding the program's input lease may.
+    Exclusive,
+}
+
+impl InputPolicy {
+    /// Names are the CLI spelling, lower case, one word. Anything unknown is
+    /// rejected so the caller can keep the default and warn — same contract as
+    /// `--encoder`.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "shared" => Some(Self::Shared),
+            "exclusive" => Some(Self::Exclusive),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Shared => "shared",
+            Self::Exclusive => "exclusive",
+        }
+    }
+}
+
+impl Default for InputPolicy {
+    fn default() -> Self {
+        Self::Shared
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Listen interface.
@@ -110,6 +145,21 @@ pub struct Config {
     /// level, and silently streaming software instead would hide the mistake
     /// until the first frame looked wrong.
     pub encoder: String,
+    /// #105: who may inject input into the shared program.
+    ///
+    /// Default [`InputPolicy::Shared`] — every attached session may type and
+    /// move the pointer. This is not a relaxation of security, it is a
+    /// correction of a wrong default: upstream selkies has no exclusive input
+    /// at all, and the only deployments that exist today are one operator with
+    /// one or two tabs on the same machine. Gating the second tab made "open
+    /// the page twice" look like "input is broken" (denied_inputs counted
+    /// hundreds of refused pointer moves per minute) while buying nothing:
+    /// Windows can only isolate input per *session*, never per window, so a
+    /// real second user needs a second OS session, not a lease.
+    ///
+    /// [`InputPolicy::Exclusive`] restores the single-controller behaviour for
+    /// the day a program really does serve several people.
+    pub input_policy: InputPolicy,
     /// #102: ceiling on live signaling sessions.
     ///
     /// Eight is not a capacity claim — it is the point past which an unbounded
@@ -161,6 +211,7 @@ impl Default for Config {
             auth_token: None,
             encoder: "auto".to_owned(),
             tune: "tuned".to_owned(),
+            input_policy: InputPolicy::default(),
             max_sessions: 8,
         }
     }
@@ -312,6 +363,20 @@ impl Config {
                     if let Some(v) = iter.next() {
                         if let Ok(n) = v.parse::<usize>() {
                             cfg.max_sessions = n;
+                        }
+                    }
+                }
+                // #105: 输入策略。默认 `shared`（谁能看见谁就能操作），
+                // `exclusive` 恢复单主模式。拼错保留默认并告警，与 `--encoder`
+                // 一致：启动参数写错不该让被控机起不来。
+                "--input-policy" => {
+                    if let Some(v) = iter.next() {
+                        match InputPolicy::parse(&v) {
+                            Some(policy) => cfg.input_policy = policy,
+                            None => log::warn!(
+                                "unknown --input-policy {v} (expected shared|exclusive), keeping {}",
+                                cfg.input_policy.as_str()
+                            ),
                         }
                     }
                 }

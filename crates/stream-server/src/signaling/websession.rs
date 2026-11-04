@@ -22,7 +22,7 @@
 //! loop (#36) and arms the 1 s stats timer; the loop owns the blocking
 //! capture/encode worker and the async sample forwarder between them.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -36,13 +36,16 @@ use tokio_tungstenite::{
     WebSocketStream,
 };
 
-use crate::config::Config;
+use crate::config::{Config, InputPolicy};
 use crate::dispatch::{
     classify, connection, cursor, display, hostui, pipeline, server_settings, stream_info,
     stream_stats, system, Action, ClipboardSink, GamepadHub, InputSinkRef, StreamInfo,
     StreamStats, WinInputSink, read_clipboard_update,
 };
-use crate::pipeline::{spawn_loop, PipelineEvent, PipelineHandle, StreamSettings};
+use crate::pipeline::{
+    DisplayKey, PipelineEvent, PipelineHandle, PipelineRegistry, SharedPipeline, SinkCounters,
+    SinkHandle, StreamSettings,
+};
 use crate::platform::{HostSample, Sampler};
 use crate::security::{self, ClipOp, Device, EventKind, MediaDir, Principal};
 use crate::signaling::{
@@ -82,12 +85,46 @@ pub struct SessionInfo {
     pub device_id: String,
     /// `client_tab_id` from the hello: per-tab, dies with the tab.
     pub tab_id: String,
-    /// `client_type` from the hello (`primary` / `secondary` / ...).
-    pub role: String,
+    /// `client_type` **as the page sent it** (`controller` / `viewer`).
+    ///
+    /// This is a claim, not a role. Every page that is not told otherwise calls
+    /// itself `controller`, so two tabs of the same browser both say it; the
+    /// server's answer lives on the program (see [`SharedPipeline::controller_id`])
+    /// and is reported separately as `role` by the health endpoint.
+    pub client_type: String,
+    /// Which display this session attached to, once it did.
+    ///
+    /// `None` until `Connected`: the key comes from the session's own attach,
+    /// and a connection that never got that far has no program to name. The
+    /// health endpoint needs it to answer "is this id the one holding the
+    /// lease on that program".
+    pub display: Option<u32>,
     /// The live handles, so the health endpoint reads the pipeline rather than a
     /// copy of its numbers.
     pub pipeline: Option<PipelineHandle>,
     pub settings: Option<StreamSettings>,
+    /// This session's own downlink tally (#102).
+    ///
+    /// One shared encoder means the *program's* byte count cannot say who spent
+    /// it, so the number is kept per sink and hung here after `attach`. `None`
+    /// until then — a connection that never reached `Connected` has no downlink
+    /// and must not be reported as a zero-traffic viewer.
+    pub sink: Option<Arc<SinkCounters>>,
+    /// Input messages this session sent and the lease refused (#103).
+    ///
+    /// Without it, a viewer whose pointer does nothing is indistinguishable
+    /// from a viewer whose messages never arrived — the exact ambiguity that
+    /// makes "the second tab is unresponsive" unactionable. A non-zero counter
+    /// says the input reached the server and the role gate dropped it.
+    pub denied: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// How many times this browser has connected before now, keyed by
+    /// `device_id`. 0 on the first connection.
+    ///
+    /// This is the difference between "a user" and "a page in a reload loop":
+    /// a client that reconnects every few seconds shows up here as a growing
+    /// count while `connected_s` stays near zero, which is the shape of every
+    /// reconnect storm this project has had.
+    pub reconnects: u32,
 }
 
 /// What the client told us about itself when it opened the WebSocket.
@@ -97,32 +134,59 @@ pub struct ClientMeta {
     pub user_agent: String,
 }
 
-/// Shared registry: the newest session holds the handle that evicts the older
-/// one. Stage1 single-session scope; a second browser tab evicts the first.
+/// One live connection: the handle that can close it and what it told us about
+/// itself.
+struct LiveSession {
+    notice: mpsc::UnboundedSender<CloseNotice>,
+    info: SessionInfo,
+}
+
+/// Every live signaling session, addressable by id (#101).
+///
+/// It used to be a single slot: registering a session evicted the previous one
+/// with close code 4001, which is what made "one browser tab" a hard invariant
+/// of the whole server. That is no longer true — a second tab is a legitimate
+/// *viewer* of the same pipeline, and the frontend's multi-display design is
+/// literally "one page per screen", so eviction has to go.
+///
+/// What survives of the old rule is the part that was actually load-bearing: a
+/// **reload of the same tab** leaves a zombie socket behind (the browser is
+/// already gone, the server has not noticed, and the zombie keeps holding a PC
+/// and a control channel). Eviction therefore keys on `client_tab_id` from the
+/// hello rather than on "newest connection wins": the same tab reconnecting
+/// replaces itself, a different tab is a second citizen.
 #[derive(Clone, Default)]
 pub struct SessionRegistry {
-    inner: Arc<Mutex<Option<mpsc::UnboundedSender<CloseNotice>>>>,
-    /// #93: the live session's identity, read by `GET /api/v1/health`.
-    ///
-    /// A **std** mutex, not the tokio one above: the value is a small struct
-    /// that is never held across an `await`, and both sides want it
-    /// synchronously — the publish happens in the hello branch of a `select!`
-    /// arm, the read happens in a plain HTTP handler.
-    info: Arc<std::sync::Mutex<Option<SessionInfo>>>,
-    /// Next session id; monotonic so `clear_if` can tell whose entry it is.
+    /// A tokio mutex: publishing a hello evicts another session, and eviction
+    /// must not interleave with a teardown removing its own entry.
+    inner: Arc<Mutex<std::collections::HashMap<u64, LiveSession>>>,
+    /// Next session id; monotonic so a finishing session can never clear the
+    /// entry a newer one already published under the same slot.
     next_id: Arc<std::sync::atomic::AtomicU64>,
+    /// Connections seen per `device_id` (#102).
+    ///
+    /// A std mutex — it is touched only inside `publish`, which never awaits
+    /// while holding it, and the map is a handful of entries. Kept outside the
+    /// async lock so a slow hello cannot make the counter wait behind a teardown.
+    seen: Arc<std::sync::Mutex<std::collections::HashMap<String, u32>>>,
 }
 
 impl SessionRegistry {
-    /// Register this session's notice sender; evict the previous holder first.
-    async fn register(&self, notice_tx: mpsc::UnboundedSender<CloseNotice>) {
+    /// Take a slot for this connection. The hello (and with it the tab id)
+    /// arrives later, which is when a same-tab reconnect is detected.
+    async fn register(&self, id: u64, notice: mpsc::UnboundedSender<CloseNotice>) {
         let mut guard = self.inner.lock().await;
-        if let Some(old) = guard.replace(notice_tx) {
-            let _ = old.send(CloseNotice {
-                code: 4001,
-                reason: "Session superseded by a new connection. Reload to take over.".to_owned(),
-            });
-        }
+        guard.insert(
+            id,
+            LiveSession {
+                notice,
+                info: SessionInfo {
+                    id,
+                    ..Default::default()
+                },
+            },
+        );
+        log::info!("session {id} registered ({} live)", guard.len());
     }
 
     /// Allocate the id this session publishes under.
@@ -130,39 +194,222 @@ impl SessionRegistry {
         self.next_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
     }
 
-    /// Publish (or replace) the live session's identity.
-    fn publish(&self, info: SessionInfo) {
-        let mut guard = self.info.lock().unwrap_or_else(|p| p.into_inner());
-        *guard = Some(info);
+    /// Publish what the hello said, and evict a previous socket for the **same
+    /// browser tab**.
+    ///
+    /// Returns the number of sessions evicted (0 or 1): the caller logs it, and
+    /// a test pins that a second tab is not one of them.
+    async fn publish(&self, mut info: SessionInfo) -> usize {
+        // #102: how many times this browser has connected, *before* this one.
+        // A page in a reload loop shows a count climbing while `connected_s`
+        // stays near zero — the shape every reconnect storm has had here.
+        if !info.device_id.is_empty() {
+            let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
+            let count = seen.entry(info.device_id.clone()).or_insert(0);
+            info.reconnects = *count;
+            *count = count.saturating_add(1);
+        }
+        let mut guard = self.inner.lock().await;
+        let tab = info.tab_id.clone();
+        let mut evicted = 0usize;
+        if !tab.is_empty() {
+            let stale: Vec<u64> = guard
+                .iter()
+                .filter(|(id, live)| {
+                    **id != info.id && !live.info.tab_id.is_empty() && live.info.tab_id == tab
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            for id in stale {
+                if let Some(live) = guard.remove(&id) {
+                    let _ = live.notice.send(CloseNotice {
+                        code: 4001,
+                        reason: "This tab reconnected from another socket.".to_owned(),
+                    });
+                    evicted += 1;
+                    log::info!("session {id} evicted: tab {} reconnected", info.id);
+                }
+            }
+        }
+        let id = info.id;
+        match guard.get_mut(&id) {
+            Some(live) => live.info = info,
+            None => {
+                // A hello for a session that already tore down, or one that
+                // never registered: re-registering would need a notice sender we
+                // no longer have, so the entry is simply not published.
+                log::debug!("hello for unregistered session {id} ignored");
+            }
+        }
+        if evicted == 0 {
+            log::info!(
+                "session {id} published as '{}' from {} ({} live)",
+                guard
+                    .get(&id)
+                    .map(|l| l.info.client_type.clone())
+                    .unwrap_or_default(),
+                guard.get(&id).map(|l| l.info.peer_ip.clone()).unwrap_or_default(),
+                guard.len()
+            );
+        }
+        evicted
     }
 
-    /// Drop the entry if it is still ours; a newer session's entry survives.
-    fn clear_if(&self, id: u64) {
-        let mut guard = self.info.lock().unwrap_or_else(|p| p.into_inner());
-        if guard.as_ref().map(|i| i.id) == Some(id) {
-            *guard = None;
+    /// Drop this session's entry on teardown.
+    async fn remove(&self, id: u64) {
+        let mut guard = self.inner.lock().await;
+        if guard.remove(&id).is_some() {
+            log::info!("session {id} unregistered ({} live)", guard.len());
         }
     }
 
-    /// #93: read handle for the HTTP side.
-    pub fn info(&self) -> Arc<std::sync::Mutex<Option<SessionInfo>>> {
-        self.info.clone()
+    /// Hang this session's downlink counters, display key and refusal counter on
+    /// its entry (#102, #103).
+    ///
+    /// The hello publishes identity long before `Connected` creates the sink, so
+    /// none of this can travel in the same message. Called by the PC-state
+    /// watcher right after `attach`; a session that tears down before then
+    /// simply never gets one, and `health` reports `null` rather than a
+    /// misleading zero.
+    pub async fn set_downlink(
+        &self,
+        id: u64,
+        display: DisplayKey,
+        counters: Arc<SinkCounters>,
+        denied: Arc<AtomicU64>,
+    ) {
+        let mut guard = self.inner.lock().await;
+        if let Some(live) = guard.get_mut(&id) {
+            live.info.sink = Some(counters);
+            live.info.display = Some(display.0);
+            live.info.denied = Some(denied);
+        }
     }
 
-    /// #93: `POST /api/v1/control/kick` — drop the current session's socket
-    /// through the same notice path a newer connection uses.
-    pub async fn kick(&self, reason: &str) -> bool {
+    /// The session that should inherit the input lease when `leaving` goes away:
+    /// the oldest other session attached to the same display, if any (#103).
+    ///
+    /// Handing the lease to nobody would leave the program injecting nothing —
+    /// the survivor would keep watching a desktop it cannot touch, and no
+    /// reconnect would fix it because the lease is keyed on the program, not on
+    /// the socket. Oldest rather than newest so the choice does not depend on
+    /// who happened to connect last.
+    pub async fn successor(&self, leaving: u64, display: u32) -> Option<u64> {
+        let guard = self.inner.lock().await;
+        guard
+            .values()
+            .filter(|live| live.info.id != leaving)
+            .filter(|live| live.info.display == Some(display))
+            .map(|live| live.info.id)
+            .min()
+    }
+
+    /// Every live session, oldest first. The health endpoint reports this list;
+    /// the oldest entry is also the one whose pipeline the report describes.
+    pub async fn infos(&self) -> Vec<SessionInfo> {
+        let guard = self.inner.lock().await;
+        let mut out: Vec<SessionInfo> = guard.values().map(|l| l.info.clone()).collect();
+        out.sort_by_key(|i| i.id);
+        out
+    }
+
+    /// `POST /api/v1/control/session/kick` — close every session (`id == None`)
+    /// or one specific one (#101). Returns how many were asked to close.
+    ///
+    /// The id form exists so a stuck viewer can be dropped without taking the
+    /// whole stream down: with N sessions, "kick" can no longer mean "kick the
+    /// only one".
+    pub async fn kick(&self, reason: &str, id: Option<u64>) -> usize {
         let mut guard = self.inner.lock().await;
-        match guard.take() {
-            Some(tx) => {
-                let _ = tx.send(CloseNotice {
+        let targets: Vec<u64> = match id {
+            Some(want) if guard.contains_key(&want) => vec![want],
+            Some(_) => Vec::new(),
+            None => guard.keys().copied().collect(),
+        };
+        let n = targets.len();
+        for want in targets {
+            if let Some(live) = guard.remove(&want) {
+                let _ = live.notice.send(CloseNotice {
                     code: 4002,
                     reason: reason.to_owned(),
                 });
-                true
             }
-            None => false,
         }
+        n
+    }
+}
+
+/// How many signaling sessions this process will hold at once (#102).
+///
+/// Before this there was no limit at all: `handle_inner` upgraded every
+/// WebSocket it saw. That is the wrong default for a host that can encode one
+/// stream — every extra sink costs a packetizer pass and a full copy of the
+/// bitrate, so an unbounded fan-out does not "serve more people", it degrades
+/// the picture for the people already watching. The cap is the difference
+/// between a late viewer being told "try again" and a room where nothing works.
+///
+/// A counter plus a guard rather than a `Semaphore`, because the slot must be
+/// taken **before** the upgrade (so a rejected client never gets a 101) and
+/// released when the session task ends — including the paths where it unwinds.
+/// `Drop` covers all of them and needs no `async`.
+#[derive(Clone)]
+pub struct Admission {
+    max: usize,
+    live: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Admission {
+    pub fn new(max: usize) -> Self {
+        Self {
+            // 0 would lock the door for everybody, including the operator who
+            // typed it; 1 is the only sane reading of "no more than zero".
+            max: max.max(1),
+            live: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    /// Take one of the `max` slots, or `None` when they are all held.
+    ///
+    /// Compare-exchange rather than load-then-store: two upgrades arriving in
+    /// the same tick would otherwise both read `max - 1` and both get in, which
+    /// is exactly the case a limit exists for.
+    pub fn try_enter(&self) -> Option<AdmissionPermit> {
+        loop {
+            let now = self.live.load(Ordering::SeqCst);
+            if now >= self.max {
+                return None;
+            }
+            if self
+                .live
+                .compare_exchange(now, now + 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return Some(AdmissionPermit {
+                    live: self.live.clone(),
+                });
+            }
+        }
+    }
+
+    pub fn max(&self) -> usize {
+        self.max
+    }
+
+    /// Slots in use right now. Reported by `/api/v1/health`; not the same as
+    /// the session count, because a slot is taken before the hello arrives.
+    pub fn live(&self) -> usize {
+        self.live.load(Ordering::SeqCst)
+    }
+}
+
+/// One held slot; dropping it is the release.
+pub struct AdmissionPermit {
+    live: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for AdmissionPermit {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -180,11 +427,44 @@ fn push_task(tasks: &SessionTasks, handle: tokio::task::JoinHandle<()>) {
     }
 }
 
+/// This session's hold on a shared pipeline (#101), filled at `Connected`.
+///
+/// A cell rather than four fields because two tasks own different halves of it:
+/// the PC-state watcher attaches (it is the one that sees `Connected`), while
+/// the WS task detaches on teardown, and the control hook reads the handle. None
+/// of them can hand the others a `&mut`, and a snapshot taken at construction
+/// would leave whoever read it first driving a dead placeholder.
+struct Attachment {
+    /// The placeholder until `Connected`; the shared program's handle after.
+    handle: PipelineHandle,
+    shared: Option<Arc<SharedPipeline>>,
+    /// This session's downlink slot in the program's fan-out.
+    sink: Option<SinkHandle>,
+    /// Input messages the role gate refused, published to the registry so the
+    /// health endpoint can tell "refused" from "never arrived" (#103).
+    denied: Arc<AtomicU64>,
+}
+
+impl Default for Attachment {
+    fn default() -> Self {
+        Self {
+            handle: PipelineHandle::new(),
+            shared: None,
+            sink: None,
+            denied: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
 /// Per-connection context owned by the WS task.
 struct SessionCtx {
     cfg: Arc<Config>,
     session: SignalingSession,
-    pipeline: PipelineHandle,
+    /// The pipeline this session is attached to (#101); see [`Attachment`].
+    attach: Arc<std::sync::Mutex<Attachment>>,
+    /// #62: the worker-termination sender, registered with the shared handle at
+    /// `Connected` (the handle does not exist before that).
+    exit_tx: Option<mpsc::UnboundedSender<String>>,
     /// #50: live fps / resolution targets, mutated by `_arg_fps` / `r,WxH` /
     /// `SETTINGS` and re-read by the capture worker every beat.
     settings: StreamSettings,
@@ -218,6 +498,9 @@ struct SessionCtx {
     client: ClientMeta,
     session_id: u64,
     registry: SessionRegistry,
+    /// The shared programs, so this session can join the one for its display
+    /// instead of opening a second capture on it (#101).
+    pipelines: PipelineRegistry,
 }
 
 impl SessionCtx {
@@ -228,6 +511,7 @@ impl SessionCtx {
         client: ClientMeta,
         session_id: u64,
         registry: SessionRegistry,
+        pipelines: PipelineRegistry,
     ) -> Self {
         // #62: the sink needs the live frame size so it can map the frontend's
         // frame-space pointer coordinates onto the physical screen.
@@ -238,15 +522,17 @@ impl SessionCtx {
         let gamepad = GamepadHub::spawn();
         let input: InputSinkRef =
             Arc::new(WinInputSink::with_gamepad(settings.clone(), Some(gamepad.clone())));
-        // #80: the audio switches are process-wide (the audio thread is not
-        // tied to the select loop), so a fresh connection resets them. Without
-        // this, a reload while muted would come back silent with the panel
-        // showing "Sound on".
-        crate::pipeline::audio::set_enabled(true);
-        crate::pipeline::audio::set_bitrate_bps(0);
+        // #80: the audio switches are process-wide (the audio thread is not tied
+        // to the select loop), so a *reload* has to reset them — otherwise a
+        // reload while muted comes back silent with the panel showing "Sound
+        // on". #101: they moved out of here, because a second tab is not a
+        // reload: resetting them from the viewer's constructor would unmute the
+        // controller's stream. The reset now happens where a program is created
+        // (see `Connected` below), which only the controller does.
         Self {
             session: SignalingSession::new(),
-            pipeline: PipelineHandle::new(),
+            attach: Arc::new(std::sync::Mutex::new(Attachment::default())),
+            exit_tx: None,
             settings,
             input,
             gamepad,
@@ -263,7 +549,84 @@ impl SessionCtx {
             client,
             session_id,
             registry,
+            pipelines,
         }
+    }
+
+    /// Whether this session currently owns input and the program's settings.
+    ///
+    /// Read through the program rather than from a field of our own (#103): the
+    /// lease moves — an operator takeover hands it to another session — and a
+    /// cached boolean would leave the old holder injecting for as long as it
+    /// lives. Everything that gates on the role calls this per message, so the
+    /// switch is atomic from both sides' point of view.
+    fn is_controller(&self) -> bool {
+        let shared = self
+            .attach
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .shared
+            .clone();
+        shared
+            .map(|program| program.controller_id() == Some(self.session_id))
+            .unwrap_or(false)
+    }
+
+    /// The handle the data-channel hooks use to ask, per message, whether this
+    /// session still holds the lease.
+    ///
+    /// Built by the state watcher (which is the task that attaches), not here:
+    /// the watcher owns the `Attachment` cell for the duration of `Connected`,
+    /// and a second lock round-trip would only add a window where the gate is
+    /// armed before the display key is known.
+    #[allow(dead_code)]
+    fn control_gate(&self) -> Option<ControlGate> {
+        let att = self.attach.lock().unwrap_or_else(|p| p.into_inner());
+        let program = att.shared.clone()?;
+        Some(ControlGate {
+            program,
+            session: self.session_id,
+            denied: att.denied.clone(),
+        })
+    }
+}
+
+/// A session's claim on a program's input lease, checked per message (#103).
+///
+/// Passed to the pointer/control hooks instead of a `bool` so that a takeover
+/// takes effect on the *next* message rather than on the next reconnect.
+#[derive(Clone)]
+struct ControlGate {
+    program: Arc<SharedPipeline>,
+    session: u64,
+    /// Shared with the registry entry, so a refusal is visible in `health`
+    /// (see `SessionInfo::denied`).
+    denied: Arc<AtomicU64>,
+}
+
+impl ControlGate {
+    /// Whether this session may act on the program right now.
+    ///
+    /// #105: the answer is no longer only "do I hold the lease". Under the
+    /// default [`InputPolicy::Shared`] every attached session may inject, which
+    /// is what upstream selkies does and what the single-operator deployments
+    /// actually need — two tabs of the same page are one person, and refusing
+    /// the second one looked indistinguishable from "input is broken" (the
+    /// server was counting hundreds of refused pointer moves a minute). The
+    /// exclusive lease is still there for the multi-user case, where it will be
+    /// paired with real isolation.
+    fn owns(&self) -> bool {
+        match self.program.input_policy() {
+            InputPolicy::Shared => true,
+            InputPolicy::Exclusive => self.program.controller_id() == Some(self.session),
+        }
+    }
+
+    /// Count a message the lease refused. Called on every dropped input, so it
+    /// is a relaxed add on a shared cache line — cheap enough for the pointer
+    /// channel's rate and the only way the count stays truthful.
+    fn refuse(&self) {
+        self.denied.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -280,18 +643,26 @@ pub async fn run<S>(
     ws: WebSocketStream<S>,
     cfg: Arc<Config>,
     registry: SessionRegistry,
+    pipelines: PipelineRegistry,
     client: ClientMeta,
+    permit: AdmissionPermit,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    // #102: the slot is held for exactly as long as this session lives. Bound
+    // to a local rather than dropped here: the guard releases on return, and
+    // every exit path (clean close, ICE failure, eviction, panic) goes through
+    // the same `Drop`.
+    let _permit = permit;
     let (done_tx, done_rx) = mpsc::unbounded_channel::<()>();
     let (notice_tx, notice_rx) = mpsc::unbounded_channel::<CloseNotice>();
     let (ws_tx, ws_rx) = mpsc::unbounded_channel::<Message>();
-    registry.register(notice_tx).await;
 
     let session_id = registry.next_session_id();
-    let mut ctx = SessionCtx::new(cfg, ws_tx, done_tx, client, session_id, registry);
+    registry.register(session_id, notice_tx).await;
+
+    let mut ctx = SessionCtx::new(cfg, ws_tx, done_tx, client, session_id, registry, pipelines);
     let mut ws = ws;
 
     let outcome = session_loop(&mut ws, &mut ctx, notice_rx, done_rx, ws_rx).await;
@@ -323,16 +694,67 @@ where
     // while locked away from pointer lock would otherwise leave the desktop at
     // 1:1 with acceleration off — a change nobody made and nobody can see. A
     // no-op when nothing is pinned.
-    if let Err(reason) = hostui::unpin_pointer() {
-        log::warn!("host pointer not restored on session teardown: {reason}");
+    //
+    // #101: only the controller may undo it. A viewer leaving must not revert a
+    // pin the person in the other tab is still using.
+    if ctx.is_controller() {
+        if let Err(reason) = hostui::unpin_pointer() {
+            log::warn!("host pointer not restored on session teardown: {reason}");
+        }
     }
     if let Some(media) = ctx.media.take() {
         let _ = media.lock().await.close().await;
     }
-    ctx.pipeline.stop_loop();
-    // #93: the health endpoint must go back to `idle` even if this session
-    // crashed its way out; `clear_if` keeps a newer session's entry intact.
-    ctx.registry.clear_if(ctx.session_id);
+    // #101: leave the shared program. Detach before release so the fan-out stops
+    // writing into a track whose peer connection is already gone, and release so
+    // the last session out is the one that stops the capture — a viewer leaving
+    // must not kill the controller's stream.
+    //
+    // The guard is dropped before the await below: a std mutex held across one
+    // would serialise the watcher's attach against the teardown of another
+    // session on the same thread pool.
+    let (shared, sink) = {
+        let mut att = ctx.attach.lock().unwrap_or_else(|p| p.into_inner());
+        (att.shared.take(), att.sink.take())
+    };
+    match (shared, sink) {
+        (Some(shared), Some(sink)) => {
+            // #102: read the tally before detaching — the handle keeps working
+            // after the fan-out entry is gone, but this is the last moment the
+            // numbers are certainly final (no write can be in flight once the
+            // session's own tasks have stopped).
+            let (bytes, frames) = (sink.bytes(), sink.frames());
+            // #103: if the lease is ours, it must not die with us — the other
+            // tab on this program would inherit a desktop nobody can touch, and
+            // no reconnect would fix that (the lease lives on the program, not
+            // on a socket). Handed over *before* `release`: when we are the last
+            // one out the program is about to be dropped and `None` is right.
+            let held_lease = shared.controller_id() == Some(ctx.session_id);
+            let display = shared.display.0;
+            let left = shared.detach(sink.id());
+            log::info!(
+                "pipeline {}: session left, {} downlink(s) remain (sent {frames} frames / {:.1} MiB)",
+                display,
+                left,
+                bytes as f64 / (1024.0 * 1024.0)
+            );
+            if held_lease {
+                let next = ctx.registry.successor(ctx.session_id, display).await;
+                if let Some(next) = next {
+                    log::info!(
+                        "pipeline {display}: input lease handed to session {next} (holder left)"
+                    );
+                }
+                shared.set_controller(next);
+            }
+            ctx.pipelines.release(shared.display).await;
+        }
+        // Never reached Connected: nothing was ever attached.
+        _ => {}
+    }
+    // #93/#101: the health endpoint drops this entry, and a same-tab reconnect
+    // becomes possible again.
+    ctx.registry.remove(ctx.session_id).await;
     // #62: cancel the per-session background tasks (stats timer, state watcher,
     // ICE forwarder, recovery sink). Without this a reload leaked them.
     let tasks = {
@@ -440,17 +862,39 @@ where
                     .unwrap_or("")
                     .to_owned()
             };
-            ctx.registry.publish(SessionInfo {
-                id: ctx.session_id,
-                connected_at: Some(std::time::Instant::now()),
-                peer_ip: ctx.client.ip.clone(),
-                user_agent: ctx.client.user_agent.clone(),
-                device_id: read("client_device_id"),
-                tab_id: read("client_tab_id"),
-                role: if read("client_type").is_empty() { peer_type.clone() } else { read("client_type") },
-                pipeline: Some(ctx.pipeline.clone()),
-                settings: Some(ctx.settings.clone()),
-            });
+            ctx.registry
+                .publish(SessionInfo {
+                    id: ctx.session_id,
+                    connected_at: Some(std::time::Instant::now()),
+                    peer_ip: ctx.client.ip.clone(),
+                    user_agent: ctx.client.user_agent.clone(),
+                    device_id: read("client_device_id"),
+                    tab_id: read("client_tab_id"),
+                    client_type: if read("client_type").is_empty() {
+                        peer_type.clone()
+                    } else {
+                        read("client_type")
+                    },
+                    // #101: the pipeline report now comes from
+                    // `PipelineRegistry` (a program outlives and outnumbers
+                    // sessions); a handle snapshot here would be the
+                    // placeholder this session has not attached yet.
+                    pipeline: None,
+                    settings: Some(ctx.settings.clone()),
+                    // #103: filled by `set_downlink` right after the attach —
+                    // the display and the role are decided there, not here.
+                    display: None,
+                    denied: None,
+                    // #102: the downlink does not exist yet — it is attached at
+                    // `Connected`, which is when `set_sink` fills this in. The
+                    // byte count therefore starts at "no downlink", not at zero
+                    // traffic, and health reports `bytes_total: 0` for a session
+                    // that is still negotiating.
+                    sink: None,
+                    // Filled by `publish` from the per-device counter.
+                    reconnects: 0,
+                })
+                .await;
             ctx.session.meta = meta;
             ctx.session.transition(HandshakeState::HelloSent);
             ws.send(Message::Text(hello_ack().into())).await?;
@@ -506,10 +950,18 @@ where
                 // kick would turn one refusal into a reload every two seconds.
                 if codec != crate::pipeline::codec::VideoCodec::Vp8 {
                     crate::pipeline::codec::set(crate::pipeline::codec::VideoCodec::Vp8);
-                    let _ = ctx
+                    // #101: the codec is a property of the *program*, and every
+                    // session shares the one encoder — so a browser that refuses
+                    // it poisons all of them. Restarting every session is the
+                    // only recovery that leaves them all decodable.
+                    let n = ctx
                         .registry
-                        .kick("video codec not supported by this browser; retrying with VP8")
+                        .kick(
+                            "video codec not supported by this browser; retrying with VP8",
+                            None,
+                        )
                         .await;
+                    log::info!("restarted {n} session(s) for the VP8 fallback");
                 }
             }
         }
@@ -545,8 +997,13 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
     // to leave the PC, both data channels and the WS alive, so the browser sat
     // on a frozen picture with the stats panel still ticking. Closing the
     // signaling socket instead lets the frontend reconnect.
+    //
+    // #101: the sender is only *kept* here. The handle it belongs to is the
+    // shared program's, which does not exist until `Connected`, so the actual
+    // registration happens there — and `PipelineHandle` delivers to every
+    // attached session, not just the one that armed it.
     let (exit_tx, mut exit_rx) = mpsc::unbounded_channel::<String>();
-    ctx.pipeline.set_exit_sink(exit_tx);
+    ctx.exit_tx = Some(exit_tx.clone());
     let exit_done = ctx.done_tx.clone();
     push_task(
         &ctx.tasks,
@@ -568,19 +1025,25 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
     let watcher_media = media.clone();
     let watcher_stats_on = ctx.stats_on.clone();
     let watcher_latency = ctx.latency.clone();
-    let watcher_pipeline = ctx.pipeline.clone();
+    let watcher_attach = ctx.attach.clone();
+    let watcher_pipelines = ctx.pipelines.clone();
+    let watcher_exit = ctx.exit_tx.clone();
     let watcher_input = ctx.input.clone();
     let watcher_clipboard = ctx.clipboard.clone();
-    let watcher_settings = ctx.settings.clone();
+    let mut watcher_settings = ctx.settings.clone();
     let watcher_gamepad = ctx.gamepad.clone();
     let watcher_tasks = ctx.tasks.clone();
     let watcher_registry = ctx.registry.clone();
+    // #102: the watcher learns the session id so it can hang this session's
+    // downlink counters on the registry entry the health endpoint reads.
+    let watcher_session_id = ctx.session_id;
     let watcher_audio_stop = ctx.audio_stop.clone();
     push_task(
         &ctx.tasks,
         tokio::spawn(async move {
             let mut state_rx = state_rx;
-            let mut loop_started = false;
+            let mut attached = false;
+            let mut pli_started = false;
             let mut audio_started = false;
             loop {
                 if state_rx.changed().await.is_err() {
@@ -591,9 +1054,120 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
                 let state = *state_rx.borrow();
                 match state {
                     MediaState::Connected => {
+                        if !attached {
+                            attached = true;
+                            // #101: join the capture/encode program for this
+                            // display, creating and starting it when this is the
+                            // first session. A second session must not call
+                            // `spawn_loop`: `DuplicateOutput` is exclusive per
+                            // output, so its capturer would fail and the recovery
+                            // chain would park it on GDI while the first kept
+                            // DXGI — two encoders, one of them on the slow path.
+                            let acquired =
+                                watcher_pipelines.acquire(DisplayKey::PRIMARY, &cfg).await;
+                            let controller = acquired.created;
+                            if controller {
+                                // #80: the audio switches are process-wide, so
+                                // only the session that owns the program resets
+                                // them. A viewer connecting is not a reload and
+                                // must not unmute the controller's stream.
+                                crate::pipeline::audio::set_enabled(true);
+                                crate::pipeline::audio::set_bitrate_bps(0);
+                                // #103: the lease lives on the program and is
+                                // claimed here rather than inferred from
+                                // `created` at every use site, so a takeover can
+                                // move it later without touching this session's
+                                // state.
+                                acquired.pipeline.set_controller(Some(watcher_session_id));
+                            } else {
+                                // #105: a joiner only inherits an *unowned* lease.
+                                // Without this, a program that outlived its
+                                // creator (the usual case: a refresh, while the
+                                // other tab is still attached) was joinable but
+                                // permanently input-dead — every tab reported
+                                // `viewer` and no reconnect could fix it,
+                                // because the lease is keyed on the program and
+                                // only `created` ever wrote it.
+                                acquired.pipeline.try_claim_controller(watcher_session_id);
+                            }
+                            if let Some(tx) = watcher_exit.clone() {
+                                acquired.pipeline.handle.add_exit_sink(tx);
+                            }
+                            // Record the hold *before* the awaits below: if this
+                            // task is aborted mid-attach (session teardown aborts
+                            // every per-session task), a released-but-unrecorded
+                            // entry would keep the capture running with nobody
+                            // watching and no way to find it.
+                            {
+                                let mut att = watcher_attach
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner());
+                                att.handle = acquired.pipeline.handle.clone();
+                                att.shared = Some(acquired.pipeline.clone());
+                            }
+                            let video = watcher_media.lock().await.video().clone();
+                            let sink = acquired.pipeline.attach(video, !controller);
+                            // #102: keep the counter block, then hand it to the
+                            // registry so `health` can report this session's own
+                            // bytes. The handle stays with the session for its
+                            // final tally on teardown; both point at the same
+                            // atomics, so no shared ownership problem.
+                            let sink_counters = sink.counters();
+                            // A joiner reports the *program's* settings, not the
+                            // CLI defaults it connected with: the panel must show
+                            // the frame rate and size the encoder is really at.
+                            watcher_settings = acquired.pipeline.settings.clone();
+                            let denied = {
+                                let mut att = watcher_attach
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner());
+                                att.sink = Some(sink);
+                                att.denied.clone()
+                            };
+                            watcher_registry
+                                .set_downlink(
+                                    watcher_session_id,
+                                    acquired.pipeline.display,
+                                    sink_counters,
+                                    denied,
+                                )
+                                .await;
+                            log::info!(
+                                "pipeline {}: {} — {} downlink(s), {} holder(s)",
+                                acquired.pipeline.display.0,
+                                if controller { "program created" } else { "joined as viewer" },
+                                acquired.pipeline.video.len(),
+                                acquired.pipeline.refs()
+                            );
+                        } else {
+                            // #62: a second Connected (ICE re-connect after a
+                            // transient Disconnected) never re-ran `on_open`, so
+                            // the panel kept stale settings / capture state.
+                            resend_notices(&watcher_media, &watcher_settings).await;
+                        }
+                        let (handle, gate) = {
+                            let att = watcher_attach
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner());
+                            // #103: the hooks ask the program per message rather
+                            // than capture a bool, so a takeover from another
+                            // session takes effect immediately.
+                            let gate = att.shared.clone().map(|program| ControlGate {
+                                program,
+                                session: watcher_session_id,
+                                denied: att.denied.clone(),
+                            });
+                            (att.handle.clone(), gate)
+                        };
+                        // #101: only the first arm installs the recovery-event
+                        // sink. `PipelineHandle` now *adds* subscribers instead of
+                        // replacing the slot, so re-arming on an ICE reconnect
+                        // would leave the previous task alive and sending the same
+                        // `system` notices twice.
+                        let first_arm = !pli_started;
                         if let Err(err) = arm_connected_notices(
                             &watcher_media,
-                            &watcher_pipeline,
+                            &handle,
                             &cfg,
                             &watcher_stats_on,
                             &watcher_latency,
@@ -603,6 +1177,8 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
                             &watcher_gamepad,
                             &watcher_tasks,
                             &watcher_registry,
+                            gate,
+                            first_arm,
                         )
                         .await
                         {
@@ -610,32 +1186,24 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
                             let _ = done_tx.send(());
                             return;
                         }
-                        if !loop_started {
-                            loop_started = true;
-                            // #53: PLI/FIR from the browser -> force keyframes on
-                            // the pipeline. Spawn once per session alongside the
-                            // capture loop (both exit on PC teardown).
-                            watcher_media
-                                .lock()
-                                .await
-                                .spawn_pli_listener(watcher_pipeline.clone());
-                            let video = watcher_media.lock().await.video().clone();
-                            spawn_loop(
-                                cfg.clone(),
-                                video,
-                                watcher_pipeline.clone(),
-                                watcher_settings.clone(),
-                            );
-                            log::info!("pipeline loop spawned after PC connected");
-                        } else {
-                            // #62: a second Connected (ICE re-connect after a
-                            // transient Disconnected) never re-ran `on_open`, so
-                            // the panel kept stale settings / capture state.
-                            resend_notices(&watcher_media, &watcher_settings).await;
+                        if !pli_started {
+                            pli_started = true;
+                            // #53: PLI/FIR from the browser -> force keyframes.
+                            // One listener per session, all aimed at the shared
+                            // encoder (its 500 ms debounce coalesces them).
+                            watcher_media.lock().await.spawn_pli_listener(handle.clone());
                         }
                         // #77: the sound track needs the same `Connected` gate as
                         // video, but its own lifecycle — a second Connected must
                         // not open a second loopback capture on the same endpoint.
+                        //
+                        // #101: the loopback capture stays per session on purpose.
+                        // WASAPI shared mode allows several clients on one
+                        // endpoint, and an Opus stereo encoder is a few percent of
+                        // a core — far less than the bookkeeping a shared,
+                        // multi-sink audio fan-out would add here. The switches
+                        // above remain process-wide, which is why only the
+                        // controller resets them.
                         if !audio_started {
                             audio_started = true;
                             // #83: both media clocks restart with the audio
@@ -701,7 +1269,7 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
     // the window resets after each snapshot so the next tick starts fresh.
     let stats_media = media.clone();
     let stats_flag = ctx.stats_on.clone();
-    let stats_pipeline = ctx.pipeline.clone();
+    let stats_attach = ctx.attach.clone();
     let stats_latency = ctx.latency.clone();
     push_task(
         &ctx.tasks,
@@ -719,11 +1287,24 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
             // proves the whole-machine counter opened (it reads 0 if PDH failed).
             let mut announced = false;
             let mut stats_announced = false;
+            let mut stats_owner = false;
             loop {
                 tick.tick().await;
                 if !stats_flag.load(Ordering::SeqCst) {
                     continue;
                 }
+                // #101: nothing is attached until the PC reports Connected, and
+                // `stream_stats` before that would describe a pipeline that does
+                // not exist yet.
+                let Some(shared) = stats_attach
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .shared
+                    .clone()
+                else {
+                    continue;
+                };
+                let pipeline_handle = shared.handle.clone();
                 sampler.refresh();
                 let host: HostSample = sampler.sample();
                 if !announced {
@@ -737,25 +1318,45 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
                         host.mem_total as f64 / 1048576.0,
                     );
                 }
-                let stats_arc = stats_pipeline.stats();
-                // #62: snapshot + window reset must share one lock. Taken
-                // separately, counters accumulated between the two acquisitions
-                // were dropped, so `encoded_fps` dipped on a regular cadence.
-                let snapshot = {
-                    let mut guard = stats_arc.lock().unwrap_or_else(|p| p.into_inner());
-                    let mut snapshot = guard.snapshot(std::time::Duration::from_secs(1));
-                    // #78: the peak tracker needs `&mut` and its own "now", so
-                    // it is closed here rather than inside `snapshot`.
-                    snapshot.peak_mbps = guard.peak.take_peak_mbps(std::time::Instant::now());
-                    guard.reset_window();
-                    snapshot
+                let stats_arc = pipeline_handle.stats();
+                // #101: exactly one session ticks this window. The counters are
+                // zeroed after every snapshot, so a second ticker would halve
+                // both panels' `encoded_fps` — a wrong number that looks
+                // plausible. The owner publishes, everyone else reads.
+                let snapshot = if !stats_owner && shared.claim_stats() {
+                    stats_owner = true;
+                    true
+                } else {
+                    false
+                };
+                let snapshot = if snapshot {
+                    // #62: snapshot + window reset must share one lock. Taken
+                    // separately, counters accumulated between the two
+                    // acquisitions were dropped, so `encoded_fps` dipped on a
+                    // regular cadence.
+                    let snap = {
+                        let mut guard = stats_arc.lock().unwrap_or_else(|p| p.into_inner());
+                        let mut snapshot = guard.snapshot(std::time::Duration::from_secs(1));
+                        // #78: the peak tracker needs `&mut` and its own "now",
+                        // so it is closed here rather than inside `snapshot`.
+                        snapshot.peak_mbps = guard.peak.take_peak_mbps(std::time::Instant::now());
+                        guard.reset_window();
+                        snapshot
+                    };
+                    shared.publish_snapshot(snap);
+                    snap
+                } else {
+                    // The owner's window, up to one second stale. Zero before the
+                    // owner's first tick — the panel shows a blank sample rather
+                    // than a fabricated one.
+                    shared.last_snapshot().unwrap_or_default()
                 };
                 let stats = StreamStats::from_host(host)
                     .with_pipeline(&snapshot)
                     .with_rtt(stats_latency.rtt_ms())
                     // #84: the QoS controller lives in the capture loop; this is
                     // the only path from there to the panel.
-                    .with_throttled(stats_pipeline.is_throttled());
+                    .with_throttled(pipeline_handle.is_throttled());
                 // #78: one line when a subscriber arrives. `stream_stats` is
                 // otherwise invisible in the log (it only exists while `_stats,1`
                 // is active), so "the panel is empty" had no server-side answer:
@@ -882,6 +1483,49 @@ fn device_of(line: &str) -> Device {
     }
 }
 
+/// Whether a **viewer** may run this command (#101).
+///
+/// A viewer's job is to watch the program, not to steer it: one capture, one
+/// encoder, one desktop, so anything that reflows the host, moves the encoder or
+/// injects input belongs to the controller. Reads stay open — a second tab
+/// showing the stats panel is exactly what a second tab is for.
+///
+/// The list is an allow-list on purpose. A new `Action` defaults to
+/// controller-only, which fails safe: the cost of forgetting to add a harmless
+/// verb is a viewer whose panel does not update; the cost of an accidental
+/// permissive default is two browsers fighting over one pointer.
+///
+/// `StartVideo` is the one write that is **not** symmetric with its opposite.
+/// The video gate (`PipelineHandle::video_on`) belongs to the shared program, and
+/// with the gate shut the capture loop does not even capture — so every session
+/// goes black, not just the one that asked. A controller tab going to the
+/// background therefore closes the gate for everybody, and the visible viewer
+/// would be stuck on a frozen picture it cannot un-freeze. The frontend makes
+/// this concrete: when no chunks arrive for 3 s it resends `START_VIDEO`, three
+/// times, then forces a websocket reconnect (selkies-ws-core.js:4612-4630) — with
+/// the resend denied, that watchdog turns a transient into a reload loop.
+///
+/// Opening the gate is idempotent and costs only the encoder that the controller
+/// already wanted running. Closing it is destructive to the other sessions, so
+/// `StopVideo` stays controller-only: a viewer switching tabs must not blank
+/// someone else's screen. The acknowledged cost is that a deliberate "pause
+/// video" by the controller is not durable while a visible viewer is watching —
+/// which is the right trade, because the alternative failure (a viewer that
+/// cannot recover) has no way out from the browser side.
+fn viewer_may_run(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::StartVideo
+            | Action::StatsOn
+            | Action::StatsOff
+            | Action::PongReply(_)
+            | Action::CompressedNegotiate
+            | Action::ClipboardRequest
+            | Action::Ignore(_)
+            | Action::Unknown(_)
+    )
+}
+
 /// After Connected: register the control-channel upstream command hook and arm
 /// the one-shot downstream notices to fire when the channel actually opens. The
 /// PC `Connected` state can arrive a moment before the `control` channel does,
@@ -905,6 +1549,21 @@ async fn arm_connected_notices(
     // sends. Passed in rather than reached for globally so the DC hook stays a
     // plain set of handles.
     registry: &SessionRegistry,
+    // #101: whether this session owns the program. Everything that moves the
+    // encoder, the host desktop or the injected input is refused for a viewer —
+    // the client is told nothing about the refusal, but a viewer that could
+    // reflow the host desktop under the controller's pointer is worse than one
+    // that silently does nothing.
+    //
+    // #103: asked per message through the program, not captured once, so an
+    // operator takeover moves the gate with the lease. `None` cannot happen (the
+    // hooks are armed right after the attach that sets it) and is treated as
+    // "owns" so a future path that arms earlier degrades to the old behaviour
+    // rather than to a dead keyboard.
+    gate: Option<ControlGate>,
+    // #101: whether this is the session's first `Connected` — only then is the
+    // recovery-event sink installed (see the call site).
+    first_arm: bool,
 ) -> Result<()> {
     // #72: both channels get a handler; the frontend splits input across them
     // (motion on `pointer`, everything else on `control`), and webrtc-rs drops
@@ -918,36 +1577,40 @@ async fn arm_connected_notices(
     // `PipelineEvent` on rebuild / GDI fallback / fatal loss / restore; this task
     // maps each event to the whitelisted downstream message so the state stays
     // visible on the frontend status bar instead of living only in server logs.
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PipelineEvent>();
-    pipeline_handle.set_event_sink(event_tx);
-    let event_control = control.clone();
-    push_task(
-        tasks,
-        tokio::spawn(async move {
-            while let Some(ev) = event_rx.recv().await {
-                let line = match ev {
-                    PipelineEvent::RecoveryStart(n) => Some(system(&format!("capture_recovery,{n}"))),
-                    PipelineEvent::FallbackGdi(reason) => {
-                        Some(system(&format!("capture_fallback_gdi,{reason}")))
+    if first_arm {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PipelineEvent>();
+        pipeline_handle.add_event_sink(event_tx);
+        let event_control = control.clone();
+        push_task(
+            tasks,
+            tokio::spawn(async move {
+                while let Some(ev) = event_rx.recv().await {
+                    let line = match ev {
+                        PipelineEvent::RecoveryStart(n) => {
+                            Some(system(&format!("capture_recovery,{n}")))
+                        }
+                        PipelineEvent::FallbackGdi(reason) => {
+                            Some(system(&format!("capture_fallback_gdi,{reason}")))
+                        }
+                        PipelineEvent::Lost(reason) => Some(system(&format!("capture_lost,{reason}"))),
+                        PipelineEvent::Restored => Some(system("capture_restored")),
+                        PipelineEvent::StreamInfo { is_gdi, reason } => {
+                            Some(stream_info(&StreamInfo::from_capture(is_gdi, reason)))
+                        }
+                        PipelineEvent::Cursor(cd) => Some(cursor(&cd)),
+                    };
+                    let Some(line) = line else { continue };
+                    if event_control.ready_state() != RTCDataChannelState::Open {
+                        log::debug!("recovery event skipped: control channel not open");
+                        continue;
                     }
-                    PipelineEvent::Lost(reason) => Some(system(&format!("capture_lost,{reason}"))),
-                    PipelineEvent::Restored => Some(system("capture_restored")),
-                    PipelineEvent::StreamInfo { is_gdi, reason } => {
-                        Some(stream_info(&StreamInfo::from_capture(is_gdi, reason)))
+                    if let Err(err) = event_control.send_text(&line).await {
+                        log::debug!("recovery event send skipped: {err:#}");
                     }
-                    PipelineEvent::Cursor(cd) => Some(cursor(&cd)),
-                };
-                let Some(line) = line else { continue };
-                if event_control.ready_state() != RTCDataChannelState::Open {
-                    log::debug!("recovery event skipped: control channel not open");
-                    continue;
                 }
-                if let Err(err) = event_control.send_text(&line).await {
-                    log::debug!("recovery event send skipped: {err:#}");
-                }
-            }
-        }),
-    );
+            }),
+        );
+    }
 
     // #17: rumble downlink. ViGEm notifies us when a game moves the motors, and
     // the client's pad plays it. The receiver is handed out once per session —
@@ -1042,11 +1705,26 @@ async fn arm_connected_notices(
     // 两个闭包都是 `move`，各拿一份；`Principal` 是小结构，clone 比 Arc 便宜。
     let pointer_principal = dc_principal.clone();
     let control_principal = dc_principal;
+    // #103: the lease handle is an Arc clone per channel; both ask the same
+    // program, so the two hooks can never disagree about who owns input.
+    let pointer_gate = gate.clone();
+    let control_gate = gate;
 
     pointer.on_message(Box::new(move |msg| {
         let input = pointer_input.clone();
         let principal = pointer_principal.clone();
+        let gate = pointer_gate.clone();
         Box::pin(async move {
+            if let Some(gate) = gate.as_ref() {
+                if !gate.owns() {
+                    // #101: a viewer never injects. Not logged per message (a
+                    // moving pointer is thousands of lines a second); the
+                    // count in `health` says how much was dropped, and the
+                    // session said so once when it attached (#103).
+                    gate.refuse();
+                    return;
+                }
+            }
             if !msg.is_string {
                 log::debug!("binary message on pointer channel ignored");
                 return;
@@ -1086,6 +1764,7 @@ async fn arm_connected_notices(
         // #94: cloned per call like every other handle here — the closure is
         // `FnMut` and must not move anything out of its captures.
         let codec_registry = codec_registry.clone();
+        let gate = control_gate.clone();
         Box::pin(async move {
             if !msg.is_string {
                 log::debug!("binary control message ignored in stage1");
@@ -1096,6 +1775,18 @@ async fn arm_connected_notices(
                 return;
             }
             let action = classify(&line);
+            // #101: a viewer may read, not write. Checked before the policy
+            // gate so a refusal is a role refusal (logged as such) and not a
+            // policy denial the operator would go looking for in the rules.
+            // #103: the lease is asked per message, so a takeover lands here.
+            let owns = gate.as_ref().map(|gate| gate.owns()).unwrap_or(true);
+            if !owns && !viewer_may_run(&action) {
+                if let Some(gate) = gate.as_ref() {
+                    gate.refuse();
+                }
+                log::debug!("control message ignored: viewer session ({line})");
+                return;
+            }
             // #88: 控制通道是所有非指针指令的唯一入口（设置、码率、剪贴板、
             // 音频开关、视频开关），所以一处裁决就覆盖了整片 —— 这也是为什么
             // 它值得插桩而不是每个分支各写一遍。
@@ -1218,7 +1909,12 @@ async fn arm_connected_notices(
                             "video codec -> {}: restarting the session so the new m-line can be negotiated",
                             codec.wire()
                         );
-                        if !codec_registry.kick("video codec changed; reconnecting").await {
+                        // #101: the encoder is shared, so the new m-line has to
+                        // be negotiated by every session, not just this one.
+                        let n = codec_registry
+                            .kick("video codec changed; reconnecting", None)
+                            .await;
+                        if n == 0 {
                             log::warn!("codec changed but there is no live session to restart yet");
                         }
                     }
@@ -1720,6 +2416,97 @@ fn apply_settings_batch(settings: &StreamSettings, payload: &str) -> Option<crat
 mod tests {
     use super::*;
 
+    /// #102：准入的边界必须恰好是 `max`，多一个都不行。
+    ///
+    /// 这条不是形式主义：共享编码下「再来一个人」不是免费的——每个 sink 都要
+    /// 过一遍打包器、整份码率再拷一次，所以无上限的扇出不是「服务更多人」，
+    /// 而是把正在看的人的画质拖下去。上限的作用是让迟到者得到一个体面的
+    /// `503 + Retry-After`，而不是让整屋子人一起变卡。
+    #[test]
+    fn admission_holds_exactly_the_configured_number_of_slots() {
+        let admission = Admission::new(2);
+        let first = admission.try_enter().expect("first slot");
+        let second = admission.try_enter().expect("second slot");
+        assert!(admission.try_enter().is_none(), "the third must be refused");
+        assert_eq!(admission.live(), 2);
+
+        // A released slot is immediately reusable: a kicked, crashed or
+        // reloading session must not permanently consume capacity.
+        drop(first);
+        assert_eq!(admission.live(), 1);
+        let third = admission.try_enter().expect("after a release");
+        assert_eq!(admission.live(), 2);
+
+        drop((second, third));
+        assert_eq!(admission.live(), 0, "every permit was returned");
+    }
+
+    /// 并发到达不能超发。
+    ///
+    /// 用 `load` 再 `store` 的写法下，同一 tick 到达的两个升级会都读到 `max - 1`
+    /// 然后都进门——那正是限流存在的场景（一次刷新风暴里 N 个页签同时重连）。
+    #[test]
+    fn concurrent_arrivals_cannot_exceed_the_limit() {
+        let admission = Admission::new(4);
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let admission = admission.clone();
+                std::thread::spawn(move || admission.try_enter())
+            })
+            .collect();
+        // Collect first, count second: a permit dropped inside `is_some()` would
+        // free its slot while later threads are still racing for one, and the
+        // test would then "prove" that 16 threads all got in — the exact failure
+        // the compare-exchange exists to prevent.
+        let permits: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("thread"))
+            .collect();
+        let admitted = permits.iter().filter(|p| p.is_some()).count();
+        assert_eq!(admitted, 4, "exactly the configured number got in");
+        assert_eq!(admission.live(), 4);
+    }
+
+    /// `0` 会被夹到 `1`，而不是把运维自己锁在门外。
+    #[test]
+    fn a_zero_limit_is_clamped_instead_of_locking_everyone_out() {
+        let admission = Admission::new(0);
+        assert_eq!(admission.max(), 1);
+        // The first permit must be **held**: `assert!(x.try_enter().is_some())`
+        // would drop it on the same line and the next call would succeed, which
+        // is a property of the test rather than of the code.
+        let _held = admission.try_enter().expect("the single slot");
+        assert!(admission.try_enter().is_none());
+    }
+
+    /// #101：角色门禁的非对称性——开门放行，关门只归 controller。
+    ///
+    /// 这条挡的是「第二个页面看着看着黑屏，而且永远好不了」：视频门在共享程序
+    /// 上，controller 的页签切到后台就会发 `STOP_VIDEO` 把门关上（前端在可见性
+    /// 变化时正是这条），循环随即连采集都不做，于是**所有**会话一起黑。viewer
+    /// 唯一的自救是重发 `START_VIDEO`（前端 3 秒无帧重发三次后强制重连），
+    /// 这一条被拒就把一次瞬断变成了自我维持的刷新循环。
+    ///
+    /// 反过来 `StopVideo` 必须挡：否则任何一个 viewer 切页签都会让别人的屏幕黑掉。
+    #[test]
+    fn a_viewer_may_open_the_video_gate_but_not_close_it() {
+        assert!(
+            viewer_may_run(&Action::StartVideo),
+            "opening is idempotent: it costs the encoder the controller already wanted"
+        );
+        assert!(
+            !viewer_may_run(&Action::StopVideo),
+            "closing the gate takes every session down, not just the one that asked"
+        );
+        // 输入面与设置面一律不放行：这两类都是"有人在操作这台机器"的声明。
+        assert!(!viewer_may_run(&Action::InputStub("kd,65".to_owned())));
+        assert!(!viewer_may_run(&Action::SetFps(30)));
+        assert!(!viewer_may_run(&Action::SetAudioOn(false)));
+        // 读类照旧放行，否则第二个页签连统计面板都看不了。
+        assert!(viewer_may_run(&Action::StatsOn));
+        assert!(viewer_may_run(&Action::StatsOff));
+    }
+
     /// #88 的核心断言：控制通道上的**每一条**指令都要有面，或明确豁免。
     /// 新增一个 `Action` 变体时这条会失败 —— 那正是想要的提醒，因为漏映射
     /// 等于那条指令永远绕过策略，而且是静默绕过。
@@ -1836,5 +2623,111 @@ mod tests {
             .expect("VP8 in the answer is not a VP9 answer");
         assert!(reason.contains("VP8"), "the reason names what arrived: {reason}");
         assert_eq!(refused_video_codec(wrong_codec, VideoCodec::Vp8), None);
+    }
+
+    /// #103：输入租约挂在**程序**上，所以接管对下一条消息立刻生效。
+    ///
+    /// 这条钉的是「不缓存」这件事本身。把 `controller` 存成会话字段的实现也
+    /// 能通过「第一个连上的人是 controller」的测试，但接管之后旧会话会一直
+    /// 往被控端注入，直到它自己重连为止。
+    #[test]
+    fn the_input_lease_is_read_from_the_program_not_cached_on_the_session() {
+        use crate::pipeline::SharedPipeline;
+
+        let program = SharedPipeline::stub(
+            PipelineHandle::new(),
+            StreamSettings::from_config(&Config::default()),
+            // 严格模式：这条测试问的就是租约本身，共享模式下 `owns()` 恒真。
+            InputPolicy::Exclusive,
+        );
+        let denied_a = Arc::new(AtomicU64::new(0));
+        let denied_b = Arc::new(AtomicU64::new(0));
+        let a = ControlGate {
+            program: program.clone(),
+            session: 1,
+            denied: denied_a.clone(),
+        };
+        let b = ControlGate {
+            program: program.clone(),
+            session: 2,
+            denied: denied_b.clone(),
+        };
+
+        program.set_controller(Some(1));
+        assert!(a.owns());
+        assert!(!b.owns());
+
+        // The switch is visible to both sides on the next message: no reconnect,
+        // and no window in which two sessions both believe they own the pointer.
+        program.set_controller(Some(2));
+        assert!(!a.owns());
+        assert!(b.owns());
+
+        // Refusals are counted per session, which is what makes "the viewer's
+        // pointer does nothing" diagnosable instead of mysterious.
+        a.refuse();
+        a.refuse();
+        assert_eq!(denied_a.load(Ordering::Relaxed), 2);
+        assert_eq!(denied_b.load(Ordering::Relaxed), 0);
+    }
+
+    /// #105：默认共享输入时，非持有租约的会话也能操作。
+    ///
+    /// 上一版把第二个页签挡在门外（`role: viewer`），运维看到的却是「谁按都
+    /// 没反应」——因为租约在程序重建后是空的，连第一个页签也是 viewer。
+    /// 共享模式把这条歧路整个关掉；严格模式仍在，只是要显式打开。
+    #[test]
+    fn shared_input_lets_a_session_without_the_lease_act() {
+        use crate::pipeline::SharedPipeline;
+
+        let program = SharedPipeline::stub(
+            PipelineHandle::new(),
+            StreamSettings::from_config(&Config::default()),
+            InputPolicy::Shared,
+        );
+        let gate = ControlGate {
+            program: program.clone(),
+            session: 7,
+            denied: Arc::new(AtomicU64::new(0)),
+        };
+        program.set_controller(Some(6));
+        assert!(
+            gate.owns(),
+            "共享输入：租约在别人手里也不该挡住这个会话"
+        );
+        // 全公开的只读白名单在共享模式下不再有机会被触发，但保留它对
+        // `exclusive` 仍然有效。
+        assert!(viewer_may_run(&Action::StatsOn));
+    }
+
+    /// #103：持租约的会话退出时，租约交给同一块屏上**最早**的幸存者。
+    ///
+    /// 交给 `None` 也能编译、也能让程序继续出图，但剩下的人会看着一个碰不了
+    /// 的桌面，而且重连也修不好——租约按程序记，不按 socket 记。
+    #[tokio::test]
+    async fn the_lease_passes_to_the_oldest_survivor_when_its_holder_leaves() {
+        let registry = SessionRegistry::default();
+        for id in 1..=3u64 {
+            let (notice, _rx) = mpsc::unbounded_channel();
+            registry.register(id, notice).await;
+            registry
+                .publish(SessionInfo {
+                    id,
+                    // Distinct tabs: `publish` evicts same-tab sessions, and an
+                    // empty tab id would make all three evict each other.
+                    tab_id: format!("tab-{id}"),
+                    display: Some(0),
+                    ..Default::default()
+                })
+                .await;
+        }
+
+        // The middle session leaves: session 1 is older and still attached.
+        assert_eq!(registry.successor(2, 0).await, Some(1));
+        registry.remove(2).await;
+        // The oldest leaves: only session 3 is left on this display.
+        assert_eq!(registry.successor(1, 0).await, Some(3));
+        // Another display has no survivor on this program.
+        assert_eq!(registry.successor(1, 1).await, None);
     }
 }

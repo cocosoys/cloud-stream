@@ -37,7 +37,7 @@ use hbb_common::serde_json::{json, Value};
 use hbb_common::sysinfo::{ProcessRefreshKind, System};
 use tokio::io::AsyncWrite;
 
-use crate::config::Config;
+use crate::config::{Config, InputPolicy};
 use crate::http::write_http;
 use crate::pipeline::audio;
 use crate::pipeline::PipelineStats;
@@ -319,9 +319,10 @@ fn build(
     cfg: &Config,
     probe: &HealthProbe,
     sample: &ProbeSample,
-    session: Option<&SessionInfo>,
+    sessions: &[SessionInfo],
+    pipelines: &[std::sync::Arc<crate::pipeline::SharedPipeline>],
 ) -> (bool, Value) {
-    build_at(cfg, probe, sample, session, Instant::now())
+    build_at(cfg, probe, sample, sessions, pipelines, Instant::now())
 }
 
 /// [`build`]，但"现在"由调用方给。
@@ -334,11 +335,22 @@ fn build_at(
     cfg: &Config,
     probe: &HealthProbe,
     sample: &ProbeSample,
-    session: Option<&SessionInfo>,
+    sessions: &[SessionInfo],
+    pipelines: &[std::sync::Arc<crate::pipeline::SharedPipeline>],
     now: Instant,
 ) -> (bool, Value) {
-    let pipeline = session.and_then(|s| s.pipeline.clone());
-    let settings = session.and_then(|s| s.settings.clone());
+    // #101: sessions and programs are no longer one-to-one, so the report reads
+    // each from its own registry. The `stream` block describes the first
+    // program (the primary display, and today the only one this build can
+    // open); `pipelines` below lists every one that exists, and `clients`
+    // lists every session — a viewer's handle is the same program's, so
+    // duplicating it per session would say the same thing N times.
+    let primary = pipelines.first();
+    let pipeline = primary.map(|p| p.handle.clone());
+    let settings = primary.map(|p| p.settings.clone());
+    // The Starting verdict measures how long the *first* client has been
+    // waiting, which is the oldest hello rather than "the" session.
+    let first_connected = sessions.iter().filter_map(|s| s.connected_at).min();
 
     let mut verdict = Verdict::Idle;
     let mut flags: Vec<&'static str> = Vec::new();
@@ -379,8 +391,7 @@ fn build_at(
                 verdict = Verdict::Streaming;
             } else {
                 verdict = Verdict::Starting;
-                let waited = session
-                    .and_then(|s| s.connected_at)
+                let waited = first_connected
                     .map(|at| now.saturating_duration_since(at))
                     .unwrap_or_default();
                 if waited > FIRST_FRAME_BUDGET {
@@ -462,27 +473,103 @@ fn build_at(
         }
     };
 
-    let clients = match session {
-        Some(info) => {
-            let connected_s = info
-                .connected_at
-                .map(|at| now.saturating_duration_since(at).as_secs())
-                .unwrap_or(0);
-            json!({
-                "count": 1,
-                "items": [{
+    // #101: every live connection, oldest first. `count > 1` is the normal
+    // multi-viewer state now, not a fault.
+    let clients = json!({
+        "count": sessions.len(),
+        "items": sessions
+            .iter()
+            .map(|info| {
+                let connected_s = info
+                    .connected_at
+                    .map(|at| now.saturating_duration_since(at).as_secs())
+                    .unwrap_or(0);
+                // #102: what this one session's downlink took. With a shared
+                // encoder the program total cannot answer "who used the
+                // bandwidth", so the number comes from the fan-out's per-sink
+                // counters. A session that never reached `Connected` has no
+                // sink and reports zeros — it genuinely sent nothing.
+                let (bytes, frames) = info
+                    .sink
+                    .as_ref()
+                    .map(|c| (c.bytes(), c.frames()))
+                    .unwrap_or((0, 0));
+                // Averaged over the session's whole life, not a window: it answers
+                // "what does one viewer cost me", which is the number that decides
+                // how many fit. Round to three decimals — a JSON float with 17
+                // digits reads as precision the measurement does not have.
+                let avg_mbps = if connected_s > 0 {
+                    let raw = bytes as f64 * 8.0 / 1_000_000.0 / connected_s as f64;
+                    (raw * 1000.0).round() / 1000.0
+                } else {
+                    0.0
+                };
+                // #103: the role is the server's answer, not the page's claim.
+                // Every page calls itself `controller` in the hello, so reporting
+                // that field verbatim made two tabs look like two controllers —
+                // which is exactly what made "the second tab cannot do anything"
+                // look like a broken role gate instead of a working one. The
+                // lease lives on the program; the session is controller iff it
+                // holds it.
+                let role = match info.display {
+                    Some(key) => {
+                        let program = pipelines.iter().find(|p| p.display.0 == key);
+                        // #105: `shared` 下每个已 attach 的会话都能操作，所以
+                        // `controller` 是**真的**，不是上一轮那个「页面自称」的
+                        // bug。区分办法是同级的 `server.input_policy`。
+                        match program {
+                            Some(p) if p.input_policy() == InputPolicy::Shared => "controller",
+                            Some(p) if p.controller_id() == Some(info.id) => "controller",
+                            Some(_) => "viewer",
+                            None => "viewer",
+                        }
+                    }
+                    // No program yet: the session has not reached `Connected`,
+                    // so there is no lease it could hold.
+                    None => "pending",
+                };
+                // #103: how many input messages the role gate dropped. Without
+                // it "the viewer's pointer does nothing" has two indistinguishable
+                // causes: the messages were refused, or they never arrived.
+                let denied_inputs = info
+                    .denied
+                    .as_ref()
+                    .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+                    .unwrap_or(0);
+                json!({
                     "id": info.id,
                     "ip": info.peer_ip,
                     "device_id": info.device_id,
                     "tab_id": info.tab_id,
-                    "role": info.role,
+                    "role": role,
+                    "client_type": info.client_type,
+                    "display": info.display,
                     "user_agent": info.user_agent,
                     "connected_s": connected_s,
-                }],
+                    "reconnects": info.reconnects,
+                    "bytes_total": bytes,
+                    "frames_total": frames,
+                    "avg_mbps": avg_mbps,
+                    "denied_inputs": denied_inputs,
+                })
             })
-        }
-        None => json!({ "count": 0, "items": [] }),
-    };
+            .collect::<Vec<_>>(),
+    });
+
+    // #101: the programs themselves. One per display; `holders` is how many
+    // sessions split the encoder's cost, `downlinks` how many tracks it feeds.
+    let programs = json!({
+        "count": pipelines.len(),
+        "items": pipelines
+            .iter()
+            .map(|p| json!({
+                "display": p.display.0,
+                "holders": p.refs(),
+                "downlinks": p.video.len(),
+                "active": p.handle.is_on(),
+            }))
+            .collect::<Vec<_>>(),
+    });
 
     let payload = json!({
         "ok": verdict.healthy(),
@@ -495,6 +582,9 @@ fn build_at(
             "uptime_s": probe.uptime().as_secs(),
             "host": hostname(),
             "policy": cfg.policy,
+            // #105: 谁可以操作。`shared` 时 `role` 全是 controller 且这不是 bug；
+            // 运维要看的是这一行，而不是去数 controller 的个数。
+            "input_policy": cfg.input_policy.as_str(),
             "tls": cfg.tls_cert.is_some(),
             "listen": format!("{}:{}", cfg.host, cfg.port),
         },
@@ -520,6 +610,7 @@ fn build_at(
             "top": proc_json(&sample.top),
         },
         "clients": clients,
+        "pipelines": programs,
     });
 
     (verdict.healthy(), payload)
@@ -559,20 +650,30 @@ pub async fn handle_health<S>(
     stream: &mut S,
     cfg: &Config,
     registry: &crate::signaling::SessionRegistry,
+    admission: &crate::signaling::websession::Admission,
+    pipelines: &crate::pipeline::PipelineRegistry,
     probe: &HealthProbe,
 ) -> std::io::Result<()>
 where
     S: AsyncWrite + Unpin,
 {
     let sample = probe.sample();
-    // The registry keeps this behind a std mutex: the value is small and is
-    // never held across an await, so a blocking lock is the honest choice.
-    let session = registry
-        .info()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clone();
-    let (healthy, payload) = build(cfg, probe, &sample, session.as_ref());
+    // #101: two registries, because a session and a capture program are no
+    // longer the same thing.
+    let sessions = registry.infos().await;
+    let programs = pipelines.all().await;
+    let (healthy, mut payload) = build(cfg, probe, &sample, &sessions, &programs);
+    // #102: admission is injected here rather than threaded into `build`, for
+    // two reasons. It describes "will this host take another viewer", not "how
+    // is the stream doing" — a different question that belongs next to `ok`
+    // rather than inside `stream`. And keeping `build` a pure function of its
+    // arguments means its tests do not have to construct a live counter.
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "admission".to_owned(),
+            json!({ "max": admission.max(), "live": admission.live() }),
+        );
+    }
     let body = payload.to_string();
     let (status, text) = if healthy { (200u16, "OK") } else { (503u16, "Service Unavailable") };
     write_http(
@@ -593,52 +694,143 @@ pub async fn handle_control<S>(
     stream: &mut S,
     action: &str,
     registry: &crate::signaling::SessionRegistry,
+    pipelines: &crate::pipeline::PipelineRegistry,
     _cfg: &Config,
 ) -> std::io::Result<()>
 where
     S: AsyncWrite + Unpin,
 {
-    let session = registry
-        .info()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clone();
     match action {
-        "capture/restart" => match session.as_ref().and_then(|s| s.pipeline.clone()) {
-            Some(pipeline) => {
-                pipeline.request_rebuild();
-                log::info!("#93: capture/encoder rebuild requested over HTTP");
-                json_reply(stream, 202, "Accepted", json!({
-                    "ok": true,
-                    "action": "capture/restart",
-                }))
-                .await
-            }
-            None => {
+        // #101: every program is restarted, not just "the" pipeline — the
+        // operator asking for a capture restart wants the picture back on every
+        // screen, and a viewer's program is the same object as the controller's.
+        "capture/restart" => {
+            let programs = pipelines.all().await;
+            if programs.is_empty() {
                 json_reply(stream, 409, "Conflict", json!({
                     "ok": false,
                     "action": "capture/restart",
-                    "error": "no live session",
-                }))
-                .await
-            }
-        },
-
-        "session/kick" => {
-            if registry.kick("kicked by an operator").await {
-                json_reply(stream, 200, "OK", json!({
-                    "ok": true,
-                    "action": "session/kick",
+                    "error": "no live pipeline",
                 }))
                 .await
             } else {
-                json_reply(stream, 409, "Conflict", json!({
-                    "ok": false,
-                    "action": "session/kick",
-                    "error": "no live session",
+                for program in &programs {
+                    program.handle.request_rebuild();
+                }
+                log::info!(
+                    "#93: capture/encoder rebuild requested over HTTP ({} program(s))",
+                    programs.len()
+                );
+                json_reply(stream, 202, "Accepted", json!({
+                    "ok": true,
+                    "action": "capture/restart",
+                    "programs": programs.len(),
                 }))
                 .await
             }
+        }
+
+        // `session/kick` closes every session; `session/kick/<id>` closes one
+        // (a stuck viewer) — the id form exists because with N sessions "kick"
+        // can no longer mean "kick the only one". The id comes from the path,
+        // not a query string: `classify` strips the query before routing.
+        a if a == "session/kick" || a.starts_with("session/kick/") => {
+            // A non-numeric id must NOT degrade to `None` (which means "kick
+            // everybody"): a typo like `session/kick/2x` would then disconnect
+            // every client on the box, including the operator's own session.
+            let id = match a.strip_prefix("session/kick/") {
+                None => None,
+                Some(raw) => match raw.parse::<u64>() {
+                    Ok(id) => Some(id),
+                    Err(_) => {
+                        return json_reply(stream, 400, "Bad Request", json!({
+                            "ok": false,
+                            "error": "session id must be a number",
+                            "action": a,
+                        }))
+                        .await;
+                    }
+                },
+            };
+            match registry.kick("kicked by an operator", id).await {
+                0 => {
+                    json_reply(stream, 409, "Conflict", json!({
+                        "ok": false,
+                        "action": "session/kick",
+                        "error": "no live session",
+                    }))
+                    .await
+                }
+                n => {
+                    json_reply(stream, 200, "OK", json!({
+                        "ok": true,
+                        "action": "session/kick",
+                        "kicked": n,
+                    }))
+                    .await
+                }
+            }
+        }
+
+        // #103: hand the input lease to a session. The case that forced it: one
+        // person with two tabs, the older tab holds the lease, the person is now
+        // looking at the newer one — before this the only way to type was to
+        // close the tab that had it (or to reload until the roles swapped).
+        //
+        // Deliberately explicit rather than "last interaction wins": two people
+        // watching one desktop must not steal the pointer by moving a mouse, and
+        // an operator asking for the lease is a decision someone made.
+        a if a.starts_with("session/take/") => {
+            let id = match a.strip_prefix("session/take/").and_then(|raw| raw.parse::<u64>().ok()) {
+                Some(id) => id,
+                None => {
+                    return json_reply(stream, 400, "Bad Request", json!({
+                        "ok": false,
+                        "error": "session id must be a number",
+                        "action": a,
+                    }))
+                    .await;
+                }
+            };
+            let Some(info) = registry.infos().await.into_iter().find(|s| s.id == id) else {
+                return json_reply(stream, 404, "Not Found", json!({
+                    "ok": false,
+                    "action": "session/take",
+                    "error": "no such session",
+                    "id": id,
+                }))
+                .await;
+            };
+            let Some(display) = info.display else {
+                return json_reply(stream, 409, "Conflict", json!({
+                    "ok": false,
+                    "action": "session/take",
+                    "error": "session has not attached to a display yet",
+                    "id": id,
+                }))
+                .await;
+            };
+            let Some(program) = pipelines.get(crate::pipeline::DisplayKey(display)).await else {
+                return json_reply(stream, 409, "Conflict", json!({
+                    "ok": false,
+                    "action": "session/take",
+                    "error": "no live program for that display",
+                    "display": display,
+                }))
+                .await;
+            };
+            let previous = program.set_controller(Some(id));
+            log::info!(
+                "#103: input lease moved to session {id} over HTTP (was {previous:?})"
+            );
+            json_reply(stream, 200, "OK", json!({
+                "ok": true,
+                "action": "session/take",
+                "display": display,
+                "previous": previous,
+                "controller": id,
+            }))
+            .await
         }
 
         other => {
@@ -646,7 +838,7 @@ where
                 "ok": false,
                 "error": "unknown control action",
                 "action": other,
-                "known": ["capture/restart", "session/kick"],
+                "known": ["capture/restart", "session/kick", "session/kick/<id>", "session/take/<id>"],
             }))
             .await
         }
@@ -709,13 +901,26 @@ mod tests {
         }
     }
 
+    /// A program to hang a session's verdict off: the health report reads the
+    /// encoder from here, not from the session (#101).
+    fn program(
+        cfg: &Config,
+        handle: crate::pipeline::PipelineHandle,
+    ) -> std::sync::Arc<crate::pipeline::SharedPipeline> {
+        crate::pipeline::SharedPipeline::stub(
+            handle,
+            crate::pipeline::StreamSettings::from_config(cfg),
+            cfg.input_policy,
+        )
+    }
+
     /// 没人连着的时候必须报 `idle` 且健康 —— 一个开着但没人看的虚拟机是正常
     /// 状态，不是故障。
     #[test]
     fn idle_is_healthy_and_says_so() {
         let cfg = cfg();
         let p = probe();
-        let (ok, body) = build(&cfg, &p, &sample(), None);
+        let (ok, body) = build(&cfg, &p, &sample(), &[], &[]);
         assert!(ok, "idle must be healthy");
         assert_eq!(body["verdict"], "idle");
         assert_eq!(body["clients"]["count"], 0);
@@ -746,17 +951,68 @@ mod tests {
             user_agent: "Mozilla/5.0".to_owned(),
             device_id: "dev-uuid".to_owned(),
             tab_id: "tab-uuid".to_owned(),
-            role: "controller".to_owned(),
-            pipeline: Some(handle),
-            settings: Some(crate::pipeline::StreamSettings::from_config(&cfg)),
+            client_type: "controller".to_owned(),
+            display: Some(0),
+            ..Default::default()
         };
-        let (ok, body) = build_at(&cfg, &probe(), &sample(), Some(&info), now);
+        let program = program(&cfg, handle);
+        program.set_controller(Some(7));
+        let (ok, body) = build_at(&cfg, &probe(), &sample(), &[info], &[program], now);
         assert!(ok);
         assert_eq!(body["verdict"], "streaming");
         assert_eq!(body["clients"]["count"], 1);
         assert_eq!(body["clients"]["items"][0]["ip"], "192.168.1.5");
         assert_eq!(body["clients"]["items"][0]["device_id"], "dev-uuid");
         assert_eq!(body["stream"]["last_sample_age_ms"].as_u64(), Some(0));
+        assert_eq!(body["pipelines"]["count"], 1);
+        assert_eq!(body["pipelines"]["items"][0]["display"], 0);
+    }
+
+    /// #102：每个会话自己的字节数必须能从报告里读到。
+    ///
+    /// 共享编码下 `stream.video_mbps` 是**程序**的总量，两个人在看时它不回答
+    /// 「这个人花了多少」。这条钉的是接线：`clients.items[].bytes_total` 读的是
+    /// 扇出层按 sink 记的账，不是把总量摊到人数上——那样两个人只要帧率不同就
+    /// 立刻算错。
+    #[test]
+    fn a_session_reports_its_own_bytes_and_reconnects() {
+        let cfg = cfg();
+        let now = Instant::now();
+        let counters = std::sync::Arc::new(crate::pipeline::SinkCounters::default());
+        counters.seed(4_000_000, 240);
+        let info = SessionInfo {
+            id: 11,
+            connected_at: Some(now - Duration::from_secs(10)),
+            peer_ip: "192.168.1.5".to_owned(),
+            client_type: "viewer".to_owned(),
+            sink: Some(counters),
+            reconnects: 3,
+            ..Default::default()
+        };
+        let (_, body) = build_at(&cfg, &probe(), &sample(), &[info], &[], now);
+        let client = &body["clients"]["items"][0];
+        assert_eq!(client["bytes_total"], 4_000_000);
+        assert_eq!(client["frames_total"], 240);
+        assert_eq!(client["reconnects"], 3, "a reload loop must be visible");
+        // 4 MB over 10 s = 3.2 Mbit/s.
+        let mbps = client["avg_mbps"].as_f64().expect("avg_mbps is a number");
+        assert!((mbps - 3.2).abs() < 0.001, "expected 3.2, got {mbps}");
+    }
+
+    /// 还没 `Connected` 的会话没有下行，`health` 必须报 `null` 而不是 0——
+    /// 「没在传」和「传了 0 字节」是两件事，后者会让人以为链路坏了。
+    #[test]
+    fn a_session_without_a_downlink_reports_no_counters() {
+        let cfg = cfg();
+        let now = Instant::now();
+        let info = SessionInfo {
+            id: 12,
+            connected_at: Some(now),
+            ..Default::default()
+        };
+        let (_, body) = build_at(&cfg, &probe(), &sample(), &[info], &[], now);
+        assert_eq!(body["clients"]["items"][0]["bytes_total"], 0);
+        assert_eq!(body["clients"]["items"][0]["avg_mbps"], 0.0);
     }
 
     /// 判据必须建立在**传进来的**那个时刻上。如果 `build_at` 自己再取一次
@@ -776,13 +1032,12 @@ mod tests {
         let info = SessionInfo {
             id: 9,
             connected_at: Some(written),
-            pipeline: Some(handle),
-            settings: Some(crate::pipeline::StreamSettings::from_config(&cfg)),
             ..Default::default()
         };
+        let program = program(&cfg, handle);
         // 同一份快照，读取时刻晚 4 秒 → 必须判 stalled，尽管墙钟几乎没走。
         let late = written + Duration::from_secs(4);
-        let (ok, body) = build_at(&cfg, &probe(), &sample(), Some(&info), late);
+        let (ok, body) = build_at(&cfg, &probe(), &sample(), &[info], &[program], late);
         assert!(!ok, "four seconds of silence is a stall");
         assert_eq!(body["verdict"], "stalled");
         assert_eq!(body["flags"][0], "no_frame_for_over_3s");
@@ -804,11 +1059,10 @@ mod tests {
         let info = SessionInfo {
             id: 1,
             connected_at: Some(Instant::now()),
-            pipeline: Some(handle),
-            settings: Some(crate::pipeline::StreamSettings::from_config(&cfg)),
             ..Default::default()
         };
-        let (ok, body) = build(&cfg, &probe(), &sample(), Some(&info));
+        let program = program(&cfg, handle);
+        let (ok, body) = build(&cfg, &probe(), &sample(), &[info], &[program]);
         assert!(!ok, "a wedged pipeline must not report healthy");
         assert_eq!(body["verdict"], "stalled");
         assert_eq!(body["flags"][0], "no_frame_for_over_3s");
@@ -823,11 +1077,10 @@ mod tests {
         let info = SessionInfo {
             id: 2,
             connected_at: Some(Instant::now()),
-            pipeline: Some(handle),
-            settings: Some(crate::pipeline::StreamSettings::from_config(&cfg)),
             ..Default::default()
         };
-        let (ok, body) = build(&cfg, &probe(), &sample(), Some(&info));
+        let program = program(&cfg, handle);
+        let (ok, body) = build(&cfg, &probe(), &sample(), &[info], &[program]);
         assert!(ok);
         assert_eq!(body["verdict"], "paused");
     }
@@ -841,11 +1094,10 @@ mod tests {
         let info = SessionInfo {
             id: 3,
             connected_at: Some(Instant::now()),
-            pipeline: Some(handle),
-            settings: Some(crate::pipeline::StreamSettings::from_config(&cfg)),
             ..Default::default()
         };
-        let (ok, body) = build(&cfg, &probe(), &sample(), Some(&info));
+        let program = program(&cfg, handle);
+        let (ok, body) = build(&cfg, &probe(), &sample(), &[info], &[program]);
         assert!(ok);
         assert_eq!(body["verdict"], "starting");
     }
@@ -905,11 +1157,171 @@ mod tests {
     /// 空会话下也要能序列化，不能因为缺字段 panic。
     #[test]
     fn payload_is_valid_json_without_a_session() {
-        let (_, body) = build(&cfg(), &probe(), &ProbeSample::default(), None);
+        let (_, body) = build(&cfg(), &probe(), &ProbeSample::default(), &[], &[]);
         let text = body.to_string();
         assert!(text.starts_with('{'));
         assert!(hbb_common::serde_json::from_str::<Value>(&text).is_ok());
         assert_eq!(body["host"]["available"], false);
         assert_eq!(body["processes"]["game_running"], false);
+    }
+
+    // ---- #101：多会话下控制面的形状 ------------------------------------
+    //
+    // 这一段之前没有任何测试：控制面只有一条"置位 + 回状态码"的路，看起来
+    // 不值得测。直到 `session/kick/<id>` 出现——它多了一个会被手打错的参数。
+
+    /// 跑一次控制动作，把写出的 HTTP 报文当字符串拿回来。
+    ///
+    /// `Vec<u8>` 实现了 `AsyncWrite` 且永不失败，所以这里不需要 socket，
+    /// 也就不需要为一个纯路由判断起监听。
+    async fn control(action: &str) -> String {
+        let mut out: Vec<u8> = Vec::new();
+        handle_control(
+            &mut out,
+            action,
+            &crate::signaling::SessionRegistry::default(),
+            &crate::pipeline::PipelineRegistry::default(),
+            &cfg(),
+        )
+        .await
+        .expect("a Vec is an infallible writer");
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// `session/kick/2x` 必须是 400，而不是"解析失败 → 踢掉所有人"。
+    ///
+    /// 这是本轮新代码里唯一一个"参数错了会更糟"的地方：`kick(None)` 的语义
+    /// 是踢全部，所以一个手滑多打的字符会把整机所有客户端一起断掉——包括
+    /// 运维自己正在看的那个页面。`Option` 的 `and_then` 在这里是个陷阱，
+    /// 因为它把"没有参数"和"参数不可解析"变成了同一个值。
+    #[tokio::test]
+    async fn a_non_numeric_session_id_is_rejected_instead_of_kicking_everyone() {
+        let text = control("session/kick/2x").await;
+        assert!(text.starts_with("HTTP/1.1 400"), "got: {text}");
+        assert!(text.contains("must be a number"), "got: {text}");
+        assert!(
+            !text.contains("kicked"),
+            "a rejected id must not report a kick: {text}"
+        );
+    }
+
+    /// 踢一个不存在的会话号是 409，不是"踢了 0 个也算成功"。
+    #[tokio::test]
+    async fn kicking_an_absent_session_is_a_conflict() {
+        for action in ["session/kick", "session/kick/7"] {
+            let text = control(action).await;
+            assert!(text.starts_with("HTTP/1.1 409"), "{action} got: {text}");
+            assert!(text.contains("no live session"), "{action} got: {text}");
+        }
+    }
+
+    /// 没有任何程序时重启采集器是 409：没东西可重建，不该回 202。
+    #[tokio::test]
+    async fn restarting_capture_without_a_program_is_a_conflict() {
+        let text = control("capture/restart").await;
+        assert!(text.starts_with("HTTP/1.1 409"), "got: {text}");
+        assert!(text.contains("no live pipeline"), "got: {text}");
+    }
+
+    /// 拼错的动作得到 404 和一份白名单——静默 200 会让运维以为重启过了。
+    #[tokio::test]
+    async fn an_unknown_action_lists_the_known_ones() {
+        let text = control("capture/restat").await;
+        assert!(text.starts_with("HTTP/1.1 404"), "got: {text}");
+        assert!(text.contains("capture/restart"), "got: {text}");
+        // 带 id 的形式也要在清单里，否则它就是一个"文档里没写、只能靠猜"的接口。
+        assert!(text.contains("session/kick/<id>"), "got: {text}");
+    }
+
+    /// #103：`role` 必须是服务端的裁决，不是页面的自称。
+    ///
+    /// 两个页签在 hello 里都会说自己是 `controller`（前端不区分），把这个字段
+    /// 原样报出去会让运维看到「两个 controller」——上一轮线上就是这样，看起来
+    /// 像门禁坏了，实际门禁是对的。租约在程序上，谁拿着谁才是 controller。
+    #[test]
+    fn the_role_comes_from_the_lease_not_from_the_page() {
+        // #105: `role` 只在严格模式下才有区分度；`shared` 下所有人都是
+        // controller，所以这个测试必须先关掉共享。
+        let mut cfg = cfg();
+        cfg.input_policy = InputPolicy::Exclusive;
+        let cfg = cfg;
+        let now = Instant::now();
+        let info = |id: u64| SessionInfo {
+            id,
+            connected_at: Some(now),
+            client_type: "controller".to_owned(),
+            display: Some(0),
+            ..Default::default()
+        };
+        let program = program(&cfg, PipelineHandle::new());
+        program.set_controller(Some(2));
+
+        let (_, body) = build_at(&cfg, &probe(), &sample(), &[info(1), info(2)], &[program], now);
+        let items = &body["clients"]["items"];
+        assert_eq!(items[0]["role"], "viewer");
+        assert_eq!(items[1]["role"], "controller");
+        // The claim is still reported, just not as the role: it is the only
+        // record of what the page believed, which is useful when a client's
+        // behaviour and its role disagree.
+        assert_eq!(items[0]["client_type"], "controller");
+        assert_eq!(items[0]["denied_inputs"], 0);
+    }
+
+    /// #105：共享输入下两个页签都报 controller —— 这次是**真的**，并且必须
+    /// 有一处能让人区分「真共享」和上一轮那个「页面自称 controller」的 bug。
+    #[test]
+    fn shared_input_reports_every_tab_as_controller_and_says_so() {
+        let cfg = cfg();
+        assert_eq!(cfg.input_policy, InputPolicy::Shared, "默认必须是共享");
+        let now = Instant::now();
+        let info = |id: u64| SessionInfo {
+            id,
+            connected_at: Some(now),
+            client_type: "controller".to_owned(),
+            display: Some(0),
+            ..Default::default()
+        };
+        let program = program(&cfg, PipelineHandle::new());
+        // 一个持有租约、一个没有：租约在共享模式下不再决定能不能操作。
+        program.set_controller(Some(2));
+
+        let (_, body) = build_at(&cfg, &probe(), &sample(), &[info(1), info(2)], &[program], now);
+        let items = &body["clients"]["items"];
+        assert_eq!(items[0]["role"], "controller");
+        assert_eq!(items[1]["role"], "controller");
+        assert_eq!(body["server"]["input_policy"], "shared");
+    }
+
+    /// #103：还没 attach 的会话不持有任何租约，报 `pending` 而不是假装是 viewer。
+    #[test]
+    fn a_session_without_a_program_reports_pending() {
+        let cfg = cfg();
+        let now = Instant::now();
+        let info = SessionInfo {
+            id: 1,
+            connected_at: Some(now),
+            client_type: "controller".to_owned(),
+            ..Default::default()
+        };
+        let (_, body) = build_at(&cfg, &probe(), &sample(), &[info], &[], now);
+        assert_eq!(body["clients"]["items"][0]["role"], "pending");
+        assert!(body["clients"]["items"][0]["display"].is_null());
+    }
+
+    /// #103：非数字的会话号是 400。降级成"接管 0 号"或"接管全部"都会让一次
+    /// 手滑改掉别人正在用的控制权。
+    #[tokio::test]
+    async fn taking_with_a_bad_id_is_a_bad_request() {
+        let text = control("session/take/2x").await;
+        assert!(text.starts_with("HTTP/1.1 400"), "got: {text}");
+        assert!(text.contains("must be a number"), "got: {text}");
+    }
+
+    /// 接管一个不存在的会话是 404：没有这个人，就没有可移交的对象。
+    #[tokio::test]
+    async fn taking_a_lease_for_an_absent_session_is_a_not_found() {
+        let text = control("session/take/7").await;
+        assert!(text.starts_with("HTTP/1.1 404"), "got: {text}");
+        assert!(text.contains("no such session"), "got: {text}");
     }
 }

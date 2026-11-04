@@ -17,7 +17,7 @@
 | 5.2 WS 握手行协议 | `HELLO client <meta>` 回 `HELLO`；`SESSION server` 后回 `SESSION_OK 1` 并由服务端 always offer；`<peer_id> {"sdp":…}` / `<peer_id> {"ice":…}` 双向转发；非 answer SDP 拒绝；不可识别行降级为 debug 不拆链 | `signaling\line.rs:54–122`、`signaling\websession.rs:209–272` |
 | 5.3 Connected 后下行白名单 | `pipeline(status)`、`stream_info(StreamInfo 默认 dxgi)`、`connection(poor=false)` 三件套；`_stats,1/0` 控制 1s 周期 `stream_stats`；其余下行类型阶段 1 不发 | `dispatch\output.rs:67–122`、`signaling\websession.rs:383–407`、`326–349` |
 | 5.5 上行命令分类 | A 组（START_VIDEO / STOP_VIDEO / `_stats` / `_gz` / ping）驱动 pipeline 闸门、统计闸门、压缩应答、pong 回包；B 组仅 debug 记录；C 组进 NullInputSink 计数不注入 | `dispatch\commands.rs:47–86`、`signaling\websession.rs:416–459` |
-| 5.2 会话顶号与终态清理 | 单会话注册表 `SessionRegistry`：新连接以 close code **4001** 顶掉旧会话；PC `Failed/Closed` 以 1000 关闭；会话退出时 `media.close()` + `pipeline.stop()` | `signaling\websession.rs:61–77`、`117–141`、`284–322` |
+| 5.2 会话顶号与终态清理 | 单会话注册表 `SessionRegistry`：新连接以 close code **4001** 顶掉旧会话；PC `Failed/Closed` 以 1000 关闭；会话退出时 `media.close()` + `pipeline.stop()`。**现状**：只顶掉同 `client_tab_id` 的旧会话，跨页签共存；`pipeline.stop()` 改为按引用计数的 `PipelineRegistry::release()` | `signaling\websession.rs`（`SessionRegistry` / `Attachment` / teardown）、`pipeline\shared.rs` |
 
 ### 1.2 验收动作与结果
 
@@ -107,7 +107,7 @@
 | `http\static.rs` | 固定 MIME 表、目录穿越防护、index.html 兜底、404 文本 | `StaticFile`、`serve(dist, url_path)`、`not_found()` |
 | `signaling\line.rs` | WS 行解析器与序列化器、固定 peer id | `parse_ws_line`、`hello_ack`、`session_ok`、`sdp_line`、`ice_line`、`IncomingLine`、`SERVER_PEER_ID` |
 | `signaling\session.rs` | 握手状态机枚举、会话状态与 HELLO meta 持有 | `HandshakeState`、`SignalingSession`（`transition` / `is_connected`） |
-| `signaling\websession.rs` | 单会话上下文、四路口 select 主循环、握手分派、媒体会话装配、状态 watcher、统计周期任务、ICE forwarder、Connected 下行与 DC 命令 hook、顶号注册表与终态清理 | `SessionRegistry`、`run(ws, cfg, registry)` |
+| `signaling\websession.rs` | 会话上下文、四路口 select 主循环、握手分派、媒体会话装配、状态 watcher、统计周期任务、ICE forwarder、Connected 下行与 DC 命令 hook、会话登记表与终态清理 | `SessionRegistry`、`Attachment`、`run(ws, cfg, registry, pipelines)` |
 | `dispatch\commands.rs` | 上行命令 A/B/C/Unknown 四分类 | `Action`、`classify(line)` |
 | `dispatch\output.rs` | 下行白名单四类 JSON 构造、StreamInfo / StreamStats 结构 | `pipeline`、`stream_info`、`stream_stats`、`connection`、`StreamInfo`、`StreamStats` |
 | `dispatch\input_stub.rs` | 输入注入 trait 与阶段 1 NullInputSink 计数实现 | `InputSink`、`NullInputSink`、`InputCounters`、`InputSinkRef`、`note_stub` |
@@ -184,7 +184,7 @@ media.video().write_sample(bytes, cfg.spf()).await?;
 | 采集 / 编码 / 真实统计 | `pipeline\capture.rs`、`encoder.rs`、`sample_map.rs` 仍为 bail 占位；`platform\sysinfo.rs` Sampler 为默认零值；`stream_stats` pipeline 字段为零值 | #36 |
 | TLS | 本任务只走明文 TcpListener；`Config::tls_enabled()` 双路径齐备但 acceptor 未装配 | #37 部署 143 前接 tokio-rustls 0.26 |
 | 鉴权 | 无 token / display_id 校验；HELLO meta 只存日志 | 阶段 4 服务化 |
-| 多会话并发 | 单会话注册表，新连接顶掉旧连接 | 阶段 4 多实例调度 |
+| 多会话并发 | 阶段 1 为单会话注册表，新连接顶掉旧连接。**现已拆开**：只有同一 `client_tab_id` 才互斥，跨页签共存并共享一条采集/编码管线（首个 `controller`，其余 `viewer` 只读） | 输入仲裁（多人同时操作）仍待做，见 `roadmap-multi-display-multi-input.md` |
 | 未用暂存标注 | `main.rs:15` `#![allow(dead_code)]` 与 `dispatch\mod.rs:6` / `platform\mod.rs` / `pipeline\mod.rs` / `signaling\mod.rs` 顶部 `#![allow(unused_imports)]` 为骨架期暂存 | #36 采集循环接线完成后必须移除，让真实死代码 / 未用导入重新暴露 |
 
 ### 6.1 待 #36 清理的暂存符号

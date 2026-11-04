@@ -62,19 +62,23 @@ pub mod capture;
 pub mod codec;
 pub mod cursor;
 pub mod encoder;
+pub mod fanout;
 pub mod qos;
 pub mod sample_map;
 pub mod scale;
 pub mod settings;
+pub mod shared;
 pub mod stats;
 
 pub use stats::{FrameCounters, PipelineSnapshot, PipelineStats};
 pub use capture::CaptureWorker;
 pub use cursor::{cursor_data, cursor_info, cursor_png_b64, cursor_pos, draw_cursor, virtual_origin, CursorData};
 pub use encoder::VideoEncoder;
+pub use fanout::{SinkCounters, SinkHandle, VideoFanout};
 pub use sample_map::video_frame_to_chunks;
 pub use scale::bgra_scale;
 pub use settings::StreamSettings;
+pub use shared::{DisplayKey, PipelineRegistry, SharedPipeline};
 use settings::RateControl;
 
 use std::path::PathBuf;
@@ -90,7 +94,6 @@ use tokio::sync::mpsc;
 
 use crate::config::Config;
 use capture::CAPTURE_POLL;
-use crate::webrtc::VideoTrack;
 
 /// #65: how long the outer scheduler waits for the capture thread to open the
 /// display before it treats the open as failed (recovery backoff handles it).
@@ -207,14 +210,21 @@ pub enum PipelineEvent {
 /// the signaling task and the loop task observe them on different handlers;
 /// `stats` is a shared `std::sync::Mutex` so both the blocking worker and the
 /// async 1 s stats tick can touch the counters without an await inside the lock;
-/// `events` is a one-way sink installed by the session after the media channel
-/// opens.
+/// `events` and `exit_sinks` are sink **lists**, not single slots: one capture
+/// loop now feeds several sessions (#101), so installing a sink adds a
+/// subscriber instead of replacing the previous one. With a single slot the last
+/// session to arm silenced every other session's recovery notices — and its
+/// worker-death report, so a second tab could leave the first one frozen with
+/// nothing in the log.
 #[derive(Clone)]
 pub struct PipelineHandle {
     video_on: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
     stats: Arc<Mutex<PipelineStats>>,
-    events: Arc<Mutex<Option<mpsc::UnboundedSender<PipelineEvent>>>>,
+    events: Arc<Mutex<Vec<(u64, mpsc::UnboundedSender<PipelineEvent>)>>>,
+    /// Next sink id for `events` / `exit_sinks`; ids are never reused, so a
+    /// session that already left cannot remove a live subscriber's entry.
+    next_sink: Arc<std::sync::atomic::AtomicU64>,
     /// #53: set by the session's RTCP PLI/FIR listener; the capture loop
     /// consumes it on the next beat and forces a keyframe.
     keyframe_requested: Arc<AtomicBool>,
@@ -242,7 +252,7 @@ pub struct PipelineHandle {
     /// own termination (error or panic) through it. Without this a dead worker
     /// left the PC / data channels alive, so the browser showed a frozen picture
     /// with live stats and no error.
-    exit_sink: Arc<Mutex<Option<mpsc::UnboundedSender<String>>>>,
+    exit_sink: Arc<Mutex<Vec<(u64, mpsc::UnboundedSender<String>)>>>,
 }
 
 impl Default for PipelineHandle {
@@ -262,13 +272,14 @@ impl PipelineHandle {
             video_on: Arc::new(AtomicBool::new(true)),
             stopped: Arc::new(AtomicBool::new(false)),
             stats: Arc::new(Mutex::new(PipelineStats::default())),
-            events: Arc::new(Mutex::new(None)),
+            events: Arc::new(Mutex::new(Vec::new())),
+            next_sink: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             keyframe_requested: Arc::new(AtomicBool::new(false)),
             bitrate_override: Arc::new(AtomicU32::new(0)),
             cursor_inject: Arc::new(AtomicBool::new(false)),
             throttled: Arc::new(AtomicBool::new(false)),
             rebuild: Arc::new(AtomicBool::new(false)),
-            exit_sink: Arc::new(Mutex::new(None)),
+            exit_sink: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -355,45 +366,88 @@ impl PipelineHandle {
         self.stats.clone()
     }
 
-    /// Install the session-side event sink. Replacing an earlier sink idempotently
-    /// for a reconnect; the sink channel is `try_send`-sized so a slow frontend
-    /// never blocks the capture beat.
-    pub fn set_event_sink(&self, tx: mpsc::UnboundedSender<PipelineEvent>) {
-        if let Ok(mut guard) = self.events.lock() {
-            *guard = Some(tx);
-        }
+    /// Install a session-side event sink and return the id that removes it.
+    /// Every attached session gets its own; the capture worker fans each event
+    /// out to all of them (#101).
+    pub fn add_event_sink(&self, tx: mpsc::UnboundedSender<PipelineEvent>) -> u64 {
+        self.add_sink(&self.events, tx)
     }
 
-    /// Emit one recovery event to the session sink; a missing sink (session not
-    /// armed yet) is a silent no-op, matching the no-op default gate.
+    /// Remove one session's event sink (session teardown).
+    ///
+    /// Not called today: `emit_event` prunes senders whose receiver is gone, so
+    /// a session that leaves without detaching is dropped on the next event
+    /// rather than kept forever. Exposed because "remove without waiting for an
+    /// event" is the honest operation, and the health/teardown paths that want it
+    /// should not have to re-plumb the handle.
+    #[allow(dead_code)]
+    pub fn remove_event_sink(&self, id: u64) {
+        Self::remove_sink(&self.events, id);
+    }
+
+    /// Emit one recovery event to every attached session sink; a dead receiver
+    /// (the session left without detaching) is pruned here rather than left to
+    /// absorb sends forever.
     pub fn emit_event(&self, ev: PipelineEvent) {
-        let tx = self
-            .events
-            .lock()
-            .ok()
-            .and_then(|g| g.clone());
-        if let Some(tx) = tx {
-            let _ = tx.send(ev);
+        let mut dead: Vec<u64> = Vec::new();
+        {
+            let guard = self.events.lock().unwrap_or_else(|p| p.into_inner());
+            for (id, tx) in guard.iter() {
+                if tx.send(ev.clone()).is_err() {
+                    dead.push(*id);
+                }
+            }
+        }
+        for id in dead {
+            Self::remove_sink(&self.events, id);
         }
     }
 
-    /// #62: install the worker-termination sink (the session closes the socket
-    /// on a report so the browser reconnects instead of showing a frozen frame).
-    pub fn set_exit_sink(&self, tx: mpsc::UnboundedSender<String>) {
-        if let Ok(mut guard) = self.exit_sink.lock() {
-            *guard = Some(tx);
-        }
+    /// Install a worker-termination sink and return the id that removes it.
+    pub fn add_exit_sink(&self, tx: mpsc::UnboundedSender<String>) -> u64 {
+        self.add_sink(&self.exit_sink, tx)
     }
 
-    /// #62: report an unexpected worker exit. A session-driven stop
-    /// (`stop_loop`) is not an exit worth reporting, so it is filtered here.
+    /// Remove one session's worker-termination sink. Same note as
+    /// [`Self::remove_event_sink`]: `signal_exit` prunes on failure.
+    #[allow(dead_code)]
+    pub fn remove_exit_sink(&self, id: u64) {
+        Self::remove_sink(&self.exit_sink, id);
+    }
+
+    fn add_sink<T>(&self, list: &Mutex<Vec<(u64, mpsc::UnboundedSender<T>)>>, tx: mpsc::UnboundedSender<T>) -> u64 {
+        let id = self.next_sink.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut guard = list.lock().unwrap_or_else(|p| p.into_inner());
+        guard.push((id, tx));
+        id
+    }
+
+    fn remove_sink<T>(list: &Mutex<Vec<(u64, mpsc::UnboundedSender<T>)>>, id: u64) {
+        let mut guard = list.lock().unwrap_or_else(|p| p.into_inner());
+        guard.retain(|(sink, _)| *sink != id);
+    }
+
+    /// #62: report an unexpected worker exit to every attached session. A
+    /// session-driven stop (`stop_loop`) is not an exit worth reporting, so it is
+    /// filtered here.
+    ///
+    /// #101: with a shared pipeline this is the *only* thing that tells the
+    /// viewers apart from a healthy frozen picture, so it must reach all of them.
     fn signal_exit(&self, reason: String) {
         if self.stopped.load(Ordering::SeqCst) {
             return;
         }
-        let tx = self.exit_sink.lock().ok().and_then(|g| g.clone());
-        if let Some(tx) = tx {
-            let _ = tx.send(reason);
+        let mut dead: Vec<u64> = Vec::new();
+        {
+            let guard = self.exit_sink.lock().unwrap_or_else(|p| p.into_inner());
+            for (id, tx) in guard.iter() {
+                if tx.send(reason.clone()).is_err() {
+                    dead.push(*id);
+                }
+            }
+        }
+        for id in dead {
+            Self::remove_sink(&self.exit_sink, id);
         }
     }
 }
@@ -450,9 +504,13 @@ enum InnerOutcome {
 /// the PC reaches Connected. The gate inside still waits for `START_VIDEO`
 /// before grabbing frames; the track is accepted by the packetizer only after
 /// binding, which happens on offer/answer.
+///
+/// #101: the encoded frames go through a [`VideoFanout`], not one track, so the
+/// session that arrives second reuses this encoder instead of opening a second
+/// DXGI duplication on the same output (which the platform refuses).
 pub fn spawn_loop(
     cfg: Arc<Config>,
-    video: VideoTrack,
+    video: Arc<VideoFanout>,
     handle: PipelineHandle,
     settings: StreamSettings,
 ) {
@@ -491,15 +549,17 @@ pub fn spawn_loop(
                 forward_settings.spf()
             };
             last_beat = Some(sample.beat);
-            match video.write_sample(sample.data, spf).await {
-                Ok(()) => {
-                    // #78: capture -> on the wire. The queue wait is included
-                    // on purpose; it is the only visible cost of a link that is
-                    // falling behind.
-                    let ms = sample.beat.elapsed().as_secs_f64() * 1000.0;
-                    bump(&send_stats, |s| s.send_timing.add(ms));
-                }
-                Err(err) => log::debug!("write_sample failed: {err:#}"),
+            // #101: one encode, N downlinks. `accepted` is how many tracks took
+            // the frame: zero means nobody is watching (the gate is START_VIDEO,
+            // not the sink count), and counting that as a send would report
+            // traffic that never left.
+            let accepted = video.write(sample.data, spf).await;
+            if accepted > 0 {
+                // #78: capture -> on the wire. The queue wait is included
+                // on purpose; it is the only visible cost of a link that is
+                // falling behind.
+                let ms = sample.beat.elapsed().as_secs_f64() * 1000.0;
+                bump(&send_stats, |s| s.send_timing.add(ms));
             }
         }
         log::debug!("sample forwarder exited");

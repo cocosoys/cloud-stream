@@ -240,7 +240,7 @@ video.write_sample(chunk.data, cfg.spf()).await?;
 | 输入注入 | C 组命令全部进 `NullInputSink::note_stub` 计数，不映射 keysym→VK、不调 enigo；`pointer` DC 空挂 | 阶段 2 输入面闭环 |
 | stream_info 真实后端 | 发 `StreamInfo::default()` 占位值；真实 gdi/显示名/码率未回填 | #37 联调 |
 | 日志轮转 | 文件固定落 `logs\stream-server.log`，`WriteMode::Direct`；无按大小/日期轮转与保留策略 | 阶段 4 服务化补齐（设计稿 9.2 #5） |
-| 多会话 / 多实例 | 单会话注册表顶号；循环句柄随会话生命周期创建与销毁 | 阶段 4 多实例调度 |
+| 多会话 / 多实例 | **已拆**：会话不再与管线一一对应。`PipelineRegistry` 按 `DisplayKey` 引用计数持有采集+编码程序，首个会话 `spawn_loop`，后续会话 `attach` 到同一 `VideoFanout`，最后一个离开才停；注册表只驱逐同 `client_tab_id` 的旧连接。仍是单进程单实例 | 多实例调度（多机/多屏各跑一套）仍待做 |
 | 内存/CPU 采样 | `Sampler` 首次 `refresh()` 只打 CPU 基线，首个 tick `cpu_usage()` 为 0（sysinfo 0.29.10 语义）；第二个 tick 起为可比值 | 阶段 3 面板冷启动展示口径微调 |
 
 ## 7. 编译口径与遗留 warning（非阻塞，勿当错误）

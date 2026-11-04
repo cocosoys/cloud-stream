@@ -47,7 +47,7 @@
 | # | 能力 | 状态 | 证据 |
 | --- | --- | --- | --- |
 | 1 | WS 信令握手（hello / session / sdp / ice）+ `_gz` 压缩协商 | ✅ | `signaling/line.rs`、`signaling/websession.rs` |
-| 2 | 服务端 offerer + ICE 双向 + 单会话接管（code 4001 驱逐旧页签） | ✅ | `websession.rs:61-79` |
+| 2 | 服务端 offerer + ICE 双向 + 会话登记（同页签重连驱逐，跨页签共存） | ✅ | `websession.rs`（`SessionRegistry`） |
 | 3 | DXGI 桌面复制（`no_hdr` 跳过探测、桌面重建恢复） | ✅ | `pipeline/capture.rs`、`stage1-capture-recovery.md` |
 | 4 | VP8 编码 → 分片 → RTP 写轨（有界队列 + 溢出丢帧求关键帧） | ✅ | `pipeline/mod.rs` `forward_chunks` |
 | 5 | 动态 fps / 分辨率 / 码率（`_arg_fps` / `r,WxH` / `vb,N`） | ✅ | `dispatch/commands.rs`、`pipeline/settings.rs` |
@@ -104,7 +104,7 @@
 | --- | --- | --- | --- |
 | 29 | 自动拉起游戏 + 全屏 + 自动进服 | ✅ | `C:\dev\mc\launch-remote.ps1`（`-Server/-Port/-Fullscreen`），schtasks `MCGame` /IT 进交互会话 |
 | 30 | 默认灵敏度三层固化（游戏 0.5 / 关加速 / gain 1.0） | ✅ | `mouse-sensitivity-default.md`、`start-mc.ps1` |
-| 31 | 单会话接管（第二个页签驱逐第一个） | ✅ | `websession.rs:70-78`，属策略非缺陷 |
+| 31 | 会话互斥（同页签重连驱逐旧 socket，跨页签共存） | ✅ | `websession.rs` `SessionRegistry::publish`：按 `client_tab_id` 比对，只踢同一页签的僵尸连接。多页面共享一条采集管线，首个为 `controller`，其余 `viewer` 只读。见 `pipeline/shared.rs` 与 `roadmap-multi-display-multi-input.md §5.1` |
 | 32 | 服务自恢复 | ✅ | #81 `0159076`：`MCStreamSrv` 改 `/SC MINUTE /MO 1` + `run-hidden.vbs` 隐藏宿主 + 单实例检查。实测 `taskkill` PID 1904 → 一分钟后 PID 7612 自起，当前跑的正是它 |
 | 33 | 鉴权 | 🟡 | **骨架已就位（#88）**：22 个监听面全部插桩，五处裁决点都在副作用之前（HTTP / 信令 / 控制通道 / 指针通道 / 麦克风），`--policy allow-all\|deny-all` 可切换，`deny-all` 实测三个入口全 403 且进程照常启动。**仍无 token**：`http/mod.rs:7` 明写 "no auth gate in stage1"，`config.rs` 无 `--token`，局域网内任何人打开 8080 即取得鼠标键盘。见 `listener-surface.md` |
 | 34 | 一键部署 | ✅ | #34 `toolchain/deploy.ps1` + `deploy-remote.ps1`：构建 → 上传 → 两端 MD5 → 停任务/禁用 → 备份 → 换文件 → 起任务 → 三重体检（HTTP 200 + 进程启动时间 + 日志 `listening on`）→ 失败自动回滚。实测两次全量部署各 48 s、一次 `-Rollback` 通过；`-Bootstrap` 顺带把 sshd 钉成自动启动。见 `deploy-one-click.md` |

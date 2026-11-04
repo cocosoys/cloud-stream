@@ -142,7 +142,17 @@ pub fn classify(line: &str) -> Action {
             }
         }
         "r" => {
-            match rest.split_once('x') {
+            // `r,<W>x<H>` from the WebRTC client, `r,<W>x<H>,<displayId>` from
+            // the multi-display one — the client sends the id on *every*
+            // resolution change once it is running one page per screen
+            // (`selkies-ws-core.js`). Splitting on the first `x` alone used to
+            // hand `"922,primary"` to `parse::<u32>()`, so every such request
+            // became `Action::Unknown` and the picture silently ignored it.
+            // Taking the geometry field first accepts both shapes; a stray third
+            // field is dropped here because routing it to a display is the
+            // pipeline registry's job, not the parser's.
+            let geometry = rest.split(',').next().unwrap_or("").trim();
+            match geometry.split_once('x') {
                 Some((w, h)) => match (w.trim().parse::<u32>(), h.trim().parse::<u32>()) {
                     (Ok(w), Ok(h)) if w > 0 && h > 0 => Action::SetResolution(w, h),
                     _ => Action::Unknown(line.to_owned()),
@@ -237,6 +247,34 @@ pub fn classify(line: &str) -> Action {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #102: the multi-display client sends `r,<W>x<H>,<displayId>` on every
+    /// resolution change. Splitting on the first `x` alone handed
+    /// `"922,primary"` to `parse::<u32>()`, so the whole line became `Unknown`
+    /// and the picture silently ignored the request — a bug that only appears
+    /// once a second page connects, i.e. exactly when it is hardest to notice.
+    #[test]
+    fn a_resolution_with_a_display_id_still_reaches_the_scaler() {
+        assert!(matches!(
+            classify("r,1714x922,primary"),
+            Action::SetResolution(1714, 922)
+        ));
+        assert!(matches!(
+            classify("r,1714x922,display2"),
+            Action::SetResolution(1714, 922)
+        ));
+        // The plain WebRTC shape must keep working unchanged.
+        assert!(matches!(classify("r,1280x720"), Action::SetResolution(1280, 720)));
+    }
+
+    /// A third field is not a licence to accept garbage: the geometry still has
+    /// to be two positive integers.
+    #[test]
+    fn a_broken_geometry_is_still_unknown_even_with_a_display_id() {
+        assert!(matches!(classify("r,1714,primary"), Action::Unknown(_)));
+        assert!(matches!(classify("r,0x922,primary"), Action::Unknown(_)));
+        assert!(matches!(classify("r,abcx922,display2"), Action::Unknown(_)));
+    }
 
     /// #92: `_rc,` / `_crf,` were in the ignored B group, which is why the
     /// panel's rate-control row and CRF slider could be dragged and changed
