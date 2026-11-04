@@ -47,6 +47,8 @@ use anyhow::{anyhow, Context, Result};
 use audiopus::coder::{Decoder, Encoder};
 use audiopus::{Application, Bitrate, Channels, SampleRate};
 use bytes::Bytes;
+use std::sync::Mutex;
+use tokio::sync::mpsc;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::{
     eConsole, eRender, IAudioCaptureClient, IAudioClient, IAudioRenderClient, IMMDeviceEnumerator,
@@ -316,20 +318,143 @@ impl Drop for Loopback {
 /// COM apartment + blocking waits mean this cannot be a tokio task; the async
 /// track write is bridged with `Handle::block_on` from the runtime that spawned
 /// us.
-pub fn spawn(track: AudioTrack, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
+///
+/// #108: the thread encodes **once** for every attached sink. Before this each
+/// session opened its own WASAPI loopback client and its own Opus encoder, so
+/// the second tab doubled the capture threads and the encoding cost for a
+/// bitstream that is identical by construction (same endpoint, same mix).
+pub fn spawn(fanout: Arc<AudioFanout>, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
     let handle = tokio::runtime::Handle::current();
     std::thread::Builder::new()
         .name("audio-loopback".to_owned())
         .spawn(move || {
-            if let Err(err) = run(track, stop, handle) {
+            if let Err(err) = run(fanout, stop, handle) {
                 log::warn!("audio downlink stopped: {err:#}");
             }
         })
         .expect("spawn audio-loopback thread")
 }
 
+/// One encoded audio frame's destinations, the audio twin of `VideoFanout`.
+///
+/// Two kinds of sink because the two transports want different things: a
+/// WebRTC viewer takes a `Sample` on its own track (RTP packetises it), while
+/// the WebSocket viewer takes the raw Opus packet and frames it itself
+/// (`[0x01, 0x00] + opus` on the wire). Encoding is shared, framing is not.
+pub struct AudioFanout {
+    tracks: Mutex<Vec<(AudioSinkId, AudioTrack)>>,
+    streams: Mutex<Vec<(AudioSinkId, mpsc::Sender<Bytes>)>>,
+    next: AtomicU64,
+}
+
+/// Identity of one attached downlink, so a teardown removes exactly its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AudioSinkId(pub u64);
+
+impl Default for AudioFanout {
+    fn default() -> Self {
+        Self {
+            tracks: Mutex::new(Vec::new()),
+            streams: Mutex::new(Vec::new()),
+            next: AtomicU64::new(0),
+        }
+    }
+}
+
+impl AudioFanout {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a WebRTC audio track. The caller keeps the id and detaches on
+    /// teardown; a track left behind receives frames for a peer connection that
+    /// is already gone.
+    pub fn attach(&self, track: AudioTrack) -> AudioSinkId {
+        let id = AudioSinkId(self.next.fetch_add(1, Ordering::Relaxed) + 1);
+        self.tracks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((id, track));
+        id
+    }
+
+    /// Add a raw-Opus downlink (#106's WebSocket transport). Bounded on
+    /// purpose: a socket slower than the 20 ms cadence must lose its own
+    /// frames, not grow a queue that turns into latency.
+    pub fn attach_stream(&self, tx: mpsc::Sender<Bytes>) -> AudioSinkId {
+        let id = AudioSinkId(self.next.fetch_add(1, Ordering::Relaxed) + 1);
+        self.streams
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((id, tx));
+        id
+    }
+
+    pub fn detach(&self, id: AudioSinkId) -> bool {
+        let removed = {
+            let mut guard = self.tracks.lock().unwrap_or_else(|p| p.into_inner());
+            let before = guard.len();
+            guard.retain(|(sink, _)| *sink != id);
+            guard.len() != before
+        };
+        if removed {
+            return true;
+        }
+        let mut guard = self.streams.lock().unwrap_or_else(|p| p.into_inner());
+        let before = guard.len();
+        guard.retain(|(sink, _)| *sink != id);
+        guard.len() != before
+    }
+
+    /// Whether anybody is listening. Used by the program lifecycle: audio
+    /// capture runs exactly as long as the program does, and no sink may be
+    /// left pointing at a closed track.
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.tracks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len()
+            + self.streams
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .len()
+    }
+
+    /// Hand one encoded packet to every sink. Blocking by design: this runs on
+    /// the audio thread, whose whole job is to keep a 20 ms cadence, and
+    /// `write_sample` only enqueues on the track's internal channel.
+    fn write(&self, data: Bytes, handle: &tokio::runtime::Handle) {
+        let tracks: Vec<(AudioSinkId, AudioTrack)> = {
+            let guard = self.tracks.lock().unwrap_or_else(|p| p.into_inner());
+            guard.iter().map(|(id, t)| (*id, t.clone())).collect()
+        };
+        for (id, track) in tracks {
+            if let Err(err) = handle
+                .block_on(track.write_sample(data.clone(), Duration::from_millis(FRAME_MS as u64)))
+            {
+                log::debug!("audio sink {}: write_sample failed: {err}", id.0);
+            }
+        }
+        // Copied out so the lock is not held across `try_send`.
+        let streams: Vec<(AudioSinkId, mpsc::Sender<Bytes>)> = {
+            let guard = self.streams.lock().unwrap_or_else(|p| p.into_inner());
+            guard.iter().map(|(id, tx)| (*id, tx.clone())).collect()
+        };
+        for (id, tx) in streams {
+            match tx.try_send(data.clone()) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    log::debug!("audio sink {} is behind, one frame dropped", id.0);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {}
+            }
+        }
+    }
+}
+
 fn run(
-    track: AudioTrack,
+    fanout: Arc<AudioFanout>,
     stop: Arc<AtomicBool>,
     handle: tokio::runtime::Handle,
 ) -> Result<()> {
@@ -391,7 +516,7 @@ fn run(
                 log::debug!("avsync: dropped one audio frame (audio was ahead of video)");
             }
             Fix::Advance => {
-                emit_frame(&mut encoder, &mut opus_buf, &silence, &track, &handle)?;
+                emit_frame(&mut encoder, &mut opus_buf, &silence, &fanout, &handle)?;
                 log::debug!("avsync: emitted one extra silence frame (audio was behind video)");
             }
             _ => {}
@@ -403,7 +528,7 @@ fn run(
             // Muted: the clock keeps running (same frames, same 20 ms cadence),
             // only the payload becomes silence.
             let payload: &[i16] = if now_enabled { &frame } else { &silence };
-            emit_frame(&mut encoder, &mut opus_buf, payload, &track, &handle)?;
+            emit_frame(&mut encoder, &mut opus_buf, payload, &fanout, &handle)?;
         }
     }
     Ok(())
@@ -419,7 +544,7 @@ fn emit_frame(
     encoder: &mut Encoder,
     opus_buf: &mut [u8],
     payload: &[i16],
-    track: &AudioTrack,
+    fanout: &AudioFanout,
     handle: &tokio::runtime::Handle,
 ) -> Result<()> {
     let n = encoder
@@ -432,11 +557,7 @@ fn emit_frame(
     ENCODED_BYTES.fetch_add(n as u64, Ordering::Relaxed);
     CAPTURED_FRAMES.fetch_add(1, Ordering::Relaxed);
     let data = Bytes::copy_from_slice(&opus_buf[..n]);
-    if let Err(err) =
-        handle.block_on(track.write_sample(data, Duration::from_millis(FRAME_MS as u64)))
-    {
-        log::debug!("audio write_sample: {err}");
-    }
+    fanout.write(data, handle);
     avsync::note_audio(Duration::from_millis(FRAME_MS as u64));
     Ok(())
 }
@@ -696,5 +817,54 @@ fn push_frame(pcm: &mut VecDeque<i16>, decoded: &[i16], samples_per_channel: usi
     let end = samples_per_channel * CHANNELS as usize;
     if end <= decoded.len() {
         pcm.extend(decoded[..end].iter().copied());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #108：一条编码结果要能同时到达多个下行，且 detach 只摘掉自己的那一个。
+    ///
+    /// 这条测试刻意只挂 stream sink：`attach(track)` 需要一条真的
+    /// `TrackLocalStaticSample`，而写 track 又要一个运行中的 `PeerConnection`
+    /// 才有意义。流的路径才是这次改造真正新增的那一半。
+    #[tokio::test]
+    async fn one_encoded_frame_reaches_every_attached_sink() {
+        let fanout = AudioFanout::new();
+        let (tx_a, mut rx_a) = mpsc::channel(4);
+        let (tx_b, mut rx_b) = mpsc::channel(4);
+        let a = fanout.attach_stream(tx_a);
+        let b = fanout.attach_stream(tx_b);
+        assert_eq!(fanout.len(), 2);
+
+        fanout.write(Bytes::from_static(&[0xaa, 0xbb]), &tokio::runtime::Handle::current());
+
+        assert_eq!(rx_a.recv().await.unwrap().as_ref(), &[0xaa, 0xbb]);
+        assert_eq!(rx_b.recv().await.unwrap().as_ref(), &[0xaa, 0xbb]);
+
+        assert!(fanout.detach(a));
+        assert_eq!(fanout.len(), 1);
+        assert!(!fanout.detach(a), "第二次摘同一个 id 是无操作，不是错误");
+
+        fanout.write(Bytes::from_static(&[0xcc]), &tokio::runtime::Handle::current());
+        assert_eq!(rx_b.recv().await.unwrap().as_ref(), &[0xcc]);
+        assert!(rx_a.recv().await.is_none(), "摘掉的 sink 不再收到任何东西");
+        assert!(fanout.detach(b), "b 仍然挂着，摘它必须成功");
+        assert_eq!(fanout.len(), 0);
+    }
+
+    /// 队列满时丢的是**这一帧**，而不是把发送方堵死：音频线程必须保持 20 ms
+    /// 的节奏，一个慢 socket 不能拖住整条链路。
+    #[tokio::test]
+    async fn a_full_sink_drops_its_frame_instead_of_blocking_the_encoder() {
+        let fanout = AudioFanout::new();
+        let (tx, _rx) = mpsc::channel(1);
+        fanout.attach_stream(tx);
+        let handle = tokio::runtime::Handle::current();
+        // 第一条进队，第二、三条必然落空；`write` 仍然返回。
+        for _ in 0..3 {
+            fanout.write(Bytes::from_static(&[1, 2, 3]), &handle);
+        }
     }
 }

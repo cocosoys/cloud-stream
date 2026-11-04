@@ -664,7 +664,7 @@ where
                 accept_hdr_async(prefixed, |_req: &Request, resp: Response| Ok(resp))
                     .await
                     .map_err(|err| anyhow!("websockets upgrade failed: {err}"))?;
-            crate::http::ws_media::run(ws, cfg, pipelines, permit, peer, credential).await?;
+            crate::http::ws_media::run(ws, cfg, registry.clone(), pipelines, permit, peer, credential).await?;
         }
 
         crate::http::Route::Static(rel) => {

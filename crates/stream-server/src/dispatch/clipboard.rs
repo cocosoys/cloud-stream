@@ -269,6 +269,40 @@ pub fn read_clipboard_update() -> Vec<String> {
     clipboard_messages("text/plain", b"")
 }
 
+/// 同一份主机剪贴板，按 **WebSocket 传输** 的语法编码（#106）。
+///
+/// 两条传输的下行消息族不一样，这是前端决定的：WebRTC 数据通道吃
+/// `clipboard-msg*` JSON（见上），WS 页面吃 `clipboard,<b64>` /
+/// `clipboard_binary,<mime>,<b64>`（`selkies-ws-core.js` 的
+/// `incomingClipboard.single(...)` 调用点）。发错家族不会报错——页面只是永远
+/// 拿不到内容，而服务端日志显示"已经回答过了"。
+///
+/// 单条消息而不是分片：WS 没有 SCTP 那个 64 KiB 的帧上限，页面也能直接解
+/// 一整块 base64。分片家族（`clipboard_start/data/finish`）留给将来真需要
+/// 流式写入大图的时候。
+pub fn read_clipboard_ws_messages() -> Vec<String> {
+    if let Some(text) = read_text().filter(|t| !t.is_empty()) {
+        return vec![format!("clipboard,{}", b64(text.as_bytes()))];
+    }
+    if let Some(dib) = read_dib() {
+        if let Some(bmp) = clipboard_image::dib_to_bmp(&dib) {
+            log::info!(
+                "clipboard (ws): image answered ({} bytes DIB -> {} bytes BMP)",
+                dib.len(),
+                bmp.len()
+            );
+            return vec![format!("clipboard_binary,image/bmp,{}", b64(&bmp))];
+        }
+        log::warn!(
+            "clipboard (ws): CF_DIB present but not convertible ({} bytes)",
+            dib.len()
+        );
+    }
+    log::debug!("clipboard (ws): no text or bitmap on the host clipboard");
+    // 空文本就是"没有可粘贴的东西"，页面收到会清掉本地预览而不是卡住。
+    vec!["clipboard,".to_owned()]
+}
+
 impl ClipboardSink {
     /// Parse one uplink line. Chunks accumulate until the transfer's end message
     /// lands, then the assembled payload is written to the host clipboard.

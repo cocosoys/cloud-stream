@@ -58,6 +58,18 @@ def read_frame(sock):
     return fin, opcode, payload
 
 
+def send_text(sock, text):
+    """一个客户端必须掩码的文本帧（RFC 6455 5.3）。只用于短命令。"""
+    payload = text.encode()
+    mask = os.urandom(4)
+    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    if len(payload) < 126:
+        header = bytes([0x81, 0x80 | len(payload)])
+    else:
+        header = bytes([0x81, 0x80 | 126]) + struct.pack(">H", len(payload))
+    sock.sendall(header + mask + masked)
+
+
 def main():
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
@@ -93,11 +105,16 @@ def main():
     if f"sec-websocket-accept: {expect}".lower() not in head.decode(errors="replace").lower():
         fail("accept header mismatch")
 
+    # 连接建立时的只读剪贴板请求。服务端必须回 `clipboard_reply,cr` —— 页面的
+    # `taggedClipboardFetch` 靠它结束等待；不回只是"剪贴板永远空着"，不报错。
+    send_text(sock, "cr")
+
     text_seen = []
     frames = 0
     last_id = None
     ids_ok = True
     keyed = 0
+    audio = 0
     while frames < WANT_FRAMES:
         fin, opcode, payload = read_frame(sock)
         if opcode == 0x1:
@@ -112,10 +129,17 @@ def main():
             fail(f"server closed before any frame: {payload!r}")
         if opcode != 0x2:
             continue
-        if len(payload) < 12:
-            fail(f"binary frame shorter than the 12-byte header: {len(payload)}")
 
         ftype = payload[0]
+        # 0x01 是音频（`[0x01, 0x00] + opus`）：同一个 socket 上混着走，不能
+        # 因为"长度不足 12 字节的头"就判失败。
+        if ftype == 0x01:
+            audio += 1
+            if len(payload) < 3:
+                fail(f"audio frame without an Opus packet: {len(payload)} B")
+            continue
+        if len(payload) < 12:
+            fail(f"video frame shorter than the 12-byte header: {len(payload)}")
         type_byte = payload[1]
         codec = WIRE_CODECS.get(type_byte >> 4, f"?{type_byte >> 4}")
         is_key = (type_byte & 0x0F) == 0x01
@@ -136,8 +160,8 @@ def main():
             f"frame#{frames}: type=0x{ftype:02x} codec={codec} key={int(is_key)} "
             f"id={frame_id} y={y} {w}x{h} ref={ref} payload={body}B fin={int(bool(fin))}"
         )
-        if ftype != 0x01:
-            fail(f"unexpected frame type 0x{ftype:02x}, expected 0x01 (full frame)")
+        if ftype != 0x04:
+            fail(f"unexpected video frame type 0x{ftype:02x}, expected 0x04 (full frame)")
         if codec not in ("vp8", "vp9"):
             fail(f"unexpected codec {codec}")
         if y != 0:
@@ -154,12 +178,14 @@ def main():
         fail("no MODE websockets before the frames")
     if not any('"server_settings"' in t for t in text_seen):
         fail("no server_settings payload")
+    if "clipboard_reply,cr" not in text_seen:
+        fail("no clipboard_reply,cr answer to the connect-time `cr`")
     if not ids_ok:
         fail("frame ids are not contiguous")
     if keyed == 0:
         fail("no keyframe in the window — first frame must be a decode entry point")
 
-    print(f"RESULT ok frames={frames} keyframes={keyed} text={len(text_seen)}")
+    print(f"RESULT ok frames={frames} keyframes={keyed} audio={audio} text={len(text_seen)}")
     sock.close()
 
 

@@ -60,18 +60,33 @@ use tokio_tungstenite::{
     WebSocketStream,
 };
 
-use crate::config::Config;
+use crate::config::{Config, InputPolicy};
+use crate::dispatch::clipboard::ClipboardSink;
+use crate::dispatch::commands::{classify, Action};
+use crate::dispatch::input_stub::InputSink;
+use crate::dispatch::win_input::WinInputSink;
 use crate::pipeline::codec::{self, VideoCodec};
-use crate::pipeline::shared::DisplayKey;
-use crate::pipeline::{PipelineRegistry, StreamSettings};
-use crate::signaling::websession::AdmissionPermit;
+use crate::pipeline::shared::{DisplayKey, SharedPipeline};
+use crate::pipeline::{audio, PipelineRegistry, StreamSettings};
+use crate::signaling::websession::{
+    apply_settings_batch, AdmissionPermit, SessionInfo, SessionRegistry,
+};
 
 /// 12 字节头 + 裸码流。
 pub const HEADER_LEN: usize = 12;
 
-/// 帧类型字节：整帧。前端 `onWire` 只把 `0x03`/`0x04` 当分行模式，别的值一律按
-/// 整帧 12 字节头处理。
-const TYPE_FULL_FRAME: u8 = 0x01;
+/// 帧类型字节：整帧。
+///
+/// **必须是 `0x04`，不是 `0x01`。** 前端的分流发生在 socket worker 里，比视频
+/// worker 的 `onWire` 更早：`0x01` 一律当 Opus 音频丢给解码器，`0x03`/`0x04`
+/// 才进视频 worker（`selkies-ws-core.js` 的 "0x01 goes straight down a port to
+/// the decoder" 与 `t === 0x03 || (t === 0x04 && d.byteLength > 10)`）。用 `0x01`
+/// 的后果不是黑屏，而是把 H.264/VP8 码流当 Opus 解——页面上既没有画面，控制台
+/// 还会报一串音频解码错误。`0x04` 之后仍沿用同一套 12 字节头。
+const TYPE_FULL_FRAME: u8 = 0x04;
+
+/// 服务端音频帧：`[0x01, 0x00] + opus`（`n_red = 0` 的简单路径）。
+const TYPE_AUDIO: u8 = 0x01;
 
 /// 下行队列的深度。四帧 ≈ 60fps 下 67 ms 的缓冲：够吸收一次调度抖动，又不至于
 /// 让"观众慢"变成"画面滞后"。
@@ -126,6 +141,19 @@ pub fn wire_frame(
     out.freeze()
 }
 
+/// 服务端音频帧：`[0x01, 0x00] + opus`。
+///
+/// 第二个字节是前端的 `AUDIO_QUIET` 标志位与 RED 计数：`0x00` 表示"没有冗余、
+/// 这是一个普通帧"。前端 `extractOpusFrames` 在 `n_red == 0` 时直接
+/// `slice(2)` 当 Opus 解，所以这两个字节是全部的头。
+pub fn wire_audio(opus: &Bytes) -> Bytes {
+    let mut out = BytesMut::with_capacity(2 + opus.len());
+    out.put_u8(TYPE_AUDIO);
+    out.put_u8(0);
+    out.put_slice(opus);
+    out.freeze()
+}
+
 /// `server_settings` 在两条传输上的形状不一样，这是必须记住的一处差异。
 ///
 /// WebRTC 走数据通道，格式是 `{"type":...,"data":{"settings":{...}}}`（前端
@@ -163,9 +191,14 @@ fn auth_frame(credential: crate::security::Credential) -> String {
 ///
 /// `peer` 与 `credential` 只用于日志与 `AUTH_SUCCESS`：策略裁决在 `server.rs`
 /// 升级之前就做完了，这里不该再做一次（两处判定迟早会不一致）。
+///
+/// #106 之后这条连接不再只是"只读画面"：输入、剪贴板、音频都从同一个 socket
+/// 走（文本是命令，二进制是帧），因为前端 `selkies-ws-core.js` 本来就是这么发
+/// 的——服务端缺的只是接收端。WebRTC 与它共用同一条采集/编码程序。
 pub async fn run<S>(
     ws: WebSocketStream<S>,
     cfg: Arc<Config>,
+    registry: SessionRegistry,
     pipelines: PipelineRegistry,
     // 只为 Drop：这个许可代表这个进程里的一个会话名额，连接结束时自动归还。
     // 不 `use` 它是有意的 —— 它的价值就是活得和这条连接一样长。
@@ -201,14 +234,43 @@ where
 
     // 网关打开，编码器开始出帧。
     pipeline.handle.start();
+    // #106: 这条连接也是 health 里的一个客户端。不登记的话，"谁在占带宽"只剩
+    // `pipelines[].downlinks` 一个数字，而 `clients` 里一个 WS 观众都看不到。
+    let session_id = registry
+        .register_media(SessionInfo {
+            peer_ip: peer.to_string(),
+            client_type: "websocket".to_owned(),
+            connected_at: Some(std::time::Instant::now()),
+            display: Some(pipeline.display.0),
+            ..Default::default()
+        })
+        .await;
+    // 输入租约：空着就认领。`shared` 策略下这一步不影响能不能操作，但 `health`
+    // 的 `role` 与 `session/take` 都以租约为准，空着会让 WS 会话永远显示 viewer。
+    pipeline.try_claim_controller(session_id);
+
     let (tx, mut rx) = mpsc::channel::<Bytes>(QUEUE);
     let sink_handle = pipeline.video.attach_stream(tx);
+    let denied = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    registry
+        .set_downlink(session_id, pipeline.display, sink_handle.counters(), denied.clone())
+        .await;
     // 观众刚到，手上没有任何参考帧：不主动要一个关键帧，他要到下一个周期性的
     // 才能出画面（默认 10 s）。这和 `SharedPipeline::attach(track, joining=true)`
     // 是同一条理由。
     pipeline.handle.request_keyframe();
+
+    // 音频：与视频同构，程序只有一条 loopback，这里挂一个裸 Opus 下行。
+    let (audio_tx, mut audio_rx) = mpsc::channel::<Bytes>(8);
+    let audio_sink = pipeline.audio.attach_stream(audio_tx);
+
+    // 输入与剪贴板都是纯软件对象，创建成本可以忽略；`WinInputSink` 持有自己的
+    // 按钮/滚轮/按键状态，所以必须每会话一个，不能全局共享。
+    let input = WinInputSink::new(pipeline.settings.clone());
+    let clipboard = ClipboardSink::default();
+
     log::info!(
-        "ws media: {peer} attached ({} downlink(s), codec {:?}, queue {QUEUE})",
+        "ws media: {peer} attached as session {session_id} ({} downlink(s), codec {:?}, queue {QUEUE})",
         pipeline.video.len(),
         codec_now
     );
@@ -243,6 +305,17 @@ where
                     if !streaming {
                         continue;
                     }
+                    // 编码器是全局单例，面板切 VP8/VP9 会重建它。这条连接手里
+                    // 缓存的 `codec_now` 立刻过期，继续按旧编号发帧等于让浏览器
+                    // 用错误的解码器解新码流。关掉让它重连，重连时会读到新值。
+                    if codec::current() != codec_now {
+                        log::info!(
+                            "ws media: codec changed {} -> {}; closing so the page reconnects",
+                            codec_now.wire(),
+                            codec::current().wire()
+                        );
+                        break;
+                    }
                     let key = is_keyframe(&latest, codec_now);
                     if need_key && !key {
                         continue;
@@ -276,46 +349,42 @@ where
                     sink.send(Message::Binary(packet)).await?;
                 }
 
+                // #106: 音频帧。`[0x01, 0x00] + opus` 是前端 `extractOpusFrames`
+                // 的 `n_red == 0` 路径；第二个字节的 0x80 是"静音闸门关闭"的标记，
+                // 这里不启用（静音由服务端发静音帧表达）。
+                frame = audio_rx.recv() => {
+                    let Some(opus) = frame else { continue };
+                    sink.send(Message::Binary(wire_audio(&opus))).await?;
+                }
+
                 msg = source.next() => {
                     match msg {
                         Some(Ok(Message::Text(line))) => {
                             let line = line.as_str().trim();
-                            match line {
-                                "START_VIDEO" => {
-                                    streaming = true;
-                                    need_key = true;
-                                    pipeline.handle.start();
-                                    pipeline.handle.request_keyframe();
-                                    log::info!("ws media: START_VIDEO");
-                                }
-                                // 页签切到后台。不关管线（可能还有 WebRTC 观众），
-                                // 只是不再往这条连接上写。
-                                "STOP_VIDEO" => {
-                                    streaming = false;
-                                    log::info!("ws media: STOP_VIDEO");
-                                }
-                                "KEYFRAME" | "REQUEST_KEYFRAME" => {
-                                    need_key = true;
-                                    pipeline.handle.request_keyframe();
-                                }
-                                other => {
-                                    // 输入、剪贴板、音频的指令都会落到这里。这一版
-                                    // 只做只读画面，收到就记一行 debug —— 静默丢弃
-                                    // 会让"为什么点了没反应"变成没法回答的问题。
-                                    if let Some(kbps) = other.strip_prefix("vb,").and_then(|v| v.trim().parse::<u32>().ok()) {
-                                        pipeline.handle.set_bitrate_override(kbps);
-                                        log::info!("ws media: bitrate override {kbps} kbps");
-                                    } else {
-                                        log::debug!("ws media: ignoring upstream `{}`", short(other));
-                                    }
-                                }
-                            }
+                            handle_text(
+                                line,
+                                &pipeline,
+                                &input,
+                                &clipboard,
+                                &mut sink,
+                                &mut streaming,
+                                &mut need_key,
+                                &denied,
+                                session_id,
+                            )
+                            .await?;
                         }
                         Some(Ok(Message::Close(frame))) => {
                             log::info!("ws media: client closed ({:?})", frame.map(|f| f.code));
                             break;
                         }
-                        // 二进制上行（剪贴板图片、摄像头）这一版一概不接。
+                        // 二进制上行：麦克风 `0x02`、摄像头 `0x06`。这两条这条
+                        // 服务端都还没有接收端（麦克风走 WebRTC 的 track，摄像头
+                        // 全项目未实现），记一行 debug 而不是静默吞掉。
+                        Some(Ok(Message::Binary(data))) => {
+                            let kind = data.first().copied().unwrap_or(0);
+                            log::debug!("ws media: binary upstream type {kind:#04x} ignored ({} B)", data.len());
+                        }
                         Some(Ok(_)) => {}
                         Some(Err(err)) => {
                             log::debug!("ws media: socket error: {err}");
@@ -330,7 +399,11 @@ where
     }
     .await;
 
+    // 松开所有还按着的键：页面崩掉不会发 `kr`，而被控机上按键是全局状态。
+    input.reset();
+    pipeline.audio.detach(audio_sink);
     pipeline.detach(sink_handle.id());
+    registry.remove(session_id).await;
     // 不能漏：`acquire` 加了一次引用，最后一个走的负责停掉采集循环。
     pipelines.release(DisplayKey::PRIMARY).await;
     log::info!(
@@ -347,6 +420,139 @@ where
         })))
         .await;
     outcome
+}
+
+/// 一条上行文本命令。
+///
+/// 走的是**和 WebRTC 数据通道同一套动词**（`lib/input.js` 两边共用），所以分类
+/// 直接复用 `dispatch::commands::classify`，不另写一份解析器 —— 两份解析器迟早
+/// 会对同一个动词给出不同答案。
+#[allow(clippy::too_many_arguments)]
+async fn handle_text<S>(
+    line: &str,
+    pipeline: &Arc<SharedPipeline>,
+    input: &WinInputSink,
+    clipboard: &ClipboardSink,
+    sink: &mut futures_util::stream::SplitSink<WebSocketStream<S>, Message>,
+    streaming: &mut bool,
+    need_key: &mut bool,
+    denied: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    session_id: u64,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    // 这几个不是 `classify` 的动词：前端在 WS 上有自己的确认/节流家族。
+    match line {
+        "KEYFRAME" | "REQUEST_KEYFRAME" => {
+            *need_key = true;
+            pipeline.handle.request_keyframe();
+            return Ok(());
+        }
+        // 连接建立时的"只读缓存"剪贴板请求：先应答再给载荷，页面的
+        // `taggedClipboardFetch` 靠这条 `clipboard_reply,cr` 结束等待。
+        "cr" => {
+            send_text(sink, "clipboard_reply,cr".to_owned()).await?;
+            for msg in crate::dispatch::clipboard::read_clipboard_ws_messages() {
+                send_text(sink, msg).await?;
+            }
+            return Ok(());
+        }
+        // 帧确认/解码节奏/多屏布局都是浏览器侧的节流信息；服务端这一版不据此
+        // 调速（`vb,` 才是码率入口），记 debug 不当作错误。
+        _ if line.starts_with("LOST_FRAME")
+            || line.starts_with("DECODE_PACE")
+            || line.starts_with("CLIENT_FRAME_ACK")
+            || line.starts_with("vp,") =>
+        {
+            log::debug!("ws media: `{}` noted", short(line));
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    match classify(line) {
+        Action::StartVideo => {
+            *streaming = true;
+            *need_key = true;
+            pipeline.handle.start();
+            pipeline.handle.request_keyframe();
+            log::info!("ws media: START_VIDEO");
+        }
+        Action::StopVideo => {
+            *streaming = false;
+            log::info!("ws media: STOP_VIDEO");
+        }
+        Action::SetFps(fps) => {
+            pipeline.settings.set_fps(fps);
+            log::info!("ws media: fps -> {}", pipeline.settings.fps());
+        }
+        Action::SetResolution(w, h) => {
+            pipeline.settings.set_resolution(w, h);
+            log::info!("ws media: resolution -> {w}x{h}");
+        }
+        Action::SetBitrate(kbps) => {
+            pipeline.handle.set_bitrate_override(kbps);
+            log::info!("ws media: bitrate override {kbps} kbps");
+        }
+        Action::SetAudioOn(on) => {
+            audio::set_enabled(on);
+            log::info!("ws media: audio {}", if on { "on" } else { "off" });
+        }
+        Action::SetAudioBitrate(bps) => {
+            audio::set_bitrate_bps(bps as i32);
+            log::info!("ws media: audio bitrate -> {} bps", audio::current_bitrate_bps());
+        }
+        Action::SetNativeCursorRendering(on) => {
+            pipeline.handle.set_cursor_inject(on);
+            log::info!("ws media: native cursor rendering -> {on}");
+        }
+        Action::SetSettings(payload) => {
+            // 与信令会话共用同一个批处理：两套解析会把同一个 SETTINGS 解成两种
+            // 结果，而面板只会相信自己那一路。
+            if let Some(codec) = apply_settings_batch(&pipeline.settings, &payload) {
+                // 这条连接这次不重连就没有意义了：帧头里的 codec 是启动时缓存的。
+                log::info!("ws media: codec -> {}; closing for renegotiation", codec.wire());
+                return Err(anyhow::anyhow!("video codec changed"));
+            }
+            if let Some(settings) = settings_frame(&pipeline.settings) {
+                send_text(sink, settings).await?;
+            }
+        }
+        Action::ClipboardRequest => {
+            for msg in crate::dispatch::clipboard::read_clipboard_ws_messages() {
+                send_text(sink, msg).await?;
+            }
+        }
+        Action::ClipboardChunk(raw) => clipboard.handle_line(&raw),
+        Action::InputStub(raw) => {
+            // 租约与 WebRTC 一侧同一套语义：`shared` 谁都能操作，`exclusive`
+            // 只有租约持有者。拒绝要计数，否则"指针不动"永远分不清是没到还是
+            // 被门挡了。
+            let may = match pipeline.input_policy() {
+                InputPolicy::Shared => true,
+                InputPolicy::Exclusive => pipeline.controller_id() == Some(session_id),
+            };
+            if may {
+                input.handle_line(&raw);
+            } else {
+                denied.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        other => log::debug!("ws media: ignoring `{:?}`", other),
+    }
+    Ok(())
+}
+
+async fn send_text<S>(
+    sink: &mut futures_util::stream::SplitSink<WebSocketStream<S>, Message>,
+    text: String,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    sink.send(Message::Text(text.into())).await?;
+    Ok(())
 }
 
 /// `POST /api/switch` —— 前端模式菜单用的入口（`lib/mode-switch.js:43`）。
@@ -445,7 +651,8 @@ mod tests {
         let pkt = wire_frame(&data, VideoCodec::Vp8, true, 0x1234, 0x1233, 1920, 1080);
         assert_eq!(pkt.len(), HEADER_LEN + data.len());
 
-        assert_eq!(pkt[0], 0x01, "整帧类型");
+        // 0x04，不是 0x01：socket worker 把 0x01 当音频，视频只认 0x03/0x04。
+        assert_eq!(pkt[0], 0x04, "整帧类型必须走视频分支");
         assert_eq!(pkt[1], 0x21, "VP8(2)<<4 | key(1)");
         assert_eq!(&pkt[2..4], &[0x12, 0x34], "frameId 大端");
         assert_eq!(&pkt[4..6], &[0, 0], "y 恒零");
@@ -453,6 +660,14 @@ mod tests {
         assert_eq!(&pkt[8..10], &[0x04, 0x38], "1080");
         assert_eq!(&pkt[10..12], &[0x12, 0x33], "reference 是上一帧");
         assert_eq!(&pkt[HEADER_LEN..], &data[..], "payload 原样不动");
+    }
+
+    #[test]
+    fn audio_frames_are_the_two_byte_header_the_page_slices_off() {
+        let opus = Bytes::from_static(&[0xfc, 0x01, 0x02]);
+        let pkt = wire_audio(&opus);
+        assert_eq!(&pkt[..2], &[0x01, 0x00], "类型 0x01 + n_red=0");
+        assert_eq!(&pkt[2..], &opus[..], "Opus 原样跟在头后面");
     }
 
     #[test]

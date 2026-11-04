@@ -33,6 +33,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::config::{Config, InputPolicy};
+use crate::pipeline::audio::AudioFanout;
 use crate::pipeline::fanout::{SinkHandle, SinkId, VideoFanout};
 use crate::pipeline::{PipelineHandle, PipelineSnapshot, StreamSettings};
 use crate::webrtc::VideoTrack;
@@ -73,6 +74,11 @@ pub struct SharedPipeline {
     pub settings: StreamSettings,
     /// The downlinks. Attach on join, detach on leave.
     pub video: Arc<VideoFanout>,
+    /// #108: the audio downlinks. One loopback capture + one Opus encode feeds
+    /// every attached track and every socket, exactly like `video` above.
+    pub audio: Arc<AudioFanout>,
+    /// Set when the program is torn down; the audio thread polls it.
+    audio_stop: Arc<std::sync::atomic::AtomicBool>,
     refs: AtomicUsize,
     /// Whether some session has claimed the 1 Hz stats window for this program.
     /// The counters are reset by the window's owner, so a second ticker would
@@ -242,6 +248,8 @@ impl SharedPipeline {
             handle,
             settings,
             video: Arc::new(VideoFanout::new()),
+            audio: Arc::new(AudioFanout::new()),
+            audio_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             refs: AtomicUsize::new(1),
             stats_owner: AtomicBool::new(false),
             last_snapshot: Mutex::new(None),
@@ -290,11 +298,19 @@ impl PipelineRegistry {
         let handle = PipelineHandle::new();
         let video = Arc::new(VideoFanout::new());
         start_program(cfg, &video, &handle, &settings);
+        // #108: one loopback for the whole program. It starts with the program
+        // (the first `Connected`) and stops with the last holder, so a second
+        // viewer adds a sink rather than a second WASAPI client and encoder.
+        let audio = Arc::new(AudioFanout::new());
+        let audio_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        start_audio(&audio, &audio_stop);
         let entry = Arc::new(SharedPipeline {
             display,
             handle,
             settings,
             video,
+            audio,
+            audio_stop,
             refs: AtomicUsize::new(1),
             stats_owner: AtomicBool::new(false),
             last_snapshot: Mutex::new(None),
@@ -321,6 +337,7 @@ impl PipelineRegistry {
         if live <= 1 {
             guard.remove(&display);
             entry.handle.stop_loop();
+            entry.audio_stop.store(true, Ordering::SeqCst);
             log::info!(
                 "pipeline {}: last session left, capture loop stopped",
                 display.0
@@ -379,6 +396,16 @@ fn start_program(
 ) {
     spawn_loop(cfg.clone(), video.clone(), handle.clone(), settings.clone());
 }
+
+/// Start the shared audio downlink (production only — a unit test must not open
+/// the console session's audio endpoint, and the thread outlives the test).
+#[cfg(not(test))]
+fn start_audio(audio: &Arc<AudioFanout>, stop: &Arc<std::sync::atomic::AtomicBool>) {
+    crate::pipeline::audio::spawn(audio.clone(), stop.clone());
+}
+
+#[cfg(test)]
+fn start_audio(_audio: &Arc<AudioFanout>, _stop: &Arc<std::sync::atomic::AtomicBool>) {}
 
 #[cfg(test)]
 fn start_program(
@@ -466,6 +493,8 @@ mod tests {
             handle: PipelineHandle::new(),
             settings: StreamSettings::from_config(&cfg()),
             video: Arc::new(VideoFanout::new()),
+            audio: Arc::new(AudioFanout::new()),
+            audio_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             refs: AtomicUsize::new(1),
             stats_owner: AtomicBool::new(false),
             last_snapshot: Mutex::new(None),
@@ -488,6 +517,8 @@ mod tests {
             handle: PipelineHandle::new(),
             settings: StreamSettings::from_config(&cfg()),
             video: Arc::new(VideoFanout::new()),
+            audio: Arc::new(AudioFanout::new()),
+            audio_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             refs: AtomicUsize::new(1),
             stats_owner: AtomicBool::new(false),
             last_snapshot: Mutex::new(None),

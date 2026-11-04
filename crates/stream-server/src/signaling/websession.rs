@@ -189,6 +189,41 @@ impl SessionRegistry {
         log::info!("session {id} registered ({} live)", guard.len());
     }
 
+    /// #106: register a non-signaling session — the `/api/websockets` media
+    /// socket. Same table as the signaling sessions so `health` reports one list
+    /// of live clients instead of two half-truths.
+    ///
+    /// The close-notice sender is kept but never used: WS media sessions are not
+    /// evicted by tab id (`kick` still reaches them through `remove`). Dropping
+    /// the receiver is harmless — `notice.send` would just fail and be ignored.
+    pub async fn register_media(&self, info: SessionInfo) -> u64 {
+        let id = self.next_session_id();
+        let (notice, _notice_rx) = mpsc::unbounded_channel::<CloseNotice>();
+        let mut guard = self.inner.lock().await;
+        guard.insert(
+            id,
+            LiveSession {
+                notice,
+                info: SessionInfo { id, ..info },
+            },
+        );
+        log::info!("media session {id} registered ({} live)", guard.len());
+        id
+    }
+
+    /// Update the identity fields a WS page sends in its first `SETTINGS` batch.
+    pub async fn update_meta(&self, id: u64, tab_id: &str, device_id: &str) {
+        let mut guard = self.inner.lock().await;
+        if let Some(live) = guard.get_mut(&id) {
+            if !tab_id.is_empty() {
+                live.info.tab_id = tab_id.to_owned();
+            }
+            if !device_id.is_empty() {
+                live.info.device_id = device_id.to_owned();
+            }
+        }
+    }
+
     /// Allocate the id this session publishes under.
     fn next_session_id(&self) -> u64 {
         self.next_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
@@ -256,7 +291,7 @@ impl SessionRegistry {
     }
 
     /// Drop this session's entry on teardown.
-    async fn remove(&self, id: u64) {
+    pub async fn remove(&self, id: u64) {
         let mut guard = self.inner.lock().await;
         if guard.remove(&id).is_some() {
             log::info!("session {id} unregistered ({} live)", guard.len());
@@ -440,6 +475,8 @@ struct Attachment {
     shared: Option<Arc<SharedPipeline>>,
     /// This session's downlink slot in the program's fan-out.
     sink: Option<SinkHandle>,
+    /// #108: this session's audio slot in the program's shared downlink.
+    audio: Option<crate::pipeline::audio::AudioSinkId>,
     /// Input messages the role gate refused, published to the registry so the
     /// health endpoint can tell "refused" from "never arrived" (#103).
     denied: Arc<AtomicU64>,
@@ -451,6 +488,7 @@ impl Default for Attachment {
             handle: PipelineHandle::new(),
             shared: None,
             sink: None,
+            audio: None,
             denied: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -479,12 +517,9 @@ struct SessionCtx {
     /// #78: control-channel round-trip probe. Written by the ping task and the
     /// control-channel hook, read by the stats timer for `rtt_ms`.
     latency: Arc<LatencyProbe>,
-    /// #77: stop flag for the game-sound downlink thread. Set on Drop, which
-    /// covers every exit path (the thread is a plain OS thread, not a tokio
-    /// task, so `tasks.abort()` cannot reach it).
-    audio_stop: Arc<AtomicBool>,
-    /// #77: set once the audio thread was started for this session, so an ICE
-    /// reconnect does not open a second loopback capture on the same endpoint.
+    /// #77/#108: set once this session attached its audio track, so an ICE
+    /// reconnect does not attach a second sink (and a second stream) to the
+    /// program's shared downlink.
     audio_started: bool,
     media: Option<Arc<Mutex<MediaSession>>>,
     /// #62: background tasks owned by this session (see `SessionTasks`).
@@ -539,7 +574,6 @@ impl SessionCtx {
             clipboard: Arc::new(ClipboardSink::default()),
             stats_on: Arc::new(AtomicBool::new(false)),
             latency: Arc::new(LatencyProbe::new()),
-            audio_stop: Arc::new(AtomicBool::new(false)),
             audio_started: false,
             media: None,
             tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -630,14 +664,6 @@ impl ControlGate {
     }
 }
 
-impl Drop for SessionCtx {
-    fn drop(&mut self) {
-        // #77: the loopback thread exits on this flag; its `write_sample` would
-        // otherwise keep pushing into a closed track until the next beat.
-        self.audio_stop.store(true, Ordering::Relaxed);
-    }
-}
-
 /// Run one upgraded signaling socket to its terminal state.
 pub async fn run<S>(
     ws: WebSocketStream<S>,
@@ -713,9 +739,9 @@ where
     // The guard is dropped before the await below: a std mutex held across one
     // would serialise the watcher's attach against the teardown of another
     // session on the same thread pool.
-    let (shared, sink) = {
+    let (shared, sink, audio) = {
         let mut att = ctx.attach.lock().unwrap_or_else(|p| p.into_inner());
-        (att.shared.take(), att.sink.take())
+        (att.shared.take(), att.sink.take(), att.audio.take())
     };
     match (shared, sink) {
         (Some(shared), Some(sink)) => {
@@ -731,6 +757,12 @@ where
             // one out the program is about to be dropped and `None` is right.
             let held_lease = shared.controller_id() == Some(ctx.session_id);
             let display = shared.display.0;
+            // #108: leave the audio downlink before the video one. A track left
+            // attached would keep receiving packets for a peer connection that
+            // is about to close.
+            if let Some(audio) = audio {
+                shared.audio.detach(audio);
+            }
             let left = shared.detach(sink.id());
             log::info!(
                 "pipeline {}: session left, {} downlink(s) remain (sent {frames} frames / {:.1} MiB)",
@@ -1037,7 +1069,6 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
     // #102: the watcher learns the session id so it can hang this session's
     // downlink counters on the registry entry the health endpoint reads.
     let watcher_session_id = ctx.session_id;
-    let watcher_audio_stop = ctx.audio_stop.clone();
     push_task(
         &ctx.tasks,
         tokio::spawn(async move {
@@ -1206,13 +1237,30 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
                         // controller resets them.
                         if !audio_started {
                             audio_started = true;
-                            // #83: both media clocks restart with the audio
-                            // thread, so a reconnect does not inherit the skew of
-                            // the session that just ended.
+                            // #108: the program already owns the one loopback
+                            // capture and Opus encoder; this session only adds
+                            // its own track. Spawning a thread here was what made
+                            // "two tabs" mean two captures of the same endpoint.
+                            //
+                            // #83: the media clock restarts with the first
+                            // listener, so a reconnect does not inherit the skew
+                            // of the session that just ended.
                             crate::pipeline::avsync::reset();
-                            let audio = watcher_media.lock().await.audio().clone();
-                            crate::pipeline::audio::spawn(audio, watcher_audio_stop.clone());
-                            log::info!("audio downlink spawned after PC connected");
+                            let audio_track = watcher_media.lock().await.audio().clone();
+                            let program = {
+                                let att = watcher_attach
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner());
+                                att.shared.clone()
+                            };
+                            if let Some(program) = program {
+                                let sink = program.audio.attach(audio_track);
+                                let mut att = watcher_attach
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner());
+                                att.audio = Some(sink);
+                                log::info!("audio downlink attached to the shared program");
+                            }
                         }
                     }
                     MediaState::Failed | MediaState::Closed => {
@@ -2332,7 +2380,7 @@ fn refused_video_codec(answer: &str, codec: crate::pipeline::codec::VideoCodec) 
 /// recorded in `pipeline::codec` and the caller restarts the session when it
 /// changes. The returned `Some(codec)` is that signal; `None` means nothing that
 /// needs a reconnect moved.
-fn apply_settings_batch(settings: &StreamSettings, payload: &str) -> Option<crate::pipeline::codec::VideoCodec> {
+pub(crate) fn apply_settings_batch(settings: &StreamSettings, payload: &str) -> Option<crate::pipeline::codec::VideoCodec> {
     let value: Result<hbb_common::serde_json::Value, _> = hbb_common::serde_json::from_str(payload);
     let Ok(value) = value else {
         log::debug!("SETTINGS payload is not JSON: {payload}");
