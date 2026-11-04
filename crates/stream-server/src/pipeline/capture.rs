@@ -40,36 +40,99 @@ pub struct CaptureSource {
     name: String,
 }
 
+/// Where a display sits in the virtual desktop, plus its native size.
+///
+/// Input injection needs the origin: the frontend's `m,x,y` is relative to the
+/// frame it is looking at, and a frame from a secondary monitor starts at that
+/// monitor's corner, not at (0, 0).
+#[derive(Clone, Copy, Debug)]
+pub struct DisplayGeometry {
+    pub origin: (i32, i32),
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Displays in the order the protocol numbers them: primary first, then the
+/// rest as enumerated.
+///
+/// Index 0 must keep meaning "the primary display" — every existing client asks
+/// for 0, and resolving it through the raw enumeration order would silently
+/// move those sessions to whichever output DXGI happened to list first on a
+/// multi-monitor host.
+fn ordered_displays() -> anyhow::Result<Vec<Display>> {
+    let mut displays = Display::all()?;
+    if displays.is_empty() {
+        anyhow::bail!("no display found on this session");
+    }
+    if let Some(pos) = displays.iter().position(|d| d.is_primary()) {
+        let primary = displays.remove(pos);
+        displays.insert(0, primary);
+    }
+    Ok(displays)
+}
+
+/// One-line description of the display topology, for the startup log.
+///
+/// Index 0 is the primary by construction (see `ordered_displays`), so the line
+/// doubles as the answer to "which screen does `display2` mean on this host".
+fn topology(displays: &[Display]) -> String {
+    displays
+        .iter()
+        .enumerate()
+        .map(|(i, d)| {
+            let (x, y) = d.origin();
+            format!("{i}:{}x{}@{},{} {}", d.width(), d.height(), x, y, d.name())
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+/// Geometry of display `index` without opening a capturer.
+pub fn geometry_at(index: u32) -> Option<DisplayGeometry> {
+    let displays = ordered_displays().ok()?;
+    let d = displays.get(index as usize)?;
+    Some(DisplayGeometry {
+        origin: d.origin(),
+        width: d.width() as u32,
+        height: d.height() as u32,
+    })
+}
+
 impl CaptureSource {
-    /// Enumerate displays, select the primary (fall back to the first listed
-    /// display) and build the capturer. Records native pixels, backend kind and
-    /// the display name once at open time.
+    /// Enumerate displays, select the primary and build the capturer.
     pub fn open_primary() -> anyhow::Result<Self> {
-        let displays = Display::all()?;
-        if displays.is_empty() {
-            anyhow::bail!("no display found on this session");
-        }
-        let mut primary: Option<Display> = None;
-        let mut first: Option<Display> = None;
-        for d in displays {
-            if d.is_primary() {
-                primary = Some(d);
-                break;
-            }
-            if first.is_none() {
-                first = Some(d);
-            }
-        }
-        let display = primary.or(first).expect("display list non-empty");
+        Self::open_at(0)
+    }
+
+    /// Open display `index` (0 = primary). Records native pixels, the origin,
+    /// backend kind and the display name once at open time.
+    ///
+    /// An index that does not exist is an error, not a fallback: a session that
+    /// asked for the second monitor and silently got the first is worse than
+    /// one that gets a clear failure.
+    pub fn open_at(index: u32) -> anyhow::Result<Self> {
+        let displays = ordered_displays()?;
+        let available = displays.len();
+        // #109: log the whole topology once per open. On a multi-monitor host
+        // "the picture is of the wrong screen" is otherwise indistinguishable
+        // from "the picture is broken", and the numbering (`display2` = index 1
+        // = the second output here) is the thing every other layer assumes.
+        log::info!("displays: {}", topology(&displays));
+        let display = displays.into_iter().nth(index as usize).ok_or_else(|| {
+            anyhow::anyhow!("display {index} does not exist ({available} present)")
+        })?;
 
         let width = display.width() as u32;
         let height = display.height() as u32;
         let name = display.name();
 
+        let origin = display.origin();
         let capturer = Capturer::new(display)?;
         let gdi = capturer.is_gdi();
         log::info!(
-            "capture source opened: {width}x{height} gdi={gdi} display={name}",
+            "capture source opened: display {index} {width}x{height} at ({}, {}) gdi={gdi} name={name}",
+            origin.0,
+            origin.1
         );
         Ok(Self {
             capturer,
@@ -210,8 +273,8 @@ pub struct CaptureWorker {
 }
 
 impl CaptureWorker {
-    /// Spawn the capture thread; it opens the primary display itself.
-    pub fn spawn() -> Self {
+    /// Spawn the capture thread; it opens display `index` itself (0 = primary).
+    pub fn spawn(display: u32) -> Self {
         let shared = Arc::new(Shared {
             mailbox: Mutex::new(Mailbox {
                 frame: None,
@@ -231,7 +294,7 @@ impl CaptureWorker {
         let worker_shared = shared.clone();
         let join = std::thread::Builder::new()
             .name("capture".to_owned())
-            .spawn(move || run(worker_shared))
+            .spawn(move || run(worker_shared, display))
             .ok();
         if join.is_none() {
             log::error!("failed to spawn the capture thread");
@@ -371,8 +434,8 @@ impl Drop for CaptureWorker {
 
 /// Capture thread body: open the display, then block in `frame()`, publish the
 /// newest pixels, wait for the beat to consume, repeat.
-fn run(shared: Arc<Shared>) {
-    let mut source = match CaptureSource::open_primary() {
+fn run(shared: Arc<Shared>, display: u32) {
+    let mut source = match CaptureSource::open_at(display) {
         Ok(source) => source,
         Err(err) => {
             log::warn!("capture thread: open failed: {err:#}");

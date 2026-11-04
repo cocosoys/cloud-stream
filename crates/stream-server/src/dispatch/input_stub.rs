@@ -27,6 +27,15 @@ pub trait InputSink: Send + Sync {
     /// Clear held keys and pointer position on session drop / reconnect.
     fn reset(&self);
 
+    /// #109: the display this session's frames come from.
+    ///
+    /// A no-op for the stub and for any sink that always targets the primary
+    /// monitor. The real sink needs it because a frame from the second monitor
+    /// starts at that monitor's corner: without the origin every click on the
+    /// secondary screen lands on the primary one, offset by exactly the
+    /// secondary's position in the virtual desktop.
+    fn set_target_display(&self, _origin: (i32, i32), _size: (u32, u32)) {}
+
     /// Tally an unparsed input line in stage1; stage2 parses each C-group line
     /// and dispatches it to the matching concrete method above instead.
     fn note_stub(&self, line: &str);

@@ -145,6 +145,14 @@ pub struct Config {
     /// level, and silently streaming software instead would hide the mistake
     /// until the first frame looked wrong.
     pub encoder: String,
+    /// Which display the process starts on (DXGI output ordinal, 0 = primary).
+    ///
+    /// A per-session request (`SETTINGS.displayId`) wins over this; the flag is
+    /// what a headless/kiosk host uses when the screen it wants is not the
+    /// primary one. Asking for an index that does not exist is a startup-time
+    /// capture failure with a clear log, not a silent fallback to the primary —
+    /// serving the wrong screen is worse than serving none.
+    pub display: u32,
     /// #105: who may inject input into the shared program.
     ///
     /// Default [`InputPolicy::Shared`] — every attached session may type and
@@ -209,6 +217,7 @@ impl Default for Config {
             ghost_cursor_idle_secs: crate::dispatch::ghost::DEFAULT_IDLE_SECS,
             policy: "allow-all".to_owned(),
             auth_token: None,
+            display: 0,
             encoder: "auto".to_owned(),
             tune: "tuned".to_owned(),
             input_policy: InputPolicy::default(),
@@ -342,6 +351,17 @@ impl Config {
                 }
                 // #95: 后端策略名。未知值保留 `auto` 并在 main 里告警 —— 与
                 // `--video-codec` 同一套取舍：拼错不该让服务起不来，但要看得见。
+                "--display" => {
+                    if let Some(v) = iter.next() {
+                        match v.trim().parse::<u32>() {
+                            Ok(n) => cfg.display = n,
+                            Err(_) => log::warn!(
+                                "unknown --display {v} (expected a DXGI output index), keeping {}",
+                                cfg.display
+                            ),
+                        }
+                    }
+                }
                 "--encoder" => {
                     if let Some(v) = iter.next() {
                         cfg.encoder = v;

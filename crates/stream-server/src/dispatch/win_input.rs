@@ -36,10 +36,13 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     MapVirtualKeyW,
     MOUSEINPUT, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
     MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
-    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, SendInput, VkKeyScanW, INPUT,
-    INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE,
+    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
+    SendInput, VkKeyScanW, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetSystemMetrics, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+};
 
 use crate::pipeline::StreamSettings;
 
@@ -300,6 +303,36 @@ pub struct WinInputSink {
     /// (debug log, drop) — which is what a build without ViGEmBus, and the unit
     /// tests, get.
     gamepad: Option<Arc<super::gamepad::GamepadHub>>,
+    /// #109: the display these frames belong to. Default is the primary
+    /// monitor; a session watching display N sets this after it attaches, and
+    /// every absolute move is then expressed in that monitor's corner.
+    target: Mutex<TargetSpace>,
+}
+
+/// The monitor the injected pointer lives on, in virtual-desktop coordinates.
+#[derive(Clone, Copy, Debug)]
+struct TargetSpace {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    /// True when the target is not the primary monitor, so `SendInput` has to
+    /// carry `MOUSEEVENTF_VIRTUALDESK` and normalise against the virtual
+    /// desktop rather than the primary screen.
+    virtual_desk: bool,
+}
+
+impl Default for TargetSpace {
+    fn default() -> Self {
+        let (w, h) = screen_size();
+        Self {
+            x: 0,
+            y: 0,
+            w,
+            h,
+            virtual_desk: false,
+        }
+    }
 }
 
 impl Default for WinInputSink {
@@ -330,7 +363,49 @@ impl WinInputSink {
             mapping_logged: std::sync::atomic::AtomicBool::new(false),
             last_abs_seq: std::sync::atomic::AtomicU64::new(0),
             gamepad,
+            target: Mutex::new(TargetSpace::default()),
         }
+    }
+
+    /// #109: move the pointer to a pixel in the *target monitor's* space.
+    ///
+    /// On the primary monitor this is the pre-#109 `SendInput` exactly:
+    /// normalised against `SM_CXSCREEN/CYSCREEN`. anywhere else it has to carry
+    /// `MOUSEEVENTF_VIRTUALDESK`, and the normalised value is measured against
+    /// the whole virtual desktop — without the flag Windows interprets the
+    /// coordinate in primary-screen space and the pointer lands on the wrong
+    /// monitor.
+    fn move_abs(&self, x: i32, y: i32) {
+        let t = *self.target.lock().unwrap_or_else(|p| p.into_inner());
+        let (dx, dy, flags) = if t.virtual_desk {
+            let (vx, vy, vw, vh) = virtual_screen();
+            let vw = vw.max(2);
+            let vh = vh.max(2);
+            (
+                (((x - vx) as i64 * 65535) / (vw as i64 - 1)) as i32,
+                (((y - vy) as i64 * 65535) / (vh as i64 - 1)) as i32,
+                MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            )
+        } else {
+            (
+                absolute_norm(x, t.w),
+                absolute_norm(y, t.h),
+                MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
+            )
+        };
+        send_inputs(&mut [INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx,
+                    dy,
+                    mouseData: 0,
+                    dwFlags: flags,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        }]);
     }
 
     /// #68: one INFO line per session showing both sides of the pointer mapping.
@@ -439,21 +514,15 @@ fn key_input(vk: u16, down: bool) -> INPUT {
 /// `SetCursorPos` only moves the cursor, it produces no `WM_INPUT`, so any
 /// raw-input consumer (pointer-locked games, several Unity/UE titles) saw
 /// nothing at all. This path generates a real input event.
-fn mouse_move_abs(x: i32, y: i32) {
-    let (w, h) = screen_size();
-    send_inputs(&mut [INPUT {
-        r#type: INPUT_MOUSE,
-        Anonymous: INPUT_0 {
-            mi: MOUSEINPUT {
-                dx: absolute_norm(x, w),
-                dy: absolute_norm(y, h),
-                mouseData: 0,
-                dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
-                time: 0,
-                dwExtraInfo: 0,
-            },
-        },
-    }]);
+fn virtual_screen() -> (i32, i32, i32, i32) {
+    unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    }
 }
 
 fn mouse_move_rel(dx: i32, dy: i32) {
@@ -642,7 +711,8 @@ impl WinInputSink {
 
     fn frame_to_screen(&self, x: i32, y: i32) -> (i32, i32) {
         let (fw, fh) = self.transmitted_frame();
-        let (sw, sh) = screen_size();
+        let t = *self.target.lock().unwrap_or_else(|p| p.into_inner());
+        let (sw, sh) = (t.w, t.h);
         if fw == 0 || fh == 0 {
             return (x, y);
         }
@@ -650,7 +720,13 @@ impl WinInputSink {
         // frame pixel -> last screen pixel) so a 1:1 stream is an exact
         // identity and no sub-pixel bias accumulates toward the far edge.
         self.log_mapping_once(fw, fh, sw, sh);
-        (map_axis(x, fw, sw), map_axis(y, fh, sh))
+        // The origin is added last, after the frame->monitor mapping: the
+        // frontend's pixel is relative to the frame, and the monitor's corner
+        // is where that frame begins in the virtual desktop.
+        (
+            map_axis(x, fw, sw) + t.x,
+            map_axis(y, fh, sh) + t.y,
+        )
     }
 
     /// #74: pointer-locked deltas pass through unchanged.
@@ -712,7 +788,7 @@ impl WinInputSink {
                 // #68: frame pixels = the *transmitted* size (see
                 // `transmitted_frame`), never the client's requested resolution.
                 let (sx, sy) = self.frame_to_screen(x, y);
-                mouse_move_abs(sx, sy);
+                self.move_abs(sx, sy);
                 if let Ok(mut st) = self.state.lock() {
                     sync_buttons(&mut st, mask);
                     let _ = mag;
@@ -797,8 +873,11 @@ impl WinInputSink {
 
 impl InputSink for WinInputSink {
     fn mouse_absolute(&self, x: f64, y: f64, mask: u32, _magnitude: f64) {
-        let (w, h) = screen_size();
-        mouse_move_abs(normalized_to_px(x, w), normalized_to_px(y, h));
+        let t = *self.target.lock().unwrap_or_else(|p| p.into_inner());
+        self.move_abs(
+            normalized_to_px(x, t.w) + t.x,
+            normalized_to_px(y, t.h) + t.y,
+        );
         if let Ok(mut st) = self.state.lock() {
             sync_buttons(&mut st, mask);
         }
@@ -869,6 +948,35 @@ impl InputSink for WinInputSink {
         sync_buttons(&mut st, 0);
         st.scroll_bits_prev = 0;
         log::info!("input state reset: held keys / buttons released");
+    }
+
+    fn set_target_display(&self, origin: (i32, i32), size: (u32, u32)) {
+        if size.0 == 0 || size.1 == 0 {
+            log::warn!(
+                "input target display has zero size ({}x{}); keeping the primary",
+                size.0,
+                size.1
+            );
+            return;
+        }
+        // Primary keeps the exact pre-#109 path (no VIRTUALDESK) so a
+        // single-monitor session cannot regress because of this feature.
+        let primary = screen_size();
+        let virtual_desk = origin != (0, 0) || (size.0 as i32, size.1 as i32) != primary;
+        *self.target.lock().unwrap_or_else(|p| p.into_inner()) = TargetSpace {
+            x: origin.0,
+            y: origin.1,
+            w: size.0 as i32,
+            h: size.1 as i32,
+            virtual_desk,
+        };
+        log::info!(
+            "input target display: {}x{} at ({}, {}) virtual_desk={virtual_desk}",
+            size.0,
+            size.1,
+            origin.0,
+            origin.1
+        );
     }
 
     fn note_stub(&self, line: &str) {

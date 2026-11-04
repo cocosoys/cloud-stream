@@ -212,12 +212,29 @@ OS 光标只有一个，但每个客户端需要看到「我自己的指针在�
       同一 `tab_id` 才互斥；`SessionRole` 以 `controller: bool` 落在 `Attachment` 里
 - [x] `DisplayKey(u32)` 作为管线索引键（`pipeline/shared.rs`），主屏 `DisplayKey::PRIMARY`；
       请求一个不存在的 display 会如实失败，而不是把主屏错发过去
-- [ ] `StreamSettings` 增加 `display: u32`（默认 0），`width()/height()` 语义不变
-- [ ] `capture.rs` 把 `is_primary()` 换成 `output_at(settings.display)`，行为等价
-- [ ] `stream_info` 下行加 `display` 字段（老前端忽略未知字段即可）
-- [ ] `WinInputSink` 增加 `target_origin: (i32, i32)`，默认 `(0, 0)`；
+- [x] `StreamSettings` 增加 `display: u32`（默认 0），`width()/height()` 语义不变
+- [x] `capture.rs` 把 `is_primary()` 换成 `output_at(settings.display)`，行为等价
+- [x] `stream_info` 下行加 `display` 字段（老前端忽略未知字段即可）
+- [x] `WinInputSink` 增加 `target_origin: (i32, i32)`，默认 `(0, 0)`；
       `frame_to_screen` 末尾加偏移，默认值为 0 时行为不变
 - [ ] 统计行的 `m= m2= dm= pm=` 从进程级 `AtomicU64` 改为 `SessionCtx` 上的字段
+
+### 5.0 多屏落地时与上面几条的差异
+
+计划写的是 `output_at(index)`，实际用的是 `capture::ordered_displays()` + `open_at(index)`：
+`scrap` 的 `Display::all()` 顺序是 DXGI 枚举顺序，`index 0` 在有些机器上不是主屏，
+而**所有老客户端都在要 0**。所以先把 primary 排到 0，其余保持枚举顺序，
+"0 = 主屏"这条既有语义才不会在双屏机器上被悄悄改掉。
+
+`DisplayKey::from_hello()` 负责把 hello 的 `display_id`（`primary` / `display2` / …）
+映射成索引：页面从 1 数，索引从 0 数，`displayN → N-1`。认不出的值一律回落到主屏
+（拼错或旧页面拿错屏只是刷新一次的事，拒绝握手会让人停在黑页上）。
+
+输入侧的 `target_origin` 落成了 `TargetSpace { x, y, w, h, virtual_desk }`：
+主屏之外光加 origin 不够，`SendInput` 的绝对坐标还必须带 `MOUSEEVENTF_VIRTUALDESK`
+并针对**整个虚拟桌面**归一化，否则 Windows 仍按主屏解释，指针会跑到主屏去。
+主屏走原来那条不带 flag 的路径，保证单屏机器不可能因为这条改动回归。
+
 
 ### 5.1 拆会话时实际改了什么
 

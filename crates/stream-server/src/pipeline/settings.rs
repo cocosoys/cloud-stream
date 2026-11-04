@@ -114,6 +114,12 @@ impl RateControl {
 
 #[derive(Clone, Default)]
 pub struct StreamSettings {
+    /// Which display this program captures (#101 的第二个维度)。
+    ///
+    /// 不是 `Arc<AtomicU32>`：显示器是**程序**的身份，不是可以中途改的参数
+    /// —— 换屏意味着换一条采集管线（`PipelineRegistry` 按它索引），所以在
+    /// 建程序时定下来，运行期只读。
+    display: u32,
     fps: Arc<AtomicU32>,
     width: Arc<AtomicU32>,
     height: Arc<AtomicU32>,
@@ -137,6 +143,7 @@ impl StreamSettings {
     /// Seed from the CLI config; `dirty=false` until the client asks.
     pub fn from_config(cfg: &Config) -> Self {
         Self {
+            display: cfg.display,
             fps: Arc::new(AtomicU32::new(cfg.fps)),
             width: Arc::new(AtomicU32::new(cfg.width)),
             height: Arc::new(AtomicU32::new(cfg.height)),
@@ -146,6 +153,17 @@ impl StreamSettings {
             crf: Arc::new(AtomicU32::new(CRF_DEFAULT)),
             dirty: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Which display this program captures (DXGI output ordinal).
+    pub fn display(&self) -> u32 {
+        self.display
+    }
+
+    /// Bind the settings to a display. Called by the registry when a session
+    /// asks for a non-default screen, before the capture loop reads them.
+    pub fn set_display(&mut self, display: u32) {
+        self.display = display;
     }
 
     pub fn fps(&self) -> u32 {

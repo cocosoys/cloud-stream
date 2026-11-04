@@ -44,16 +44,48 @@ use crate::pipeline::spawn_loop;
 
 /// Which screen a pipeline captures.
 ///
-/// `0` is the primary display, the only one this build can open. The index is
-/// the DXGI output ordinal (`Display::all()` order), not a session-chosen id:
-/// two sessions asking for the same screen must land on the same key or they
-/// will fight over the duplication interface.
+/// `0` is the primary display. The index is the ordinal of
+/// `capture::ordered_displays()` — primary first, then the rest in DXGI order —
+/// not a session-chosen id: two sessions asking for the same screen must land
+/// on the same key or they will fight over the duplication interface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DisplayKey(pub u32);
 
 impl DisplayKey {
-    /// The primary display — what every session gets today.
+    /// The primary display — the default for a session that says nothing.
     pub const PRIMARY: Self = Self(0);
+
+    /// Map the hello's `display_id` onto an index.
+    ///
+    /// The page sends `primary`, `display2`, `display3`… (`signaling.js` builds
+    /// the string from the thumbnail the user clicked). `displayN` means index
+    /// `N-1`, so `display2` is the second screen — the same off-by-one the
+    /// frontend uses. Unknown values fall back to the primary: an old page or a
+    /// typo should still get a picture, and reloading fixes a wrong screen,
+    /// whereas refusing the hello strands the user on a black tab.
+    pub fn from_hello(raw: &str) -> Self {
+        let raw = raw.trim();
+        if raw.is_empty() || raw.eq_ignore_ascii_case("primary") {
+            return Self::PRIMARY;
+        }
+        let Some(rest) = raw
+            .strip_prefix("display")
+            .or_else(|| raw.strip_prefix("DISPLAY"))
+        else {
+            // A bare number is accepted too: `--display 1` users tend to type
+            // the index directly into config files.
+            return match raw.parse::<u32>() {
+                Ok(n) => Self(n),
+                Err(_) => Self::PRIMARY,
+            };
+        };
+        match rest.parse::<u32>() {
+            Ok(n) if n >= 1 => Self(n - 1),
+            // `display1` would be index 0 spelled wrong; treat it as primary
+            // instead of wrapping to u32::MAX - 1.
+            _ => Self::PRIMARY,
+        }
+    }
 }
 
 impl Default for DisplayKey {
@@ -294,7 +326,12 @@ impl PipelineRegistry {
             };
         }
 
-        let settings = StreamSettings::from_config(cfg);
+        // The settings carry the display this program captures: the loop reads
+        // it to open the right output, and the input sink reads it to place the
+        // pointer. `from_config` seeds the CLI default; the key this call was
+        // made with is the truth.
+        let mut settings = StreamSettings::from_config(cfg);
+        settings.set_display(display.0);
         let handle = PipelineHandle::new();
         let video = Arc::new(VideoFanout::new());
         start_program(cfg, &video, &handle, &settings);
@@ -576,5 +613,39 @@ mod tests {
         entry.set_controller(None);
         assert!(entry.try_claim_controller(7));
         assert_eq!(entry.controller_id(), Some(7));
+    }
+
+    /// #109: the hello's `display_id` is a *name*, not an index, and the page
+    /// numbers from one (`display2` is the second screen). Getting this
+    /// off-by-one wrong is invisible on a single-monitor host and shows up on a
+    /// wall as "the second tab watches the first screen".
+    #[test]
+    fn display_id_names_map_onto_zero_based_indices() {
+        assert_eq!(DisplayKey::from_hello("primary"), DisplayKey::PRIMARY);
+        assert_eq!(DisplayKey::from_hello("display2"), DisplayKey(1));
+        assert_eq!(DisplayKey::from_hello("display3"), DisplayKey(2));
+    }
+
+    /// Anything unrecognised must still get a picture. A refused hello strands
+    /// the user on a black tab; the wrong screen is one reload away from right.
+    #[test]
+    fn an_unknown_display_id_falls_back_to_the_primary() {
+        for raw in ["", "  ", "primary-ish", "display", "display0", "display1", "displayx"] {
+            assert_eq!(
+                DisplayKey::from_hello(raw),
+                DisplayKey::PRIMARY,
+                "{raw:?} must not produce a bogus index"
+            );
+        }
+    }
+
+    /// A bare number is accepted because `--display 1` users type the index;
+    /// whitespace and case come from hand-edited config, not the page.
+    #[test]
+    fn a_bare_index_and_case_are_accepted() {
+        assert_eq!(DisplayKey::from_hello("1"), DisplayKey(1));
+        assert_eq!(DisplayKey::from_hello(" 2 "), DisplayKey(2));
+        assert_eq!(DisplayKey::from_hello("DISPLAY2"), DisplayKey(1));
+        assert_eq!(DisplayKey::from_hello("PRIMARY"), DisplayKey::PRIMARY);
     }
 }

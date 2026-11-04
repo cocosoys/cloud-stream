@@ -500,6 +500,10 @@ struct SessionCtx {
     session: SignalingSession,
     /// The pipeline this session is attached to (#101); see [`Attachment`].
     attach: Arc<std::sync::Mutex<Attachment>>,
+    /// #109: which display this session watches. Comes from the hello's
+    /// `display_id` (`primary` / `display2`), before `Connected` decides which
+    /// program to join. A session that never says anything gets the primary.
+    display: DisplayKey,
     /// #62: the worker-termination sender, registered with the shared handle at
     /// `Connected` (the handle does not exist before that).
     exit_tx: Option<mpsc::UnboundedSender<String>>,
@@ -567,6 +571,12 @@ impl SessionCtx {
         Self {
             session: SignalingSession::new(),
             attach: Arc::new(std::sync::Mutex::new(Attachment::default())),
+            // #109: the server's `--display` is the default, not a hard
+            // override — a session that names a screen in its hello moves off
+            // this value. Starting here rather than at `PRIMARY` keeps a
+            // single-monitor box on `--display 0` and a wall-display box on
+            // whatever it was launched with, without the page having to know.
+            display: DisplayKey(cfg.display),
             exit_tx: None,
             settings,
             input,
@@ -894,6 +904,21 @@ where
                     .unwrap_or("")
                     .to_owned()
             };
+            // #109: `display_id` picks the program this session joins. The
+            // page sends `primary` / `display2` / `display3`… (`signaling.js`
+            // builds it from the selected thumbnail); anything else — an old
+            // page, a typo, an out-of-range index — stays on the primary
+            // rather than failing the handshake, because a wrong screen is
+            // recoverable by reloading and a refused hello is not.
+            ctx.display = DisplayKey::from_hello(&read("display_id"));
+            // Keep the session's own settings in step with the answer: the
+            // downstream `stream_info` / `server_settings` builders read
+            // `display()` off this object, and a copy still saying "primary"
+            // would report the wrong screen for the whole session.
+            ctx.settings.set_display(ctx.display.0);
+            if ctx.display != DisplayKey::PRIMARY {
+                log::info!("client asked for display {}", ctx.display.0);
+            }
             ctx.registry
                 .publish(SessionInfo {
                     id: ctx.session_id,
@@ -1069,6 +1094,9 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
     // #102: the watcher learns the session id so it can hang this session's
     // downlink counters on the registry entry the health endpoint reads.
     let watcher_session_id = ctx.session_id;
+    // #109: the program this session will join is keyed by the display the
+    // hello named; captured before the task moves.
+    let watcher_display = ctx.display;
     push_task(
         &ctx.tasks,
         tokio::spawn(async move {
@@ -1094,8 +1122,7 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
                             // output, so its capturer would fail and the recovery
                             // chain would park it on GDI while the first kept
                             // DXGI — two encoders, one of them on the slow path.
-                            let acquired =
-                                watcher_pipelines.acquire(DisplayKey::PRIMARY, &cfg).await;
+                            let acquired = watcher_pipelines.acquire(watcher_display, &cfg).await;
                             let controller = acquired.created;
                             if controller {
                                 // #80: the audio switches are process-wide, so
@@ -1138,6 +1165,18 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
                             }
                             let video = watcher_media.lock().await.video().clone();
                             let sink = acquired.pipeline.attach(video, !controller);
+                            // #109: absolute input is relative to the frame's
+                            // monitor. Without this the pointer on a secondary
+                            // display lands on the primary at the same relative
+                            // position — every click is off by the monitor's
+                            // origin, and on a host whose secondary sits left of
+                            // the primary it is off-screen entirely.
+                            if let Some(geom) =
+                                crate::pipeline::capture::geometry_at(acquired.pipeline.display.0)
+                            {
+                                watcher_input
+                                    .set_target_display(geom.origin, (geom.width, geom.height));
+                            }
                             // #102: keep the counter block, then hand it to the
                             // registry so `health` can report this session's own
                             // bytes. The handle stays with the session for its
@@ -1629,6 +1668,10 @@ async fn arm_connected_notices(
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PipelineEvent>();
         pipeline_handle.add_event_sink(event_tx);
         let event_control = control.clone();
+        // #109: the events below do not carry the display, but the snapshot
+        // they build does; the settings object knows which screen this session
+        // watches (set from the hello, before the attach).
+        let event_display = settings.display();
         push_task(
             tasks,
             tokio::spawn(async move {
@@ -1642,9 +1685,9 @@ async fn arm_connected_notices(
                         }
                         PipelineEvent::Lost(reason) => Some(system(&format!("capture_lost,{reason}"))),
                         PipelineEvent::Restored => Some(system("capture_restored")),
-                        PipelineEvent::StreamInfo { is_gdi, reason } => {
-                            Some(stream_info(&StreamInfo::from_capture(is_gdi, reason)))
-                        }
+                        PipelineEvent::StreamInfo { is_gdi, reason } => Some(stream_info(
+                            &StreamInfo::from_capture(is_gdi, reason).with_display(event_display),
+                        )),
                         PipelineEvent::Cursor(cd) => Some(cursor(&cd)),
                     };
                     let Some(line) = line else { continue };
@@ -1698,7 +1741,10 @@ async fn arm_connected_notices(
     // targets; the one-shot here seeds the first connect.
     let notices = [
         pipeline("Connected to server"),
-        stream_info(&StreamInfo::default()),
+        // #109: the same snapshot now names the screen, so "connected but the
+        // picture is of the wrong monitor" is answerable from the stream_info
+        // alone.
+        stream_info(&StreamInfo::default().with_display(settings.display())),
         server_settings(settings),
         connection(false),
     ];
@@ -2174,7 +2220,7 @@ async fn resend_notices(media: &Arc<Mutex<MediaSession>>, settings: &StreamSetti
         return;
     }
     let notices = [
-        stream_info(&StreamInfo::default()),
+        stream_info(&StreamInfo::default().with_display(settings.display())),
         server_settings(settings),
         connection(false),
     ];

@@ -21,6 +21,13 @@ pub struct StreamInfo {
     pub is_gdi: bool,
     /// Capture-only explanatory reason; empty on the normal DXGI path.
     pub capture_reason: String,
+    /// #109: which display the frames come from (0 = primary).
+    ///
+    /// The page has no tile for this and ignores unknown fields, so it is a
+    /// diagnostics aid, not a contract: on a multi-monitor host "the picture is
+    /// wrong" and "the picture is of another screen" look identical on the
+    /// wire, and this field tells them apart without reading the server log.
+    pub display: u32,
 }
 
 impl Default for StreamInfo {
@@ -29,6 +36,7 @@ impl Default for StreamInfo {
             capture: "dxgi",
             is_gdi: false,
             capture_reason: String::new(),
+            display: 0,
         }
     }
 }
@@ -42,7 +50,14 @@ impl StreamInfo {
             capture: capture_backend_name(is_gdi),
             is_gdi,
             capture_reason: reason.into(),
+            display: 0,
         }
+    }
+
+    /// #109: attach the display this snapshot describes.
+    pub fn with_display(mut self, display: u32) -> Self {
+        self.display = display;
+        self
     }
 }
 
@@ -149,6 +164,9 @@ pub fn stream_info(info: &StreamInfo) -> String {
             "zero_copy": false,
             "zero_copy_available": false,
             "capture_reason": info.capture_reason,
+            // #109: which screen this is. Diagnostics only — the panel has no
+            // tile for it, and an old frontend simply ignores the key.
+            "display": info.display,
             "encoder": "libvpx",
             "hardware": false,
             "gpu_present": false,
@@ -486,6 +504,20 @@ mod tests {
         assert_eq!(parsed["type"], json!("stream_stats"), "wrong envelope: {line}");
         assert!(parsed["data"]["encode_ms"].is_number(), "no figures under data: {line}");
         assert!(parsed["data"]["peak_mbps"].is_number(), "no figures under data: {line}");
+    }
+
+    /// #109: `stream_info` names the screen it describes. The page has no tile
+    /// for it, so this is a diagnostics field — but a field nobody asserts is a
+    /// field that silently disappears on the next refactor of the builder.
+    #[test]
+    fn stream_info_carries_the_display_index() {
+        let line = stream_info(&StreamInfo::default().with_display(2));
+        let parsed: hbb_common::serde_json::Value =
+            hbb_common::serde_json::from_str(&line).expect("stream_info is not JSON");
+        assert_eq!(parsed["data"]["display"], json!(2), "display missing: {line}");
+        // The envelope must stay the data-channel one; the WS transport strips
+        // this layer itself and would break if the builder changed shape.
+        assert_eq!(parsed["type"], json!("stream_info"), "wrong envelope: {line}");
     }
 
     /// The names are the frontend's (`lib/stream-stats-view.js` reads them off

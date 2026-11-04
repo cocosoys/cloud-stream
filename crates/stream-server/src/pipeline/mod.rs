@@ -622,7 +622,7 @@ fn run_blocking_loop(
         // #65: the capturer is opened *inside* the capture thread (it owns raw
         // COM pointers and is not `Send`); wait for its dimensions before the
         // encoder can be sized.
-        let worker = CaptureWorker::spawn();
+        let worker = CaptureWorker::spawn(settings.display());
         let (src_w, src_h) = match worker.wait_ready(CAPTURE_OPEN_TIMEOUT) {
             Ok(dims) => dims,
             Err(reason) => {

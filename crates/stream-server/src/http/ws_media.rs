@@ -223,7 +223,8 @@ where
 
     // 共享管线：如果此刻已有一个 WebRTC 会话在跑，这里是**加入**而不是新开一路
     // 采集 —— `DuplicateOutput` 对同一个输出是独占的，新开只会失败并退到 GDI。
-    let acquired = pipelines.acquire(DisplayKey::PRIMARY, &cfg).await;
+    // #109: WS 页面没有 hello，选不了屏幕，所以这里跟服务端默认走（`--display`）。
+    let acquired = pipelines.acquire(DisplayKey(cfg.display), &cfg).await;
     let pipeline = acquired.pipeline.clone();
 
     if let Some(settings) = settings_frame(&pipeline.settings) {
@@ -267,6 +268,12 @@ where
     // 输入与剪贴板都是纯软件对象，创建成本可以忽略；`WinInputSink` 持有自己的
     // 按钮/滚轮/按键状态，所以必须每会话一个，不能全局共享。
     let input = WinInputSink::new(pipeline.settings.clone());
+    // #109: 非主屏的绝对坐标要先加到那块屏的 origin 上，并用虚拟桌面归一化 ——
+    // 主屏之外按 0,0 归一会把鼠标送到左上角那块屏去。WS 的指针空间就是采集
+    // 画面本身，所以这里和 WebRTC 的 attach 之后做的是同一件事。
+    if let Some(geom) = crate::pipeline::capture::geometry_at(pipeline.display.0) {
+        input.set_target_display(geom.origin, (geom.width, geom.height));
+    }
     let clipboard = ClipboardSink::default();
 
     log::info!(
@@ -405,7 +412,9 @@ where
     pipeline.detach(sink_handle.id());
     registry.remove(session_id).await;
     // 不能漏：`acquire` 加了一次引用，最后一个走的负责停掉采集循环。
-    pipelines.release(DisplayKey::PRIMARY).await;
+    // #109: 必须释放**这一条**连接真正加入的那个 key，不能写死成 PRIMARY ——
+    // 否则 `--display 1` 下程序永远不会被回收，而 PRIMARY 的计数会被扣成负数。
+    pipelines.release(pipeline.display).await;
     log::info!(
         "ws media: {peer} detached ({} downlink(s) left, {dropped} frame(s) dropped)",
         pipeline.video.len()

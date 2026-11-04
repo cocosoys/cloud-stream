@@ -18,13 +18,25 @@ WebRTC 必须有 UDP，或者一台 TURN 中继。局域网里从来不是问题
 
 | 偏移 | 长度 | 含义 |
 |---|---|---|
-| 0 | 1 | 帧类型。整帧恒 `0x01`；`0x03`/`0x04` 是 JPEG/H.264 分行模式，这里不发 |
+| 0 | 1 | 帧类型。**视频整帧是 `0x04`**；`0x03` 是 JPEG 分行、`0x01` 是音频（见 §2.1）。发错这一个字节，页面会把码流当 Opus 解 —— 见 §8 |
 | 1 | 1 | `codec_id << 4 \| is_key`（`lib/wire-codecs.js:23`）：h264=1、vp8=2、vp9=3、av1=4、h265=5 |
 | 2 | 2 | frameId，大端 u16，回绕 |
 | 4 | 2 | y（行偏移）。整帧恒 0 |
 | 6 | 2 | 宽，大端 |
 | 8 | 2 | 高，大端 |
 | 10 | 2 | reference：本帧依赖的**上一帧** frameId |
+
+### 2.1 帧类型字节是最容易错的一处
+
+前端在 **socket worker** 里分流，比视频 worker 的 `onWire` 更早：先看第一个字节，
+`0x01` 直接进音频解码器，`0x03` 走 JPEG 分行，`0x04` 且长度 > 10 才当成视频整帧。
+所以视频整帧必须是 `0x04`。这一版之前发的是 `0x01`，症状是"连上了、日志有帧、
+页面永远黑"—— 码流被当成 Opus 塞进音频解码器，视频这条路一次也没被走到过。
+
+音频是 `[0x01, flags] + opus`：第二字节低 7 位是 RED 冗余帧数（这里是 0），
+最高位 `0x80` 表示静音段；前端 `extractOpusFrames` 直接 `slice(2)`。
+一条 loopback 采到的 PCM 只在程序级编码一次，结果按 sink 分发（`AudioFanout`），
+和视频的 fan-out 同构 —— 观众数不线性放大 CPU。
 
 `reference` 不是装饰。前端解码闸门（`lib/decode-gate.js:99`）在
 `reference !== frameId` 时才做丢帧跟踪：发现依赖缺席就不解这一帧并要求关键帧。
@@ -106,13 +118,20 @@ python toolchain/ws-probe.py 192.168.59.148 8080 5
 handshake: HTTP/1.1 101 Switching Protocols
 text: MODE websockets
 text: {"settings":{"audio_bitrate":{…},"encoder":{"value":"vp8enc",…},…},"type":"server_settings"}
-frame#0: type=0x01 codec=vp8 key=1 id=0 y=0 1920x1080 ref=0 payload=173437B fin=1
-frame#1: type=0x01 codec=vp8 key=1 id=1 y=0 1920x1080 ref=0 payload=173247B fin=1
-frame#2: type=0x01 codec=vp8 key=0 id=2 y=0 1920x1080 ref=1 payload=46550B fin=1
-frame#3: type=0x01 codec=vp8 key=0 id=3 y=0 1920x1080 ref=2 payload=31472B fin=1
-frame#4: type=0x01 codec=vp8 key=0 id=4 y=0 1920x1080 ref=3 payload=27759B fin=1
-RESULT ok frames=4 keyframes=1 text=2
+frame#0: type=0x04 codec=vp8 key=1 id=0 y=0 1920x1080 ref=0 payload=173437B fin=1
+frame#1: type=0x04 codec=vp8 key=1 id=1 y=0 1920x1080 ref=0 payload=173247B fin=1
+frame#2: type=0x04 codec=vp8 key=0 id=2 y=0 1920x1080 ref=1 payload=46550B fin=1
+frame#3: type=0x04 codec=vp8 key=0 id=3 y=0 1920x1080 ref=2 payload=31472B fin=1
+frame#4: type=0x04 codec=vp8 key=0 id=4 y=0 1920x1080 ref=3 payload=27759B fin=1
+text: clipboard_reply,cr
+RESULT ok frames=8 keyframes=1 audio=0 text=4
 ```
+
+`clipboard_reply,cr` 是连接建立时页面发的 `cr` 的回执：没有它，页面的
+`taggedClipboardFetch` 会一直等在那儿，剪贴板同步永远不开始。
+
+这台虚拟机上 `audio=0` 是预期结果 —— 机器不播放任何声音，loopback 没有事件可采。
+有声音的机器上同一个探针应给出非零值。
 
 同一次连接在服务端留下的日志（注意 `sink 1` 是已在线的 WebRTC 页签，`stream sink 2`
 是这次 WS 探针 —— 同一个 program，一个编码器）：
@@ -127,19 +146,44 @@ video fanout: sink 2 detached (1 live)
 ws media: 192.168.59.146 detached (1 downlink(s) left, 0 frame(s) dropped)
 ```
 
-## 7. 这一版**没做**什么
+## 7. 上行：输入与剪贴板
+
+上行**不另写解析器**：`lib/input.js` 在两种传输下是同一份，所以 WS 侧直接复用
+`dispatch::commands::classify` 的结果，落到和 WebRTC 相同的 `WinInputSink`。
+
+| 上行 | 处理 |
+|---|---|
+| `SETTINGS,{json}` | 与 WebRTC 同形，复用 `apply_settings_batch`（`displayId` / `tabId` / `encoder` / `framerate` / `manual_resolution`） |
+| `KEYFRAME` / `REQUEST_KEYFRAME` | `pipeline.handle.request_keyframe()` |
+| `cr` | 回 `clipboard_reply,cr`，然后把当前剪贴板按 WS 家族发下去 |
+| `m` / `m2` / `kd` / `ku` / `kh` / `kr` / `p` / `sf` / `js` | `classify` → `InputStub`，按 `--input-policy` 放行或计入 `denied` |
+| `cw` / `cws` / `cwd` / `cwe` / `cb` / `cbs` / `cbd` / `cbe` | `ClipboardSink`：读请求、写开始、分块、结束 |
+| `LOST_FRAME` / `DECODE_PACE` / `CLIENT_FRAME_ACK` / `vp,…` | 忽略（前端自己的流控） |
+| 二进制 `0x02` / `0x06` | 麦克风与摄像头上行，记 debug 后丢弃 |
+
+下行剪贴板与 WebRTC **不是同一族**，必须按 WS 的发：
+`clipboard,<b64>` / `clipboard_binary,<mime>,<b64>` / `clipboard_start,<mime>,<total>` /
+`clipboard_data,<b64>` / `clipboard_finish` / `clipboard_reply,cr` / `clipboard_secret`。
+发成 WebRTC 那套 `cb,…` 页面只会当成未知消息丢掉。
+
+## 8. 这一版**没做**什么
 
 | 缺口 | 现状 |
 |---|---|
-| 键鼠注入 | 前端会把输入当文本命令发上来，服务端目前只记 debug 日志。页面能看不能操作 |
-| 音频 | `START_AUDIO` 已忽略；WebSocket 侧的 Opus 分帧（2 字节头）未实现 |
-| 剪贴板 | 二进制上行不接（`Message::Binary` 直接丢弃） |
-| 摄像头上行 | `server_settings` 里仍声明 `webcam_encoder: vp9`，实现为空 |
+| 麦克风上行 | 二进制 `0x02` 已识别但不解码，`server_settings` 里仍声明 `audio_encoder` |
+| 摄像头上行 | `0x06` 记 debug 后丢弃；`webcam_encoder: vp9` 仍是"广告了没货" |
+| WS 选屏 | 这条通路没有 hello，选不了屏幕：跟服务端 `--display` 走。多屏选择走 WebRTC 的 `display_id` |
 
-最后一条是已知的"广告了没货"：页面会画一个摄像头开关，点了没有反应。下一轮要么
-补上，要么把声明改成 unsupported。
+前两条是同一类问题：页面上有开关、服务端没有实现。下一轮要么补上，要么把声明改成
+unsupported —— 一个点了没反应的开关比没有这个开关更贵。
 
-## 8. 踩过的坑
+## 9. 踩过的坑
+
+- **视频整帧发成 `0x01`**：这是本文件最贵的一次错误。`0x01` 是音频，码流进了 Opus
+  解码器，视频一次都没被解开；探针当时也断言 `0x01`，于是"验证通过"——测试和实现
+  一起错了，没人发现。探针现在先判 `0x01` 当音频并计数，视频必须 `0x04`。
+- **`shared.rs` 的引用计数释放要按 join 的 key**：`WS` 侧 `acquire` 用的是服务端
+  默认屏，`release` 若写死 `PRIMARY`，`--display 1` 下程序永远不会被回收。
 
 - **探针只存了前 120 个字符**做断言，`server_settings` 是一整行设置表，于是"有没有
   这条消息"的检查变成假阴性，第一次跑出 `RESULT fail no server_settings` 而服务端
