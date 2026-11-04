@@ -23,6 +23,9 @@ pub mod health;
 // #99: `dist/.asset-manifest.json` — the bundle's hash table, read for ETags and
 // served whole on `GET /api/v1/manifest`.
 pub mod manifest;
+// #106: `GET /api/websockets` — the WebSocket + WebCodecs transport. Same
+// frames as WebRTC, different wire: 12-byte header, raw bitstream, no RTP.
+pub mod ws_media;
 
 pub use server::serve;
 pub use health::HealthProbe;
@@ -157,6 +160,20 @@ pub enum Route {
     Control { action: String },
     /// Static file path (relative to dist) to serve.
     Static(PathBuf),
+    /// #106: `GET /api/websockets` — the WebSocket media transport.
+    ///
+    /// A separate route from `Signaling`, not a second app segment under it:
+    /// the two answer with different protocols on the same socket, and a
+    /// signaling path that silently accepted a media client would look like a
+    /// dead page rather than a wrong one.
+    WebSockets,
+    /// #106: `POST /api/switch` — the transport menu's entry point.
+    ///
+    /// The frontend posts `{"mode":"webrtc"|"websockets"}` here before it
+    /// reloads into that mode (`lib/mode-switch.js:43`). Without it the menu
+    /// gets a 404 and the page never reloads — a control that silently does
+    /// nothing, which is exactly the failure shape this project keeps chasing.
+    Switch,
     /// Unrecognized API segment or unsupported method; 404 / 400.
     NotFound,
 }
@@ -190,6 +207,12 @@ pub fn classify(path: &str, _app_name: &str) -> Route {
         ["api", app, "signaling"] | ["api", app, "signaling", ""] => {
             Route::Signaling { app: (*app).to_owned() }
         }
+        // #106: the media socket. The frontend builds this as
+        // `getRoutePrefix() + '/api/websockets'` (`selkies-ws-core.js:7722`), so
+        // with no prefix it is exactly this path — a trailing slash included
+        // because a proxy may normalize one in.
+        ["api", "websockets"] | ["api", "websockets", ""] => Route::WebSockets,
+        ["api", "switch"] => Route::Switch,
         ["api", ..] => Route::NotFound,
         _ => {
             let rel = if segments.is_empty() {
@@ -216,6 +239,26 @@ mod tests {
             classify("/api/webrtc/signaling", "webrtc"),
             Route::Signaling { .. }
         ));
+    }
+
+    #[test]
+    fn routes_websockets() {
+        // #106: the path the frontend builds (`getRoutePrefix() + '/api/websockets'`).
+        assert!(matches!(classify("/api/websockets", "webrtc"), Route::WebSockets));
+        assert!(matches!(classify("/api/websockets/", "webrtc"), Route::WebSockets));
+        // A token in the query must not change the route: `?token=` is one of the
+        // five carriers the media socket authenticates with.
+        assert!(matches!(
+            classify("/api/websockets?token=abc", "webrtc"),
+            Route::WebSockets
+        ));
+        // It is not a signaling app segment — the two take different protocols.
+        assert!(matches!(
+            classify("/api/websockets/signaling", "webrtc"),
+            Route::Signaling { ref app } if app == "websockets"
+        ));
+        // #106: the mode menu's POST.
+        assert!(matches!(classify("/api/switch", "webrtc"), Route::Switch));
     }
 
     #[test]

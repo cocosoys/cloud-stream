@@ -34,8 +34,9 @@ use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 
 use crate::config::Config;
 use crate::http::{classify, file_transfer, header_value, r#static, write_http, Route};
+use crate::pipeline::PipelineRegistry;
 use crate::security::{self, Credential, Endpoint, EventKind, TokenGate};
-use crate::signaling::websession;
+use crate::signaling::websession::{self, Admission};
 use crate::signaling::SessionRegistry;
 
 /// 把路由映射成鉴权骨架认的端点（#88）。
@@ -57,6 +58,12 @@ fn surface_of(route: &Route) -> EventKind {
         // 并进 `Static` —— 将来"能拉页面"和"能点出整棵文件树"可以分权。
         Route::Manifest => Endpoint::Manifest,
         Route::Static(_) => Endpoint::Static,
+        // #106: 媒体 socket 与信令同一个端点面 —— 两者都是"给我一路画面"的升级
+        // 路径，区别只在线上格式。给它单开一类，就得到策略表里再加一处"忘了配"
+        // 的地方，而默认值会比现在更宽松还是更严，取决于表的写法：不值得赌。
+        Route::WebSockets => Endpoint::Signaling,
+        // #106: 切传输是一次写操作（前端会据此重载页面），归到控制面。
+        Route::Switch => Endpoint::Control,
         Route::NotFound => Endpoint::NotFound,
     })
 }
@@ -187,13 +194,19 @@ async fn handle_connection<S>(
     stream: S,
     cfg: Arc<Config>,
     registry: SessionRegistry,
+    admission: Admission,
+    pipelines: PipelineRegistry,
     chunks: file_transfer::ChunkStore,
     health: crate::http::HealthProbe,
     peer: std::net::IpAddr,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    if let Err(err) = handle_inner(stream, cfg, registry, chunks, health, peer).await {
+    if let Err(err) = handle_inner(
+        stream, cfg, registry, admission, pipelines, chunks, health, peer,
+    )
+    .await
+    {
         log::debug!("connection closed: {err:#}");
     }
 }
@@ -202,6 +215,8 @@ async fn handle_inner<S>(
     mut stream: S,
     cfg: Arc<Config>,
     registry: SessionRegistry,
+    admission: Admission,
+    pipelines: PipelineRegistry,
     chunks: file_transfer::ChunkStore,
     health: crate::http::HealthProbe,
     peer: std::net::IpAddr,
@@ -276,6 +291,38 @@ where
 
     // #67: POST /api/upload carries the raw body; every other method is 405.
     if method == "POST" {
+        // #106: 模式菜单的入口。放在 upload 之前，因为它的 body 很小且是要解析的
+        // JSON，而 upload 那条路会把整段字节写进磁盘目录。
+        if matches!(route, crate::http::Route::Switch) {
+            let clen = header_value(&headers, "Content-Length")
+                .and_then(|v| std::str::from_utf8(v).ok())
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(0);
+            // 一个 `{"mode":"websockets"}` 是 24 字节；四位数的上限够宽松，也够
+            // 挡住"往这个端点灌一百兆"这种最省事的滥用。
+            if clen > 4096 {
+                write_http(
+                    &mut stream,
+                    413,
+                    "Payload Too Large",
+                    "application/json; charset=utf-8",
+                    br#"{"status":"error","message":"switch body too large"}"#,
+                )
+                .await?;
+                return Ok(());
+            }
+            let mut body = Vec::with_capacity(clen);
+            body.extend_from_slice(&extra);
+            extra.clear();
+            let need = clen.saturating_sub(body.len());
+            if need > 0 {
+                let mut rest = vec![0u8; need];
+                stream.read_exact(&mut rest).await?;
+                body.extend_from_slice(&rest);
+            }
+            let _ = crate::http::ws_media::handle_switch(&mut stream, &body).await;
+            return Ok(());
+        }
         if matches!(route, crate::http::Route::Upload) {
             let clen = header_value(&headers, "Content-Length")
                 .and_then(|v| std::str::from_utf8(v).ok())
@@ -309,7 +356,14 @@ where
         // #93: the write surface is two POSTs; everything else on POST stays 405
         // so a stray form post cannot look like it did something.
         if let crate::http::Route::Control { action } = &route {
-            let _ = crate::http::health::handle_control(&mut stream, action, &registry, &cfg).await;
+            let _ = crate::http::health::handle_control(
+                &mut stream,
+                action,
+                &registry,
+                &pipelines,
+                &cfg,
+            )
+            .await;
             return Ok(());
         }
         write_http(
@@ -368,7 +422,15 @@ where
         // simply idle, 503 when the process is up but frames stopped going out —
         // that distinction is the whole point, `Route::Status` cannot make it.
         crate::http::Route::Health => {
-            let _ = crate::http::health::handle_health(&mut stream, &cfg, &registry, &health).await;
+            let _ = crate::http::health::handle_health(
+                &mut stream,
+                &cfg,
+                &registry,
+                &admission,
+                &pipelines,
+                &health,
+            )
+            .await;
             return Ok(());
         }
 
@@ -421,6 +483,20 @@ where
             return Ok(());
         }
 
+        // #106: same for the transport switch. A GET here would look like a probe
+        // that always "succeeds" while changing nothing.
+        crate::http::Route::Switch => {
+            write_http(
+                &mut stream,
+                405,
+                "Method Not Allowed",
+                "text/plain; charset=utf-8",
+                b"405 Method Not Allowed",
+            )
+            .await?;
+            return Ok(());
+        }
+
         crate::http::Route::Signaling { .. } => {
             // #88: 路径匹配放行不等于允许开会话。"这个 URL 存不存在"和"你能
             // 不能拿到一路画面"是两个问题，前者在 `Endpoint::Signaling` 判过，
@@ -458,6 +534,36 @@ where
                 return Ok(());
             }
 
+            // #102: 准入放在升级**之前**。拒绝一个还在握手的客户端，比让它建
+            // PeerConnection、走完 SDP、再被一条关闭码踹掉便宜得多；而且 101
+            // 之后的拒绝只能靠关闭码表达，前端读到的是"连上又断"，会当成网络
+            // 抖动进入重连循环 —— 那正是限流想避免的负载。
+            //
+            // `Retry-After` 是有用的：前端的重连是带退避的，没有这个头它只能按
+            // 自己的节奏试；有了它，一个被拒的页面至少知道"别人占满了"，而不是
+            // "服务端坏了"。
+            let Some(permit) = admission.try_enter() else {
+                let body = format!(
+                    "{{\"status\":\"error\",\"message\":\"session limit reached ({}); retry after a holder disconnects\"}}",
+                    admission.max()
+                );
+                crate::http::write_http_with(
+                    &mut stream,
+                    503,
+                    "Service Unavailable",
+                    "application/json; charset=utf-8",
+                    body.as_bytes(),
+                    &[("Retry-After", "5")],
+                )
+                .await?;
+                log::warn!(
+                    "signaling refused from {peer}: {} of {} slots in use",
+                    admission.live(),
+                    admission.max()
+                );
+                return Ok(());
+            };
+
             // #93: hand the identity down so `/api/v1/health` can name the
             // client. `User-Agent` is the only fingerprint a browser volunteers;
             // the rest (`client_device_id`) comes in the hello.
@@ -482,7 +588,83 @@ where
             .await
             .map_err(|err| anyhow!("signaling upgrade failed: {err}"))?;
 
-            websession::run(ws, cfg, registry, client).await?;
+            websession::run(ws, cfg, registry, pipelines, client, permit).await?;
+        }
+
+        // #106: 画面走 WebSocket 的那条线。和信令是同一个升级动作，但**下游没有
+        // 一处共享**：这里发的是 12 字节头 + 裸码流，不开 PeerConnection，也不进
+        // 信令状态机。混在一个分支里，媒体客户端会停在"等 HELLO"上，页面一片空白
+        // 而日志一切正常 —— 这类"接上了但没画面"正是这一版要消灭的形态。
+        //
+        // 裁决复用 `Endpoint::Signaling` + `EventKind::Signaling`：能开一路画面的
+        // 人就能用任一传输看这一路画面，传输方式不是权限维度。等真的出现
+        // "只许看、不许开 PeerConnection" 的需求，再单独分一个端点。
+        crate::http::Route::WebSockets => {
+            if !security::allow(EventKind::Signaling, &principal) {
+                write_http(
+                    &mut stream,
+                    403,
+                    "Forbidden",
+                    "text/plain; charset=utf-8",
+                    b"403 Forbidden\n",
+                )
+                .await?;
+                return Ok(());
+            }
+            let upgrade = header_value(&headers, "Upgrade")
+                .and_then(|v| std::str::from_utf8(v).ok())
+                .unwrap_or("");
+            let connection = header_value(&headers, "Connection")
+                .and_then(|v| std::str::from_utf8(v).ok())
+                .unwrap_or("");
+            let is_ws = upgrade.eq_ignore_ascii_case("websocket")
+                && connection
+                    .split([',', ' '])
+                    .any(|p| p.eq_ignore_ascii_case("upgrade"));
+            if !is_ws {
+                // 前端的重连探针会 GET 这个路径而不升级（`scheduleReconnect`
+                // 用一次普通请求问"服务还在不在"），所以这里必须给一个明确的
+                // 4xx 而不是挂住 —— 探针读到 400 就知道该重开 socket 了。
+                write_http(
+                    &mut stream,
+                    400,
+                    "Bad Request",
+                    "text/plain; charset=utf-8",
+                    b"400 Expected WebSocket upgrade\n",
+                )
+                .await?;
+                return Ok(());
+            }
+            // 与信令同一道闸：拒绝放在 101 之前，前端能读到 503 + Retry-After
+            // 并退避；101 之后再拒只能靠关闭码，页面会当成网络抖动。
+            let Some(permit) = admission.try_enter() else {
+                let body = format!(
+                    "{{\"status\":\"error\",\"message\":\"session limit reached ({}); retry after a holder disconnects\"}}",
+                    admission.max()
+                );
+                crate::http::write_http_with(
+                    &mut stream,
+                    503,
+                    "Service Unavailable",
+                    "application/json; charset=utf-8",
+                    body.as_bytes(),
+                    &[("Retry-After", "5")],
+                )
+                .await?;
+                log::warn!(
+                    "websockets refused from {peer}: {} of {} slots in use",
+                    admission.live(),
+                    admission.max()
+                );
+                return Ok(());
+            };
+
+            let prefixed = PrefixedStream { head, pos: 0, inner: stream };
+            let ws: WebSocketStream<PrefixedStream<S>> =
+                accept_hdr_async(prefixed, |_req: &Request, resp: Response| Ok(resp))
+                    .await
+                    .map_err(|err| anyhow!("websockets upgrade failed: {err}"))?;
+            crate::http::ws_media::run(ws, cfg, pipelines, permit, peer, credential).await?;
         }
 
         crate::http::Route::Static(rel) => {
@@ -562,6 +744,16 @@ pub async fn serve(cfg: Arc<Config>) -> Result<()> {
     }
 
     let registry = SessionRegistry::default();
+    // #102: how many sessions may hold the stream at once. One shared encoder
+    // means "one more viewer" is not free — it costs a packetizer pass and a
+    // full copy of the bitrate — so the bound exists to protect the people
+    // already watching, not to ration a license. Default 8, `--max-sessions`.
+    let admission = Admission::new(cfg.max_sessions);
+    log::info!("session admission: at most {} live signaling session(s)", admission.max());
+    // #101: one program per display, shared by every session attached to it.
+    // Held here rather than per connection because a capture outlives the
+    // session that opened it whenever a second viewer is still watching.
+    let pipelines = PipelineRegistry::default();
     // #67: one chunked-upload registry per process; each upload slice is an
     // independent TCP connection, so the registry is shared across them.
     let chunks = file_transfer::new_chunk_store();
@@ -574,6 +766,8 @@ pub async fn serve(cfg: Arc<Config>) -> Result<()> {
             Ok((stream, peer)) => {
                 let cfg = cfg.clone();
                 let registry = registry.clone();
+                let admission = admission.clone();
+                let pipelines = pipelines.clone();
                 let chunks = chunks.clone();
                 let health = health.clone();
                 match &acceptor {
@@ -585,8 +779,11 @@ pub async fn serve(cfg: Arc<Config>) -> Result<()> {
                         tokio::spawn(async move {
                             match acc.accept(stream).await {
                                 Ok(tls) => {
-                                    handle_connection(tls, cfg, registry, chunks, health, peer.ip())
-                                        .await
+                                    handle_connection(
+                                        tls, cfg, registry, admission, pipelines, chunks, health,
+                                        peer.ip(),
+                                    )
+                                    .await
                                 }
                                 Err(err) => {
                                     log::debug!("TLS handshake failed from {peer}: {err:#}")
@@ -596,8 +793,11 @@ pub async fn serve(cfg: Arc<Config>) -> Result<()> {
                     }
                     None => {
                         tokio::spawn(async move {
-                            handle_connection(stream, cfg, registry, chunks, health, peer.ip())
-                                .await;
+                            handle_connection(
+                                stream, cfg, registry, admission, pipelines, chunks, health,
+                                peer.ip(),
+                            )
+                            .await;
                         });
                     }
                 }

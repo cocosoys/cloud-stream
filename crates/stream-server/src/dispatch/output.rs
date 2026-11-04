@@ -404,7 +404,16 @@ pub fn server_settings(s: &crate::pipeline::StreamSettings) -> String {
                 "video_fullcolor": { "value": false, "locked": true },
                 "video_10bit": { "value": false, "locked": true },
                 "use_cpu": { "value": true, "locked": true },
-                "webcam_encoder": { "value": "vp9", "locked": true }
+                // #106：这里原先写的是 `webcam_encoder: vp9, locked`，而摄像头上行
+                // 一行都没实现 —— 声明了一个这台机器根本收不到的编码器。前端的
+                // 后果是：摄像头按钮可以点、点了本地开始采集、然后画面没有下文，
+                // 而页面不会报错，因为服务端确实"说过"它支持 vp9。
+                //
+                // `webcam_enabled: false + locked` 是前端自己的"这台机器没有摄像头
+                // 通路"写法（`selkies-ws-core.js:5267` 的 `lockedOff`），它同时挡住
+                // 自动启动与按需启动。真要做摄像头上行（WebRTC 反向 track）时，
+                // 把这一行换回真实的 `webcam_encoder`，不要两行都留。
+                "webcam_enabled": { "value": false, "locked": true }
             }
         }
     })
