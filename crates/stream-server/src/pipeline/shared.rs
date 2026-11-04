@@ -86,6 +86,19 @@ impl DisplayKey {
             _ => Self::PRIMARY,
         }
     }
+
+    /// The page's name for this screen — the inverse of [`Self::from_hello`].
+    ///
+    /// Needed downstream because the page matches on the *name*, not the index:
+    /// `PIPELINE_RESETTING` is ignored unless the id in it equals the page's own
+    /// `displayId` (`selkies-ws-core.js:8996`), so sending `1` there resets
+    /// nothing and the decoder keeps a stale reference.
+    pub fn hello_name(&self) -> String {
+        match self.0 {
+            0 => "primary".to_owned(),
+            n => format!("display{}", n + 1),
+        }
+    }
 }
 
 impl Default for DisplayKey {
@@ -647,5 +660,16 @@ mod tests {
         assert_eq!(DisplayKey::from_hello(" 2 "), DisplayKey(2));
         assert_eq!(DisplayKey::from_hello("DISPLAY2"), DisplayKey(1));
         assert_eq!(DisplayKey::from_hello("PRIMARY"), DisplayKey::PRIMARY);
+    }
+
+    /// #109: the name → index → name round trip has to be exact, because the
+    /// index goes in the log and the name goes back to the page.
+    #[test]
+    fn hello_name_is_the_inverse_of_from_hello() {
+        for (name, index) in [("primary", 0u32), ("display2", 1), ("display3", 2)] {
+            let key = DisplayKey::from_hello(name);
+            assert_eq!(key.0, index, "{name} resolved wrong");
+            assert_eq!(key.hello_name(), name, "index {index} names wrong");
+        }
     }
 }

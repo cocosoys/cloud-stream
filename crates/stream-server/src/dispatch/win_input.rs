@@ -377,22 +377,7 @@ impl WinInputSink {
     /// monitor.
     fn move_abs(&self, x: i32, y: i32) {
         let t = *self.target.lock().unwrap_or_else(|p| p.into_inner());
-        let (dx, dy, flags) = if t.virtual_desk {
-            let (vx, vy, vw, vh) = virtual_screen();
-            let vw = vw.max(2);
-            let vh = vh.max(2);
-            (
-                (((x - vx) as i64 * 65535) / (vw as i64 - 1)) as i32,
-                (((y - vy) as i64 * 65535) / (vh as i64 - 1)) as i32,
-                MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-            )
-        } else {
-            (
-                absolute_norm(x, t.w),
-                absolute_norm(y, t.h),
-                MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
-            )
-        };
+        let (dx, dy, flags) = space_to_send(x, y, &t, virtual_screen());
         send_inputs(&mut [INPUT {
             r#type: INPUT_MOUSE,
             Anonymous: INPUT_0 {
@@ -523,6 +508,61 @@ fn virtual_screen() -> (i32, i32, i32, i32) {
             GetSystemMetrics(SM_CYVIRTUALSCREEN),
         )
     }
+}
+
+/// Frame pixel -> *virtual-desktop* pixel for a monitor whose corner is `origin`
+/// (#109). `map_axis` handles the frame→monitor scale; the origin is the second
+/// half and is what makes a secondary screen clickable at all.
+fn place(v: i32, frame: u32, screen: i32, origin: i32) -> i32 {
+    map_axis(v, frame, screen) + origin
+}
+
+/// A screen pixel in the target monitor's space -> the `(dx, dy, flags)` triple
+/// `SendInput` wants for an absolute move (#109).
+///
+/// Split out from `move_abs` so the arithmetic can be tested without a second
+/// monitor: the whole "点哪儿准哪儿" question on a dual-screen host is these two
+/// branches, and a mistake here is invisible on a single-screen machine.
+///
+/// Two different normalisations, and they are not interchangeable:
+/// * primary — `0..65535` across `SM_CXSCREEN/CYSCREEN`, no extra flag. This is
+///   the pre-#109 path, kept byte-for-byte so a single-monitor session cannot
+///   regress.
+/// * anywhere else — `0..65535` across the **whole virtual desktop**, plus
+///   `MOUSEEVENTF_VIRTUALDESK`. Without the flag Windows reads the value in
+///   primary-screen space and the pointer lands on the primary monitor; with the
+///   flag but primary-space values it lands offset by the monitor's origin.
+fn space_to_send(
+    x: i32,
+    y: i32,
+    space: &TargetSpace,
+    desktop: (i32, i32, i32, i32),
+) -> (i32, i32, u32) {
+    if space.virtual_desk {
+        let (vx, vy, vw, vh) = desktop;
+        let last_x = (vw.max(2) - 1) as i64;
+        let last_y = (vh.max(2) - 1) as i64;
+        (
+            (((x - vx) as i64).clamp(0, last_x) * 65535 / last_x) as i32,
+            (((y - vy) as i64).clamp(0, last_y) * 65535 / last_y) as i32,
+            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+        )
+    } else {
+        (
+            absolute_norm(x, space.w),
+            absolute_norm(y, space.h),
+            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
+        )
+    }
+}
+
+/// Does this target need `MOUSEEVENTF_VIRTUALDESK`?
+///
+/// The primary monitor is the only case that must avoid it: the flag changes how
+/// Windows interprets *every* absolute move, and a single-screen box has no
+/// virtual desktop to be wrong about.
+fn needs_virtual_desk(origin: (i32, i32), size: (u32, u32), primary: (i32, i32)) -> bool {
+    origin != (0, 0) || (size.0 as i32, size.1 as i32) != primary
 }
 
 fn mouse_move_rel(dx: i32, dy: i32) {
@@ -724,8 +764,8 @@ impl WinInputSink {
         // frontend's pixel is relative to the frame, and the monitor's corner
         // is where that frame begins in the virtual desktop.
         (
-            map_axis(x, fw, sw) + t.x,
-            map_axis(y, fh, sh) + t.y,
+            place(x, fw, sw, t.x),
+            place(y, fh, sh, t.y),
         )
     }
 
@@ -961,8 +1001,7 @@ impl InputSink for WinInputSink {
         }
         // Primary keeps the exact pre-#109 path (no VIRTUALDESK) so a
         // single-monitor session cannot regress because of this feature.
-        let primary = screen_size();
-        let virtual_desk = origin != (0, 0) || (size.0 as i32, size.1 as i32) != primary;
+        let virtual_desk = needs_virtual_desk(origin, size, screen_size());
         *self.target.lock().unwrap_or_else(|p| p.into_inner()) = TargetSpace {
             x: origin.0,
             y: origin.1,
@@ -1095,5 +1134,101 @@ mod tests {
         // Both vertical bits at once would be a broken client, but it must not
         // panic or drop one silently.
         assert_eq!(scroll_pulses(0, 0x18, 1), vec![(true, -1), (true, 1)]);
+    }
+
+    // ---- #109: multi-monitor pointer mapping ------------------------------
+    //
+    // These are the only parts of "点哪儿准哪儿" that can be checked on a host
+    // with one screen. The live acceptance still needs two physical monitors
+    // (see `toolchain/display-probe.ps1`), but the arithmetic below is exactly
+    // what goes wrong there.
+
+    fn space(origin: (i32, i32), size: (i32, i32), virtual_desk: bool) -> TargetSpace {
+        TargetSpace {
+            x: origin.0,
+            y: origin.1,
+            w: size.0,
+            h: size.1,
+            virtual_desk,
+        }
+    }
+
+    /// The frame origin is *added*, so the first frame pixel lands on the
+    /// monitor's top-left corner in virtual-desktop coordinates — not on (0,0),
+    /// which is the bug this whole change exists to fix.
+    #[test]
+    fn a_secondary_frame_starts_at_its_own_corner() {
+        // 1920x1080 monitor sitting to the right of the primary.
+        assert_eq!(place(0, 1920, 1920, 1920), 1920);
+        assert_eq!(place(1919, 1920, 1920, 1920), 3839);
+        // Scaled stream: the far edge still reaches the far edge, plus origin.
+        assert_eq!(place(1279, 1280, 1920, 1920), 3839);
+        // A monitor to the left has a negative origin; the offset is signed.
+        assert_eq!(place(0, 1920, 1920, -1920), -1920);
+    }
+
+    /// Primary: identical to the pre-#109 output, with no `VIRTUALDESK` — the
+    /// guarantee that a single-screen machine cannot regress.
+    #[test]
+    fn the_primary_monitor_keeps_the_old_no_flag_path() {
+        let t = space((0, 0), (1920, 1080), false);
+        let desktop = (0, 0, 1920, 1080);
+        assert_eq!(space_to_send(0, 0, &t, desktop), (0, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE));
+        let (dx, dy, flags) = space_to_send(1919, 1079, &t, desktop);
+        assert_eq!((dx, dy), (65535, 65535), "far corner must be the top of the range");
+        assert_eq!(flags & MOUSEEVENTF_VIRTUALDESK, 0, "primary must not set VIRTUALDESK");
+    }
+
+    /// Secondary to the right: the value is measured against the whole virtual
+    /// desktop, so its left edge is the midpoint of `0..65535`, not zero. Sending
+    /// zero here is the classic "clicks land on the primary monitor".
+    #[test]
+    fn a_secondary_monitor_normalises_against_the_virtual_desktop() {
+        let t = space((1920, 0), (1920, 1080), true);
+        let desktop = (0, 0, 3840, 1080); // two 1080p side by side
+        let (dx, dy, flags) = space_to_send(1920, 0, &t, desktop);
+        assert_eq!(flags & MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_VIRTUALDESK, "flag missing");
+        // 1920 * 65535 / 3839 = 32776 (integer division) — half of the desktop,
+        // which is where that monitor's left edge lands. Zero would mean "the
+        // pointer goes to the primary screen instead".
+        assert_eq!(dx, 32776, "left edge of the right-hand screen is the middle of the desktop");
+        assert_eq!(dy, 0, "top edge is the top of the desktop");
+        let (dx, _, _) = space_to_send(3839, 1079, &t, desktop);
+        assert_eq!(dx, 65535, "the far edge must reach the top of the range");
+    }
+
+    /// Secondary to the **left**: the virtual desktop starts at -1920, so that
+    /// monitor's own left edge is virtual x = 0. A version that forgot to
+    /// subtract the desktop origin would clamp every click on the left screen
+    /// onto its right-hand neighbour.
+    #[test]
+    fn a_monitor_left_of_the_primary_uses_a_signed_desktop_origin() {
+        let t = space((-1920, 0), (1920, 1080), true);
+        let desktop = (-1920, 0, 3840, 1080);
+        let (dx, _, _) = space_to_send(-1920, 0, &t, desktop);
+        assert_eq!(dx, 0, "the left screen's first pixel is the desktop's first pixel");
+        let (dx, _, _) = space_to_send(-1, 0, &t, desktop);
+        // 1919 * 65535 / 3839 = 32758 — its last pixel, just short of the middle.
+        assert_eq!(dx, 32758, "its last pixel is the middle of the desktop");
+    }
+
+    /// Out-of-range values clamp instead of wrapping into negative `dx`.
+    #[test]
+    fn out_of_range_points_clamp_onto_the_desktop() {
+        let t = space((1920, 0), (1920, 1080), true);
+        let desktop = (0, 0, 3840, 1080);
+        assert_eq!(space_to_send(-500, -500, &t, desktop).0, 0);
+        assert_eq!(space_to_send(99_999, 99_999, &t, desktop).0, 65535);
+    }
+
+    /// Only the primary avoids the flag; anything else gets it, including a
+    /// same-size monitor at a non-zero origin.
+    #[test]
+    fn only_the_primary_skips_the_virtual_desk_flag() {
+        assert!(!needs_virtual_desk((0, 0), (1920, 1080), (1920, 1080)));
+        assert!(needs_virtual_desk((1920, 0), (1920, 1080), (1920, 1080)));
+        assert!(needs_virtual_desk((-1920, 0), (1920, 1080), (1920, 1080)));
+        // Same origin, different size: a rotated or non-native primary.
+        assert!(needs_virtual_desk((0, 0), (1080, 1920), (1920, 1080)));
     }
 }

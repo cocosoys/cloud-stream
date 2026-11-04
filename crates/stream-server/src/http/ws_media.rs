@@ -223,9 +223,10 @@ where
 
     // 共享管线：如果此刻已有一个 WebRTC 会话在跑，这里是**加入**而不是新开一路
     // 采集 —— `DuplicateOutput` 对同一个输出是独占的，新开只会失败并退到 GDI。
-    // #109: WS 页面没有 hello，选不了屏幕，所以这里跟服务端默认走（`--display`）。
+    // #109: WS 页面没有 hello，先按服务端默认（`--display`）开一路，页面的
+    // `SETTINGS.displayId` 到了再决定要不要换 —— 换屏是 `PendingDisplay` 那段。
     let acquired = pipelines.acquire(DisplayKey(cfg.display), &cfg).await;
-    let pipeline = acquired.pipeline.clone();
+    let mut pipeline = acquired.pipeline.clone();
 
     if let Some(settings) = settings_frame(&pipeline.settings) {
         sink.send(Message::Text(settings.into())).await?;
@@ -251,7 +252,7 @@ where
     pipeline.try_claim_controller(session_id);
 
     let (tx, mut rx) = mpsc::channel::<Bytes>(QUEUE);
-    let sink_handle = pipeline.video.attach_stream(tx);
+    let mut sink_handle = pipeline.video.attach_stream(tx);
     let denied = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     registry
         .set_downlink(session_id, pipeline.display, sink_handle.counters(), denied.clone())
@@ -263,7 +264,7 @@ where
 
     // 音频：与视频同构，程序只有一条 loopback，这里挂一个裸 Opus 下行。
     let (audio_tx, mut audio_rx) = mpsc::channel::<Bytes>(8);
-    let audio_sink = pipeline.audio.attach_stream(audio_tx);
+    let mut audio_sink = pipeline.audio.attach_stream(audio_tx);
 
     // 输入与剪贴板都是纯软件对象，创建成本可以忽略；`WinInputSink` 持有自己的
     // 按钮/滚轮/按键状态，所以必须每会话一个，不能全局共享。
@@ -289,6 +290,14 @@ where
     let mut need_key = true;
     let mut streaming = true;
     let mut dropped: u64 = 0;
+    // #109: 页面在 `SETTINGS` 里点名了另一块屏。换屏要拆掉这条连接挂着的
+    // 视频/音频 sink、释放旧程序、再 acquire 新的 —— 全都在 `select!` 之外做，
+    // 因为在分支体里改 `rx` / `pipeline` 会和同一轮 `select!` 的其他分支借用打架。
+    let mut pending_display: Option<DisplayKey> = None;
+    // 上行的麦克风/摄像头回绝只发一次：页面的电平条按帧发 `0x02`，每帧回一条
+    // 文本会把 socket 变成回音壁。
+    let mut mic_refused = false;
+    let mut cam_refused = false;
 
     let outcome: Result<()> = async {
         loop {
@@ -368,11 +377,12 @@ where
                     match msg {
                         Some(Ok(Message::Text(line))) => {
                             let line = line.as_str().trim();
-                            handle_text(
+                            pending_display = handle_text(
                                 line,
                                 &pipeline,
                                 &input,
                                 &clipboard,
+                                &registry,
                                 &mut sink,
                                 &mut streaming,
                                 &mut need_key,
@@ -386,11 +396,35 @@ where
                             break;
                         }
                         // 二进制上行：麦克风 `0x02`、摄像头 `0x06`。这两条这条
-                        // 服务端都还没有接收端（麦克风走 WebRTC 的 track，摄像头
-                        // 全项目未实现），记一行 debug 而不是静默吞掉。
+                        // 服务端都还没有接收端（被控机上没有"播进主机麦克风"的接口，
+                        // 摄像头反向 track 全项目未实现），所以**明确回绝**而不是
+                        // 静默吞掉：页面收到 `MICROPHONE_DISABLED` 会把
+                        // `microphoneEnabled` 置 false 并停掉采集，用户不会看到一条
+                        // 一直在跳却传不出去的电平条。每条连接只回一次。
                         Some(Ok(Message::Binary(data))) => {
                             let kind = data.first().copied().unwrap_or(0);
-                            log::debug!("ws media: binary upstream type {kind:#04x} ignored ({} B)", data.len());
+                            match kind {
+                                0x02 if !mic_refused => {
+                                    mic_refused = true;
+                                    log::info!(
+                                        "ws media: microphone uplink is not implemented; telling the page ({})",
+                                        data.len()
+                                    );
+                                    send_text(&mut sink, "MICROPHONE_DISABLED".to_owned()).await?;
+                                }
+                                0x06 if !cam_refused => {
+                                    cam_refused = true;
+                                    log::info!(
+                                        "ws media: webcam uplink is not implemented; telling the page ({})",
+                                        data.len()
+                                    );
+                                    send_text(&mut sink, "WEBCAM_DISABLED".to_owned()).await?;
+                                }
+                                _ => log::debug!(
+                                    "ws media: binary upstream type {kind:#04x} ignored ({} B)",
+                                    data.len()
+                                ),
+                            }
                         }
                         Some(Ok(_)) => {}
                         Some(Err(err)) => {
@@ -400,6 +434,71 @@ where
                         None => break,
                     }
                 }
+            }
+
+            // #109: 页面换了屏。顺序是 detach → release → acquire，因为
+            // `DuplicateOutput` 对同一个输出是独占的：先在旧程序还活着的时候去
+            // 开新一路，某些卡会直接失败并退到 GDI，然后两个程序一个 DXGI 一个
+            // 慢路径；而先释放再打开，最坏只是中间黑几帧。
+            if let Some(wanted) = pending_display.take() {
+                if wanted == pipeline.display {
+                    continue;
+                }
+                let previous = pipeline.display;
+                pipeline.audio.detach(audio_sink);
+                pipeline.detach(sink_handle.id());
+                pipelines.release(previous).await;
+
+                let acquired = pipelines.acquire(wanted, &cfg).await;
+                let next = acquired.pipeline.clone();
+                next.handle.start();
+                let (next_tx, next_rx) = mpsc::channel::<Bytes>(QUEUE);
+                let next_sink = next.video.attach_stream(next_tx);
+                let (next_audio_tx, next_audio_rx) = mpsc::channel::<Bytes>(8);
+                let next_audio = next.audio.attach_stream(next_audio_tx);
+                // 刚到一块新的屏：手上没有参考帧，不要关键帧就只能等周期性的那个。
+                next.handle.request_keyframe();
+                registry
+                    .set_downlink(
+                        session_id,
+                        next.display,
+                        next_sink.counters(),
+                        denied.clone(),
+                    )
+                    .await;
+                // 输入的目标屏也要跟着换，否则点哪儿都在上一块屏上。
+                match crate::pipeline::capture::geometry_at(next.display.0) {
+                    Some(geom) => {
+                        input.set_target_display(geom.origin, (geom.width, geom.height))
+                    }
+                    None => log::warn!(
+                        "ws media: display {} has no geometry; input stays on the previous screen",
+                        next.display.0
+                    ),
+                }
+                // 帧号必须从头开始：新程序是新的编码器，接着旧号会让页面的
+                // 解码闸门把第一帧当成"依赖缺席"。
+                frame_id = 0;
+                reference = 0;
+                need_key = true;
+                pipeline = next;
+                rx = next_rx;
+                audio_rx = next_audio_rx;
+                sink_handle = next_sink;
+                audio_sink = next_audio;
+                if let Some(settings) = settings_frame(&pipeline.settings) {
+                    let _ = sink.send(Message::Text(settings.into())).await;
+                }
+                // 页面自己的"服务端把流重启了"协议：它据此清掉帧号跟踪、解码器
+                // 与画布，然后等新关键帧。**必须用页面的名字**（`display2`），
+                // 它拿这个名字和自己的 `displayId` 比，发索引等于什么都没做。
+                let reset = format!("PIPELINE_RESETTING {}", pipeline.display.hello_name());
+                let _ = sink.send(Message::Text(reset.into())).await;
+                log::info!(
+                    "ws media: session {session_id} moved from display {} to {}",
+                    previous.0,
+                    pipeline.display.0
+                );
             }
         }
         Ok(())
@@ -442,12 +541,13 @@ async fn handle_text<S>(
     pipeline: &Arc<SharedPipeline>,
     input: &WinInputSink,
     clipboard: &ClipboardSink,
+    registry: &SessionRegistry,
     sink: &mut futures_util::stream::SplitSink<WebSocketStream<S>, Message>,
     streaming: &mut bool,
     need_key: &mut bool,
     denied: &std::sync::Arc<std::sync::atomic::AtomicU64>,
     session_id: u64,
-) -> Result<()>
+) -> Result<Option<DisplayKey>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -456,7 +556,7 @@ where
         "KEYFRAME" | "REQUEST_KEYFRAME" => {
             *need_key = true;
             pipeline.handle.request_keyframe();
-            return Ok(());
+            return Ok(None);
         }
         // 连接建立时的"只读缓存"剪贴板请求：先应答再给载荷，页面的
         // `taggedClipboardFetch` 靠这条 `clipboard_reply,cr` 结束等待。
@@ -465,7 +565,7 @@ where
             for msg in crate::dispatch::clipboard::read_clipboard_ws_messages() {
                 send_text(sink, msg).await?;
             }
-            return Ok(());
+            return Ok(None);
         }
         // 帧确认/解码节奏/多屏布局都是浏览器侧的节流信息；服务端这一版不据此
         // 调速（`vb,` 才是码率入口），记 debug 不当作错误。
@@ -475,7 +575,7 @@ where
             || line.starts_with("vp,") =>
         {
             log::debug!("ws media: `{}` noted", short(line));
-            return Ok(());
+            return Ok(None);
         }
         _ => {}
     }
@@ -524,9 +624,22 @@ where
                 log::info!("ws media: codec -> {}; closing for renegotiation", codec.wire());
                 return Err(anyhow::anyhow!("video codec changed"));
             }
+            // #109/#110: 这一批里还带着"这是哪块屏"和"这是哪个页签"。WS 没有
+            // hello，这**是唯一一处**页面告诉服务端它在哪块屏上 —— 无视它，
+            // 页面上的 "#display2" 就只能看主屏。
+            let identity = crate::dispatch::settings_identity(&payload);
+            // #110: 页签 id 到了就补登记。WS 会话没有 hello，此前 health 里这条
+            // 连接的 `tab_id` 一直是空串，"同一个页签重连"与"第二个观众"分不开。
+            if let Some(tab) = identity.tab_id.as_deref() {
+                registry.update_meta(session_id, tab, "").await;
+                log::debug!("ws media: session {session_id} tab -> {tab}");
+            }
             if let Some(settings) = settings_frame(&pipeline.settings) {
                 send_text(sink, settings).await?;
             }
+            // 换屏交给调用方：这里没有第二个 receiver，也没有 acquire 的引用计数，
+            // 就地重建会把这几个状态撕成两半。返回意图、循环里统一处理。
+            return Ok(identity.display.filter(|d| *d != pipeline.display));
         }
         Action::ClipboardRequest => {
             for msg in crate::dispatch::clipboard::read_clipboard_ws_messages() {
@@ -550,7 +663,7 @@ where
         }
         other => log::debug!("ws media: ignoring `{:?}`", other),
     }
-    Ok(())
+    Ok(None)
 }
 
 async fn send_text<S>(

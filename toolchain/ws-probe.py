@@ -6,7 +6,16 @@
 RFC 6455 拆帧——剩下的字节原样看。
 
 用法：
-    python ws-probe.py [host] [port] [帧数]
+    python ws-probe.py [host] [port] [帧数] [目标屏]
+    python ws-probe.py 192.168.59.148 8080 5            # 只看默认屏
+    python ws-probe.py 192.168.59.148 8080 5 display2   # 切到第二块屏再看
+
+给了「目标屏」时，探针会像页面那样发一条 `SETTINGS,{"displayId":…}`，然后**只统计
+`PIPELINE_RESETTING` 之后**的帧 —— 那之前的帧属于旧屏，混进来会把"换屏没生效"验成
+通过。
+
+多屏机上应当看到 `PIPELINE_RESETTING display2` + 之后每一帧都是第二块屏的尺寸；
+单屏机上应当看到同一行文本、然后**没有帧**（服务端如实失败，不会把主屏错发过来）。
 输出每一帧的 head 解析结果，最后给出结论行 `RESULT ok|fail <原因>`。
 """
 
@@ -21,8 +30,15 @@ import sys
 HOST = sys.argv[1] if len(sys.argv) > 1 else "192.168.59.148"
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8080
 WANT_FRAMES = int(sys.argv[3]) if len(sys.argv) > 3 else 5
+# `primary` / `display2` / … — 与页面 hash 里的关键字同一套。
+TARGET_DISPLAY = sys.argv[4] if len(sys.argv) > 4 else None
 
 WIRE_CODECS = {1: "h264", 2: "vp8", 3: "vp9", 4: "av1", 5: "h265"}
+
+# 探针自己的进度，只为了让**超时**这条退出路径能说人话：换屏后没有帧是最需要解释的
+# 一种失败（单屏机上它是预期结果，多屏机上它是 bug），而 `read_frame` 只能抛一个
+# `TimeoutError: timed out`。
+STATE = {"armed": False, "frames": 0}
 
 
 def fail(reason):
@@ -70,6 +86,19 @@ def send_text(sock, text):
     sock.sendall(header + mask + masked)
 
 
+def send_binary(sock, payload):
+    """掩码的二进制帧（opcode 0x2）——麦克风/摄像头上行走的就是这条。"""
+    mask = os.urandom(4)
+    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    if len(payload) < 126:
+        header = bytes([0x82, 0x80 | len(payload)])
+    elif len(payload) < 65536:
+        header = bytes([0x82, 0x80 | 126]) + struct.pack(">H", len(payload))
+    else:
+        header = bytes([0x82, 0x80 | 127]) + struct.pack(">Q", len(payload))
+    sock.sendall(header + mask + masked)
+
+
 def main():
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
@@ -109,12 +138,29 @@ def main():
     # `taggedClipboardFetch` 靠它结束等待；不回只是"剪贴板永远空着"，不报错。
     send_text(sock, "cr")
 
+    # #110: 麦克风上行服务端没有接收端，必须**明确回绝**（`MICROPHONE_DISABLED`），
+    # 否则页面会一直采集、电平条一直跳，而对面永远听不到。这里发一帧假的 `0x02`，
+    # 断言这句回绝真的回来了 —— 这是"广告了没货"那条最直接的证据。
+    send_binary(sock, b"\x02" + b"\x00" * 8)
+
+    # #109: 像页面一样选屏。`displayId` 是页面自己的字段名（signaling 的 hello
+    # 用 `display_id`，这是两套写法，别混），服务端从这一批里读出目标屏。
+    reset_line = None
+    if TARGET_DISPLAY:
+        payload = '{"displayId":"%s","tabId":"ws-probe"}' % TARGET_DISPLAY
+        send_text(sock, f"SETTINGS,{payload}")
+        reset_line = f"PIPELINE_RESETTING {TARGET_DISPLAY}"
+
     text_seen = []
     frames = 0
     last_id = None
     ids_ok = True
     keyed = 0
     audio = 0
+    # 换屏前属于旧屏的帧要丢掉：把它们算进去，"换了屏但画面没换"会验成通过。
+    armed = not TARGET_DISPLAY
+    pre_switch_frames = 0
+    first_after_switch = None
     while frames < WANT_FRAMES:
         fin, opcode, payload = read_frame(sock)
         if opcode == 0x1:
@@ -124,8 +170,17 @@ def main():
             # 就是这么误报的。
             text_seen.append(line)
             print(f"text: {line[:160]}")
+            if reset_line and line.strip() == reset_line:
+                armed = True
+                STATE["armed"] = True
+                last_id = None  # 新程序从新的帧号开始
             continue
         if opcode == 0x8:
+            if TARGET_DISPLAY and not armed:
+                fail(
+                    f"server closed before answering the display switch "
+                    f"({TARGET_DISPLAY}): {payload!r}"
+                )
             fail(f"server closed before any frame: {payload!r}")
         if opcode != 0x2:
             continue
@@ -137,6 +192,9 @@ def main():
             audio += 1
             if len(payload) < 3:
                 fail(f"audio frame without an Opus packet: {len(payload)} B")
+            continue
+        if not armed:
+            pre_switch_frames += 1
             continue
         if len(payload) < 12:
             fail(f"video frame shorter than the 12-byte header: {len(payload)}")
@@ -153,6 +211,8 @@ def main():
         if last_id is not None and frame_id != (last_id + 1) & 0xFFFF:
             ids_ok = False
         last_id = frame_id
+        if first_after_switch is None:
+            first_after_switch = (w, h)
         if is_key:
             keyed += 1
 
@@ -171,6 +231,7 @@ def main():
         if body == 0:
             fail("empty payload")
         frames += 1
+        STATE["frames"] = frames
 
     sock.sendall(b"\x88\x82" + b"\x00\x00\x00\x00" + struct.pack(">H", 1000))
 
@@ -180,12 +241,21 @@ def main():
         fail("no server_settings payload")
     if "clipboard_reply,cr" not in text_seen:
         fail("no clipboard_reply,cr answer to the connect-time `cr`")
+    if "MICROPHONE_DISABLED" not in text_seen:
+        fail("no MICROPHONE_DISABLED answer to a 0x02 uplink: the page would keep capturing")
+    if reset_line and reset_line not in text_seen:
+        fail(f"no `{reset_line}` after SETTINGS displayId={TARGET_DISPLAY}")
     if not ids_ok:
         fail("frame ids are not contiguous")
     if keyed == 0:
         fail("no keyframe in the window — first frame must be a decode entry point")
 
-    print(f"RESULT ok frames={frames} keyframes={keyed} audio={audio} text={len(text_seen)}")
+    size = f" {first_after_switch[0]}x{first_after_switch[1]}" if first_after_switch else ""
+    switched = f" display={TARGET_DISPLAY}" if TARGET_DISPLAY else ""
+    print(
+        f"RESULT ok frames={frames} keyframes={keyed} audio={audio} text={len(text_seen)}"
+        f"{switched}{size} pre_switch={pre_switch_frames}"
+    )
     sock.close()
 
 
@@ -193,4 +263,14 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as exc:  # noqa: BLE001 - a probe prints, it does not raise
+        if isinstance(exc, (TimeoutError, socket.timeout)) and TARGET_DISPLAY:
+            if STATE["armed"] and STATE["frames"] == 0:
+                fail(
+                    f"no frame after switching to {TARGET_DISPLAY}: the capture could not "
+                    f"open that display. On a single-monitor host this is the CORRECT "
+                    f"answer (the server must not serve the primary screen instead) — "
+                    f"check the server log for `display N does not exist`"
+                )
+            if not STATE["armed"]:
+                fail(f"no PIPELINE_RESETTING {TARGET_DISPLAY} within the timeout")
         fail(f"{type(exc).__name__}: {exc}")

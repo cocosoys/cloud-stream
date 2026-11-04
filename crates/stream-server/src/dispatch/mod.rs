@@ -23,7 +23,7 @@ pub mod output;
 pub mod win_input;
 
 pub use clipboard::{ClipboardSink, read_clipboard_update};
-pub use commands::{Action, classify};
+pub use commands::{classify, settings_identity, Action};
 pub use gamepad::GamepadHub;
 pub use input_stub::InputSinkRef;
 pub use win_input::WinInputSink;

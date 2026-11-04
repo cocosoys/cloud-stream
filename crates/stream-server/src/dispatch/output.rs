@@ -431,7 +431,18 @@ pub fn server_settings(s: &crate::pipeline::StreamSettings) -> String {
                 // 通路"写法（`selkies-ws-core.js:5267` 的 `lockedOff`），它同时挡住
                 // 自动启动与按需启动。真要做摄像头上行（WebRTC 反向 track）时，
                 // 把这一行换回真实的 `webcam_encoder`，不要两行都留。
-                "webcam_enabled": { "value": false, "locked": true }
+                "webcam_enabled": { "value": false, "locked": true },
+                // 麦克风同理，而且是同一个坑的下一层：上行帧（WS 的 `0x02`、
+                // WebRTC 的反向 audio track）服务端没有接收端 —— 被控机上不存在
+                // "把浏览器音频播进主机麦克风"的接口。此前什么都不声明，页面就把
+                // 麦克风按钮画出来、开了、本地电平条跳动，而对面永远听不到。
+                //
+                // `lockedOff('microphone_enabled')` 挡自动启动；手动点开关那一路由
+                // `ws_media` 在真的收到 `0x02` 时回一条 `MICROPHONE_DISABLED`
+                // 挡住（页面收到就把 `microphoneEnabled` 置 false 并停止采集）。
+                // 两条都要有：只发设置，用户手动点还能开；只回消息，页面启动时
+                // 会先弹一次权限请求。
+                "microphone_enabled": { "value": false, "locked": true }
             }
         }
     })
@@ -655,5 +666,16 @@ mod tests {
             &json!(ceiling[ceiling.len() - 1]),
             "a stop above the encoder's ceiling is one it silently clamps: {line}"
         );
+
+        // #106/#110: the two uplinks this server cannot receive a byte of must be
+        // advertised as `{value: false, locked: true}` — the frontend's `lockedOff`
+        // shape, which hides the row instead of drawing a dead switch. Pinned here
+        // because "advertised but not implemented" is exactly what this pair of
+        // keys exists to stop, and a future refactor of the settings block must not
+        // quietly drop them back to a plausible-looking `*_encoder`.
+        for key in ["webcam_enabled", "microphone_enabled"] {
+            assert_eq!(settings[key]["value"], json!(false), "{key}: {line}");
+            assert_eq!(settings[key]["locked"], json!(true), "{key}: {line}");
+        }
     }
 }

@@ -153,31 +153,78 @@ ws media: 192.168.59.146 detached (1 downlink(s) left, 0 frame(s) dropped)
 
 | 上行 | 处理 |
 |---|---|
-| `SETTINGS,{json}` | 与 WebRTC 同形，复用 `apply_settings_batch`（`displayId` / `tabId` / `encoder` / `framerate` / `manual_resolution`） |
+| `SETTINGS,{json}` | 与 WebRTC 同形，复用 `apply_settings_batch`（`encoder` / `framerate` / `manual_resolution`）；另外从中读出 **`displayId`** 与 **`tabId`**（见下） |
 | `KEYFRAME` / `REQUEST_KEYFRAME` | `pipeline.handle.request_keyframe()` |
 | `cr` | 回 `clipboard_reply,cr`，然后把当前剪贴板按 WS 家族发下去 |
 | `m` / `m2` / `kd` / `ku` / `kh` / `kr` / `p` / `sf` / `js` | `classify` → `InputStub`，按 `--input-policy` 放行或计入 `denied` |
 | `cw` / `cws` / `cwd` / `cwe` / `cb` / `cbs` / `cbd` / `cbe` | `ClipboardSink`：读请求、写开始、分块、结束 |
 | `LOST_FRAME` / `DECODE_PACE` / `CLIENT_FRAME_ACK` / `vp,…` | 忽略（前端自己的流控） |
-| 二进制 `0x02` / `0x06` | 麦克风与摄像头上行，记 debug 后丢弃 |
+| 二进制 `0x02`（麦克风） | 回一条 `MICROPHONE_DISABLED`，见 §8 |
+| 二进制 `0x06`（摄像头） | 回一条 `WEBCAM_DISABLED`，见 §8 |
+
+### 7.1 选屏：`SETTINGS.displayId`
+
+页面在 URL hash 里选屏（`#display2`），但 **hash 不会发到服务端**；它把选择写在
+`SETTINGS` 批里（`selkies-ws-core.js:3811` 的 `settingsToSend['displayId']`）。所以
+WS 侧能选屏的唯一信息来源就是这一批 —— 这一版之前直接无视它，于是 `#display2` 的
+页面看到的是主屏，而它自己的面板写着 "Secondary"。
+
+处理顺序（`ws_media::run`）：
+
+1. 连接先按服务端默认屏（`--display`）开一路，因为此刻还不知道页面要哪块；
+2. `SETTINGS` 到了，若 `displayId` 与当前不同，按 detach → release → acquire 换过去。
+   **顺序不能反**：`DuplicateOutput` 对同一个输出是独占的，新的一路要先开起来，某些
+   卡会让第一路直接失败并退到 GDI，变成"一个 DXGI + 一个慢路径"两个程序；
+3. 换完发 `PIPELINE_RESETTING <displayId>`，用**页面的名字**（`display2`，不是索引 1）：
+   页面拿这个名字和自己的 `displayId` 比，不等就什么都不做（`selkies-ws-core.js:8996`）；
+4. 帧号从 0 重新开始 —— 新程序是新的编码器，接着旧号会让解码闸门把第一帧当成
+   "依赖缺席"；同时 `set_target_display` 把输入的目标屏换过去。
+
+`tabId` 同样在这一批里，到了就 `registry.update_meta(...)` 补登记 —— 此前 WS 会话在
+`health` 里 `tab_id` 永远是空串，"同一个页签重连"与"第二个观众"分不开。
+
 
 下行剪贴板与 WebRTC **不是同一族**，必须按 WS 的发：
 `clipboard,<b64>` / `clipboard_binary,<mime>,<b64>` / `clipboard_start,<mime>,<total>` /
 `clipboard_data,<b64>` / `clipboard_finish` / `clipboard_reply,cr` / `clipboard_secret`。
 发成 WebRTC 那套 `cb,…` 页面只会当成未知消息丢掉。
 
-## 8. 这一版**没做**什么
+## 8. 没做的两件事：麦克风与摄像头
 
-| 缺口 | 现状 |
-|---|---|
-| 麦克风上行 | 二进制 `0x02` 已识别但不解码，`server_settings` 里仍声明 `audio_encoder` |
-| 摄像头上行 | `0x06` 记 debug 后丢弃；`webcam_encoder: vp9` 仍是"广告了没货" |
-| WS 选屏 | 这条通路没有 hello，选不了屏幕：跟服务端 `--display` 走。多屏选择走 WebRTC 的 `display_id` |
+两条上行都**没有接收端**，所以现在的做法是**明确回绝**，而不是收下再丢掉：
 
-前两条是同一类问题：页面上有开关、服务端没有实现。下一轮要么补上，要么把声明改成
-unsupported —— 一个点了没反应的开关比没有这个开关更贵。
+| 上行 | 页面收到 | 页面行为 |
+|---|---|---|
+| `0x02` 麦克风 Opus | `MICROPHONE_DISABLED` | `microphoneEnabled = false`，停采集，状态条关掉 |
+| `0x06` 摄像头帧 | `WEBCAM_DISABLED` | `webcamEnabled = false`，停采集 |
 
-## 9. 踩过的坑
+每条连接只回一次：页面的电平条按帧发 `0x02`，每帧回一条文本会把 socket 变成回音壁。
+
+同时 `server_settings` 里两条声明都是 `{value: false, locked: true}`（前端的
+`lockedOff` 写法），挡住自动启动 —— 只发设置挡不住手动点，只回消息则启动时会先弹
+一次权限请求，两条都要有。
+
+为什么不做：麦克风要"把浏览器音频播进被控机的麦克风"，Windows 上没有这个接口
+（要么装虚拟声卡，要么走 `Stereo Mix` 之类的回环），摄像头要一条反向视频 track
+加一路解码。这两条都不是"再接一个分支"的量级，所以这一版宁可把开关关掉，也不留一个
+点了没反应的开关。
+
+注意 `MICROPHONE_DISABLED` 只在 WebSocket 这条路上发：WebRTC 的页面
+（`selkies-wr-core.js`）没有这个分支，发过去只会被当成未知消息。
+
+## 9. 还差什么：多屏的物理验收
+
+代码、协议与坐标数学都到位了（`win_input::tests` 用合成的虚拟桌面覆盖了主屏/右侧屏/
+左侧屏三种归一化，含"左侧屏的第一个像素就是桌面的第一个像素"这条最容易写错的），
+但**没有第二块物理屏就点不了**。真机验收两步：
+
+1. `python toolchain/ws-probe.py <host> 8080 5 display2` —— 期望 `PIPELINE_RESETTING
+   display2` + 之后每帧都是第二块屏的尺寸；单屏机上期望"同一行文本 + 没有帧"（服务端
+   如实失败，不会把主屏错发过来）。
+2. 在这个页面上把鼠标点到第二块屏的四角：落点必须在该屏的四角。左/上超过主屏的
+   显示器是最容易错的那台（虚拟桌面原点是负的）。
+
+## 10. 踩过的坑
 
 - **视频整帧发成 `0x01`**：这是本文件最贵的一次错误。`0x01` 是音频，码流进了 Opus
   解码器，视频一次都没被解开；探针当时也断言 `0x01`，于是"验证通过"——测试和实现

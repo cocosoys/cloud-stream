@@ -230,6 +230,12 @@ OS 光标只有一个，但每个客户端需要看到「我自己的指针在�
 映射成索引：页面从 1 数，索引从 0 数，`displayN → N-1`。认不出的值一律回落到主屏
 （拼错或旧页面拿错屏只是刷新一次的事，拒绝握手会让人停在黑页上）。
 
+**WS 那条通路没有 hello**，它的选屏写在同一批 `SETTINGS` 里（`displayId`，页面
+`#display2` 的产物）。服务端此前无视这个字段，所以 WS 永远只能看主屏。现在的做法：
+先按 `--display` 开一路，`SETTINGS` 到了发现不一致就 detach → release → acquire 换过去，
+再回 `PIPELINE_RESETTING <页面的名字>` 让页面重置解码器与帧号跟踪。顺序与理由见
+`docs/websocket-transport.md` §7.1。
+
 输入侧的 `target_origin` 落成了 `TargetSpace { x, y, w, h, virtual_desk }`：
 主屏之外光加 origin 不够，`SendInput` 的绝对坐标还必须带 `MOUSEEVENTF_VIRTUALDESK`
 并针对**整个虚拟桌面**归一化，否则 Windows 仍按主屏解释，指针会跑到主屏去。

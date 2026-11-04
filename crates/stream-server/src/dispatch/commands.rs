@@ -244,6 +244,53 @@ pub fn classify(line: &str) -> Action {
     }
 }
 
+/// The session-identity fields a `SETTINGS` batch carries.
+///
+/// #109/#110: `displayId` and `tabId` ride the same batch as the stream knobs
+/// (`selkies-ws-core.js:3811`), but they are not knobs — they say *which screen
+/// this page wants* and *which browser tab it is*. `apply_settings_batch`
+/// deliberately ignores both (it moves the program, not the session), so the
+/// WebSocket session reads them here.
+///
+/// Why this matters: the WS page has no `HELLO`, so this batch is the **only**
+/// place it says which monitor it is on. Ignoring it is why a `#display2` page
+/// used to show the primary screen while its own panel said "Secondary".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SettingsIdentity {
+    /// `displayId`: `primary` / `display2` / … → the display index.
+    pub display: Option<crate::pipeline::shared::DisplayKey>,
+    /// `tabId`: the browser tab, so two tabs are distinguishable in `health`
+    /// and a reconnect can be told apart from a second viewer.
+    pub tab_id: Option<String>,
+}
+
+/// Read the identity fields out of a `SETTINGS` batch.
+///
+/// Never fails: a malformed batch yields `default()` (no identity), which the
+/// caller treats as "the page said nothing" — the same outcome as a page that
+/// predates these fields.
+pub fn settings_identity(payload: &str) -> SettingsIdentity {
+    let Ok(value) = hbb_common::serde_json::from_str::<hbb_common::serde_json::Value>(payload)
+    else {
+        return SettingsIdentity::default();
+    };
+    let Some(map) = value.as_object() else {
+        return SettingsIdentity::default();
+    };
+    let display = map
+        .get("displayId")
+        .or_else(|| map.get("display_id"))
+        .and_then(|v| v.as_str())
+        .map(crate::pipeline::shared::DisplayKey::from_hello);
+    let tab_id = map
+        .get("tabId")
+        .or_else(|| map.get("tab_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty());
+    SettingsIdentity { display, tab_id }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,5 +375,39 @@ mod tests {
         assert!(matches!(classify("ma,2"), Action::Unknown(_)));
         assert!(matches!(classify("ma,"), Action::Unknown(_)));
         assert!(matches!(classify("ma"), Action::Unknown(_)));
+    }
+
+    /// #109: the WS page names its screen in the `SETTINGS` batch, not in a
+    /// hello. `display2` must mean index 1 — off by one here sends a `#display2`
+    /// tab to the primary screen, which reads as "multi-monitor is broken".
+    #[test]
+    fn settings_identity_reads_the_display_the_page_asked_for() {
+        use crate::pipeline::shared::DisplayKey;
+        let id = settings_identity(r#"{"displayId":"display2","tabId":"tab-7"}"#);
+        assert_eq!(id.display, Some(DisplayKey(1)));
+        assert_eq!(id.tab_id.as_deref(), Some("tab-7"));
+
+        let primary = settings_identity(r#"{"displayId":"primary"}"#);
+        assert_eq!(primary.display, Some(DisplayKey::PRIMARY));
+        assert_eq!(primary.tab_id, None, "absent tabId must stay absent");
+    }
+
+    /// A batch that predates these fields, or is not JSON at all, must read as
+    /// "the page said nothing" rather than as index 0 — the caller has to tell
+    /// "no opinion" from "the primary, please", because only the latter may
+    /// authorise a capture switch.
+    #[test]
+    fn a_batch_without_identity_yields_none() {
+        assert_eq!(
+            settings_identity(r#"{"framerate":60}"#),
+            SettingsIdentity::default()
+        );
+        assert_eq!(settings_identity("not json"), SettingsIdentity::default());
+        assert_eq!(settings_identity("[]"), SettingsIdentity::default());
+        assert_eq!(
+            settings_identity(r#"{"tabId":"   "}"#).tab_id,
+            None,
+            "a blank tab id is not an identity"
+        );
     }
 }
