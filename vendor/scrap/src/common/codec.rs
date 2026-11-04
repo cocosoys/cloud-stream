@@ -94,6 +94,14 @@ pub trait EncoderApi {
 
     fn is_hardware(&self) -> bool;
 
+    /// #95: what the backend actually applied, for the startup log and the
+    /// benchmark. Read back from the backend's own live config rather than
+    /// echoed from the request, because a clamped or rejected control is
+    /// otherwise invisible. Backends with nothing to report return "".
+    fn effective_config(&self) -> String {
+        String::new()
+    }
+
     fn disable(&self);
 }
 

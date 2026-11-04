@@ -11,7 +11,9 @@ use base::message_proto::{Chroma, EncodedVideoFrame, EncodedVideoFrames, VideoFr
 use crate::codec::{base_bitrate, codec_thread_num, EncoderApi};
 use crate::{EncodeInput, EncodeYuvFormat, GoogleImage, Pixfmt, STRIDE_ALIGN};
 
-use super::vpx::{vp8e_enc_control_id::*, vpx_codec_err_t::*, *};
+// #95: `VP9E_CONTENT_SCREEN` is a variant of the generated `vp9e_tune_content`
+// enum, not a module-level constant, so the glob import does not reach it.
+use super::vpx::{vp8e_enc_control_id::*, vp9e_tune_content::VP9E_CONTENT_SCREEN, vpx_codec_err_t::*, *};
 use crate::{generate_call_macro, generate_call_ptr_macro, Error, Result};
 use hbb_common::bytes::Bytes;
 use std::os::raw::{c_int, c_uint};
@@ -119,7 +121,39 @@ impl EncoderApi for VpxEncoder {
                 // there) so 1080p@60fps software encoding can actually keep up.
                 c.g_threads =
                     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(4) as _;
-                c.g_error_resilient = VPX_ERROR_RESILIENT_DEFAULT;
+                // #95: lookahead off, for both codecs. VP8's default is already
+                // 0 (`vp8/vp8_cx_iface.c:1346`), but VP9's is **25**
+                // (`vp9/vp9_cx_iface.c:2197`) — libvpx ships VP9 in "good
+                // quality" mode, where the encoder holds 25 frames before it
+                // emits anything. That is up to 0.4 s of pure added latency at
+                // 60 fps (0.8 s at 30), and it is invisible until measured: the
+                // `effective:` line reads `lag=25` and the picture is simply
+                // late. Realtime wants 0, and `RANGE_CHECK_HI(.., MAX_LAG_BUFFERS)`
+                // only caps the top, so 0 is accepted.
+                c.g_lag_in_frames = 0;
+                // #95: 0 = off. See `VpxTuning` for why this is not "better
+                // error resilience" but "every frame self-contained": on a link
+                // that already recovers through NACK and a PLI-driven keyframe,
+                // paying for self-containment in every frame is pure waste.
+                c.g_error_resilient = if config.tuning.error_resilient {
+                    VPX_ERROR_RESILIENT_DEFAULT
+                } else {
+                    0
+                };
+                // #95: the rate controller's buffer window. libvpx defaults to
+                // 6000/4000/5000 ms, which lets it bank a surplus across a
+                // static desktop and then blow it on the next explosion.
+                // Clamped to libvpx's own accepted range so a bad caller cannot
+                // make `vpx_codec_enc_init` fail at open time.
+                c.rc_buf_sz = config.tuning.buf_sz_ms.clamp(200, 60_000);
+                c.rc_buf_initial_sz = config
+                    .tuning
+                    .buf_initial_ms
+                    .clamp(200, c.rc_buf_sz);
+                c.rc_buf_optimal_sz = config
+                    .tuning
+                    .buf_optimal_ms
+                    .clamp(200, c.rc_buf_sz);
                 // https://developers.google.com/media/vp9/bitrate-modes/
                 // Constant Bitrate mode (CBR) is recommended for live streaming with VP9.
                 //
@@ -187,7 +221,10 @@ impl EncoderApi for VpxEncoder {
                     Higher numbers (7 or 8) will be lower quality but more manageable for lower latency
                     use cases and also for lower CPU power devices such as mobile.
                     */
-                    call_vpx!(vpx_codec_control_(&mut ctx, VP8E_SET_CPUUSED as _, 7,));
+                    // #95: 7 stays the default; `cpu_used` only exists so an A/B
+                    // can move it without another build.
+                    let cpu_used = config.tuning.cpu_used.unwrap_or(7);
+                    call_vpx!(vpx_codec_control_(&mut ctx, VP8E_SET_CPUUSED as _, cpu_used,));
                     // set row level multi-threading
                     /*
                     as some people in comments and below have already commented,
@@ -205,15 +242,39 @@ impl EncoderApi for VpxEncoder {
                         1 as c_int
                     ));
 
+                    // #95: 4 is left as-is on purpose. libvpx clamps it to what
+                    // the width allows (`get_max_log2_tile_cols`, min tile width
+                    // 256px), so 1920px lands on 2 either way; changing it would
+                    // be a no-op dressed as tuning.
                     call_vpx!(vpx_codec_control_(
                         &mut ctx,
                         VP9E_SET_TILE_COLUMNS as _,
                         4 as c_int
                     ));
+
+                    // #95: the one thing libvpx has *for desktops*. Palette
+                    // coding and intra-block-copy are the tools a screen of flat
+                    // panels and text wants, and they are off by default because
+                    // the generic path assumes camera footage.
+                    if config.tuning.screen_content {
+                        Self::tune(
+                            &mut ctx,
+                            VP9E_SET_TUNE_CONTENT as i32,
+                            VP9E_CONTENT_SCREEN as c_int,
+                        );
+                    }
+                    if config.tuning.max_inter_pct > 0 {
+                        Self::tune(
+                            &mut ctx,
+                            VP9E_SET_MAX_INTER_BITRATE_PCT as i32,
+                            config.tuning.max_inter_pct as c_int,
+                        );
+                    }
                 } else if config.codec == VpxVideoCodecId::VP8 {
                     // https://github.com/webmproject/libvpx/blob/972149cafeb71d6f08df89e91a0130d6a38c4b15/vpx/vp8cx.h#L172
                     // https://groups.google.com/a/webmproject.org/g/webm-discuss/c/DJhSrmfQ61M
-                    call_vpx!(vpx_codec_control_(&mut ctx, VP8E_SET_CPUUSED as _, 12,));
+                    let cpu_used = config.tuning.cpu_used.unwrap_or(12);
+                    call_vpx!(vpx_codec_control_(&mut ctx, VP8E_SET_CPUUSED as _, cpu_used,));
                     // #92: in CQ mode the quantizer is the whole point, so state
                     // it as the CQ level too (chromium's vpx_video_encoder.cc
                     // sets it alongside rc_end_usage). Without this libvpx still
@@ -228,7 +289,18 @@ impl EncoderApi for VpxEncoder {
                     }
                 }
 
-                Ok(Self {
+                // #95: intra-frame cap, shared by both codecs (VP9 accepts the
+                // VP8 control id). An un-capped I-frame at 1080p is 100-200 KB,
+                // which a jitter buffer has to swallow in one go.
+                if config.tuning.max_intra_pct > 0 {
+                    Self::tune(
+                        &mut ctx,
+                        VP8E_SET_MAX_INTRA_BITRATE_PCT as i32,
+                        config.tuning.max_intra_pct as c_int,
+                    );
+                }
+
+                let enc = Self {
                     ctx,
                     width: config.width as _,
                     height: config.height as _,
@@ -236,7 +308,15 @@ impl EncoderApi for VpxEncoder {
                     i444,
                     yuvfmt: Self::get_yuvfmt(config.width, config.height, i444),
                     force_kf: false,
-                })
+                };
+                // #95: read back what libvpx kept, not what was asked for.
+                log::info!(
+                    "{:?} encoder ready, tuning {:?}: {}",
+                    config.codec,
+                    config.tuning,
+                    enc.describe()
+                );
+                Ok(enc)
             }
             _ => Err(anyhow!("encoder type mismatch")),
         }
@@ -319,10 +399,50 @@ impl EncoderApi for VpxEncoder {
         false
     }
 
+    fn effective_config(&self) -> String {
+        self.describe()
+    }
+
     fn disable(&self) {}
 }
 
 impl VpxEncoder {
+    /// #95: apply an optional tuning control.
+    ///
+    /// Deliberately *not* `call_vpx!`: that macro returns `Err`, and an encoder
+    /// that refuses to open is a dead session. A tuning control is an
+    /// optimisation — if a future libvpx drops one, the stream must keep
+    /// running at the old quality rather than not run at all.
+    fn tune(ctx: &mut vpx_codec_ctx_t, id: i32, val: c_int) {
+        let rc = unsafe { vpx_codec_control_(ctx, id as _, val) };
+        if rc != VPX_CODEC_OK {
+            log::warn!("optional vpx control {id} = {val} rejected ({rc:?}); keeping libvpx default");
+        }
+    }
+
+    /// #95: what libvpx actually ended up with, read back from the live
+    /// context rather than echoed from the request.
+    ///
+    /// This exists because the interesting failures here are silent: a control
+    /// id the build does not know, a value libvpx clamps, a config that
+    /// `enc_config_set` reverted. `ctx.config.enc` is the encoder's own copy,
+    /// so anything printed here is in force.
+    pub fn describe(&self) -> String {
+        let c = unsafe { *self.ctx.config.enc };
+        format!(
+            "threads={} lag={} buf={}/{}/{}ms err_res={} bitrate={}kbps q={}..{}",
+            c.g_threads,
+            c.g_lag_in_frames,
+            c.rc_buf_sz,
+            c.rc_buf_initial_sz,
+            c.rc_buf_optimal_sz,
+            c.g_error_resilient,
+            c.rc_target_bitrate,
+            c.rc_min_quantizer,
+            c.rc_max_quantizer
+        )
+    }
+
     pub fn encode<'a>(&'a mut self, pts: i64, data: &[u8], stride_align: usize) -> Result<EncodeFrames<'a>> {
         let bpp = if self.i444 { 24 } else { 12 };
         if data.len() < self.width * self.height * bpp / 8 {
@@ -487,6 +607,101 @@ pub struct EncodeFrame<'a> {
     pub pts: i64,
 }
 
+/// #95: the realtime knobs that are **not** the quantizer.
+///
+/// Everything here was read out of the vendored libvpx 1.15.2 sources rather
+/// than assumed, because two of the three "obvious" optimisations turned out
+/// not to exist:
+///
+/// * `g_lag_in_frames` is already **0** in `vp8e_usage_cfg_map`
+///   (`vp8/vp8_cx_iface.c:1346`), so "disable lookahead" would have been a
+///   no-op edit that looked like work.
+/// * VP8's parallelism is **row-parallel** (`vp8cx_create_encoder_threads` in
+///   `vp8/encoder/ethreading.c:490`, gated on `oxcf.multi_threaded > 1`, i.e.
+///   `g_threads`), not token-partition parallel. Raising
+///   `VP8E_SET_TOKEN_PARTITIONS` therefore buys no throughput on this build
+///   (`CONFIG_ONTHEFLY_BITPACKING` is off, so those extra partitions would
+///   only cost bytes). `g_threads = 4` already yields 3 worker threads and is
+///   left alone.
+///
+/// What is left is real:
+///
+/// * `rc_buf_sz` / `rc_buf_initial_sz` / `rc_buf_optimal_sz` default to
+///   **6000 / 4000 / 5000 ms** (`vp8/vp8_cx_iface.c:1361`). A six-second
+///   buffer lets the rate controller bank seconds of budget on a static
+///   desktop and then spend it on the next explosion, so the instantaneous
+///   bitrate swings far wider than the target. WebRTC's own libvpx adapter
+///   uses 1000 ms for exactly this reason.
+/// * `g_error_resilient` defaults to 0; the pipeline sets
+///   `VPX_ERROR_RESILIENT_DEFAULT`. That makes every frame self-contained,
+///   which costs bits on a link where loss is already handled by NACK plus
+///   the PLI->`force_keyframe` path.
+/// * VP9 has a screen-content mode (`VP9E_SET_TUNE_CONTENT`), i.e. palette and
+///   intra-block-copy tooling — the one thing libvpx offers that is *built*
+///   for a desktop of flat panels and text.
+/// * A keyframe is 100-200 KB at 1080p; unbounded it is a spike the receiver's
+///   jitter buffer has to absorb. `VP8E_SET_MAX_INTRA_BITRATE_PCT` caps it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VpxTuning {
+    /// CBR buffer window, milliseconds. Smaller = the controller tracks the
+    /// target instead of banking a surplus.
+    pub buf_sz_ms: u32,
+    /// Where in that window the controller starts.
+    pub buf_initial_ms: u32,
+    /// Where it tries to sit.
+    pub buf_optimal_ms: u32,
+    /// Make every frame independently decodable (`VPX_ERROR_RESILIENT_DEFAULT`).
+    pub error_resilient: bool,
+    /// VP9: enable the screen-content toolset.
+    pub screen_content: bool,
+    /// Cap a single intra frame at this percentage of the target bitrate.
+    /// 0 leaves libvpx's default (unbounded).
+    pub max_intra_pct: u32,
+    /// VP9: cap a single inter frame, same units. 0 = unbounded.
+    pub max_inter_pct: u32,
+    /// Override `-cpu-used`. `None` keeps the per-codec value the encoder has
+    /// always used (VP8 12, VP9 7).
+    pub cpu_used: Option<i32>,
+}
+
+impl VpxTuning {
+    /// What this pipeline shipped before #95 — kept verbatim so an A/B on the
+    /// same binary can reproduce the old numbers instead of trusting a
+    /// remembered baseline.
+    pub fn legacy() -> Self {
+        Self {
+            buf_sz_ms: 6000,
+            buf_initial_ms: 4000,
+            buf_optimal_ms: 5000,
+            error_resilient: true,
+            screen_content: false,
+            max_intra_pct: 0,
+            max_inter_pct: 0,
+            cpu_used: None,
+        }
+    }
+
+    /// The realtime defaults (see the type docs for the source of each).
+    pub fn tuned() -> Self {
+        Self {
+            buf_sz_ms: 1000,
+            buf_initial_ms: 600,
+            buf_optimal_ms: 700,
+            error_resilient: false,
+            screen_content: true,
+            max_intra_pct: 300,
+            max_inter_pct: 0,
+            cpu_used: None,
+        }
+    }
+}
+
+impl Default for VpxTuning {
+    fn default() -> Self {
+        Self::tuned()
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct VpxEncoderConfig {
     /// The width (in pixels).
@@ -504,6 +719,9 @@ pub struct VpxEncoderConfig {
     /// #92: VP8 quantizer index (0..=63, lower is better) used when `rc` is
     /// `Cq`. Ignored under `Cbr`, where `quality` drives the quantizer range.
     pub cq_level: c_uint,
+    /// #95: the realtime knobs. `Default` is the tuned set; `VpxTuning::legacy()`
+    /// reproduces the pre-#95 encoder exactly.
+    pub tuning: VpxTuning,
 }
 
 #[derive(Clone, Copy, Debug)]

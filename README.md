@@ -126,6 +126,8 @@ cd target\output\cloud-stream
 | `--auth-token` | — | 访问口令。设了之后 `/api/*` 全部要求它（Bearer / cookie / `?token=` / WS subprotocol）；静态资源与 `/api/status` 豁免 |
 | `--dump-frame` | — | 把采集帧导成 bmp 便于排查 |
 | `--policy` | `allow-all` | 监听面策略，`deny-all` 用于覆盖率探针 |
+| `--encoder` | `auto` | 编码后端策略：`auto` / `software` / `nvenc` / `amf` / `qsv`。`auto` 永不失败，只把探测结论写进日志；点名一个不存在的硬编会在启动时直接报错 |
+| `--tune` | `tuned` | 软编实时参数组；`legacy` 复现 #95 之前的参数，仅用于同机 A/B |
 | `--log` | `logs\stream-server.log` | 日志落盘路径 |
 | `--no-hdr` | — | 关闭 HDR 采集路径 |
 

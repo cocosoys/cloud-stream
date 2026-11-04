@@ -34,10 +34,11 @@
 //! counts it as `encode_no_output` without treating it as a fatal encoder error.
 
 use std::ffi::c_uint;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use base::message_proto::VideoFrame;
 use scrap::codec::{Encoder, EncoderCfg};
-use scrap::{EncodeInput, EncodeYuvFormat, VpxEncoderConfig, VpxNoOutput, VpxRateControl};
+use scrap::{EncodeInput, EncodeYuvFormat, VpxEncoderConfig, VpxNoOutput, VpxRateControl, VpxTuning};
 
 use crate::pipeline::codec::VideoCodec;
 use crate::pipeline::settings::RateControl;
@@ -54,6 +55,35 @@ fn keyframe_backstop_frames(fps: u32, keyframe_secs: u32) -> usize {
     let fps = u64::from(fps);
     let secs = u64::from(keyframe_secs.clamp(1, 120));
     (fps * secs * 2).clamp(60, 240_000) as usize
+}
+
+/// #95: process-wide A/B switch for the realtime knob set.
+///
+/// The encoder is constructed deep inside the capture loop, from a signature
+/// that already carries eight arguments; threading one more through it would
+/// touch every call site for a diagnostic that is set once at startup. A static
+/// is the smaller change and matches how the codec pick is handled
+/// (`pipeline::codec`): a process-wide choice read at open time.
+///
+/// Default is off — the tuned set is what ships. `--tune legacy` exists so the
+/// deployed binary can reproduce the pre-#95 numbers on the same machine, which
+/// is the only way to tell "the tuning helped" from "the machine was busier".
+static LEGACY_TUNING: AtomicBool = AtomicBool::new(false);
+
+/// Select the realtime knob set for encoders opened from now on. Live encoders
+/// keep what they were opened with; the loop rebuilds on the next codec or rc
+/// change.
+pub fn set_legacy_tuning(on: bool) {
+    LEGACY_TUNING.store(on, Ordering::Relaxed);
+}
+
+/// The knob set `VideoEncoder::new` will use.
+pub fn tuning() -> VpxTuning {
+    if LEGACY_TUNING.load(Ordering::Relaxed) {
+        VpxTuning::legacy()
+    } else {
+        VpxTuning::default()
+    }
 }
 
 /// Thin lifecycle wrapper the capture loop holds between opens.
@@ -98,6 +128,35 @@ impl VideoEncoder {
         crf: u32,
         codec: VideoCodec,
     ) -> anyhow::Result<Self> {
+        Self::with_tuning(
+            width,
+            height,
+            _bitrate_kbps,
+            keyframe_secs,
+            fps,
+            rc,
+            crf,
+            codec,
+            tuning(),
+        )
+    }
+
+    /// #95: same encoder, but with the realtime knob set spelled out. `new`
+    /// forwards here with the tuned defaults; the tests use `legacy()` to prove
+    /// the two sets really reach libvpx, and a future `--tune` flag has a place
+    /// to land without touching this signature again.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_tuning(
+        width: u32,
+        height: u32,
+        _bitrate_kbps: u32,
+        keyframe_secs: u32,
+        fps: u32,
+        rc: RateControl,
+        crf: u32,
+        codec: VideoCodec,
+        tuning: VpxTuning,
+    ) -> anyhow::Result<Self> {
         let backstop = keyframe_backstop_frames(fps, keyframe_secs);
         let cfg = EncoderCfg::VPX(VpxEncoderConfig {
             width: width as c_uint,
@@ -125,6 +184,10 @@ impl VideoEncoder {
                 RateControl::Cq => VpxRateControl::Cq,
             },
             cq_level: crf,
+            // #95: the realtime knob set (buffer window, error resilience,
+            // VP9 screen-content, intra cap). `Default` is the tuned set; the
+            // legacy set stays available for A/B on the same binary.
+            tuning,
         });
         let encoder = Encoder::new(cfg, false)?;
         let yuvfmt = encoder.yuvfmt();
@@ -232,6 +295,13 @@ impl VideoEncoder {
     pub fn is_hardware(&self) -> bool {
         self.encoder.is_hardware()
     }
+
+    /// #95: what libvpx actually applied, read back from the live context.
+    /// The startup log prints this so "the knob did nothing" and "the knob was
+    /// clamped" are distinguishable without a rebuild.
+    pub fn effective_config(&self) -> String {
+        self.encoder.effective_config()
+    }
 }
 
 #[cfg(test)]
@@ -328,5 +398,86 @@ mod tests {
         // The seconds keep their own floor of 1.
         assert_eq!(keyframe_backstop_frames(0, 0), 480);
         assert_eq!(keyframe_backstop_frames(1, 1), 60);
+    }
+
+    /// #95: the whole point of the tuning struct is that the values reach
+    /// libvpx. `vpx_codec_enc_init` validating the config proves it is legal,
+    /// not that it is what we asked for, so read the encoder back.
+    #[test]
+    fn tuned_setting_reaches_the_live_encoder() {
+        let enc = super::VideoEncoder::with_tuning(
+            320,
+            240,
+            800,
+            10,
+            30,
+            crate::pipeline::settings::RateControl::Cbr,
+            25,
+            VideoCodec::Vp8,
+            scrap::VpxTuning::tuned(),
+        )
+        .expect("tuned VP8 encoder must open");
+        let cfg = enc.effective_config();
+        assert!(
+            cfg.contains("buf=1000/600/700ms"),
+            "buffer window did not reach libvpx: {cfg}"
+        );
+        assert!(
+            cfg.contains("err_res=0"),
+            "error-resilient was not turned off: {cfg}"
+        );
+        // #95: lookahead is libvpx's own default of 0 -- asserted so a future
+        // "optimisation" that turns it on gets caught here instead of in a
+        // latency report.
+        assert!(cfg.contains("lag=0"), "lookahead must stay off: {cfg}");
+    }
+
+    /// The A/B path has to be a real reproduction, not a comment: `legacy()`
+    /// must read back exactly what this pipeline shipped before #95.
+    #[test]
+    fn legacy_setting_is_reproducible() {
+        let enc = super::VideoEncoder::with_tuning(
+            320,
+            240,
+            800,
+            10,
+            30,
+            crate::pipeline::settings::RateControl::Cbr,
+            25,
+            VideoCodec::Vp8,
+            scrap::VpxTuning::legacy(),
+        )
+        .expect("legacy VP8 encoder must open");
+        let cfg = enc.effective_config();
+        assert!(
+            cfg.contains("buf=6000/4000/5000ms"),
+            "legacy buffer window is not the old one: {cfg}"
+        );
+        assert!(
+            cfg.contains("err_res=1"),
+            "legacy encoder used to be error-resilient: {cfg}"
+        );
+    }
+
+    /// VP9 with the screen-content toolset and an intra cap is the combination
+    /// the deployed server uses, and the one where a rejected control would
+    /// silently fall back. `tune` logs instead of failing, so the only way to
+    /// know it took is to open one and check it still opens + reports.
+    #[test]
+    fn vp9_screen_content_and_intra_cap_open() {
+        let enc = super::VideoEncoder::with_tuning(
+            320,
+            240,
+            800,
+            10,
+            30,
+            crate::pipeline::settings::RateControl::Cbr,
+            25,
+            VideoCodec::Vp9,
+            scrap::VpxTuning::tuned(),
+        )
+        .expect("VP9 must still open with screen-content tuning");
+        assert_eq!(enc.codec(), VideoCodec::Vp9);
+        assert!(!enc.is_hardware());
     }
 }

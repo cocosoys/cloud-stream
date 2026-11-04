@@ -9,3 +9,6 @@ rust-version = "1.75"
 
 [dependencies]
 scrap = { path = "../../vendor/scrap" }
+# #95: 统计实际输出字节（码率是否贴合目标、关键帧峰值多高）。编码器返回的
+# VideoFrame 是 base 的 protobuf 类型，scrap 没有 re-export，所以这里直接依赖。
+base = { path = "../../vendor/base" }

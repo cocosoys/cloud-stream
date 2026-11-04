@@ -100,6 +100,33 @@ pub struct Config {
     /// 依赖表里没有（现成可用的只有 SipHash 的随机种子，拿它当 CSPRNG 是
     /// 错的）。口令是运维输入，不是程序猜出来的。
     pub auth_token: Option<String>,
+    /// #95: which encoder backend to use — `auto` (default), `software`, or one
+    /// of `nvenc` / `amf` / `qsv` to demand a specific one.
+    ///
+    /// This is a *policy* name, resolved against the hardware probe in
+    /// `platform::hwenc`. `auto` never fails: it lands on software and logs the
+    /// reason. A named hardware encoder that is not there **does** fail at
+    /// startup — an operator who wrote `--encoder nvenc` asked for a quality
+    /// level, and silently streaming software instead would hide the mistake
+    /// until the first frame looked wrong.
+    pub encoder: String,
+    /// #102: ceiling on live signaling sessions.
+    ///
+    /// Eight is not a capacity claim — it is the point past which an unbounded
+    /// fan-out on this class of host stops protecting the people already
+    /// watching. One shared encoder means every extra viewer costs a
+    /// packetizer pass and a full copy of the bitrate, so the limit exists to
+    /// keep a late joiner's failure *polite* (a 503 with `Retry-After`) instead
+    /// of degrading everyone's picture.
+    pub max_sessions: usize,
+    /// #95: realtime knob set for the software encoder — `tuned` (default) or
+    /// `legacy` (exactly what shipped before #95).
+    ///
+    /// Diagnostic, not a feature: it exists so the same binary can produce the
+    /// old numbers on the same machine, which is the only way to tell "the
+    /// tuning helped" from "the machine was busier". Live encoders keep what
+    /// they were opened with. See `pipeline::encoder::tuning`.
+    pub tune: String,
 }
 
 impl Default for Config {
@@ -132,6 +159,9 @@ impl Default for Config {
             ghost_cursor_idle_secs: crate::dispatch::ghost::DEFAULT_IDLE_SECS,
             policy: "allow-all".to_owned(),
             auth_token: None,
+            encoder: "auto".to_owned(),
+            tune: "tuned".to_owned(),
+            max_sessions: 8,
         }
     }
 }
@@ -257,6 +287,32 @@ impl Config {
                 "--auth-token" => {
                     if let Some(v) = iter.next() {
                         cfg.auth_token = if v.trim().is_empty() { None } else { Some(v) };
+                    }
+                }
+                // #95: 后端策略名。未知值保留 `auto` 并在 main 里告警 —— 与
+                // `--video-codec` 同一套取舍：拼错不该让服务起不来，但要看得见。
+                "--encoder" => {
+                    if let Some(v) = iter.next() {
+                        cfg.encoder = v;
+                    }
+                }
+                // #95: 软编参数组。`legacy` 只为同一台机器上复现旧数据而存在，
+                // 默认组才是要发布的那一套。
+                "--tune" => {
+                    if let Some(v) = iter.next() {
+                        cfg.tune = v;
+                    }
+                }
+                // #102: silently keeping the default on a non-numeric value is
+                // the same policy as every other numeric flag here — a typo in a
+                // launcher must not stop the host from coming up. 0 is clamped to
+                // 1 by `Admission::new` rather than accepted as "lock everyone
+                // out", which is never what an operator meant.
+                "--max-sessions" => {
+                    if let Some(v) = iter.next() {
+                        if let Ok(n) = v.parse::<usize>() {
+                            cfg.max_sessions = n;
+                        }
                     }
                 }
                 "--upload-dir" => {

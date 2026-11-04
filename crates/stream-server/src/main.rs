@@ -146,6 +146,49 @@ async fn main() -> anyhow::Result<()> {
         ),
     }
 
+    // #95: hardware-encoder reservation. The probe is advisory — this build has
+    // no hardware encoder — but it answers the two questions a support report
+    // actually asks: "does this machine have an encoder" and "why is the stream
+    // software". Probed once, before the listener binds, so the answer is in the
+    // log even when the process dies a second later.
+    let hw = platform::hwenc::probe();
+    log::info!("encoder probe | {}", hw.summary());
+    for line in hw.detail() {
+        log::info!("encoder probe | {}", line);
+    }
+    let requested = platform::hwenc::Requested::from_name(&cfg.encoder).unwrap_or_else(|| {
+        log::warn!(
+            "unknown --encoder {:?}, using auto (builtin: auto, software, nvenc, amf, qsv)",
+            cfg.encoder
+        );
+        platform::hwenc::Requested::Auto
+    });
+    let (backend, note) = platform::hwenc::decide(requested, &hw)?;
+    log::info!("encoder backend={:?} | {}", backend, note);
+
+    // #95: the software knob set. Same policy as `--video-codec`: a name this
+    // build does not know keeps the default and says so, because the only
+    // reason to pass this flag is to compare against old numbers — silently
+    // running the new set would fake the comparison.
+    match cfg.tune.trim().to_ascii_lowercase().as_str() {
+        "tuned" | "default" | "" => {}
+        "legacy" | "none" | "off" => {
+            pipeline::encoder::set_legacy_tuning(true);
+            log::warn!("--tune legacy: pre-#95 encoder settings (diagnostic only)");
+        }
+        other => log::warn!(
+            "unknown --tune {:?}, keeping tuned (builtin: tuned, legacy)",
+            other
+        ),
+    }
+    log::info!(
+        "encoder tuning | buf={}ms err_res={} screen={} intra_cap={}% (--tune legacy reproduces pre-#95)",
+        pipeline::encoder::tuning().buf_sz_ms,
+        pipeline::encoder::tuning().error_resilient,
+        pipeline::encoder::tuning().screen_content,
+        pipeline::encoder::tuning().max_intra_pct,
+    );
+
     log::info!(
         "stream-server stage1 | listen={}:{} tls={} dist={} app={} video={}x{}@{}fps bitrate={}kbps codec={}",
         cfg.host,
