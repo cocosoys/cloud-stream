@@ -64,6 +64,7 @@ pub mod cursor;
 pub mod encoder;
 pub mod fanout;
 pub mod qos;
+pub mod raw;
 pub mod sample_map;
 pub mod scale;
 pub mod settings;
@@ -253,6 +254,14 @@ pub struct PipelineHandle {
     /// left the PC / data channels alive, so the browser showed a frozen picture
     /// with live stats and no error.
     exit_sink: Arc<Mutex<Vec<(u64, mpsc::UnboundedSender<String>)>>>,
+    /// #106: the capture path as last reported — `(is_gdi, reason)`.
+    ///
+    /// `StreamInfo` events only reach sessions that were already subscribed
+    /// when they fired, so a viewer joining after a GDI fallback was told the
+    /// stream was DXGI (`StreamInfo::default()`), and a WebSocket session has
+    /// no event sink at all. Keeping the last one here turns "what the
+    /// capturer is doing" into a value anybody can read at any time.
+    stream_info: Arc<Mutex<(bool, String)>>,
 }
 
 impl Default for PipelineHandle {
@@ -280,6 +289,7 @@ impl PipelineHandle {
             throttled: Arc::new(AtomicBool::new(false)),
             rebuild: Arc::new(AtomicBool::new(false)),
             exit_sink: Arc::new(Mutex::new(Vec::new())),
+            stream_info: Arc::new(Mutex::new((false, String::new()))),
         }
     }
 
@@ -295,6 +305,17 @@ impl PipelineHandle {
 
     pub fn is_on(&self) -> bool {
         self.video_on.load(Ordering::SeqCst)
+    }
+
+    /// #106: `(is_gdi, reason)` as last reported by the capture loop.
+    ///
+    /// A late joiner (or a socket session, which has no event sink) gets the
+    /// live answer instead of assuming the good path.
+    pub fn stream_info(&self) -> (bool, String) {
+        self.stream_info
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// Session cleanup: stop the loop task and close the write gate together.
@@ -389,6 +410,13 @@ impl PipelineHandle {
     /// (the session left without detaching) is pruned here rather than left to
     /// absorb sends forever.
     pub fn emit_event(&self, ev: PipelineEvent) {
+        // #106: remember the capture path before fanning it out. Every
+        // `StreamInfo` event means "the path just changed", so the last one is
+        // the current truth for anyone who asks later.
+        if let PipelineEvent::StreamInfo { is_gdi, ref reason } = ev {
+            *self.stream_info.lock().unwrap_or_else(|p| p.into_inner()) =
+                (is_gdi, reason.clone());
+        }
         let mut dead: Vec<u64> = Vec::new();
         {
             let guard = self.events.lock().unwrap_or_else(|p| p.into_inner());
@@ -591,6 +619,17 @@ pub fn spawn_loop(
             }
         }
     });
+}
+
+/// #106: 把一帧 BGRA 交给 JPEG 旁路。
+///
+/// 没有订阅者时只花一次原子读：这条路径在采集线程上，每一拍都会走到，不能因为
+/// "可能有人要 JPEG"就让所有人付一次拷贝。
+fn publish_raw(display: u32, pixels: &[u8], w: u32, h: u32) {
+    if crate::pipeline::raw::subscribers() == 0 {
+        return;
+    }
+    crate::pipeline::raw::publish(display, pixels, w, h);
 }
 
 /// Outer recovery scheduler: open capturer + encoder, hand the pair to the inner
@@ -1354,6 +1393,9 @@ fn run_inner_beat(
                                     forward_chunks(&tx, encoded, &stats, &handle, beat);
                                     last_paint = want;
                                     cursor_repaints += 1;
+                                    // #106: JPEG 观众在静态桌面上靠这一条活着 ——
+                                    // WouldBlock 是"桌面没变"，不是"没有画面"。
+                                    publish_raw(settings.display(), &cursor_buf, tw, th);
                                 }
                                 Ok(None) => bump(&stats, |s| s.counters.repeat_skipped += 1),
                                 Err(err) => {
@@ -1406,6 +1448,13 @@ fn run_inner_beat(
                             s.last_sample_at = Some(std::time::Instant::now());
                         });
                         forward_chunks(&tx, encoded, &stats, &handle, beat);
+                        // #106: 同上 —— 一条重复帧也是"现在屏幕上是什么"，JPEG 没有
+                        // 参考链，重发一张一模一样的画面正是它需要的。
+                        if cursor_on && !cursor_buf.is_empty() {
+                            publish_raw(settings.display(), &cursor_buf, tw, th);
+                        } else {
+                            publish_raw(settings.display(), &pristine_bgra, tw, th);
+                        }
                     }
                     Ok(None) => bump(&stats, |s| s.counters.repeat_skipped += 1),
                     Err(err) => {
@@ -1570,6 +1619,15 @@ fn run_inner_beat(
                 is_gdi: on_gdi,
                 reason: reason.clone(),
             });
+        }
+
+        // #106: 旁路一帧原始像素给 JPEG 观众（没有订阅者时这是一次原子读）。
+        // 位置在 YUV 转换之后、缓冲归还之前：此时 `scaled_buf`/`captured.data`
+        // 是这一拍真正要编码的画面，光标也已经合成进去了。
+        if scale_needed {
+            publish_raw(settings.display(), &scaled_buf, tw, th);
+        } else {
+            publish_raw(settings.display(), &captured.data, src_w, src_h);
         }
 
         // #65: hand the native buffer back so the capture thread refills it in

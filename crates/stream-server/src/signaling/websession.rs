@@ -2455,9 +2455,18 @@ pub(crate) fn apply_settings_batch(settings: &StreamSettings, payload: &str) -> 
                     codec_changed = Some(pick);
                 }
             }
-            None => log::warn!(
-                "SETTINGS: encoder {id:?} is not one this build can encode (have: vp8enc, vp9enc)"
-            ),
+            None => {
+                // #106: `jpeg` 在这条批处理里是**合法**的，但它不是全局编码器 ——
+                // WebSocket 会话自己把它翻成 JPEG 条纹（`ws_media::Intent`），
+                // 程序仍然只出 VP8/VP9。所以这一条只值得一行 debug。
+                if id.eq_ignore_ascii_case("jpeg") {
+                    log::debug!("SETTINGS: encoder jpeg handled per session on the socket transport");
+                } else {
+                    log::warn!(
+                        "SETTINGS: encoder {id:?} is not one this build can encode (have: vp8enc, vp9enc)"
+                    );
+                }
+            }
         }
     }
 
