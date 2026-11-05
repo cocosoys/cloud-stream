@@ -52,3 +52,7 @@ Thumbs.db
 *~
 .idea/
 .vscode/
+
+# Python bytecode (toolchain/*.py 是本机诊断脚本)
+__pycache__/
+*.pyc
