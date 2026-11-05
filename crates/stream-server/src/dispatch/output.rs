@@ -283,6 +283,17 @@ pub fn server_settings(s: &crate::pipeline::StreamSettings) -> String {
         "type": "server_settings",
         "data": {
             "settings": {
+                // #106: both transports exist, so the panel is allowed to offer
+                // the switch (`Sidebar.jsx:2804` reads this into
+                // `canSwitchMode`). `locked: false` is the whole content of the
+                // field: `value` is the deployment's default, and the client
+                // keeps its own persisted choice anyway.
+                //
+                // This used to be absent on purpose — there was no WebSocket
+                // transport to switch to. Leaving it out now would hide the only
+                // way back from a WebRTC session that cannot connect on a given
+                // network, which is exactly the case the switch exists for.
+                "enable_dual_mode": { "value": true, "locked": false },
                 // #91: the encoder, and the one place the panel could contradict
                 // itself. `pipeline::encoder` builds exactly one encoder —
                 // libvpx, software — so the row names which libvpx codec is

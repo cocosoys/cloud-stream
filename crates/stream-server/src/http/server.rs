@@ -2,7 +2,9 @@
 //! (design 2.2, 5.1, 5.2).
 //!
 //! Stage1 split:
-//! * `GET /api/status` — plain-text liveness probe.
+//! * `GET /api/status` — liveness probe. JSON since #106: the dashboard reads
+//!   `current_mode` / `enable_dual_mode` from it to pick a transport; the
+//!   deploy wrapper and the watchdog only check the status code.
 //! * `GET /api/<app>/signaling/` — tungstenite WebSocket upgrade; the session
 //!   handshake and SDP/ICE exchange live in `signaling::websession`.
 //! * Every other GET — served from `--dist` by `http::static`.
@@ -407,13 +409,29 @@ where
             .await?;
             return Ok(());
         }
+        // #106: JSON, not the old plain-text `ok`. The dashboard's
+        // `detectInitialMode()` (`main.jsx`) parses this body and uses it to
+        // decide which transport to start and whether to draw the panel's
+        // mode switch; against `ok\n` it threw, swallowed the error, and the
+        // page fell through to the core's hard default — which used to be a
+        // WebSocket connection to an endpoint this server did not have.
+        //
+        // The probe's *status code* is what the deploy wrapper and the
+        // watchdog check, so the body change costs them nothing.
         crate::http::Route::Status => {
+            let body = serde_json::json!({
+                "status": "ok",
+                "current_mode": cfg.default_mode,
+                "enable_dual_mode": true,
+                "transports": ["webrtc", "websockets"],
+            })
+            .to_string();
             write_http(
                 &mut stream,
                 200,
                 "OK",
-                "text/plain; charset=utf-8",
-                b"ok\n",
+                "application/json; charset=utf-8",
+                body.as_bytes(),
             )
             .await?;
         }

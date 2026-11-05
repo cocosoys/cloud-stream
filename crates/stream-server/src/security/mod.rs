@@ -61,7 +61,8 @@ pub enum EventKind {
 /// HTTP 端点。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Endpoint {
-    /// `GET /api/status` —— 纯文本 `ok`。
+    /// `GET /api/status` —— 存活探针，JSON（`status` / `current_mode` /
+    /// `enable_dual_mode`）。看门狗只看状态码，浏览器才解析正文。
     Status,
     /// `POST /api/upload` —— 分片上传。
     Upload,

@@ -52,6 +52,14 @@ pub struct Config {
     /// WebRTC app segment echoed into the WS path; the client hardcodes
     /// `webrtc`, stage1 accepts the segment without validation.
     pub app_name: String,
+    /// #106: the transport a page with **no stored choice** should start on.
+    ///
+    /// Both transports are implemented, so the old "the page is pinned to
+    /// WebRTC at build time" workaround (`index.html`) is gone: the page asks
+    /// `/api/status` and this is the answer. A browser that already switched
+    /// with the panel keeps its own choice — see `main.jsx`, which seeds
+    /// localStorage only when it is empty instead of overriding it.
+    pub default_mode: String,
     /// Output capture width requested from the capturer/encoder.
     pub width: u32,
     /// Output capture height requested from the capturer/encoder.
@@ -199,6 +207,11 @@ impl Default for Config {
             // somewhere else — the kind of failure that looks like a broken build.
             dist: PathBuf::from("selkies-web"),
             app_name: "webrtc".to_owned(),
+            // WebRTC wins the first load: it is the path with NACK/PLI/FEC and
+            // the one every earlier deployment was tested against. A page can
+            // still switch, and `--mode websockets` flips this default for a
+            // network where WebRTC cannot get through.
+            default_mode: "webrtc".to_owned(),
             width: 1920,
             height: 1080,
             fps: 30,
@@ -255,6 +268,21 @@ impl Config {
                 "--app" => {
                     if let Some(v) = iter.next() {
                         cfg.app_name = v;
+                    }
+                }
+                // #106: which transport a fresh browser starts on. Only the two
+                // real ones are accepted — a typo must not leave the page in a
+                // mode that has no core behind it, so it keeps the default and
+                // says so.
+                "--mode" => {
+                    if let Some(v) = iter.next() {
+                        match v.trim().to_ascii_lowercase().as_str() {
+                            "webrtc" | "websockets" => cfg.default_mode = v.trim().to_ascii_lowercase(),
+                            other => eprintln!(
+                                "unknown --mode {other:?}, keeping {:?} (webrtc, websockets)",
+                                cfg.default_mode
+                            ),
+                        }
                     }
                 }
                 "--width" => {

@@ -5,8 +5,9 @@
 //! * `GET /api/<app>/signaling/` — WS upgrade. `app` may be `webrtc` (client
 //!   hardcodes it) or any other segment accepted as a fallback; the app segment
 //!   is not validated against credentials (no auth gate in stage1).
-//! * `GET /api/status` — plain-text health probe used by the deploy wrapper
-//!   before the browser opens the signaling socket.
+//! * `GET /api/status` — liveness probe used by the deploy wrapper before the
+//!   browser opens the signaling socket. JSON (`current_mode`,
+//!   `enable_dual_mode`): the dashboard parses it to choose a transport (#106).
 //! * Any other GET — served from the `--dist` root by `static`.
 //!
 //! The raw TCP accept loop, HTTP/Upgrade handshake, tungstenite upgrade and
