@@ -24,11 +24,12 @@
 //! intended position). `output()` is (0, 0) until the capture loop publishes
 //! its real encoder size; callers must fall back explicitly.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::Config;
+use crate::pipeline::codec::VideoCodec;
 
 /// Lower/upper clamp for client-requested values.
 ///
@@ -112,7 +113,7 @@ impl RateControl {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct StreamSettings {
     /// Which display this program captures (#101 的第二个维度)。
     ///
@@ -137,6 +138,29 @@ pub struct StreamSettings {
     rc: Arc<AtomicU32>,
     crf: Arc<AtomicU32>,
     dirty: Arc<AtomicBool>,
+    /// #110: the video codec **this program** encodes with.
+    ///
+    /// It used to be a process-wide `AtomicU8` in `codec`, on the reasoning that
+    /// a pick has to outlive the session that carried it (the pick forces a
+    /// reconnect, and `StreamSettings` was rebuilt from `Config` on every
+    /// connect). Both halves of that reasoning changed: the settings object is
+    /// now owned by the *program* (`SharedPipeline.settings`), which outlives
+    /// every session on it and is created exactly once, so the pick survives
+    /// the reconnect here just as well.
+    ///
+    /// Keeping it process-wide made one viewer's menu change every screen on the
+    /// machine and kick every other session (`codec_registry.kick`), which is
+    /// not a settings panel — it is a broadcast.
+    codec: Arc<AtomicU8>,
+    /// #110: the Opus target for this program's audio downlink, in bps.
+    ///
+    /// Was `audio::TARGET_BPS`. The audio thread is already per-program (one
+    /// loopback capture feeds every sink on it), so the one value it read had no
+    /// business being shared with the other programs.
+    audio_bps: Arc<AtomicI32>,
+    /// #110: whether this program's audio downlink actually carries sound.
+    /// Was `audio::ENABLED`.
+    audio_enabled: Arc<AtomicBool>,
 }
 
 impl StreamSettings {
@@ -152,7 +176,65 @@ impl StreamSettings {
             rc: Arc::new(AtomicU32::new(RateControl::Cbr.as_u32())),
             crf: Arc::new(AtomicU32::new(CRF_DEFAULT)),
             dirty: Arc::new(AtomicBool::new(false)),
+            codec: Arc::new(AtomicU8::new(
+                VideoCodec::from_wire(&cfg.video_codec)
+                    .unwrap_or_default()
+                    .as_byte(),
+            )),
+            audio_bps: Arc::new(AtomicI32::new(crate::pipeline::audio::default_bitrate_bps())),
+            audio_enabled: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    /// The codec this program encodes with.
+    ///
+    /// Read by the capture loop every beat (a pick forces a rebuild), by
+    /// `server_settings`/`stream_info`, and by the SDP builder when the program's
+    /// first session negotiates — all of them from the program, so they cannot
+    /// disagree.
+    pub fn codec(&self) -> VideoCodec {
+        VideoCodec::from_byte(self.codec.load(Ordering::Relaxed))
+    }
+
+    /// Record a codec pick. Returns `true` when it actually changed, which is
+    /// what the caller uses to decide whether a restart is worth forcing.
+    pub fn set_codec(&self, codec: VideoCodec) -> bool {
+        let previous = self.codec.swap(codec.as_byte(), Ordering::Relaxed);
+        VideoCodec::from_byte(previous) != codec
+    }
+
+    /// The audio downlink's Opus target, in bps.
+    pub fn audio_bitrate_bps(&self) -> u32 {
+        self.audio_bps.load(Ordering::Relaxed).max(0) as u32
+    }
+
+    /// Re-aim the audio encoder for this program. `<= 0` means "back to the
+    /// built-in default"; anything outside the Opus range is clamped, so the
+    /// panel's slider can only hold values the encoder will take.
+    pub fn set_audio_bitrate_bps(&self, bps: i32) -> i32 {
+        let clamped = crate::pipeline::audio::clamp_bps(bps);
+        self.audio_bps.store(clamped, Ordering::Relaxed);
+        clamped
+    }
+
+    /// Whether this program's downlink carries game sound at all.
+    pub fn audio_enabled(&self) -> bool {
+        self.audio_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Mute or unmute this program's downlink.
+    pub fn set_audio_enabled(&self, on: bool) {
+        self.audio_enabled.store(on, Ordering::Relaxed);
+    }
+
+    /// #110: the audio thread's two handles.
+    ///
+    /// Cloned `Arc`s rather than a `&StreamSettings` because the thread owns its
+    /// own copy for the life of the program: it must keep reading after the
+    /// settings struct that spawned it has been dropped, and both atomics are
+    /// shared with the session that changes them.
+    pub fn audio_handles(&self) -> (Arc<AtomicI32>, Arc<AtomicBool>) {
+        (self.audio_bps.clone(), self.audio_enabled.clone())
     }
 
     /// Which display this program captures (DXGI output ordinal).
@@ -299,6 +381,15 @@ impl StreamSettings {
         self.crf
             .store(crf.clamp(CRF_MIN, CRF_MAX), Ordering::SeqCst);
         self.dirty.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Default for StreamSettings {
+    /// Going through `Config::default()` rather than hand-writing a second set
+    /// of numbers: a default that disagrees with `from_config` is a default that
+    /// only shows up in tests and then quietly lies.
+    fn default() -> Self {
+        Self::from_config(&Config::default())
     }
 }
 

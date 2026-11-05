@@ -24,7 +24,7 @@ use std::task::{Context, Poll};
 use anyhow::{anyhow, Result};
 use httparse::Status;
 use log;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
 use tokio_tungstenite::{
     accept_hdr_async,
@@ -37,7 +37,7 @@ use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use crate::config::Config;
 use crate::http::{classify, file_transfer, header_value, r#static, write_http, Route};
 use crate::pipeline::PipelineRegistry;
-use crate::security::{self, Credential, Endpoint, EventKind, TokenGate};
+use crate::security::{self, Endpoint, EventKind};
 use crate::signaling::websession::{self, Admission};
 use crate::signaling::SessionRegistry;
 
@@ -251,10 +251,10 @@ where
     //     秘密；而且页面必须能打开，否则用户连"这机器要口令"都看不到，只能
     //     看到一片空白 —— 那正是本项目花了几轮才消掉的"启动了但没效果"。
     //   * `Status` —— 部署脚本的探活口径，正文只有 `ok` 两个字。
-    let credential = match cfg.auth_token.as_deref().and_then(TokenGate::new) {
+    let grant = match cfg.token_gate() {
         Some(gate) if !matches!(route, Route::Static(_) | Route::Status) => {
             match gate.check_request(&headers, path) {
-                Some(cred) => cred,
+                Some(grant) => Some(grant),
                 None => {
                     // `WWW-Authenticate` 必须带 `Bearer realm="Selkies"`：前端的
                     // `auth-guard.js` 按这个前缀区分"令牌不匹配"（重载也没用，
@@ -275,10 +275,12 @@ where
                 }
             }
         }
-        _ => Credential::None,
+        _ => None,
     };
 
-    let principal = crate::security::token::principal(peer, credential);
+    // #110: 身份里现在带着租户与角色 —— 策略与 `/api/v1/health` 的过滤都从
+    // 这里取判据，而不是从"有没有出示令牌"反推。
+    let principal = crate::security::token::principal(peer, grant.clone());
     if !crate::security::allow(surface_of(&route), &principal) {
         write_http(
             &mut stream,
@@ -352,7 +354,7 @@ where
                 stream.read_exact(&mut rest).await?;
                 body.extend_from_slice(&rest);
             }
-            let _ = file_transfer::handle_upload(&mut stream, &headers, &body, &cfg, &chunks).await;
+            let _ = file_transfer::handle_upload(&mut stream, &headers, &body, &cfg, &chunks, &principal).await;
             return Ok(());
         }
         // #93: the write surface is two POSTs; everything else on POST stays 405
@@ -393,7 +395,7 @@ where
 
     match route {
         crate::http::Route::Files { rel } => {
-            let _ = file_transfer::handle_files(&mut stream, &rel, &cfg).await;
+            let _ = file_transfer::handle_files(&mut stream, &rel, &cfg, &principal).await;
             return Ok(());
         }
 
@@ -447,6 +449,8 @@ where
                 &admission,
                 &pipelines,
                 &health,
+                // #110: 谁在问，决定报多少。
+                &principal,
             )
             .await;
             return Ok(());
@@ -606,7 +610,7 @@ where
             .await
             .map_err(|err| anyhow!("signaling upgrade failed: {err}"))?;
 
-            websession::run(ws, cfg, registry, pipelines, client, permit).await?;
+            websession::run(ws, cfg, registry, pipelines, client, permit, grant).await?;
         }
 
         // #106: 画面走 WebSocket 的那条线。和信令是同一个升级动作，但**下游没有
@@ -682,7 +686,7 @@ where
                 accept_hdr_async(prefixed, |_req: &Request, resp: Response| Ok(resp))
                     .await
                     .map_err(|err| anyhow!("websockets upgrade failed: {err}"))?;
-            crate::http::ws_media::run(ws, cfg, registry.clone(), pipelines, permit, peer, credential).await?;
+            crate::http::ws_media::run(ws, cfg, registry.clone(), pipelines, permit, peer, grant).await?;
         }
 
         crate::http::Route::Static(rel) => {

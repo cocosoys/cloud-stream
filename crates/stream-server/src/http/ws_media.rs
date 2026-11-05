@@ -45,6 +45,17 @@
 //! 不是二选一。两者都通过 [`PipelineRegistry`] 拿同一路程序（一次采集、一次编码），
 //! 各自往 [`VideoFanout`] 挂自己的下行。所以"一个页签在 WebRTC、另一个在
 //! WebSocket"是天然支持的 —— 这不是设计的巧合，是 fan-out 本来就该有的形状。
+//!
+//! # 上行：`0x02` 是麦克风（#110）
+//!
+//! 页面把麦克风编成 `[0x02] + Opus`（24 kHz 单声道、20 ms 一帧，`selkies-core` 的
+//! mic worker 写死这组参数），服务端解到 48 kHz 立体声后写**虚拟录音设备**。写哪里
+//! 由 `--mic-device` 在启动时决议一次（`platform/virtual_mic.rs`），不是默认扬声器：
+//! 写默认扬声器会被下行 loopback 原样采回，就是那个"开麦听到自己"。
+//!
+//! 目标不可用时回 `MICROPHONE_DISABLED`（页面会关麦），并且**只回一次** —— 电平条
+//! 按帧发，每帧回一条文本会把 socket 变成回音壁。`0x06`（摄像头）仍然是回绝，反向
+//! track 全项目未实现。
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -60,12 +71,12 @@ use tokio_tungstenite::{
     WebSocketStream,
 };
 
-use crate::config::{Config, InputPolicy};
+use crate::config::Config;
 use crate::dispatch::clipboard::ClipboardSink;
 use crate::dispatch::commands::{classify, Action};
 use crate::dispatch::input_stub::InputSink;
 use crate::dispatch::win_input::WinInputSink;
-use crate::pipeline::codec::{self, VideoCodec};
+use crate::pipeline::codec::VideoCodec;
 use crate::pipeline::shared::{DisplayKey, SharedPipeline};
 use crate::pipeline::{audio, PipelineRegistry, StreamSettings};
 use crate::signaling::websession::{
@@ -260,9 +271,22 @@ fn settings_frame(settings: &StreamSettings) -> Option<String> {
 ///
 /// 采集路径取 `handle.stream_info()` 而不是 `StreamInfo::default()`：GDI 回落
 /// 之后仍报 DXGI 的话，这份诊断的唯一用途就没了。
-fn stream_info_frame(handle: &crate::pipeline::PipelineHandle, display: u32) -> Option<String> {
-    let (is_gdi, reason) = handle.stream_info();
-    let info = crate::dispatch::StreamInfo::from_capture(is_gdi, reason).with_display(display);
+///
+/// #110: 整个 `SharedPipeline` 而不是 `handle` + `display` —— 报告里的编码器
+/// 现在属于 program，多传一个参数只会多一个能传错的地方。
+///
+/// `name_host` 决定 `encode_node` 发不发（见
+/// [`crate::security::Principal::may_name_host`]）。机器名是主机级标识，
+/// 不是流的属性。
+fn stream_info_frame(
+    pipeline: &crate::pipeline::SharedPipeline,
+    name_host: bool,
+) -> Option<String> {
+    let (is_gdi, reason) = pipeline.handle.stream_info();
+    let info = crate::dispatch::StreamInfo::from_capture(is_gdi, reason)
+        .with_display(pipeline.display.0)
+        .with_codec(pipeline.settings.codec())
+        .with_node_visible(name_host);
     let full: serde_json::Value =
         serde_json::from_str(&crate::dispatch::output::stream_info(&info)).ok()?;
     let flat = full.get("data")?.clone();
@@ -305,6 +329,46 @@ fn encoder_in(payload: &str) -> Option<String> {
     Some(name.trim().to_ascii_lowercase())
 }
 
+/// #110: 这一批 `SETTINGS` 里有没有**会动到别人**的字段。
+///
+/// 这条批是复合的，同一份 JSON 里混着三类东西：
+///
+/// * 身份（`tabId` / `deviceId`）—— 谁都能报，服务端只用来登记；
+/// * 选屏（`displayId`）—— 只改变这条连接看哪块屏，不动别人的画面；
+/// * 本连接自己的编码兜底（`encoder: "jpeg"`）—— JPEG 条纹由这个会话自己编；
+/// * **程序参数**（帧率、分辨率、音频码率、码控、CRF、真编码器）—— 同屏所有
+///   会话都看得见，只有操作者能改。
+///
+/// 前三类要是跟着一起被拒，观众在 `health` 里就没有 `tab_id`、也换不了屏 ——
+/// 一条安全规则顺手弄坏两个无害功能，是这类"整条拒绝"最常见的样子。
+fn touches_program_settings(payload: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return false;
+    };
+    let Some(map) = value.as_object() else {
+        return false;
+    };
+    for key in [
+        "framerate",
+        "manual_width",
+        "manual_height",
+        "audio_bitrate",
+        "rate_control",
+        "rc",
+        "crf",
+    ] {
+        if map.contains_key(key) {
+            return true;
+        }
+    }
+    match map.get("encoder").and_then(|v| v.as_str()) {
+        // `jpeg` 是这条连接自己的降级路径，不是程序编码器。
+        Some(name) if name.eq_ignore_ascii_case("jpeg") => false,
+        Some(_) => true,
+        None => false,
+    }
+}
+
 /// 这条连接用什么身份。
 ///
 /// 前端只认 **带前缀** 的 `AUTH_SUCCESS,{json}`（`selkies-ws-core.js:8407`：
@@ -316,11 +380,23 @@ fn encoder_in(payload: &str) -> Option<String> {
 /// 现在**无条件发送**（此前只在有口令时发）：无口令的部署就是单用户机器，
 /// 它必须和控制器一样能操作；不发只会让页面在"未认证"状态里走一遍再等一条
 /// 永远不来的消息。
-fn auth_frame(credential: crate::security::Credential) -> String {
+fn auth_frame(principal: &crate::security::Principal) -> String {
+    // #110: `role` 现在说的是**令牌**能做什么，不再是写死的 "controller"。
+    // 没有凭据的部署（`credential: none`）仍然是控制者 —— 那是单用户机器；
+    // 但一张 `viewer` 令牌现在会如实说明自己是观众，页面据此隐藏控制项，
+    // 而不是先显示能操作、再被服务端一条条拒掉。
+    let role = if principal.may_operate() {
+        "controller"
+    } else {
+        "viewer"
+    };
     let body = serde_json::json!({
-        "role": "controller",
+        "role": role,
         "slot": 1,
-        "credential": credential.label(),
+        "credential": principal.credential.label(),
+        // #110: 页面现在不读它，但它是排障时第一个要问的字段 —— "我看到的
+        // 是哪个租户的屏"。多出来的键对前端是无害的（它按 `role`/`slot` 取值）。
+        "tenant": principal.tenant.as_str(),
     })
     .to_string();
     format!("AUTH_SUCCESS,{body}")
@@ -379,8 +455,8 @@ fn sample_stats(
 
 /// 一条 WebSocket 画面会话。
 ///
-/// `peer` 与 `credential` 只用于日志与 `AUTH_SUCCESS`：策略裁决在 `server.rs`
-/// 升级之前就做完了，这里不该再做一次（两处判定迟早会不一致）。
+/// `peer` 与 `grant` 用于日志、`AUTH_SUCCESS` 与**策略裁决**（#110 起这条路
+/// 也接上了 `security::allow`；在此之前它一条都没有，装上真策略也是空心的）。
 ///
 /// #106 之后这条连接不再只是"只读画面"：输入、剪贴板、音频都从同一个 socket
 /// 走（文本是命令，二进制是帧），因为前端 `selkies-ws-core.js` 本来就是这么发
@@ -394,18 +470,21 @@ pub async fn run<S>(
     // 不 `use` 它是有意的 —— 它的价值就是活得和这条连接一样长。
     _permit: AdmissionPermit,
     peer: IpAddr,
-    credential: crate::security::Credential,
+    grant: Option<crate::security::token::Grant>,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let (mut sink, mut source) = ws.split();
-    let codec_now = codec::current();
+
+    // #110: 身份在第一条消息之前就要定下来 —— `AUTH_SUCCESS` 要报角色，而角色
+    // 来自令牌。会话号要等登记之后才有，所以先带 `session: None`，登记完补上。
+    let mut principal = crate::security::token::principal(peer, grant);
 
     // 顺序是有意的：先身份、再模式、最后设置。前端收到 `MODE websockets` 就会
     // 开始初始化输入与音频，此时若还不知道自己的角色，它会按"未认证"走一遍，
     // 然后在 `AUTH_SUCCESS` 到达后再补一遍 —— 少发一条消息就能避免的抖动。
-    sink.send(Message::Text(auth_frame(credential).into()))
+    sink.send(Message::Text(auth_frame(&principal).into()))
         .await?;
     sink.send(Message::Text("MODE websockets".into())).await?;
 
@@ -415,6 +494,10 @@ where
     // `SETTINGS.displayId` 到了再决定要不要换 —— 换屏是 `PendingDisplay` 那段。
     let acquired = pipelines.acquire(DisplayKey(cfg.display), &cfg).await;
     let mut pipeline = acquired.pipeline.clone();
+    // #110: the codec belongs to the program we just joined, so it is read here
+    // rather than at connection time (there was no program yet) and re-read
+    // after every display switch.
+    let mut codec_now = pipeline.settings.codec();
 
     if let Some(settings) = settings_frame(&pipeline.settings) {
         sink.send(Message::Text(settings.into())).await?;
@@ -423,7 +506,7 @@ where
     }
     // #106: 面板的"服务端在做什么"那一栏。发一次就够，采集路径变化会由
     // `PIPELINE_RESETTING` 之后的重新连接重发；它不带时间敏感的数值。
-    if let Some(info) = stream_info_frame(&pipeline.handle, pipeline.display.0) {
+    if let Some(info) = stream_info_frame(&pipeline, principal.may_name_host()) {
         sink.send(Message::Text(info.into())).await?;
     }
 
@@ -437,12 +520,36 @@ where
             client_type: "websocket".to_owned(),
             connected_at: Some(std::time::Instant::now()),
             display: Some(pipeline.display.0),
+            // #110: 谁连着 —— `health` 按这一行决定这条记录给谁看。
+            tenant: principal.tenant.clone(),
             ..Default::default()
         })
         .await;
-    // 输入租约：空着就认领。`shared` 策略下这一步不影响能不能操作，但 `health`
-    // 的 `role` 与 `session/take` 都以租约为准，空着会让 WS 会话永远显示 viewer。
-    pipeline.try_claim_controller(session_id);
+    // 输入租约：空着就认领。`exclusive`（#110 起的默认）下这就是"能不能操作"，
+    // 所以先到的那条连接成为操作者、后来的是观众；`shared` 下只影响 `health`
+    // 的 `role` 与 `session/take`。
+    //
+    // #110: 但只有**能操作**的令牌才认领。`viewer` 令牌若在这里认领，一个观众
+    // 会握住租约、把之后连上来的操作者永远挡在门外（认领是 claim-if-free，
+    // 没人能把它挤掉）—— 那会表现成"操作者连上了，键鼠没反应"。
+    let may_operate = principal.may_operate();
+    if may_operate {
+        pipeline.try_claim_controller(session_id);
+    }
+
+    // #110: 会话号登记完才补得上 —— 身份本身（租户/角色）在连接开头就定了，
+    // 那时还没有 session 可填。
+    principal.session = Some(session_id);
+    // #110: 两个问题是分开的，日志也必须分两栏写。`grant` 是令牌上写的角色，
+    // `operates` 是这条连接实际能不能动手 —— 无门部署（`cred=none`）里前者是
+    // `viewer`、后者是 true，只写一栏的话每次复盘都要重新推一遍这个差。
+    log::info!(
+        "ws media: {peer} identified as tenant={} grant={} operates={} cred={}",
+        principal.tenant.as_str(),
+        principal.role.as_str(),
+        if may_operate { "yes" } else { "no" },
+        principal.credential.label()
+    );
 
     let (tx, mut rx) = mpsc::channel::<Bytes>(QUEUE);
     let mut sink_handle = pipeline.video.attach_stream(tx);
@@ -492,6 +599,9 @@ where
     // 文本会把 socket 变成回音壁。
     let mut mic_refused = false;
     let mut cam_refused = false;
+    // #110: 麦克风注入点。第一次收到 `0x02` 才起线程 —— 没人开麦的连接不该占一个
+    // 音频线程和一个 render 客户端。连接结束时 `Drop` 停掉它。
+    let mut mic: Option<audio::MicUplink> = None;
     // #106: `_stats,1` 之后每秒一条 `stream_stats`。页面只在面板打开时才订阅
     // （`lib/stream-stats.js`），所以默认整条通道上是安静的 —— 一个不看的统计
     // 不该占用带宽，也不该每秒唤醒两条任务。
@@ -540,14 +650,15 @@ where
                     if !streaming {
                         continue;
                     }
-                    // 编码器是全局单例，面板切 VP8/VP9 会重建它。这条连接手里
-                    // 缓存的 `codec_now` 立刻过期，继续按旧编号发帧等于让浏览器
-                    // 用错误的解码器解新码流。关掉让它重连，重连时会读到新值。
-                    if codec::current() != codec_now {
+                    // 编码器现在属于**这块屏**（#110），面板切 VP8/VP9 只会重建
+                    // 这一路。这条连接手里缓存的 `codec_now` 立刻过期，继续按旧
+                    // 编号发帧等于让浏览器用错误的解码器解新码流。关掉让它重连，
+                    // 重连时会读到新值。
+                    if pipeline.settings.codec() != codec_now {
                         log::info!(
                             "ws media: codec changed {} -> {}; closing so the page reconnects",
                             codec_now.wire(),
-                            codec::current().wire()
+                            pipeline.settings.codec().wire()
                         );
                         break;
                     }
@@ -661,6 +772,7 @@ where
                                 &mut stats_on,
                                 &denied,
                                 session_id,
+                                &principal,
                             )
                             .await?;
                         }
@@ -668,23 +780,115 @@ where
                             log::info!("ws media: client closed ({:?})", frame.map(|f| f.code));
                             break;
                         }
-                        // 二进制上行：麦克风 `0x02`、摄像头 `0x06`。这两条这条
-                        // 服务端都还没有接收端（被控机上没有"播进主机麦克风"的接口，
-                        // 摄像头反向 track 全项目未实现），所以**明确回绝**而不是
-                        // 静默吞掉：页面收到 `MICROPHONE_DISABLED` 会把
-                        // `microphoneEnabled` 置 false 并停掉采集，用户不会看到一条
-                        // 一直在跳却传不出去的电平条。每条连接只回一次。
+                        // 二进制上行：麦克风 `0x02`、摄像头 `0x06`。
+                        //
+                        // #110 麦克风：页面把 `[0x02] + Opus`（24 kHz 单声道、
+                        // 20 ms 一帧，来自 `selkies-core` 的 mic worker）发上来，
+                        // 服务端解到 48 kHz 立体声后写**虚拟录音设备**。目的地由
+                        // `--mic-device` 在启动时决议一次，不是默认扬声器 —— 写默认
+                        // 扬声器会被下行 loopback 原样采回，就是那个"开麦听到自己"。
+                        //
+                        // 摄像头 `0x06` 仍然回绝：反向 track 全项目未实现，而静默
+                        // 吞掉会让页面显示一路永远不动的摄像头。回绝必须是**一次**：
+                        // 电平条按帧发，每帧回一条文本会把 socket 变成回音壁。
                         Some(Ok(Message::Binary(data))) => {
                             let kind = data.first().copied().unwrap_or(0);
                             match kind {
                                 0x02 if !mic_refused => {
-                                    mic_refused = true;
-                                    log::info!(
-                                        "ws media: microphone uplink is not implemented; telling the page ({})",
-                                        data.len()
-                                    );
-                                    send_text(&mut sink, "MICROPHONE_DISABLED".to_owned()).await?;
+                                    // 租约与指针/键盘同一条门禁：`shared` 谁都能说，
+                                    // `exclusive` 只有持租约的人能说。拒绝会计数，否则
+                                    // "开了麦没声音"分不清是没到还是被挡了。
+                                    // #110: 角色是这道门的另一半 —— 麦克风是往主机
+                                    // 送声音，`viewer` 令牌在任何策略下都不该有它。
+                                    let may = may_operate && pipeline.owns_input(session_id);
+                                    if !may {
+                                        // 回绝而不是静默丢弃。两种拒绝（没租约、令牌是
+                                        // 观众）在页面上的正确反应都是"关麦"：继续采
+                                        // 只会让一条永远不动的声音白占带宽，而用户看到
+                                        // 的是电平条在跳、对面没声音 —— 最坏的一种
+                                        // "看起来正常"。
+                                        denied.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        mic_refused = true;
+                                        log::info!(
+                                            "ws media: microphone refused (grant={}, operates={}, lease={})",
+                                            principal.role.as_str(),
+                                            if may_operate { "yes" } else { "no" },
+                                            if pipeline.owns_input(session_id) { "yes" } else { "no" }
+                                        );
+                                        send_text(
+                                            &mut sink,
+                                            "MICROPHONE_DISABLED".to_owned(),
+                                        )
+                                        .await?;
+                                    } else if data.len() > 1 {
+                                        if mic.is_none() {
+                                            match audio::MicUplink::start() {
+                                                Ok(up) => {
+                                                    let (where_to, provider, echoes) =
+                                                        match crate::platform::virtual_mic::target()
+                                                        {
+                                                            Some(t) => (
+                                                                t.note.clone(),
+                                                                t.provider.as_str(),
+                                                                t.echoes(),
+                                                            ),
+                                                            None => (
+                                                                "默认 render 端点".to_owned(),
+                                                                "default",
+                                                                true,
+                                                            ),
+                                                        };
+                                                    log::info!(
+                                                        "ws media: microphone uplink open ({} B 首帧) | {where_to}",
+                                                        data.len() - 1
+                                                    );
+                                                    mic = Some(up);
+                                                    // #110: 正向确认。页面发 `0x02` 之后
+                                                    // 只有"被拒"才有回信，于是"开了麦"和
+                                                    // "发出去的帧被服务端吃了"在客户端完全
+                                                    // 同形。这一行让探针（以及页面将来）能
+                                                    // 说出"上行通到哪个端点"，`echoes` 是为
+                                                    // 了让自听这件事在日志和面板里都看得见。
+                                                    send_text(
+                                                        &mut sink,
+                                                        format!(
+                                                            "MICROPHONE_READY,{}",
+                                                            serde_json::json!({
+                                                                "target": provider,
+                                                                "note": where_to,
+                                                                "echoes": echoes,
+                                                            })
+                                                        ),
+                                                    )
+                                                    .await?;
+                                                }
+                                                Err(note) => {
+                                                    // 目标不可用：明确回绝，并让页面把
+                                                    // 麦克风关掉 —— 让它继续采、继续发，
+                                                    // 用户只会看到一条白跳的电平条。
+                                                    mic_refused = true;
+                                                    log::warn!(
+                                                        "ws media: microphone refused: {note}"
+                                                    );
+                                                    send_text(
+                                                        &mut sink,
+                                                        "MICROPHONE_DISABLED".to_owned(),
+                                                    )
+                                                    .await?;
+                                                }
+                                            }
+                                        }
+                                        if let Some(up) = mic.as_mut() {
+                                            if !up.push(&data[1..]) {
+                                                log::debug!(
+                                                    "ws media: mic frame dropped ({} B)",
+                                                    data.len() - 1
+                                                );
+                                            }
+                                        }
+                                    }
                                 }
+                                0x02 => {} // 已经拒绝过：静默丢弃，不再回文本
                                 0x06 if !cam_refused => {
                                     cam_refused = true;
                                     log::info!(
@@ -792,6 +996,9 @@ where
                 reference = 0;
                 need_key = true;
                 pipeline = next;
+                // #110: the new program may encode with a different codec, and
+                // the framing below reads this value.
+                codec_now = pipeline.settings.codec();
                 rx = next_rx;
                 audio_rx = next_audio_rx;
                 sink_handle = next_sink;
@@ -877,6 +1084,12 @@ async fn handle_text<S>(
     stats_on: &mut bool,
     denied: &std::sync::Arc<std::sync::atomic::AtomicU64>,
     session_id: u64,
+    // #110: who is asking. The WS transport had no policy surface at all —
+    // `security::allow` was called from the HTTP routes, the WebRTC data
+    // channels and the signaling path, but never from here, so a policy
+    // installed to stop input or settings changes simply did not apply to a
+    // WebSocket viewer.
+    principal: &crate::security::Principal,
 ) -> Result<Intent>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -910,7 +1123,35 @@ where
         _ => {}
     }
 
-    match classify(line) {
+    let action = classify(line);
+    // #110: 与 WebRTC 控制通道**同一套**门禁、同一个顺序：
+    //   1) 角色 —— 这块屏的操作者才能动它；观众只允许白名单里的读操作；
+    //   2) 策略 —— `security::allow` 按 surface 裁决。
+    // 两步都必须在副作用之前，否则"拒绝"只是记账。
+    //
+    // 在这之前这条路径一条 `security::allow` 都没有：装上真策略之后，走 WS
+    // 的观众仍然能注入输入、改设置、取剪贴板 —— 策略是空心的。
+    // `SETTINGS` 是复合批：身份（`tabId`/`deviceId`）、选屏（`displayId`）、本连接
+    // 自己的 JPEG 兜底，这三样谁都能发；只有"改程序参数"那部分需要独占。整条
+    // 拒绝会连带丢掉身份登记和选屏，所以它自己在分支里按字段裁决。
+    let compound = matches!(action, Action::SetSettings(_));
+    // #110: "能不能动这块屏"是**两个**条件 —— 租约（两个操作者里谁说了算）
+    // 与角色（你是不是操作者）。以前只有前者，于是 `--input-policy shared`
+    // 下任何持 `viewer` 令牌的连接都能注入输入。
+    let operates = principal.may_operate() && pipeline.owns_input(session_id);
+    if !compound && !operates && !crate::signaling::viewer_may_run(&action) {
+        denied.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        log::debug!("ws media: viewer refused `{}`", short(line));
+        return Ok(Intent::default());
+    }
+    if let Some(kind) = crate::signaling::surface_of(&action) {
+        if !crate::security::allow(kind, principal) {
+            log::debug!("ws media: policy denied {}", kind.label());
+            return Ok(Intent::default());
+        }
+    }
+
+    match action {
         Action::StartVideo => {
             *streaming = true;
             *need_key = true;
@@ -949,12 +1190,12 @@ where
             log::info!("ws media: bitrate override {kbps} kbps");
         }
         Action::SetAudioOn(on) => {
-            audio::set_enabled(on);
+            pipeline.settings.set_audio_enabled(on);
             log::info!("ws media: audio {}", if on { "on" } else { "off" });
         }
         Action::SetAudioBitrate(bps) => {
-            audio::set_bitrate_bps(bps as i32);
-            log::info!("ws media: audio bitrate -> {} bps", audio::current_bitrate_bps());
+            let applied = pipeline.settings.set_audio_bitrate_bps(bps as i32);
+            log::info!("ws media: audio bitrate -> {applied} bps");
         }
         Action::SetNativeCursorRendering(on) => {
             pipeline.handle.set_cursor_inject(on);
@@ -973,6 +1214,22 @@ where
             };
             // 与信令会话共用同一个批处理：两套解析会把同一个 SETTINGS 解成两种
             // 结果，而面板只会相信自己那一路。
+            //
+            // #110: 但先按字段裁一次 —— 这一批里只有"改程序参数"需要操作者身份。
+            if touches_program_settings(&payload) && !operates {
+                denied.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                log::debug!("ws media: viewer refused a program settings change");
+                // 回一份**真实**值：面板刚点下去的那一档必须被顶回去，否则它
+                // 会一直显示一个没有生效的帧率。
+                if let Some(settings) = settings_frame(&pipeline.settings) {
+                    send_text(sink, settings).await?;
+                }
+                let identity = crate::dispatch::settings_identity(&payload);
+                return Ok(Intent {
+                    display: identity.display.filter(|d| *d != pipeline.display),
+                    jpeg,
+                });
+            }
             if let Some(codec) = apply_settings_batch(&pipeline.settings, &payload) {
                 // 这条连接这次不重连就没有意义了：帧头里的 codec 是启动时缓存的。
                 log::info!("ws media: codec -> {}; closing for renegotiation", codec.wire());
@@ -1012,18 +1269,9 @@ where
         }
         Action::ClipboardChunk(raw) => clipboard.handle_line(&raw),
         Action::InputStub(raw) => {
-            // 租约与 WebRTC 一侧同一套语义：`shared` 谁都能操作，`exclusive`
-            // 只有租约持有者。拒绝要计数，否则"指针不动"永远分不清是没到还是
-            // 被门挡了。
-            let may = match pipeline.input_policy() {
-                InputPolicy::Shared => true,
-                InputPolicy::Exclusive => pipeline.controller_id() == Some(session_id),
-            };
-            if may {
-                input.handle_line(&raw);
-            } else {
-                denied.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
+            // 角色门禁在上面统一做过了（`owns_input` + `viewer_may_run`），拒绝
+            // 时已经记进 `denied`。这里只剩"放行"这一种情况。
+            input.handle_line(&raw);
         }
         other => log::debug!("ws media: ignoring `{:?}`", other),
     }
@@ -1127,6 +1375,35 @@ mod tests {
 
     fn le(n: usize) -> Bytes {
         Bytes::from(vec![0u8; n])
+    }
+
+    /// #110：`SETTINGS` 的字段裁决必须把"会动到别人的"和"只动自己的"分开。
+    ///
+    /// 这条区分是"观众也能换屏、也能报到自己是哪个页签"与"观众不能改我的
+    /// 帧率"之间唯一的分界线；写错了，要么观众被整条拒掉（health 里没有
+    /// `tab_id`、换不了屏），要么观众能改所有人的画面。
+    #[test]
+    fn only_program_settings_need_the_operator() {
+        // 身份与选屏：谁都能发，不该被挡。
+        assert!(!touches_program_settings(r#"{"tabId":"t1","deviceId":"d1"}"#));
+        assert!(!touches_program_settings(r#"{"displayId":"display2"}"#));
+        // 本连接自己的 JPEG 兜底：不是程序编码器。
+        assert!(!touches_program_settings(r#"{"encoder":"jpeg"}"#));
+        assert!(!touches_program_settings(r#"{"encoder":{"value":"jpeg"}}"#));
+        // 程序参数：同屏所有会话都看得见，只有操作者能改。
+        assert!(touches_program_settings(r#"{"framerate":60}"#));
+        assert!(touches_program_settings(r#"{"manual_width":1280}"#));
+        assert!(touches_program_settings(r#"{"audio_bitrate":96000}"#));
+        assert!(touches_program_settings(r#"{"crf":30}"#));
+        assert!(touches_program_settings(r#"{"encoder":"vp9enc"}"#));
+        // 混合批：只要有任何一个程序参数在里面，整批就要操作者身份。
+        assert!(touches_program_settings(
+            r#"{"displayId":"display2","tabId":"t1","framerate":60}"#
+        ));
+        // 不可解析的载荷按"什么都没改"处理：后面 `apply_settings_batch` 会
+        // 自己记一条 debug，这里不该把它当成越权。
+        assert!(!touches_program_settings("not json"));
+        assert!(!touches_program_settings("[]"));
     }
 
     /// 一块 `w`x`h` 的假 BGRA 画面：从上到下渐变，好让条纹之间不撞码流。

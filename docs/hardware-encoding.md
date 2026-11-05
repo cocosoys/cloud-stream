@@ -80,14 +80,20 @@ encoder backend=Software | no display adapter visible to this session (session 0
 
 ## 5. 等真正接上硬编时要改的地方
 
-只有 `Backend::Hardware` 那一支：
+> **2026-11-05 订正**：这一节原来写「只有 `Backend::Hardware` 那一支」，核对后
+> 不成立。真实断点是「四处语义 + 一道传输层缺口 + 一次依赖 vendor 化」，完整设计与
+> 开工顺序见 `roadmap-future.md` §6。下面只留与**探测/决议**相关的部分。
 
-1. `scrap` 开 `hwcodec` feature（`vendor/scrap/src/common/hwcodec.rs` 766 行已实现：
-   `HWRAM`/`VRAM`、`is_hardware()`、`force_keyframe()`，`vram` 走 D3D11 纹理直通）。
-   构建需要 `VCPKG_ROOT` + ffmpeg 的 `x64-windows-static`（`vendor/scrap/build.rs:103`）。
-2. `hwenc::decide` 在候选可用时返回 `Backend::Hardware(enc)`，把同一份 `EncoderCfg`
-   换个变体。
+1. `scrap` 开 `hwcodec` feature（`vendor/scrap/src/common/hwcodec.rs` 766 行，
+   `HWRAM`/`VRAM`、`is_hardware()` 都在；**但 `force_keyframe()` 没覆写，走的是
+   trait 默认空实现**，这是接线后第一个要补的）。构建需要 `VCPKG_ROOT` + ffmpeg 静态
+   库：链接由 `hwcodec` 自己的 `build.rs:103` 负责（`vendor/scrap/build.rs:250` 的
+   `ffmpeg()` 已被注释掉）。
+2. `hwenc::decide` 在候选可用时返回 `Backend::Hardware(enc)`。注意这一步还要求
+   传输层已经能发 H.264——`codec_id` 目前只有 `Vp8=2`/`Vp9=3`。
 3. 探测门槛不用动——那部分与编码器实现无关，已经是纯数据判断。
+4. VAAPI 是 Linux 分支：它的前置是整个 server 的平台移植，不是探测层的一行 `cfg`。
+
 
 ## 6. 验证
 

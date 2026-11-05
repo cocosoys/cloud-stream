@@ -73,19 +73,18 @@ async fn main() -> anyhow::Result<()> {
     }
     let _logger = init_logger(&cfg)?;
 
-    // #94: the codec the process starts on. A name this build cannot encode
-    // keeps VP8 and says so — silently accepting it would leave the panel
-    // claiming a codec nothing produces.
-    match pipeline::codec::VideoCodec::from_wire(&cfg.video_codec) {
-        Some(codec) => {
-            pipeline::codec::set(codec);
-        }
-        None => log::warn!(
-            "unknown --video-codec {:?}, keeping {} (built in: vp8, vp9)",
-            cfg.video_codec,
-            pipeline::codec::current().wire()
-        ),
-    }
+    // #110: `--video-codec` now only seeds each program's settings — there is
+    // no process-wide live value any more. Validated here so a name this build
+    // cannot encode is reported once at startup instead of silently becoming
+    // VP8 on every program with the panel none the wiser.
+    let startup_codec =
+        pipeline::codec::VideoCodec::from_wire(&cfg.video_codec).unwrap_or_else(|| {
+            log::warn!(
+                "unknown --video-codec {:?}, programs will start on vp8 (built in: vp8, vp9)",
+                cfg.video_codec
+            );
+            pipeline::codec::VideoCodec::default()
+        });
 
     // #96: how long a game-mode ghost pointer stays on screen without moving.
     // Announced through `server_settings`, not enforced here — the browser owns
@@ -96,11 +95,27 @@ async fn main() -> anyhow::Result<()> {
         dispatch::ghost::idle_secs()
     );
 
-    // #88: 监听面鉴权骨架。策略必须在 bind 之前装好 —— 第一个可能被裁决的
+    // #88/#110: 监听面鉴权骨架。策略必须在 bind 之前装好 —— 第一个可能被裁决的
     // 事件是 `serve` 收到的 HTTP 请求，装晚了就会出现"前几个请求按默认放行"
     // 的窗口。策略名拼错时退回 allow-all 而不是退出：本项目的默认本来就是
     // 全放行，退出只会让一个拼写错误变成一次停服；但那声 warn 必须留着。
-    let policy = security::policy::by_name(&cfg.policy).unwrap_or_else(|| {
+    //
+    // `auto` 是默认值，也是唯一需要看配置才能定下来的名字：
+    //   * 没配令牌表 → `allow-all`。单用户机器上"没有身份"就是"就是主人"，
+    //     装 `role-based` 会把它自己的键鼠挡掉（匿名身份是 `viewer`）。
+    //   * 配了令牌表 → `role-based`。此时每个过门的人都有真身份，让策略去读它
+    //     才是"凭据带身份"的意义；否则令牌只决定"能不能进"，进去以后所有人
+    //     一样 —— #110 之前正是这个形态。
+    let resolved_policy = if cfg.policy.trim().eq_ignore_ascii_case("auto") {
+        if cfg.token_gate().is_some() {
+            "role-based"
+        } else {
+            "allow-all"
+        }
+    } else {
+        cfg.policy.as_str()
+    };
+    let policy = security::policy::by_name(resolved_policy).unwrap_or_else(|| {
         log::warn!(
             "unknown --policy {:?}, falling back to allow-all (builtin: {})",
             cfg.policy,
@@ -132,10 +147,15 @@ async fn main() -> anyhow::Result<()> {
     // #101: 口令状态必须每次都写进日志，且两种状态各写一句。
     // "没开"和"开了但你没带 token"在浏览器里长得一模一样（一片空白），
     // 唯一的区分点就是这两行。
-    match cfg.auth_token.as_deref().and_then(security::TokenGate::new) {
-        Some(_) => log::info!(
-            "auth token REQUIRED on /api/* | open the page as {}://<host>:{}?token=<token> \
+    //
+    // #110: 判据从 `auth_token` 换成整张令牌表 —— 只用 `--auth-grant` 的部署
+    // 以前会在日志里说"没开鉴权"，而实际上 401 已经挡在前面了。
+    match cfg.token_gate() {
+        Some(gate) => log::info!(
+            "auth token REQUIRED on /api/* ({} token(s), policy {}) | open the page as {}://<host>:{}?token=<token> \
              (static assets and /api/status stay open)",
+            gate.len(),
+            security::policy_name(),
             if cfg.tls_enabled() { "https" } else { "http" },
             cfg.port,
         ),
@@ -144,6 +164,19 @@ async fn main() -> anyhow::Result<()> {
              (set --auth-token <password> to require one)",
             cfg.port,
         ),
+    }
+    // #110: 报出**身份表**（只有 `tenant:role`，没有令牌本身）。多令牌部署里
+    // "我这张令牌是哪个租户的"是排障第一问，而令牌不能进日志 —— 这两条一起
+    // 决定了这里只能打身份，不能打口令。
+    if !cfg.auth_grants.is_empty() {
+        let mut listing: Vec<String> = Vec::new();
+        if cfg.auth_token.is_some() {
+            listing.push(format!("{}:{} (--auth-token)", crate::security::TenantId::DEFAULT, "host"));
+        }
+        for spec in &cfg.auth_grants {
+            listing.push(format!("{}:{}", spec.tenant.as_str(), spec.role.as_str()));
+        }
+        log::info!("auth identity table: {}", listing.join(", "));
     }
 
     // #95: hardware-encoder reservation. The probe is advisory — this build has
@@ -165,6 +198,41 @@ async fn main() -> anyhow::Result<()> {
     });
     let (backend, note) = platform::hwenc::decide(requested, &hw)?;
     log::info!("encoder backend={:?} | {}", backend, note);
+
+    // #109: 麦克风写哪个端点。和编码器探测同一个理由——"这台机器有没有能当
+    // 麦克风的虚拟设备"是排障会问的第一个问题，答案必须进日志，哪怕进程一秒后
+    // 就退出。决议装进进程，麦克风线程和 health 读同一份，避免日志说的端点和
+    // 实际写入的端点各说各话。
+    let endpoints = platform::virtual_mic::probe();
+    log::info!("microphone probe | {}", endpoints.summary());
+    for line in endpoints.detail() {
+        log::info!("microphone probe | {}", line);
+    }
+    let mic_target = platform::virtual_mic::resolve(
+        &cfg.mic_device,
+        &endpoints.render,
+        &endpoints.capture,
+        endpoints.default_render.as_deref().unwrap_or(""),
+        endpoints.parsec_driver,
+    );
+    if mic_target.usable {
+        log::info!(
+            "microphone target | provider={} sink={:?} capture={:?} | {}",
+            mic_target.provider.as_str(),
+            mic_target.sink.as_deref().unwrap_or("(default endpoint)"),
+            mic_target.capture.as_deref().unwrap_or(""),
+            mic_target.note
+        );
+    } else {
+        // 不可用不是启动失败：视频、输入、文件传输与它无关，把它降级成一条
+        // 明确的告警比让整个服务起不来有用得多。
+        log::warn!(
+            "microphone target | provider={} unusable | {}",
+            mic_target.provider.as_str(),
+            mic_target.note
+        );
+    }
+    platform::virtual_mic::install(mic_target);
 
     // #95: the software knob set. Same policy as `--video-codec`: a name this
     // build does not know keeps the default and says so, because the only
@@ -200,21 +268,29 @@ async fn main() -> anyhow::Result<()> {
         cfg.height,
         cfg.fps,
         cfg.bitrate_kbps,
-        // #94: the codec the first session will negotiate with. The panel can
-        // change it later; `pipeline::codec` holds the live value.
-        pipeline::codec::current().wire(),
+        // #110: the codec the first session will negotiate with. The panel can
+        // change it later; the live value now lives on each program.
+        startup_codec.wire(),
     );
     log::info!(
-        "log_file={} | spf={:.3}ms | upload_dir={}",
+        "log_file={} | spf={:.3}ms | upload_dir={} | upload_quota={}",
         cfg.log_file
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "stderr".to_owned()),
         cfg.spf().as_secs_f64() * 1000.0,
+        // #110: 目录形状变了 —— 每个租户一份子目录。把这件事写进启动日志，因为
+        // 旧部署里的文件现在不在 `GET /api/files/` 能看到的位置上了，而"文件
+        // 消失了"与"目录换了一层"的排障成本差很远。
         cfg.upload_dir
             .as_ref()
-            .map(|p| p.display().to_string())
+            .map(|p| format!("{} (per tenant: {}/<tenant>)", p.display(), p.display()))
             .unwrap_or_else(|| "disabled".to_owned()),
+        if cfg.upload_quota_mb == 0 {
+            "unlimited".to_owned()
+        } else {
+            format!("{} MiB/tenant", cfg.upload_quota_mb)
+        },
     );
 
     // #36 starts the capture loop after Connected notices are sent; the WS

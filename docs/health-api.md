@@ -104,7 +104,28 @@ RTP track 的时刻。新帧算，重复帧也算（静止桌面本来就只发�
     "errors_since_last_check": null,  // 首次查询没有基线
     "checked_ago_ms": null,
     "pli_requests": 3,            // 浏览器请求关键帧的次数，涨=下行丢包
-    "audio": { "enabled": true, "bitrate_bps": 96000 }
+    "audio": {
+      "enabled": true,
+      "bitrate_bps": 96000,
+      "uplink": {                  // 麦克风写哪个端点（#109）
+        "provider": "steam",       // steam / vb-cable / voicemeeter / parsec-vusb / default / named / none
+        "device": "Steam Streaming Microphone",  // 我们写入的 render 端；null = 默认扬声器
+        "capture": "Steam Streaming Microphone", // 让游戏去选的那个录音端
+        "usable": true,
+        "echoes": false,           // true 表示写的是默认扬声器 —— 开麦就会自听
+        "note": "注入 …，游戏/语音软件里把麦克风选成 …",
+        "live": {                  // 现在到底有没有人在说（#110）
+          "open": true,            // render 客户端开着：有数据在流，或刚说过话
+          "packets": 240,          // 收到的 Opus 包（WS 与 WebRTC 两条路合计）
+          "frames": 240,           // 解出来的 20 ms 帧
+          "dropped": 0,            // 队列满而丢的包
+          "decode_errors": 0,      // 包到了但解不开
+          "concealed": 0,          // 丢包伪造的帧（只有 WebRTC 会非零）
+          "silence": 3840,         // 端点里补零的采样/声道
+          "last_packet_age_ms": 6  // null = 这条进程还没收到过任何麦克风包
+        }
+      }
+    }
   },
 
   "processes": {
@@ -125,6 +146,7 @@ RTP track 的时刻。新帧算，重复帧也算（静止桌面本来就只发�
       "ip": "192.168.1.5",
       "device_id": "9f2c…",       // localStorage 持久 UUID（见 §4）
       "tab_id": "1b7e…",          // sessionStorage，关标签即失效
+      "tenant": "default",        // #110：这条连接属于哪个租户（主机级身份才看得到别人的）
       "role": "controller",       // 能不能动手：shared 下恒为 controller（见下）
       "client_type": "controller", // 页面在 HELLO 里**自称**的角色，仅供对照
       "display": 0,               // 挂在哪块屏上；未 attach 为 null
@@ -140,7 +162,8 @@ RTP track 的时刻。新帧算，重复帧也算（静止桌面本来就只发�
       "ip": "192.168.1.5",
       "device_id": "9f2c…",       // 同一个浏览器，第二个标签/第二个显示器页面
       "tab_id": "4c9a…",
-      "role": "controller",       // 默认 shared：第二个页签同样能操作
+      "tenant": "default",        // 列表已按身份过滤；只有主机级身份会看到多个值
+      "role": "controller",       // 默认 exclusive：第二个页签是 viewer（见 §7）
       "client_type": "controller", // 页面自称；和 role 不一致才是值得看的信号
       "display": 0,
       "user_agent": "Mozilla/5.0 …",
@@ -356,18 +379,55 @@ curl -X POST http://host:8081/api/v1/control/session/take/2
 
 ---
 
-## 7. 鉴权
+## 7. 鉴权与租户过滤（#110 起真的有了）
 
-**没有**。这是明确决定，不是遗漏。
+这个端点本身不额外加锁，但**它开始看身份了**。判据不是"有没有配令牌"，而是
+`security::Principal`：
 
-这份报告确实比 `status` 暴露得多（谁连着、从哪个 IP、什么设备码、进程表），
-但本项目的监听面本来就是局域网内不设防，在这里单独加一把和别处不一致的锁只会
-制造"以为安全了"的错觉。
+| 字段 | 含义 | 从哪来 |
+|---|---|---|
+| `credential` | `none` / `bearer` / `master` | 请求带了哪种凭据（`none` = 这部署没有门） |
+| `tenant` | 租户名，默认 `default` | `--auth-grant <tenant>:<role>:<token>` |
+| `role` | `host` / `operator` / `viewer` | 同上；`--auth-token` 等价于 `default:host` |
 
-正确的做法已经铺好：`Route::Health` → `Endpoint::Health`、`Route::Control` →
-`Endpoint::Control`，两者在 `security::check` 里是**两个不同的面**（`http.health`
-归在 `is_observational`，`http.control` 不归）。将来装上真策略时，"能探活"和
-"能看连接清单"、"能看"和"能踢人"可以分别授权，不需要改这个文件。
+`clients.items[]` 现在**按租户过滤**：`principal.may_see(session.tenant)`，主机级
+身份跨租户。在此之前这个端点把所有人的 IP / 设备码 / UA 发给任何能访问它的人 ——
+一张给参观者看的令牌，等于附赠了一份全机连接清单。
+
+响应里多一段 `viewer`，回答"你正以谁的身份在看"：
+
+```json
+"viewer": {
+  "tenant": "alpha",
+  "role": "operator",
+  "credential": "bearer",
+  "hidden_clients": 2
+}
+```
+
+`hidden_clients` 是**必须**报的：少了它，"这里只有我一个人"和"我只是看不到别人"
+在 JSON 里长得一模一样。
+
+两个 `role` **不是同一个问题**，别当同义词读：
+
+| 位置 | 回答的问题 | 取值 |
+|---|---|---|
+| `clients.items[].role` | 这条连接现在**能不能动手**（输入租约） | `controller` / `viewer` |
+| `viewer.role` | 这张**令牌**给了什么身份 | `host` / `operator` / `viewer` |
+
+两者在单用户部署里必然不一致：没有令牌表时凭据是 `none`、令牌身份落在 `viewer`，
+而那条连接其实是机器的唯一主人（`may_operate()` 为真，`clients[].role` 报
+`controller`）。WS 日志里同样分两栏写：`grant=viewer operates=yes`。把这两件事
+合成一栏，就没有办法区分"你是观众"和"这台机器没有门"。
+
+`stream` / `host` / `processes` 三段不过滤 —— 同机的多个租户共用一路采集，把 CPU
+数字按租户切开是在编造精度。同理，`stream_info` 里的 `encode_node`（机器名）只在
+`principal.may_name_host()` 为真时下发：机器名是主机的身份，不是流的属性。
+
+策略侧同名的一步是 `--policy role-based`（等价别名 `roles` / `rbac`）。默认值是
+`auto`：**没配令牌表 → `allow-all`**（单用户机器，"没有身份"就是"就是主人"），
+**配了令牌表 → `role-based`**。这条 `auto` 规则存在的理由很具体：装了令牌表却还
+全放行，就是"开了鉴权但谁都能干任何事"的空心状态 —— #110 之前正是这个形态。
 
 细节见 `listener-surface.md`。
 

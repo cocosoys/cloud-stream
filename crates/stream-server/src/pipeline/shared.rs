@@ -182,6 +182,20 @@ impl SharedPipeline {
         self.input_policy
     }
 
+    /// #110: whether `session` may act on this program right now.
+    ///
+    /// The single answer both transports ask: `ControlGate::owns()` on the
+    /// WebRTC data channels and the inline checks in `ws_media` used to spell
+    /// this match out twice, which is two places to forget when the policy
+    /// grows a third variant. `shared` means everybody (the pre-#110 default),
+    /// `exclusive` means the lease holder only.
+    pub fn owns_input(&self, session: u64) -> bool {
+        match self.input_policy {
+            InputPolicy::Shared => true,
+            InputPolicy::Exclusive => self.controller_id() == Some(session),
+        }
+    }
+
     /// Take the lease only if nobody holds it. Returns whether this session now
     /// owns it.
     ///
@@ -383,7 +397,7 @@ impl PipelineRegistry {
         // viewer adds a sink rather than a second WASAPI client and encoder.
         let audio = Arc::new(AudioFanout::new());
         let audio_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        start_audio(&audio, &audio_stop);
+        start_audio(&audio, &audio_stop, &settings);
         let entry = Arc::new(SharedPipeline {
             display,
             handle,
@@ -479,13 +493,27 @@ fn start_program(
 
 /// Start the shared audio downlink (production only — a unit test must not open
 /// the console session's audio endpoint, and the thread outlives the test).
+///
+/// #110: the two atomics come from the program's settings, not from
+/// process-wide statics, so this thread's mute button and bitrate slider belong
+/// to the screen it is capturing.
 #[cfg(not(test))]
-fn start_audio(audio: &Arc<AudioFanout>, stop: &Arc<std::sync::atomic::AtomicBool>) {
-    crate::pipeline::audio::spawn(audio.clone(), stop.clone());
+fn start_audio(
+    audio: &Arc<AudioFanout>,
+    stop: &Arc<std::sync::atomic::AtomicBool>,
+    settings: &StreamSettings,
+) {
+    let (bps, enabled) = settings.audio_handles();
+    crate::pipeline::audio::spawn(audio.clone(), stop.clone(), bps, enabled);
 }
 
 #[cfg(test)]
-fn start_audio(_audio: &Arc<AudioFanout>, _stop: &Arc<std::sync::atomic::AtomicBool>) {}
+fn start_audio(
+    _audio: &Arc<AudioFanout>,
+    _stop: &Arc<std::sync::atomic::AtomicBool>,
+    _settings: &StreamSettings,
+) {
+}
 
 #[cfg(test)]
 fn start_program(

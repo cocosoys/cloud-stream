@@ -8,29 +8,39 @@
 //! webrtc-rs has a VP9 payloader, so the second choice costs an SDP line and a
 //! rebuild — not a new dependency.
 //!
-//! Why the choice is process-wide
-//! -----------------------------
+//! Why the choice is per program, not per session or per process
+//! -------------------------------------------------------------
 //! The codec is decided **before negotiation**: it is the m-line's `a=rtpmap`
 //! and the payloader the track binds to. There is no renegotiation path in this
 //! pipeline (the PC is built once per session), so switching codecs is done the
 //! only way that does not need one: the server records the pick, and the session
 //! is closed so the client — which reconnects on its own — negotiates again with
 //! the new codec. That means the pick has to outlive the session that carried
-//! it, hence a process-wide atomic rather than a `StreamSettings` field: the
-//! settings object is rebuilt from `Config` on every connect, and the user's
-//! choice would be reverted by the very reload it triggered.
+//! it.
+//!
+//! It lives on [`crate::pipeline::settings::StreamSettings`], which is owned by
+//! the **program** (`SharedPipeline.settings`): created once per display,
+//! outliving every session attached to it. That satisfies "outlives the session"
+//! without the process-wide atomic this module used to hold.
+//!
+//! #110 — why it moved off the process
+//! -----------------------------------
+//! A process-wide atomic meant one viewer's pick changed the codec for every
+//! screen on the machine, then kicked every session (`codec_registry.kick`) to
+//! renegotiate. That is not a settings panel, that is a broadcast. With two
+//! displays, or two organisations on one host, "my encoder" has to be a real
+//! thing before any isolation can be built on top of it.
 //!
 //! What this is not
 //! ----------------
-//! Not a per-connection negotiation: one server, one codec, everyone gets it.
-//! Not persisted: a restart returns to `--video-codec` (default VP8).
+//! Not a per-connection negotiation: one program, one codec, every session on
+//! that screen gets it. Not persisted: a restart returns to `--video-codec`
+//! (default VP8), which only seeds the first program.
 //!
 //! Cost of the second choice: VP9 costs more CPU at the same resolution (libvpx
 //! VP9 real-time is roughly 2x VP8 here) and buys sharper text at the same
 //! bitrate. That trade is the user's to make, so both are offered and neither is
 //! hidden.
-
-use std::sync::atomic::{AtomicU8, Ordering};
 
 use scrap::VpxVideoCodecId;
 
@@ -116,36 +126,28 @@ impl VideoCodec {
             VideoCodec::Vp9 => "profile-id=0",
         }
     }
-}
 
-/// 0 = VP8, 1 = VP9. A `u8` rather than a `OnceLock<Mutex<_>>` because the read
-/// happens on the hot path of a session start and the write is a panel click.
-static CURRENT: AtomicU8 = AtomicU8::new(0);
-
-/// The codec new sessions negotiate with.
-pub fn current() -> VideoCodec {
-    match CURRENT.load(Ordering::Relaxed) {
-        1 => VideoCodec::Vp9,
-        _ => VideoCodec::Vp8,
-    }
-}
-
-/// Record a pick. Returns `true` when it actually changed, which is what the
-/// caller uses to decide whether a reconnect is worth forcing.
-pub fn set(codec: VideoCodec) -> bool {
-    let previous = CURRENT.swap(
-        match codec {
+    /// The `u8` the program's atomic stores: 0 = VP8, 1 = VP9.
+    ///
+    /// A `u8` rather than a `Mutex<VideoCodec>` because the read happens on the
+    /// capture loop's hot path (every beat, to notice a pick and rebuild) and
+    /// the write is a panel click.
+    pub fn as_byte(self) -> u8 {
+        match self {
             VideoCodec::Vp8 => 0,
             VideoCodec::Vp9 => 1,
-        },
-        Ordering::Relaxed,
-    );
-    let previous = if previous == 1 {
-        VideoCodec::Vp9
-    } else {
-        VideoCodec::Vp8
-    };
-    previous != codec
+        }
+    }
+
+    /// Inverse of [`Self::as_byte`]. Anything that is not 1 is VP8, so a
+    /// corrupted or future byte degrades to the codec every browser decodes.
+    pub fn from_byte(byte: u8) -> Self {
+        if byte == 1 {
+            VideoCodec::Vp9
+        } else {
+            VideoCodec::Vp8
+        }
+    }
 }
 
 #[cfg(test)]
@@ -177,22 +179,16 @@ mod tests {
         }
     }
 
-    /// `set` reports the transition, which is what gates the reconnect.
+    /// The atomic byte has to round-trip, and an unknown byte must degrade to
+    /// the codec every browser decodes rather than to a stream nobody can play.
     #[test]
-    fn setting_the_same_codec_reports_no_change() {
-        let original = current();
-        // Put the process back where it started even if an assert panics.
-        let _ = set(original);
-        assert!(!set(original), "re-selecting the live codec is not a change");
-        let other = if original == VideoCodec::Vp8 {
-            VideoCodec::Vp9
-        } else {
-            VideoCodec::Vp8
-        };
-        assert!(set(other));
-        assert_eq!(current(), other);
-        assert!(set(original));
-        assert_eq!(current(), original);
+    fn the_stored_byte_round_trips_and_fails_safe() {
+        for codec in VideoCodec::ALL {
+            assert_eq!(VideoCodec::from_byte(codec.as_byte()), codec);
+        }
+        for junk in [2u8, 7, 255] {
+            assert_eq!(VideoCodec::from_byte(junk), VideoCodec::Vp8, "{junk}");
+        }
     }
 
     /// VP8 stays the default: an upgrade must not silently move every session

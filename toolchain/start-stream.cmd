@@ -90,6 +90,15 @@ set "ARGS=--host 0.0.0.0 --port 8080 --width 1920 --height 1080 --fps 60 --bitra
 set "ARGS=%ARGS% --app webrtc --dist "%ROOT%\selkies-web" --log "%ROOT%\logs\stream-server.log""
 set "ARGS=%ARGS% --no-hdr --repeat-every 1"
 
+rem Microphone destination is left at the default: "auto". The server then picks
+rem the first virtual cable it can find (Steam Streaming Microphone, VB-CABLE,
+rem VoiceMeeter) and writes the uplink there, so the injected voice never touches
+rem the default playback endpoint and the downlink loopback cannot echo it back.
+rem On a machine with no such cable the microphone simply reports "unavailable"
+rem with the install hint -- it does NOT silently fall back to the speakers,
+rem because that fallback is exactly the self-hearing bug. --mic-device default
+rem brings that behaviour back on purpose (talk-back only).
+
 rem Labelled instead of an if/else block: cmd expands %ARGS% once per *block*,
 rem so a set inside parentheses would append to the value from before the block.
 rem A bundle built without certificates still has to run (plain HTTP); clipboard

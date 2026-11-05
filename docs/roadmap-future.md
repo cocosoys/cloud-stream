@@ -148,22 +148,217 @@ L2/L3 的缺口清单见 `roadmap-l2-l3-gaps.md`（全量 34 项盘点 + 11 项�
 
 ---
 
-## 5. 音频自听（麦克风回声）
+## 5. 麦克风上行：从"注入扬声器"改为"虚拟录音设备"
 
-**现象**：开麦说话时，玩家会在浏览器里听到自己一次，延迟一个往返（~100–200 ms）。
+> 状态：**探测层（#109）与 WS 上行（#110）都已落地并在 .148 上验到"写进端点"。**
+> 剩 P1 会话开始切默认录音设备、P2 Parsec IOCTL、P3 Linux 两行 pactl。
 
-**根因**：麦克风注入到**默认 render 端点**，而下行 loopback 采集的正是同一端点的
-后混音信号。注入的信号在混音之后才被采到，无法从混音里分出来。这是拓扑决定的，
-不是实现错误（详见 `stage3-audio-design.md` §8.2）。
+**原位问题**：麦克风注入到**默认 render 端点**，而下行 loopback 采集的正是同一端点的
+后混音信号，于是开麦时玩家听到自己，延迟一个往返（按代码常量估算 150–330 ms，
+不是原文写的 100–200 ms）。这是拓扑决定的，改延迟、改码率都消不掉。
 
-**为什么暂缓**：三条出路都要付代价，而当前没有对讲场景的真实需求——
-- 进程回环（只采 java.exe）：系统音与启动器声音一并丢失，且要重写采集侧为
-  `ActivateAudioInterfaceAsync` + `AUDIOCLIENT_ACTIVATION_PARAMS`；
-- 回声消除（用注入的 PCM 作参考相减）：需要延迟对齐与自适应滤波，工程量最大；
-- 接受：耳机 + 对讲用法，当前取这条。
+**核对过的事实**（2026-11）：
 
-**回访触发**：出现"多人同服语音"或"客服/远程协助要说话"的实际场景，
-且玩家对自听的抱怨可复现。
+1. **这在当前传输上根本复现不了**。WS 传输收到麦克风二进制帧（`0x02`）时直接回
+   `MICROPHONE_DISABLED`（`http/ws_media.rs:677`），页面随即关麦；上行只存在于
+   WebRTC 传输（`webrtc/mod.rs:314`）。所以这不是"已知缺陷"，是"没复刻的功能"。
+2. **业界没有一家把麦克风注入默认扬声器**。Steam 用 `Steam Streaming Microphone`、
+   Parsec 用 VUSB 虚拟 USB 麦克风、Selkies（本项目上游）用 PulseAudio 的 null-sink +
+   virtual-source。只有 Sunshine 那个未合并的 PR #4078 用了 `mic_sink=default`，
+   和原实现同构，关闭理由全是协议层的，没人讨论回声。
+3. **注入扬声器只能实现"对讲"**。游戏读的是 capture 端点，写 render 端点永远到不了
+   游戏内语音——功能语义和实现方式在这里是绑死的。
 
-**开工时要做**：先量化"混音延迟"（注入 → loopback 采到的固定偏置），
-再决定是走进程回环（简单、丢系统音）还是 AEC（复杂、保全部声音）。
+**决议**：麦克风落到**虚拟录音设备**上，回声因为回路不存在而消失，一行 AEC 都不用写。
+Windows 上"虚拟设备"不必自研，按优先级探测现成的虚拟线缆：
+
+| 优先级 | 提供方 | 我们写入（render 端） | 程序选它当麦克风 | 需要装什么 |
+|---|---|---|---|---|
+| 1 | Steam | `Steam Streaming Microphone` | 同名 | Steam 自带，普通权限 |
+| 2 | VB-CABLE | `CABLE Input` | `CABLE Output` | VB-Audio Virtual Cable |
+| 3 | VoiceMeeter | `VoiceMeeter Input` | `VoiceMeeter Output` | VoiceMeeter |
+| 4 | Parsec VUSB | 无端点（IOCTL 造 USB 麦克风） | `Parsec Virtual Microphone` | VUSB 驱动 + 管理员；**后端未实现** |
+
+Steam 排第一是因为它不需要额外安装：玩家机器上本来就有，我们只是往它的 render 端起
+一个 WASAPI 客户端——和写默认扬声器是同一段代码。
+
+**已落地**：
+- **WS 上行（#110）**：`ws_media.rs` 把 `0x02 + Opus` 送进 `audio::MicUplink`，与 WebRTC
+  共用同一个解码/写设备循环；页面的 24 kHz 单声道由 Opus 解码器直接出 48 kHz 立体声。
+  设备按需打开（第一包到达）、空闲 1.5 s 关闭，只维持 50 ms 排队深度（填满 100 ms 设备
+  缓冲会让数据与静音交替，听感是断续的 —— 这一条是实测踩出来的）。
+  health 的 `stream.audio.uplink.live` 报 `open/packets/frames/dropped/decode_errors/
+  silence/last_packet_age_ms`。
+- `platform/virtual_mic.rs`：端点枚举（友好名，容忍驱动版本加的后缀）、决议、
+  进程级单例；`--mic-device auto|default|steam|vb-cable|voicemeeter|parsec|<端点名>`。
+- 启动日志 `microphone probe | ...` + `microphone target | ...`，health 的
+  `stream.audio.uplink` 报 `provider / device / capture / usable / echoes / note`。
+- **自听陷阱有硬拦**：虚拟线缆若同时是默认播放端点，决议直接判 `usable:false` 并
+  给出改法（这正是 `steam-deck-routing-for-moonlight` README 里踩过的坑）。
+- 没有可用设备时**不静默退回默认扬声器**，而是让上行失败并说明装什么——静默退回
+  会让"一切看起来正常，只是每次开麦都听见自己"。
+- **正向验证（2026-11-05，被控机 192.168.59.148）**：装 VB-CABLE 45 后 `auto` 决议为
+  `provider=vb-cable / usable=true / echoes=false`；WS 推 251 帧 24 kHz Opus，
+  `mic-probe.exe` 从 `CABLE Output` 读到 rms −22 dBFS、peak −17.9 dBFS、`VERDICT=SIGNAL`
+  （未开麦时同一端点只有 −96.7 dBFS 底噪）。读数端与被控端两个工具都在仓库里：
+  `crates/stream-server/src/bin/mic-probe.rs`、`toolchain/mic-push.py`。细节见
+  `stage3-audio-design.md` §8.5。
+
+**还剩**：
+
+| 项 | 为什么必须 | 量级 |
+|---|---|---|
+| ~~P0 WS 上行~~ `0x02` Opus → 解码 → 写目标端点 | 不分传输就永远只有 WebRTC 能用 | **已完成**（#110）：两条传输共用一个 `pump`，见 `stage3-audio-design.md` §8.3 |
+| P1 会话开始时切换默认录音设备 | 游戏/Discord 缓存设备名，不切就选不到虚拟麦（Vibepollo 用 2/5/10/20 s 重试绕开） | 小 |
+| P2 Parsec VUSB IOCTL 后端 | 驱动在但没端点；需要逆向文档里的 IOCTL 序列 + 管理员 | 大，按需 |
+| P3 Linux 侧 | 那边是 `module-null-sink` + `module-remap-source` 两行命令，随平台移植一起做 | 随移植 |
+
+**回访触发**：出现"游戏内语音 / 远程会议要说话"的实际需求，或 WS 上行开工。
+"多人同服语音"不再算回声的回访触发——它是虚拟麦克风的需求，已经含在这条里。
+
+---
+
+## 6. 硬件编码（NVENC / VAAPI）
+
+> 探测与「决议」的设计见 `hardware-encoding.md`。本文补的是**真正接线之后**的设计。
+> 那份文档 §5 写「只有 `Backend::Hardware` 那一支要改」——2026-11-05 逐层核对后
+> **不成立**：断点是「四处语义 + 一道传输层缺口 + 一次依赖 vendor 化」，见 6.2 / 6.3。
+
+### 6.1 先分清维度：这四个不是同类项
+
+| 名字 | 是什么 | 在本项目里产出 | 现状 |
+| --- | --- | --- | --- |
+| VP8 / VP9 | **codec**（编出什么格式） | libvpx 软编的 VP8/VP9 码流 | 已上线，面板可切 |
+| NVENC / VAAPI | **encoder API**（谁来算） | ffmpeg 的 H.264 / HEVC | 只探测，从未编译进来 |
+
+所以「NVENC vs VP8」不是二选一，是「硬编 H.264」vs「软编 VP8」。硬编做不出
+VP8/VP9，软编也接不了 NVENC——两者的产物在传输层是两个不同的 codec_id。
+
+### 6.2 现状：三层各断一处
+
+| 层 | NVENC | VAAPI | 证据 |
+| --- | --- | --- | --- |
+| 项目层探测 | ✅ 有（PCI id + 名字分档 + `nvEncodeAPI64.dll` 存在性） | ❌ 无。枚举走 `EnumDisplayDevicesW`，整份文件是 Windows 专有 | `platform/hwenc.rs:460-507` |
+| 决议 | ❌ 三个分支全返回 `Backend::Software`，`Backend::Hardware` 全仓无构造点 | 同 | `platform/hwenc.rs:292-368` |
+| 中间层封装 | ⚠️ `HwRamEncoder` 完整，但 `cfg(feature="hwcodec")` 关闭 | 同 | `vendor/scrap/src/common/codec.rs:53-56` |
+| native | ✅ 依赖里有 `h264_nvenc`/`hevc_nvenc` | ✅ 有 `h264_vaapi`（`hevc_vaapi` 上游已注释，理由「某台机器画质差」） | `hwcodec/src/ffmpeg_ram/encode.rs:218-260` |
+
+顺带一句：`hwenc.rs:318` 和 `hardware-encoding.md:87` 提示的
+`--features hwcodec` **跑不通**——`stream-server` 没有 `[features]` 段，实测
+`cargo build -p stream-server --features hwcodec` 直接报
+`none of the selected packages contains these features`。真做时要加一个转发 feature。
+
+### 6.3 硬编和软编不是同一个形状：四条语义要对齐
+
+| 缺口 | 软编（vpx） | 硬编（hwcodec） | 不补的后果 | 补法 |
+| --- | --- | --- | --- | --- |
+| 强制关键帧 | `force_kf` flag，两代通用 | 走 trait 默认 **no-op**（`codec.rs:85`），`HwRamEncoder` 没覆写 | PLI 与 `--keyframe-secs` 定时 IDR 全失效；硬编 gop 是 `INT16_MAX`，丢一次包就花屏到会话结束 | ffmpeg_ram_encode 加 `force_idr` 入口（`frame->pict_type = AV_PICTURE_TYPE_I`），`HwRamEncoder::force_keyframe` 转发 |
+| 本轮无输出 | `VpxNoOutput` → `Ok(None)` | 返回 `Err("no valid frame")`（`hwcodec.rs:139-141`） | 每帧计入 `encode_err`（`pipeline/mod.rs:1633`），日志噪音 + 计数器失去意义 | 归一成 `Ok(None)` |
+| 改码率 | `set_quality(ratio)` / `set_target_bitrate` | 仅 CBR，`set_target_bitrate` 走默认 `Err` | 面板拖码率对硬编无效，而且**不报错** | 映射到 hwcodec 已有的 `Encoder::set_bitrate` |
+| CQ / CRF | 支持（`VP8E_SET_CQ_LEVEL` / `rc_end_usage=CQ`） | 只支持 CBR（`hwcodec.rs:246-252`） | 面板选 CRF 会被静默当成 CBR，画质档位是假的 | 新增能力位，面板在硬编下禁用 CRF |
+
+### 6.4 前置：H.264 通道（P0，可独立验收，与硬编无关）
+
+硬编只产 H.264/H.265（`hwcodec.rs:133-137` 只有这两个分支），而当前 WS 帧头的
+`codec_id` 只有 `Vp8=2` / `Vp9=3`（`http/ws_media.rs:122-126`）。**没有这一步，
+硬编接上去也没有地方输出**。这一步用**软编 H.264 也能验**，所以它排在硬编前面。
+
+- [ ] wire：`VideoCodec` 加 `H264`，`codec_id` 取值需与前端 `wire-codecs.js` 对齐
+      （4 bit 字段，建议 `1`），帧头、`SPS/PPS` 前置、按关键帧判定的逻辑同步
+- [ ] 前端：`wire-codecs.js` 加 id 与 `WebCodecs` 的 `avc1.*` 描述（H.264 需要
+      `description` = AVCC 的 extradata，VP8/VP9 不需要——这是最容易漏的一条）
+- [ ] 面板：`dispatch/output.rs:555` 的 `["vp8enc","vp9enc"]` 加 `h264enc`，
+      并给 `codec.rs` 补 `wire()`/`label()`/`encoder_id()`
+- [ ] health：`http/health.rs:422/463` 的 `"encoder": "libvpx"` 改成实际后端
+- [ ] `pipeline/sample_map.rs` 接受 `H264s` union（不改就是静默黑屏，与 #94 的 VP9 同一个坑）
+
+### 6.5 NVENC（Windows）
+
+**触发条件**：被控机有 GTX 10 系及以上且驱动完整（探测已覆盖），并且 H.264 通道已通。
+
+**数据流**（与软编只差中间一段，抓帧转换不用动）：
+
+```
+DXGI 采集 BGRA → convert_to_yuv(NV12, stride/offset 取自 encoder.yuvfmt())
+  → HwRamEncoder(h264_nvenc) → VideoFrame{h264s} → sample_map → WS(codec_id=H264)
+```
+
+`yuvfmt()` 这条契约现在已经是**编码器说了算**（`pipeline/mod.rs:890/1365/1505`），
+NV12 + `HW_STRIDE_ALIGN` 会被自动遵守 —— 这是现有代码里唯一为硬编准备好的地方。
+
+| 改动点 | 改什么 |
+| --- | --- |
+| `vendor/hwcodec/`（新） | **必须 vendor 进来**。现在它是 `Cargo.lock` 里的 git 依赖（`hwcodec#febec27`），补不了 6.3 那四条；CI 也要确定性 |
+| `crates/stream-server/Cargo.toml` | 加转发 feature `hwcodec = ["scrap/hwcodec"]`，修掉 6.2 那条假提示 |
+| `pipeline/encoder.rs` | `VideoEncoder` 内部改成 `enum Inner { Vpx(..), Hw(..) }`，`new()` 按 `Backend` 分派；`force_keyframe`/`set_bitrate`/`encode` 三个方法与 6.3 对齐 |
+| `platform/hwenc.rs` | `decide()` 的 `Auto` 分支在候选可用时返回 `Backend::Hardware`；`--encoder nvenc` 不再「检测到了还回落」 |
+| `pipeline/mod.rs` | Rebuild 判定加一条「后端变了」；`is_hardware()` 进 `stream_info` |
+| `docs/` | 6.2 的假提示、「只有一支要改」的结论都要改 |
+
+**并发事实**：消费级 NVIDIA 驱动对同时 NVENC session 数有限制（新版驱动已放宽到 8），
+而本项目**一个进程只有一路编码**（共享管线 + fanout）。所以这个限制只影响「一台机器
+跑几个实例」，不影响「一路几个人看」——与 `capacity-slicing.md` 的路数预算直接相关，
+验收时要单独记一个数。
+
+### 6.6 VAAPI（Linux）
+
+**它的门槛不是编码器，是整个平台。** native 侧已经就绪（设备走
+`av_hwdevice_ctx_create(VAAPI)` 默认 `/dev/dri/renderD128`，`sw_pix_fmt=NV12`，
+`async_depth=1`），项目侧是零：
+
+- 9 个文件直接调 Win32：`dispatch/win_input.rs`、`cursor.rs`、`display.rs`、
+  `clipboard.rs`、`gamepad.rs`、`hostui.rs`、`pipeline/audio.rs`（WASAPI）、
+  `platform/hwenc.rs`、`main.rs`；采集侧是 DXGI。
+- 所以顺序只能是：**Linux 移植（采集 X11/PipeWire + 注入 evdev/uinput + 音频）→
+  再谈 VAAPI**。把 VAAPI 单独立项会得到一个编译不过的 crate。
+- 移植完成后要新增的探测（Linux 分支）：`/sys/class/drm/renderD*/device/vendor`
+  取厂商，渲染节点优先取 `DRM_RENDER_NODE`，否则第一个 `renderD*`。**仍然不在启动时
+  试开编码器**——理由与 `hardware-encoding.md` §2 相同（探测会撒谎），真正的判定放在
+  `HwRamEncoder::new` 失败时回落。
+- 只用 `h264_vaapi`，不碰 `hevc_vaapi`（上游因画质问题注释掉，没有理由逆着来）。
+- VAAPI 不支持改码率（`support_changing_quality()==false`，`hwcodec.rs:196-198`），
+  面板要有对应的禁用态，而不是让人拖了没反应。
+
+### 6.7 为什么暂缓
+
+1. **被控机没有 GPU**。`.148` 是 VMware SVGA（`PCI\VEN_15AD&DEV_0405`），探针实测
+   `candidate=none ... VMware SVGA 3D [other too-old]`。现在把硬编编进去，得到的只是
+   一条「已回落软件」的日志。
+2. **H.264 通道还没做**，硬编即使能开也没有输出格式。
+3. **在当前瓶颈上，换 codec 比接硬编更划算**。2026-11-05 用 `bench-capture.exe` 在
+   开发机实测（1718×926、60 目标、各 8 s、四轮交替）：VP9 每帧 **8.0 ms**、VP8
+   **22.7 ms**，实测帧率 30.6 vs 22.6，码率 224 vs 547 kbps —— 与
+   `codec-choice.md:86` 的「VP9 约 2x CPU」方向相反。机制上对得上仓库自己的注释：
+   VP8 的并行不是 token-partition（`vendor/scrap/src/common/vpxcodec.rs:621`），
+   而 VP9 那条分支开了 `row-mt` + `tile-columns` + 屏幕内容工具。**这条数据只在
+   开发机成立，被控机是 4 vCPU 的 VM，必须先复测再动默认值。**
+4. 硬编的收益只在「CPU 已经打满、且降分辨率不再可接受」时才变现。当前 `.148`
+   静态桌面 0.49 核/路，还没到那一步。
+
+### 6.8 回访触发（任一成立即开工）
+
+- [ ] 被控机换物理显卡，或开 vGPU / GPU 直通（NVENC 的前提）
+- [ ] 决定用 Linux 主机承载实例（VAAPI 的前提，与平台移植同一次变更）
+- [ ] `capacity-slicing.md` 的路数撞墙：单机路数被 CPU 限住，且降分辨率/降帧率都不再可接受
+- [ ] 出现 4K、或 >60 fps 的需求（软编在这台机器上已经不够）
+
+### 6.9 开工顺序
+
+- [ ] **P0** H.264 通道（6.4，软编可验）
+- [ ] **P0.5** `hwcodec` vendor 进 `vendor/`，打 6.3 的四条补丁
+- [ ] **P1** 转发 feature + `VideoEncoder` 分派 + `decide()` 返回 `Backend::Hardware`（NVENC）
+- [ ] **P1** 验收：`enc_ms`、`process_cpu_percent`、fps、PLI 重锚（拔网线 3 s 后 1 帧内恢复）、
+      定时 IDR（`keyframes` 计数按 `--keyframe-secs` 增长）、改码率生效、连续 2 h 无崩溃
+- [ ] **P2** Linux 移植（独立路线，不与本文混）
+- [ ] **P2** VAAPI 探测 + 接线 + 同样的验收清单
+
+### 6.10 风险
+
+| 风险 | 影响 | 缓解 |
+| --- | --- | --- |
+| `hwcodec` 是 git 依赖，未 vendored | 补不了 6.3 的四条；构建不可复现 | 先 vendor，再动手 |
+| 静态 ffmpeg + C++ 全树 | 部署包显著变大；构建需要 `VCPKG_ROOT`（`hwcodec/build.rs:103` 直接 `unwrap`） | 单独产一个 `stream-server-hw.exe`，别让软件版背上 |
+| 消费卡 NVENC 并发 session 上限 | 一机多实例的路数被 GPU 限住 | 验收时记数，进 `capacity-slicing.md` |
+| 硬编锁死 H.264 码流 | 前端必须支持 `avc1` + AVCC extradata；老 Safari 之外反而更稳 | P0 就用软编 H.264 把前端这条路验完 |
+| VAAPI 画质 | 上游注释 `hevc_vaapi` 就是这个原因 | 只用 h264_vaapi，别碰 hevc |
+| 没有 GPU 的机器无法验收 | 只验到「回落正确」 | 验收必须在有卡的机器上做，VM 只能验回落 |

@@ -36,8 +36,23 @@ impl InputPolicy {
 }
 
 impl Default for InputPolicy {
+    /// #110: **exclusive** by default.
+    ///
+    /// This was `shared`, on the reasoning that two tabs of one page are one
+    /// person and refusing the second one looked like "input is broken". That
+    /// trade was right for a single-operator box and wrong as a default: with
+    /// `shared`, every attached session may type, move the pointer, reflow the
+    /// host desktop and change the encoder, and `viewer_may_run` — the whole
+    /// role gate — never runs, because `ControlGate::owns()` answers `true` for
+    /// everybody. A viewer could not be told apart from a controller because
+    /// there was no such thing.
+    ///
+    /// The cost is real and documented: a second tab, or a browser that
+    /// reconnects while its old tab is still live, comes up read-only until it
+    /// takes the lease. `--input-policy shared` restores the old behaviour in one
+    /// word, and the panel says which role it got (`AUTH_SUCCESS.role`).
     fn default() -> Self {
-        Self::Shared
+        Self::Exclusive
     }
 }
 
@@ -107,6 +122,15 @@ pub struct Config {
     /// traversal, drive letters and reserved characters before touching the
     /// filesystem (RustDesk `fs::join_validated_path` style).
     pub upload_dir: Option<PathBuf>,
+    /// #110: 每个租户在上传根下各占一个子目录，这里是**每个租户**的字节配额
+    /// （MiB）。`0` 表示不限。
+    ///
+    /// 为什么配额必须存在：`upload_dir` 是唯一一个外部可以无限往里写字节的
+    /// 面。以前它只有一份，一个人就能把主机磁盘写满；分租户之后没有配额，那
+    /// 只是把"一个人写满"变成"任意一个人写满自己那份、但总量仍然无上限"。
+    ///
+    /// 512 MiB 是个偏保守的默认：够传存档、截图、日志，不够把系统盘写死。
+    pub upload_quota_mb: u64,
     /// #94: the video codec sessions negotiate with, `vp8` (default) or `vp9`.
     ///
     /// Only the starting value: the panel can change it at runtime, and the
@@ -124,12 +148,16 @@ pub struct Config {
     /// top of the action and lies about where the pointer is; one that
     /// disappears too early is gone before the hand starts moving again.
     pub ghost_cursor_idle_secs: u64,
-    /// #88: 监听面鉴权策略名（`allow-all` / `deny-all`）。
+    /// #88: 监听面鉴权策略名（`auto` / `allow-all` / `role-based` / `deny-all`）。
     ///
-    /// 默认 `allow-all`，与插桩前行为完全一致 —— 骨架本身不改变任何访问
-    /// 控制。`deny-all` 不是安全模式，是**覆盖率探针**：装上它跑一遍，凡是
-    /// 还能用的入口就是漏插桩的地方。真正的策略由上层项目实现 `Policy`
-    /// 后注入。
+    /// 默认 `auto`，由 `main` 决定成哪一个：**没有令牌表时是 `allow-all`**
+    /// （与插桩前行为完全一致，骨架不改变任何访问控制），**配了令牌表时是
+    /// `role-based`**（令牌不再是"对不对"的开关，而是身份，见
+    /// [`crate::security::Role`]）。这样"开了鉴权却还全放行"这种空心状态不会
+    /// 悄悄存在 —— 那正是 #110 之前的形态。
+    ///
+    /// `deny-all` 不是安全模式，是**覆盖率探针**：装上它跑一遍，凡是还能用的
+    /// 入口就是漏插桩的地方。真正的策略由上层项目实现 `Policy` 后注入。
     pub policy: String,
     /// #101: 会话口令。`Some` 且非空时，`/api/` 下的每个请求（含信令握手）
     /// 都必须出示它，否则 401；`None` 保持本项目原来的"局域网不鉴权"。
@@ -143,6 +171,12 @@ pub struct Config {
     /// 依赖表里没有（现成可用的只有 SipHash 的随机种子，拿它当 CSPRNG 是
     /// 错的）。口令是运维输入，不是程序猜出来的。
     pub auth_token: Option<String>,
+    /// #110: 多张令牌，每张带一个 `(租户, 角色)`。`--auth-grant` 可重复。
+    ///
+    /// `--auth-token` 是它的单条特例（默认租户的主机级身份），两者可以并存：
+    /// 老部署只写 `--auth-token` 时行为不变，多租户部署改用若干条
+    /// `--auth-grant tenant:role:token`。
+    pub auth_grants: Vec<crate::security::token::GrantSpec>,
     /// #95: which encoder backend to use — `auto` (default), `software`, or one
     /// of `nvenc` / `amf` / `qsv` to demand a specific one.
     ///
@@ -185,6 +219,13 @@ pub struct Config {
     /// keep a late joiner's failure *polite* (a 503 with `Retry-After`) instead
     /// of degrading everyone's picture.
     pub max_sessions: usize,
+    /// #109: 麦克风往哪儿写 —— `auto`（默认，按优先级挑一台虚拟线缆）、`default`
+    /// （写默认扬声器，只服务对讲且必定自听）、`steam` / `vb-cable` /
+    /// `voicemeeter` / `parsec`，或者一个具体的端点名（`Line 1`）。
+    ///
+    /// 默认不再是"写默认扬声器"：那条路会把注入的声音交给下行的 loopback 采回来，
+    /// 开麦就听到自己，而且改延迟、改码率都消不掉。见 `platform::virtual_mic`。
+    pub mic_device: String,
     /// #95: realtime knob set for the software encoder — `tuned` (default) or
     /// `legacy` (exactly what shipped before #95).
     ///
@@ -226,20 +267,40 @@ impl Default for Config {
             repeat_every: 2,
             keyframe_secs: 10,
             upload_dir: None,
+            upload_quota_mb: 512,
             video_codec: "vp8".to_owned(),
             ghost_cursor_idle_secs: crate::dispatch::ghost::DEFAULT_IDLE_SECS,
-            policy: "allow-all".to_owned(),
+            policy: "auto".to_owned(),
             auth_token: None,
+            auth_grants: Vec::new(),
             display: 0,
             encoder: "auto".to_owned(),
             tune: "tuned".to_owned(),
             input_policy: InputPolicy::default(),
             max_sessions: 8,
+            mic_device: "auto".to_owned(),
         }
     }
 }
 
 impl Config {
+    /// #110: 这次部署的门。
+    ///
+    /// `--auth-token` 与若干条 `--auth-grant` 合并成一张令牌表：前者是后者的
+    /// 单条特例（默认租户的主机级身份），所以老部署只写 `--auth-token` 时行为
+    /// 不变。两者都没配时返回 `None` —— 不鉴权，和以前一致。
+    pub fn token_gate(&self) -> Option<crate::security::TokenGate> {
+        let mut grants: Vec<(String, crate::security::token::Grant)> = Vec::new();
+        if let Some(token) = self.auth_token.as_deref() {
+            grants.push((
+                token.to_owned(),
+                crate::security::token::Grant::new(crate::security::TenantId::DEFAULT, crate::security::Role::Host),
+            ));
+        }
+        grants.extend(self.auth_grants.iter().map(|spec| spec.to_grant()));
+        crate::security::TokenGate::from_grants(grants)
+    }
+
     /// Parse `argv` after the program name. Unknown flags keep the default and
     /// are logged once; a non-numeric value for a numeric flag keeps the
     /// default rather than aborting startup.
@@ -377,6 +438,16 @@ impl Config {
                         cfg.auth_token = if v.trim().is_empty() { None } else { Some(v) };
                     }
                 }
+                // #110: `--auth-grant <tenant>:<role>:<token>`，可重复。
+                // 拼错只拒绝这一条并说明，不拖垮启动 —— 与其它参数同一套取舍。
+                "--auth-grant" => {
+                    if let Some(v) = iter.next() {
+                        match crate::security::token::GrantSpec::parse(&v) {
+                            Ok(spec) => cfg.auth_grants.push(spec),
+                            Err(err) => eprintln!("--auth-grant rejected: {err}"),
+                        }
+                    }
+                }
                 // #95: 后端策略名。未知值保留 `auto` 并在 main 里告警 —— 与
                 // `--video-codec` 同一套取舍：拼错不该让服务起不来，但要看得见。
                 "--display" => {
@@ -428,12 +499,35 @@ impl Config {
                         }
                     }
                 }
+                "--mic-device" => {
+                    // #109：不做白名单校验。除了四个家族名，这里还接受任意端点名
+                    // （Virtual Audio Cable 的 `Line 1` 之类），合法性由探测那一侧
+                    // 判断——启动参数写错不该让被控机起不来，与 `--encoder` 一致。
+                    if let Some(v) = iter.next() {
+                        if !v.is_empty() {
+                            cfg.mic_device = v;
+                        }
+                    }
+                }
                 "--upload-dir" => {
                     if let Some(v) = iter.next() {
                         if v.is_empty() {
                             cfg.upload_dir = None;
                         } else {
                             cfg.upload_dir = Some(PathBuf::from(v));
+                        }
+                    }
+                }
+                // #110: 每租户配额（MiB）。`0` 等于不限 —— 与其它数值参数同一
+                // 套取舍：解析不了就保留默认并说一句，不拖垮启动。
+                "--upload-quota-mb" => {
+                    if let Some(v) = iter.next() {
+                        match v.trim().parse::<u64>() {
+                            Ok(n) => cfg.upload_quota_mb = n,
+                            Err(_) => log::warn!(
+                                "unknown --upload-quota-mb {v} (expected MiB, 0 = unlimited), keeping {}",
+                                cfg.upload_quota_mb
+                            ),
                         }
                     }
                 }

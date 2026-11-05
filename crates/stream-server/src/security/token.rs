@@ -23,7 +23,7 @@
 
 use base64::Engine as _;
 
-use crate::security::{Credential, Principal};
+use crate::security::{Principal, Role, TenantId};
 
 /// 401 响应里 `WWW-Authenticate` 的 realm。前端按 `^Bearer realm="Selkies`
 /// 匹配，改这里等于改协议。
@@ -36,16 +36,89 @@ pub const COOKIE_NAME: &str = "selkies_token";
 /// 因为 subprotocol 名只允许 token 字符。
 pub const PROTOCOL_PREFIX: &str = "selkies.token.";
 
-/// 一扇门：持有正确口令，能回答"这次请求对不对"。
+/// 一个令牌换来的东西（#110）：属于哪个租户、能做什么。
 ///
-/// 只存一个字符串，因为本项目是单用户单口令；多用户是上层项目的事，
-/// 它们要实现自己的 [`crate::security::Policy`]，而不是把用户表塞进这里。
+/// 在此之前令牌只回答"对不对"，于是所有持令牌的人都是同一个人 ——
+/// `/api/v1/health` 就得把所有人的 IP 报给所有人，上传目录也只能有一份。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Grant {
+    pub tenant: TenantId,
+    pub role: Role,
+}
+
+impl Grant {
+    pub fn new(tenant: impl Into<String>, role: Role) -> Self {
+        Self {
+            tenant: TenantId::new(tenant),
+            role,
+        }
+    }
+
+    /// 旧式单口令：默认租户的主机级身份。
+    fn host_of_default_tenant() -> Self {
+        Self {
+            tenant: TenantId::default(),
+            role: Role::Host,
+        }
+    }
+}
+
+/// `--auth-grant <tenant>:<role>:<token>` 解析后的形状（#110）。
+///
+/// 令牌放**最后**：它是唯一可能含冒号的部分（`splitn(3, ':')` 把余下的全给
+/// 令牌），所以 `alpha:operator:se:cr:et` 仍然只切两刀。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantSpec {
+    pub token: String,
+    pub tenant: TenantId,
+    pub role: Role,
+}
+
+impl GrantSpec {
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let mut parts = spec.splitn(3, ':');
+        let tenant = parts.next().unwrap_or("").trim();
+        let role = parts.next().unwrap_or("").trim();
+        let token = parts.next().unwrap_or("").trim();
+        if tenant.is_empty() || role.is_empty() || token.is_empty() {
+            return Err(format!(
+                "{spec:?} is not <tenant>:<role>:<token> (roles: host, operator, viewer)"
+            ));
+        }
+        let role = Role::parse(role).ok_or_else(|| {
+            format!("unknown role {role:?} in {spec:?} (host, operator, viewer)")
+        })?;
+        Ok(Self {
+            token: token.to_owned(),
+            tenant: TenantId::new(tenant),
+            role,
+        })
+    }
+
+    pub fn to_grant(&self) -> (String, Grant) {
+        (
+            self.token.clone(),
+            Grant {
+                tenant: self.tenant.clone(),
+                role: self.role,
+            },
+        )
+    }
+}
+
+/// 一扇门：几张令牌，每张带着一个身份。
+///
+/// 仍然是"令牌 → 身份"的静态表，不是用户数据库：真正的账号体系属于上层项目，
+/// 它们要做的是实现 [`crate::security::Policy`]。这里只保证**同一份进程里
+/// 两个人不是同一个身份**，否则"按租户过滤"没有任何东西可以过滤。
 #[derive(Debug, Clone)]
 pub struct TokenGate {
-    token: String,
+    entries: Vec<(String, Grant)>,
 }
 
 impl TokenGate {
+    /// 旧接口：一个口令 = 默认租户的主机级令牌。
+    ///
     /// 空口令等于没设口令，返回 `None` —— 调用方据此退回当前行为（不鉴权）。
     /// 这样 `--auth-token ""` 不会把机器锁死，也不会让人误以为开着。
     pub fn new(token: impl Into<String>) -> Option<Self> {
@@ -53,17 +126,57 @@ impl TokenGate {
         if token.trim().is_empty() {
             None
         } else {
-            Some(Self { token })
+            Some(Self {
+                entries: vec![(token.trim().to_owned(), Grant::host_of_default_tenant())],
+            })
         }
     }
 
-    /// 口令是否匹配。用常量时间比较：`==` 在第一个不同的字节就返回，等于把
-    /// 口令前缀的长度泄露给能反复试的人。
-    pub fn verify(&self, presented: &str) -> bool {
-        constant_time_eq(self.token.as_bytes(), presented.as_bytes())
+    /// #110: 若干张令牌各自带身份。空令牌被丢掉；一张都不剩时返回 `None`
+    /// （与 [`Self::new`] 同一条约定：没配就是没配）。
+    pub fn from_grants(grants: impl IntoIterator<Item = (String, Grant)>) -> Option<Self> {
+        let entries: Vec<(String, Grant)> = grants
+            .into_iter()
+            .filter_map(|(token, grant)| {
+                let token = token.trim();
+                if token.is_empty() {
+                    None
+                } else {
+                    Some((token.to_owned(), grant))
+                }
+            })
+            .collect();
+        if entries.is_empty() {
+            None
+        } else {
+            Some(Self { entries })
+        }
     }
 
-    /// 从一次请求的各个载体里找出令牌并校验。
+    /// 表里有几张令牌。启动日志用它说明"开了鉴权，有几个人"。
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// 这个口令换来的是哪个身份。用常量时间比较：`==` 在第一个不同的字节就
+    /// 返回，等于把口令前缀的长度泄露给能反复试的人。
+    pub fn verify(&self, presented: &str) -> Option<Grant> {
+        // 整张表走完再决定，不因为命中就 break：提前退出会泄漏"命中的是第几个
+        // 令牌"，而表的规模是个位数，这点代价买不到什么。
+        let mut hit: Option<&Grant> = None;
+        for (token, grant) in &self.entries {
+            if constant_time_eq(token.as_bytes(), presented.as_bytes()) {
+                hit = Some(grant);
+            }
+        }
+        hit.cloned()
+    }
+
+    /// 从一次请求的各个载体里找出令牌并返回它换来的身份。
     ///
     /// 顺序即优先级：`Authorization` 是脚本显式声明的，压过浏览器自动带的
     /// cookie；信令握手没有 header 可放（浏览器的 WebSocket API 不让设），
@@ -72,10 +185,10 @@ impl TokenGate {
         &self,
         headers: &[httparse::Header<'_>],
         path: &str,
-    ) -> Option<Credential> {
+    ) -> Option<Grant> {
         for candidate in presented(headers, path) {
-            if self.verify(&candidate) {
-                return Some(Credential::Bearer);
+            if let Some(grant) = self.verify(&candidate) {
+                return Some(grant);
             }
         }
         None
@@ -215,19 +328,22 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// 这次请求的完整身份：来源地址 + 凭据种类。
+/// 这次请求的完整身份：来源地址 + 那个令牌换来的租户与角色。
 ///
-/// `credential` 为 `None` 表示没出示令牌（或没开鉴权），策略可以据此区分
-/// "匿名观众"和"持有口令的操作员"。
-pub fn principal(peer: std::net::IpAddr, credential: Credential) -> Principal {
-    let mut who = Principal::from_peer(peer);
-    who.credential = credential;
-    who
+/// `grant` 为 `None` 表示没出示令牌（或没开鉴权），身份落回默认租户的观众 ——
+/// 策略可以据此区分"匿名观众"和"持有口令的操作员"。
+pub fn principal(peer: std::net::IpAddr, grant: Option<Grant>) -> Principal {
+    let who = Principal::from_peer(peer);
+    match grant {
+        Some(grant) => who.with_grant(grant.tenant, grant.role),
+        None => who,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::Credential;
 
     fn hdrs(pairs: &[(&'static str, &'static str)]) -> Vec<httparse::Header<'static>> {
         pairs
@@ -251,8 +367,10 @@ mod tests {
     fn bearer_header_is_accepted() {
         let g = gate("s3cret");
         assert_eq!(
-            g.check_request(&hdrs(&[("Authorization", "Bearer s3cret")]), "/"),
-            Some(Credential::Bearer)
+            g.check_request(&hdrs(&[("Authorization", "Bearer s3cret")]), "/")
+                .map(|k| k.role),
+            Some(Role::Host),
+            "单口令等价于默认租户的主机级身份"
         );
         // Header names are case-insensitive.
         assert!(g
@@ -266,6 +384,106 @@ mod tests {
         assert!(g
             .check_request(&hdrs(&[("Authorization", "Basic czNjcmV0")]), "/")
             .is_none());
+    }
+
+    /// #110：不同令牌必须换出不同身份，否则"按租户过滤"没有东西可过滤。
+    #[test]
+    fn each_token_carries_its_own_tenant_and_role() {
+        let g = TokenGate::from_grants([
+            ("alpha-ops".to_owned(), Grant::new("alpha", Role::Operator)),
+            ("beta-view".to_owned(), Grant::new("beta", Role::Viewer)),
+            ("root".to_owned(), Grant::new("default", Role::Host)),
+        ])
+        .expect("three non-empty tokens");
+
+        let check = |token: &str| {
+            let value = format!("Bearer {token}");
+            let h = vec![httparse::Header {
+                name: "Authorization",
+                value: value.as_bytes(),
+            }];
+            g.check_request(&h, "/")
+        };
+
+        let alpha = check("alpha-ops").expect("known token");
+        assert_eq!(alpha.tenant.as_str(), "alpha");
+        assert_eq!(alpha.role, Role::Operator);
+        assert!(alpha.role.may_operate() && !alpha.role.crosses_tenants());
+
+        let beta = check("beta-view").expect("known token");
+        assert_eq!(beta.tenant.as_str(), "beta");
+        assert!(!beta.role.may_operate(), "viewer 不能改流参数");
+
+        let root = check("root").expect("known token");
+        assert!(root.role.crosses_tenants(), "主机级身份才跨租户");
+
+        assert!(check("nope").is_none());
+        assert_eq!(g.len(), 3, "一张都不该被丢掉");
+    }
+
+    /// 一张空令牌要像没写一样被丢掉；全都空则整扇门不存在。
+    #[test]
+    fn empty_grants_do_not_open_a_door() {
+        assert!(TokenGate::from_grants(Vec::<(String, Grant)>::new()).is_none());
+        let g = TokenGate::from_grants([
+            ("   ".to_owned(), Grant::new("a", Role::Operator)),
+            ("real".to_owned(), Grant::new("a", Role::Operator)),
+        ])
+        .expect("one real token left");
+        assert_eq!(g.len(), 1);
+    }
+
+    /// #110：`Principal` 必须把租户带出去，否则过滤层拿不到判据。
+    #[test]
+    fn a_principal_keeps_its_tenant_and_role() {
+        let who = principal(
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            Some(Grant::new("alpha", Role::Operator)),
+        );
+        assert_eq!(who.tenant.as_str(), "alpha");
+        assert_eq!(who.role, Role::Operator);
+        assert_eq!(who.credential, Credential::Bearer);
+        assert!(who.may_see(&TenantId::new("alpha")));
+        assert!(!who.may_see(&TenantId::new("beta")), "租户之间互不可见");
+
+        // 主机级身份跨租户。
+        let host = principal(
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            Some(Grant::new("default", Role::Host)),
+        );
+        assert_eq!(host.credential, Credential::Master);
+        assert!(host.may_see(&TenantId::new("beta")));
+
+        // 没出示令牌：默认租户的观众，不能改任何东西。
+        let anon = principal(std::net::IpAddr::from([127, 0, 0, 1]), None);
+        assert_eq!(anon.credential, Credential::None);
+        assert_eq!(anon.role, Role::Viewer);
+        assert!(!anon.may_see(&TenantId::new("alpha")));
+    }
+
+    /// #110：`viewer` 令牌**不能**因为"没出示凭据"的判定而拿到操作权。
+    ///
+    /// 这是一个真实存在过的后门：`with_grant` 曾把 "viewer + 原本没凭据" 记成
+    /// `Credential::None`，而 `None` 的含义是"这台机器没有门、进来的人就是
+    /// 主人"。于是任意一张参观者令牌都成了操作员。凭据种类回答"你怎么进来的"，
+    /// 角色回答"你能做什么"，两者不能互相顶替。
+    #[test]
+    fn a_viewer_token_is_presented_but_powerless() {
+        let viewer = principal(
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            Some(Grant::new("alpha", Role::Viewer)),
+        );
+        assert_eq!(viewer.credential, Credential::Bearer, "令牌就是出示过凭据");
+        assert!(!viewer.may_operate(), "观众不能改这台机器");
+        assert!(!viewer.may_name_host(), "观众也看不到机器名");
+
+        // 对照组：真的没出示凭据 —— 没有门的部署，连进来的人就是主人。
+        let open = principal(std::net::IpAddr::from([127, 0, 0, 1]), None);
+        assert_eq!(open.credential, Credential::None);
+        assert!(open.may_operate(), "没有门的部署不能被自己的门禁挡住");
+        assert!(open.may_name_host());
+        // 但它仍然不是主机级身份：看不见别的租户。
+        assert!(!open.may_see(&TenantId::new("alpha")));
     }
 
     #[test]

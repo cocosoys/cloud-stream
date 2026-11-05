@@ -309,6 +309,50 @@ fn proc_json(rows: &[ProcRow]) -> Value {
     )
 }
 
+/// #109: 麦克风写哪个端点，以及为什么。
+///
+/// 决议在启动时算一次（`platform::virtual_mic`），这里只是把它报出来。没有这
+/// 一段，"开麦对方听不见"或"开麦听见自己"都得翻日志才知道往哪个端点写的；
+/// 而 `usable: false` + `note` 正好回答"是不是没装虚拟声卡"。
+fn uplink_json() -> Value {
+    // #110: 上行的活动量。`usable` 说的是"配置上能不能开麦"，这里说的是
+    // "现在到底有没有人在说"。两者必须分开：页面点了麦克风却没声音时，
+    // 没有这一组数字就只能猜是"包没到"、"包到了解不开"还是"写不进设备"。
+    let stats = audio::uplink_stats();
+    let live = json!({
+        "open": stats.open,
+        "packets": stats.packets,
+        "frames": stats.frames,
+        "dropped": stats.dropped,
+        "decode_errors": stats.decode_errors,
+        "concealed": stats.concealed,
+        "silence": stats.silence,
+        "last_packet_age_ms": stats.last_packet_age_ms,
+    });
+    match crate::platform::virtual_mic::target() {
+        Some(target) => json!({
+            "provider": target.provider.as_str(),
+            "device": target.sink,
+            "capture": target.capture,
+            "usable": target.usable,
+            // echoes 为 true 表示写的是默认扬声器 —— 开麦就会自听。运维看到
+            // 这个 true 而用户又抱怨回声，不用再猜。
+            "echoes": target.echoes(),
+            "note": target.note,
+            "live": live,
+        }),
+        None => json!({
+            "provider": "unknown",
+            "device": null,
+            "capture": null,
+            "usable": false,
+            "echoes": false,
+            "note": "麦克风目标尚未探测",
+            "live": live,
+        }),
+    }
+}
+
 fn round1(v: f32) -> f64 {
     // 面板同款口径：一位小数。`as f64` 之后再 round，避免 f32 的尾数泄漏到 JSON。
     ((v as f64) * 10.0).round() / 10.0
@@ -420,9 +464,10 @@ fn build_at(
                 // The same string the panel advertises (`server_settings.encoder`):
                 // one encoder, one name. `codec` carries the detail.
                 "encoder": "libvpx",
-                // #94: the codec this server is negotiating with; a session
-                // that picked VP9 is not running the same encoder as before.
-                "codec": crate::pipeline::codec::current().wire(),
+                // #94/#110: the codec *this program* is negotiating with; a
+                // session that picked VP9 is not running the same encoder as
+                // before, and the other screen is unaffected.
+                "codec": settings.codec().wire(),
                 "rate_control": settings.rate_control().as_str(),
                 "crf": settings.crf(),
                 "target_kbps": target_kbps,
@@ -447,8 +492,9 @@ fn build_at(
                 "checked_ago_ms": err_delta.map(|(_, ms)| ms),
                 "pli_requests": pli,
                 "audio": {
-                    "enabled": audio::enabled(),
-                    "bitrate_bps": audio::current_bitrate_bps(),
+                    "enabled": settings.audio_enabled(),
+                    "bitrate_bps": settings.audio_bitrate_bps(),
+                    "uplink": uplink_json(),
                 },
             })
         }
@@ -461,13 +507,19 @@ fn build_at(
                 "height": cfg.height,
                 "fps": cfg.fps,
                 "encoder": "libvpx",
-                // #94: the codec this server is negotiating with; a session
-                // that picked VP9 is not running the same encoder as before.
-                "codec": crate::pipeline::codec::current().wire(),
+                // #94/#110: no program exists, so this reports what a program
+                // created now *would* start with (the CLI seed). It is not a
+                // live value any more — the live one lives on each program.
+                "codec": crate::pipeline::codec::VideoCodec::from_wire(&cfg.video_codec)
+                    .unwrap_or_default()
+                    .wire(),
                 "target_kbps": cfg.bitrate_kbps,
                 "audio": {
-                    "enabled": audio::enabled(),
-                    "bitrate_bps": audio::current_bitrate_bps(),
+                    // No program exists: report the seeds a program would start
+                    // with, not a process-wide live value (there is none).
+                    "enabled": true,
+                    "bitrate_bps": audio::default_bitrate_bps(),
+                    "uplink": uplink_json(),
                 },
             })
         }
@@ -541,6 +593,10 @@ fn build_at(
                     "ip": info.peer_ip,
                     "device_id": info.device_id,
                     "tab_id": info.tab_id,
+                    // #110: 这一条是哪个租户的。列表已经按身份过滤过，所以它
+                    // 只在"主机级身份看全部"时才有区分度 —— 而那正是它有用的
+                    // 场合：跨租户的运维要能一眼看出这条是谁的。
+                    "tenant": info.tenant.as_str(),
                     "role": role,
                     "client_type": info.client_type,
                     "display": info.display,
@@ -645,7 +701,28 @@ fn hostname() -> String {
         .unwrap_or_default()
 }
 
+/// #110: 这条连接能看见哪些会话。
+///
+/// 抽成函数是为了它能被单独测 —— 过滤逻辑藏在 `handle_health` 里的话，要验
+/// "租户之间互相看不见"就得起一个监听、握一次手、再产一条会话记录。
+fn visible_sessions(
+    infos: Vec<SessionInfo>,
+    principal: &crate::security::Principal,
+) -> Vec<SessionInfo> {
+    infos
+        .into_iter()
+        .filter(|info| principal.may_see(&info.tenant))
+        .collect()
+}
+
 /// `GET /api/v1/health`。
+///
+/// #110: 连接清单按租户过滤 —— 这是"身份带租户"真正兑现的地方。在此之前这个
+/// 端点把所有人的 IP、设备码、UA、连了多久一次性发给**任何**能访问它的人；
+/// 一张给参观者看的令牌，等于附赠了一份全机连接清单。
+///
+/// 过滤只作用于 `clients`：`stream` / `host` / `processes` 描述的是这台机器
+/// 本身，而同机的多个租户共用一路采集 —— 把 CPU 数字按租户切开是在编造精度。
 pub async fn handle_health<S>(
     stream: &mut S,
     cfg: &Config,
@@ -653,6 +730,7 @@ pub async fn handle_health<S>(
     admission: &crate::signaling::websession::Admission,
     pipelines: &crate::pipeline::PipelineRegistry,
     probe: &HealthProbe,
+    principal: &crate::security::Principal,
 ) -> std::io::Result<()>
 where
     S: AsyncWrite + Unpin,
@@ -660,7 +738,9 @@ where
     let sample = probe.sample();
     // #101: two registries, because a session and a capture program are no
     // longer the same thing.
-    let sessions = registry.infos().await;
+    let all = registry.infos().await;
+    let total = all.len();
+    let sessions = visible_sessions(all, principal);
     let programs = pipelines.all().await;
     let (healthy, mut payload) = build(cfg, probe, &sample, &sessions, &programs);
     // #102: admission is injected here rather than threaded into `build`, for
@@ -672,6 +752,17 @@ where
         object.insert(
             "admission".to_owned(),
             json!({ "max": admission.max(), "live": admission.live() }),
+        );
+        // #110: 报出"你正以谁的身份在看"。被过滤掉的连接数是运维最需要的一
+        // 个数：它把"这里只有我一个人"和"我只是看不到别人"区分开。
+        object.insert(
+            "viewer".to_owned(),
+            json!({
+                "tenant": principal.tenant.as_str(),
+                "role": principal.role.as_str(),
+                "credential": principal.credential.label(),
+                "hidden_clients": total.saturating_sub(sessions.len()),
+            }),
         );
     }
     let body = payload.to_string();
@@ -1269,10 +1360,14 @@ mod tests {
 
     /// #105：共享输入下两个页签都报 controller —— 这次是**真的**，并且必须
     /// 有一处能让人区分「真共享」和上一轮那个「页面自称 controller」的 bug。
+    ///
+    /// #110：共享不再是默认值，所以这里显式设一次 —— 被测的是"共享时怎么报"，
+    /// 不是"默认值是什么"（那条见 [`the_default_input_policy_is_exclusive`]）。
     #[test]
     fn shared_input_reports_every_tab_as_controller_and_says_so() {
-        let cfg = cfg();
-        assert_eq!(cfg.input_policy, InputPolicy::Shared, "默认必须是共享");
+        let mut cfg = cfg();
+        cfg.input_policy = InputPolicy::Shared;
+        assert_eq!(cfg.input_policy, InputPolicy::Shared, "本测试必须跑在共享模式下");
         let now = Instant::now();
         let info = |id: u64| SessionInfo {
             id,
@@ -1290,6 +1385,16 @@ mod tests {
         assert_eq!(items[0]["role"], "controller");
         assert_eq!(items[1]["role"], "controller");
         assert_eq!(body["server"]["input_policy"], "shared");
+    }
+
+    /// #110：默认必须是独占。
+    ///
+    /// 整个角色门禁都系在这一行上：`ControlGate::owns()` 在 `shared` 下恒为
+    /// 真，`viewer_may_run` 白名单因此**从不执行** —— 观众和主控者就没有区别。
+    /// 这条断言的意义不是"记住一个常量"，而是"别把门禁的开关悄悄关回去"。
+    #[test]
+    fn the_default_input_policy_is_exclusive() {
+        assert_eq!(cfg().input_policy, InputPolicy::Exclusive);
     }
 
     /// #103：还没 attach 的会话不持有任何租约，报 `pending` 而不是假装是 viewer。
@@ -1315,6 +1420,91 @@ mod tests {
         let text = control("session/take/2x").await;
         assert!(text.starts_with("HTTP/1.1 400"), "got: {text}");
         assert!(text.contains("must be a number"), "got: {text}");
+    }
+
+    // ---- #110：按租户过滤 --------------------------------------------------
+    //
+    // 这一段之前 `/api/v1/health` 把所有人的 IP / 设备码 / UA 报给任何能访问
+    // 它的人。身份带上了租户之后，过滤必须真的发生在这里，否则第 4 项做完了
+    // 也没人用得上第 5 项。
+
+    fn who(tenant: &str, role: crate::security::Role) -> crate::security::Principal {
+        use crate::security::{Principal, TenantId};
+        Principal::default().with_grant(TenantId::new(tenant), role)
+    }
+
+    fn session_of(id: u64, tenant: &str) -> SessionInfo {
+        SessionInfo {
+            id,
+            peer_ip: "10.0.0.9".to_owned(),
+            device_id: format!("dev-{id}"),
+            tenant: crate::security::TenantId::new(tenant),
+            ..Default::default()
+        }
+    }
+
+    /// 租户的操作者只看得见自己那一份。
+    #[test]
+    fn a_tenant_operator_only_sees_its_own_sessions() {
+        use crate::security::Role;
+
+        let all = vec![
+            session_of(1, "alpha"),
+            session_of(2, "beta"),
+            session_of(3, "alpha"),
+        ];
+        let alpha = visible_sessions(all.clone(), &who("alpha", Role::Operator));
+        assert_eq!(alpha.len(), 2, "alpha 应该看到两条");
+        assert!(alpha.iter().all(|s| s.tenant.as_str() == "alpha"));
+
+        let beta = visible_sessions(all, &who("beta", Role::Operator));
+        assert_eq!(beta.len(), 1);
+        assert_eq!(beta[0].id, 2);
+    }
+
+    /// 主机级身份跨租户，而且这里不能靠"角色是 host 就跳过过滤"来实现 ——
+    /// 那样 `may_see` 就有两套判据了。这条钉的是同一条路径。
+    #[test]
+    fn a_host_credential_sees_every_tenant() {
+        use crate::security::Role;
+
+        let all = vec![session_of(1, "alpha"), session_of(2, "beta")];
+        let host = visible_sessions(all.clone(), &who("default", Role::Host));
+        assert_eq!(host.len(), 2);
+
+        // 同一张表，换成观众就只剩自己那个租户（这里默认租户里没有会话）。
+        let viewer = visible_sessions(all, &who("default", Role::Viewer));
+        assert!(viewer.is_empty(), "默认租户里没有连接，不该看见别的租户的");
+    }
+
+    /// 被过滤掉的条数必须能被报出来：否则"只有我一个人"和"我看不到别人"
+    /// 在 JSON 里长得一模一样。
+    #[test]
+    fn hidden_clients_are_counted_not_silently_dropped() {
+        use crate::security::Role;
+
+        let all = vec![session_of(1, "alpha"), session_of(2, "beta")];
+        let total = all.len();
+        let visible = visible_sessions(all, &who("alpha", Role::Operator));
+        assert_eq!(total.saturating_sub(visible.len()), 1);
+    }
+
+    /// 每条客户端都带上自己的租户 —— 列表被过滤后这一项仍然有用：主机级身份
+    /// 看全部时，得能分辨哪条是谁的。
+    #[test]
+    fn every_client_row_carries_its_tenant() {
+        let cfg = cfg();
+        let now = Instant::now();
+        let (_, body) = build_at(
+            &cfg,
+            &probe(),
+            &sample(),
+            &[session_of(1, "alpha"), session_of(2, "beta")],
+            &[],
+            now,
+        );
+        assert_eq!(body["clients"]["items"][0]["tenant"], "alpha");
+        assert_eq!(body["clients"]["items"][1]["tenant"], "beta");
     }
 
     /// 接管一个不存在的会话是 404：没有这个人，就没有可移交的对象。

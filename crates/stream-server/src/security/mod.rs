@@ -28,6 +28,11 @@ pub mod policy;
 // `session-token.js` 的四种载体一一对应。
 pub mod token;
 
+// 两个内置策略的短路径。`AllowAll` 由 `main` 的兜底注入用到；`DenyAll` 目前
+// 只被 `--policy deny-all` 在 `policy::by_name` 内部构造 —— 仍然一起导出，
+// 是因为这两个名字在外层眼里是一对（"放行"与"拒绝"），只导出其中一个会让
+// 读者去猜另一个是不是不存在。
+#[allow(unused_imports)]
 pub use policy::{AllowAll, DenyAll};
 pub use token::TokenGate;
 
@@ -226,7 +231,7 @@ pub enum Credential {
     /// 没有出示任何凭据（局域网裸奔，也是当前唯一的情况）。
     #[default]
     None,
-    /// `Authorization: Bearer <session token>`。
+    /// `Authorization: Bearer <session token>`，且令牌属于某个租户。
     Bearer,
     /// 主控令牌（可改设置、可提名其他会话）。
     Master,
@@ -242,6 +247,119 @@ impl Credential {
     }
 }
 
+/// 一个租户的名字（#110）。
+///
+/// 不是一个新概念，而是把一直隐含的东西写下来：这台机器上跑着一套采集/编码，
+/// 所有连上来的人共享它。在此之前"谁是谁"只剩一个 `PeerAddr`，于是
+/// `/api/v1/health` 把所有人的 IP 报给所有人、上传目录也只有一份。
+///
+/// 空串与 `"default"` 等价 —— 单租户部署不需要为它改任何配置。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TenantId(pub String);
+
+impl TenantId {
+    /// 未配置租户时的名字。单口令 `--auth-token` 就落在这里。
+    pub const DEFAULT: &'static str = "default";
+
+    pub fn new(name: impl Into<String>) -> Self {
+        let name = name.into();
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            Self(Self::DEFAULT.to_owned())
+        } else {
+            Self(trimmed.to_owned())
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        if self.0.is_empty() {
+            Self::DEFAULT
+        } else {
+            &self.0
+        }
+    }
+
+    /// 是否是那个"没配租户"的租户。
+    pub fn is_default(&self) -> bool {
+        self.as_str() == Self::DEFAULT
+    }
+
+    /// 这个名字能不能直接当**目录名**用（#110）。
+    ///
+    /// 租户名来自命令行，而它现在要落到文件系统上（`<upload-dir>/<tenant>/`）。
+    /// 直接把运维输入拼进路径等于开一个洞：`--auth-grant ../..:host:x` 就能把
+    /// 上传根挪到别处。所以这里做一层收窄 —— 只留字母数字与 `.`/`-`/`_`，
+    /// 其余一律换成 `_`，再把纯 `.` / `..` 打回默认租户。
+    ///
+    /// 注意这是**有损**变换：`a b` 与 `a_b` 会撞到同一个目录。可接受，因为
+    /// 撞名只发生在同一个运维自己起的两个名字上，而它们本来也共享这台机器。
+    pub fn as_path_segment(&self) -> String {
+        let raw = self.as_str();
+        let cleaned: String = raw
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        match cleaned.trim_matches('.') {
+            // `.`、`..`、`...` 这些当目录名要么没意义要么会跑出根。
+            "" => Self::DEFAULT.to_owned(),
+            _ if cleaned == "." || cleaned == ".." => Self::DEFAULT.to_owned(),
+            _ => cleaned,
+        }
+    }
+}
+
+/// 这个身份能做什么（#110）。
+///
+/// 三级，不是两个布尔：`Host` 与 `Operator` 的差别是"跨不跨租户"——
+/// 主机级身份能看所有租户的会话、能踢人；租户操作者只能动自己那一份。
+/// 把两者合成一个 `is_admin` 会让 `/api/v1/health` 的过滤无从下手。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Role {
+    /// 主机级：跨租户可见，可改全局、可踢会话。
+    Host,
+    /// 某租户的操作者：可改本租户这台机器的流参数。
+    Operator,
+    /// 只看。默认值 —— 没配凭据时谁都是观众。
+    #[default]
+    Viewer,
+}
+
+impl Role {
+    /// CLI 与 `--auth-grant` 里的拼写。
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "host" | "admin" => Some(Role::Host),
+            "operator" | "controller" => Some(Role::Operator),
+            "viewer" | "read-only" | "readonly" => Some(Role::Viewer),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Host => "host",
+            Role::Operator => "operator",
+            Role::Viewer => "viewer",
+        }
+    }
+
+    /// 能不能改这台机器的流参数（设置面、输入面）。
+    pub fn may_operate(self) -> bool {
+        matches!(self, Role::Host | Role::Operator)
+    }
+
+    /// 能不能越过租户边界看/动别人的东西。
+    pub fn crosses_tenants(self) -> bool {
+        matches!(self, Role::Host)
+    }
+}
+
 /// 触发者身份。
 ///
 /// 字段全部是 `Option`/默认值，因为四个入口能拿到的信息不一样：HTTP 有 peer
@@ -252,6 +370,10 @@ pub struct Principal {
     pub peer: Option<IpAddr>,
     pub session: Option<u64>,
     pub credential: Credential,
+    /// #110: 属于哪个租户。未配置时是 [`TenantId::DEFAULT`]。
+    pub tenant: TenantId,
+    /// #110: 能做什么。默认 [`Role::Viewer`] —— 没配凭据时谁都是观众。
+    pub role: Role,
 }
 
 impl Principal {
@@ -269,6 +391,60 @@ impl Principal {
             session: Some(session),
             ..Default::default()
         }
+    }
+
+    /// #110: 带上租户与角色。`tenant` 为空表示"这条连接没出示凭据"，落回默认
+    /// 租户 —— 与 `Credential::None` 一致。
+    pub fn with_grant(mut self, tenant: TenantId, role: Role) -> Self {
+        self.tenant = tenant;
+        self.role = role;
+        // #110: **出示过令牌就是出示过**，哪怕是 `viewer` 那张。
+        //
+        // 这里曾经写成"viewer 且原本没凭据 → 保持 `None`"，本意是让日志里的
+        // `cred=` 更像"这个人只是个观众"。它实际是个后门：`Credential::None`
+        // 的含义是"这台机器没有门"（见 [`Principal::may_operate`]），于是任一
+        // `viewer` 令牌都会因此拿到操作权。凭据种类说的是"你是**怎么**进来的"，
+        // 不是"你能做什么"——后者是 `role` 的事。
+        self.credential = if role == Role::Host {
+            // 主机级令牌就是以前的 `Master`，日志里 `cred=` 字段保持可读。
+            Credential::Master
+        } else {
+            Credential::Bearer
+        };
+        self
+    }
+
+    /// #110: 这条连接能不能看见 `tenant` 名下的东西。
+    pub fn may_see(&self, tenant: &TenantId) -> bool {
+        self.role.crosses_tenants() || self.tenant.as_str() == tenant.as_str()
+    }
+
+    /// #110: 这条连接能不能改这台机器（输入、流参数、剪贴板写入）。
+    ///
+    /// 两个来源，任一成立即可：
+    ///
+    /// * 令牌写着 `host` / `operator` —— 正常的多用户形态；
+    /// * **根本没出示凭据**（[`Credential::None`]）。这一条不是漏洞，是这台
+    ///   机器的默认形态：没配令牌表就意味着没有门，连进来的人本来就是主人。
+    ///   少了它，单用户部署会发现自己键鼠没反应 —— 而日志里一切正常，因为
+    ///   从服务端看"拒绝一个 viewer"正是设计意图。
+    ///
+    /// 配了令牌表的部署里 `Credential::None` 只可能出现在 `Static` / `Status`
+    /// 这两条豁免路径上，它们拿不到会话，也就走不到这里。
+    pub fn may_operate(&self) -> bool {
+        self.role.may_operate() || self.credential == Credential::None
+    }
+
+    /// #110: 这条连接能不能知道**这台机器是谁**（机器名、`encode_node` 这类
+    /// 主机级标识）。
+    ///
+    /// 判据是"主机级身份，或者这部署根本没有门"。第二半很关键：没有出示任何
+    /// 凭据（[`Credential::None`]）意味着这台机器没配令牌表 —— 单用户部署里
+    /// 连进来的那个人本来就是主人，把他的机器名藏起来只会让面板少一栏。
+    /// 而在配了令牌表的部署里，`Credential::None` 只可能出现在 `Static` /
+    /// `Status` 这两条豁免路径上，它们本来也拿不到会话。
+    pub fn may_name_host(&self) -> bool {
+        self.role.crosses_tenants() || self.credential == Credential::None
     }
 }
 
@@ -513,5 +689,31 @@ mod tests {
             EventKind::Control("control.set-fps").label(),
             "control.set-fps"
         );
+    }
+
+    /// #110: 租户名要能安全地当目录名 —— 它直接来自命令行。
+    #[test]
+    fn a_tenant_name_is_safe_to_use_as_a_directory() {
+        assert_eq!(TenantId::new("alpha").as_path_segment(), "alpha");
+        assert_eq!(TenantId::new("team-a_1.2").as_path_segment(), "team-a_1.2");
+        // 空白与默认值等价。
+        assert_eq!(TenantId::default().as_path_segment(), "default");
+
+        // 这些是**洞**，不是风格问题：拼进路径就跑出了上传根。
+        assert_eq!(TenantId::new("..").as_path_segment(), "default");
+        assert_eq!(TenantId::new(".").as_path_segment(), "default");
+        // `.` 本身是合法字符（`team-a_1.2` 要用它），所以这里是"分隔符变 `_`"
+        // 而不是"整个丢掉" —— 结果不再是 `..`，也就跑不出去。
+        assert_eq!(TenantId::new("../../etc").as_path_segment(), ".._.._etc");
+        assert_eq!(TenantId::new("C:\\windows").as_path_segment(), "C__windows");
+        assert_eq!(TenantId::new("a b").as_path_segment(), "a_b");
+        // 结果里不可能再有分隔符 —— 这是"拼进路径也跑不出去"的直接判据。
+        for name in ["..", "../x", "a/b", "a\\b", "C:\\x"] {
+            let seg = TenantId::new(name).as_path_segment();
+            assert!(
+                !seg.contains('/') && !seg.contains('\\'),
+                "{name:?} produced {seg:?}"
+            );
+        }
     }
 }

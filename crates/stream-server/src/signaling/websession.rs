@@ -36,7 +36,7 @@ use tokio_tungstenite::{
     WebSocketStream,
 };
 
-use crate::config::{Config, InputPolicy};
+use crate::config::Config;
 use crate::dispatch::{
     classify, connection, cursor, display, hostui, pipeline, server_settings, stream_info,
     stream_stats, system, Action, ClipboardSink, GamepadHub, InputSinkRef, StreamInfo,
@@ -125,6 +125,13 @@ pub struct SessionInfo {
     /// count while `connected_s` stays near zero, which is the shape of every
     /// reconnect storm this project has had.
     pub reconnects: u32,
+    /// #110: 这条会话属于哪个租户。
+    ///
+    /// 以前没有这个字段，于是 `/api/v1/health` 只能把**所有人**的连接清单发给
+    /// 所有人 —— 谁的 IP、谁的设备码、谁连了多久，一览无余。判据必须挂在会话
+    /// 上而不是查令牌表：令牌与会话不是一对一（同一张令牌可以开两个页签），
+    /// 而过滤要按"这一条连接是谁"来做。
+    pub tenant: crate::security::TenantId,
 }
 
 /// What the client told us about itself when it opened the WebSocket.
@@ -372,6 +379,36 @@ impl SessionRegistry {
         }
         n
     }
+
+    /// #110: close every session watching one display.
+    ///
+    /// A codec pick belongs to the *program*, and a negotiated codec cannot
+    /// change inside a live PeerConnection — so the sessions that have to
+    /// renegotiate are exactly the ones attached to that program. `kick(None)`
+    /// (what the pre-#110 code called) restarted the other screen's viewers for
+    /// a change that does not affect them.
+    ///
+    /// Sessions that have not attached yet have no display and are left alone:
+    /// they have not started a stream, and their own negotiation is still ahead
+    /// of them.
+    pub async fn kick_display(&self, reason: &str, display: u32) -> usize {
+        let mut guard = self.inner.lock().await;
+        let targets: Vec<u64> = guard
+            .iter()
+            .filter(|(_, live)| live.info.display == Some(display))
+            .map(|(id, _)| *id)
+            .collect();
+        let n = targets.len();
+        for want in targets {
+            if let Some(live) = guard.remove(&want) {
+                let _ = live.notice.send(CloseNotice {
+                    code: 4002,
+                    reason: reason.to_owned(),
+                });
+            }
+        }
+        n
+    }
 }
 
 /// How many signaling sessions this process will hold at once (#102).
@@ -532,6 +569,11 @@ struct SessionCtx {
     ws_tx: mpsc::UnboundedSender<Message>,
     /// Ends the WS loop when the PC reaches a terminal state.
     done_tx: mpsc::UnboundedSender<()>,
+    /// #110: 这条连接是谁。信令/DataChannel 层的身份来源只有这里 ——
+    /// `peer` 与租户角色在 WS 升级那一刻还在手上，进了 PeerConnection 之后就
+    /// 只剩会话号了。以前这里是 `Principal::default()`，于是按角色分级的策略
+    /// 在 WebRTC 这条路上把所有人都当成观众。
+    principal: Principal,
     /// #93: who connected (peer address, UA) and the id this session publishes
     /// under; the registry also publishes the live state for `/api/v1/health`.
     client: ClientMeta,
@@ -551,6 +593,7 @@ impl SessionCtx {
         session_id: u64,
         registry: SessionRegistry,
         pipelines: PipelineRegistry,
+        principal: Principal,
     ) -> Self {
         // #62: the sink needs the live frame size so it can map the frontend's
         // frame-space pointer coordinates onto the physical screen.
@@ -594,6 +637,7 @@ impl SessionCtx {
             session_id,
             registry,
             pipelines,
+            principal,
         }
     }
 
@@ -631,6 +675,7 @@ impl SessionCtx {
             program,
             session: self.session_id,
             denied: att.denied.clone(),
+            may_operate: self.principal.may_operate(),
         })
     }
 }
@@ -646,6 +691,10 @@ struct ControlGate {
     /// Shared with the registry entry, so a refusal is visible in `health`
     /// (see `SessionInfo::denied`).
     denied: Arc<AtomicU64>,
+    /// #110: 这张令牌能不能动这台机器。与租约是**两个**条件，缺一不可 ——
+    /// 租约回答"两个操作者里谁说了算"，角色回答"你是不是操作者"。只看租约
+    /// 的话，一个 `viewer` 令牌只要先连上就能拿到租约，然后一直注入。
+    may_operate: bool,
 }
 
 impl ControlGate {
@@ -660,10 +709,10 @@ impl ControlGate {
     /// exclusive lease is still there for the multi-user case, where it will be
     /// paired with real isolation.
     fn owns(&self) -> bool {
-        match self.program.input_policy() {
-            InputPolicy::Shared => true,
-            InputPolicy::Exclusive => self.program.controller_id() == Some(self.session),
-        }
+        // #110: 两道关。角色在前 —— 它是不变的那一半，租约是运行期会移动的
+        // 那一半；先判常量能让一次 `viewer` 的注入在读完一个 `AtomicU64`
+        // 之前就被挡住，日志里也不会出现"租约明明是它的"这种误导。
+        self.may_operate && self.program.owns_input(self.session)
     }
 
     /// Count a message the lease refused. Called on every dropped input, so it
@@ -682,6 +731,9 @@ pub async fn run<S>(
     pipelines: PipelineRegistry,
     client: ClientMeta,
     permit: AdmissionPermit,
+    // #110: 升级那一刻解析出来的身份。`None` 表示没开鉴权（或静态资源豁免），
+    // 此时它就是"这台机器的主人"—— 单用户部署的默认形态。
+    grant: Option<crate::security::token::Grant>,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -698,7 +750,33 @@ where
     let session_id = registry.next_session_id();
     registry.register(session_id, notice_tx).await;
 
-    let mut ctx = SessionCtx::new(cfg, ws_tx, done_tx, client, session_id, registry, pipelines);
+    // #110: 身份在这里定下来，然后随 `SessionCtx` 一路带进 DataChannel 的闭包。
+    // 以前 `dc_principal` 是 `Principal::default()` —— 也就是"默认租户的观众"
+    // —— 于是任何读身份的策略都会把 WebRTC 会话当成观众，包括持有主机级令牌
+    // 的那一个。`client.ip` 是字符串，解析不了就当没有来源地址（不影响角色）。
+    let mut principal = match grant {
+        Some(grant) => Principal::default().with_grant(grant.tenant, grant.role),
+        None => Principal::default(),
+    };
+    principal.peer = client.ip.parse().ok();
+    principal.session = Some(session_id);
+    log::info!(
+        "signaling: session {session_id} identified as tenant={} role={} cred={}",
+        principal.tenant.as_str(),
+        principal.role.as_str(),
+        principal.credential.label()
+    );
+
+    let mut ctx = SessionCtx::new(
+        cfg,
+        ws_tx,
+        done_tx,
+        client,
+        session_id,
+        registry,
+        pipelines,
+        principal,
+    );
     let mut ws = ws;
 
     let outcome = session_loop(&mut ws, &mut ctx, notice_rx, done_rx, ws_rx).await;
@@ -950,6 +1028,8 @@ where
                     sink: None,
                     // Filled by `publish` from the per-device counter.
                     reconnects: 0,
+                    // #110: 这条连接属于谁。`health` 按它过滤清单。
+                    tenant: ctx.principal.tenant.clone(),
                 })
                 .await;
             ctx.session.meta = meta;
@@ -993,32 +1073,28 @@ where
             // #94: our m-line named one codec, and the answer is where a
             // browser that cannot decode it says no. That refusal is silent —
             // the transport still connects (the data channels are codec-free),
-            // so the session would come up healthy with a black picture. Put
-            // the process back on the codec everyone can decode and take the
-            // reconnect the client already handles.
-            let codec = crate::pipeline::codec::current();
+            // so the session would come up healthy with a black picture.
+            //
+            // #110: the fallback is recorded on *this session's* settings and is
+            // inherited by the program when this session creates it (see the
+            // `created` branch below). It deliberately does not reach into the
+            // program: at this point there may not be one, and once there is,
+            // the screens of other browsers are not this browser's to reflow.
+            // The old code set a process-wide codec and kicked every session to
+            // renegotiate, which is how one viewer's decoder took the other
+            // screen down.
+            let codec = ctx.settings.codec();
             if let Some(reason) = refused_video_codec(&sdp, codec) {
                 log::error!(
                     "client refused the {} video line ({reason})",
                     codec.label()
                 );
-                // Only worth restarting when there is something to fall back
-                // *to*. Already on VP8 there is no cheaper codec left, and a
-                // kick would turn one refusal into a reload every two seconds.
                 if codec != crate::pipeline::codec::VideoCodec::Vp8 {
-                    crate::pipeline::codec::set(crate::pipeline::codec::VideoCodec::Vp8);
-                    // #101: the codec is a property of the *program*, and every
-                    // session shares the one encoder — so a browser that refuses
-                    // it poisons all of them. Restarting every session is the
-                    // only recovery that leaves them all decodable.
-                    let n = ctx
-                        .registry
-                        .kick(
-                            "video codec not supported by this browser; retrying with VP8",
-                            None,
-                        )
-                        .await;
-                    log::info!("restarted {n} session(s) for the VP8 fallback");
+                    ctx.settings.set_codec(crate::pipeline::codec::VideoCodec::Vp8);
+                    log::info!(
+                        "this browser cannot decode {}: its program will be created on vp8",
+                        codec.label()
+                    );
                 }
             }
         }
@@ -1047,7 +1123,7 @@ where
 /// Build the PC, two channels and the VP8 track once the client asks for a
 /// session; subscribe to its state, start the stats timer and the ICE forwarder.
 async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
-    let media = Arc::new(Mutex::new(MediaSession::new().await?));
+    let media = Arc::new(Mutex::new(MediaSession::new(ctx.settings.codec()).await?));
     ctx.media = Some(media.clone());
 
     // #62: worker-termination sink. A panicking or erroring capture worker used
@@ -1097,6 +1173,11 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
     // #109: the program this session will join is keyed by the display the
     // hello named; captured before the task moves.
     let watcher_display = ctx.display;
+    // #110: 角色要不要动输入租约，在接上那一刻就定下来了 —— 令牌不会中途换。
+    let watcher_may_operate = ctx.principal.may_operate();
+    // #110: DataChannel hook 的身份。整条会话一个，`arm_connected_notices`
+    // 每个消息都拿它过 `security::allow`。
+    let watcher_principal = ctx.principal.clone();
     push_task(
         &ctx.tasks,
         tokio::spawn(async move {
@@ -1125,18 +1206,35 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
                             let acquired = watcher_pipelines.acquire(watcher_display, &cfg).await;
                             let controller = acquired.created;
                             if controller {
-                                // #80: the audio switches are process-wide, so
-                                // only the session that owns the program resets
-                                // them. A viewer connecting is not a reload and
-                                // must not unmute the controller's stream.
-                                crate::pipeline::audio::set_enabled(true);
-                                crate::pipeline::audio::set_bitrate_bps(0);
+                                // #80/#110: a fresh program starts unmuted and at
+                                // the built-in bitrate. These used to be
+                                // process-wide statics that a reload had to
+                                // reset; now they live on the program, which a
+                                // reload destroys and recreates, so seeding them
+                                // here is the same guarantee without touching
+                                // anybody else's screen.
+                                acquired.pipeline.settings.set_audio_enabled(true);
+                                acquired.pipeline.settings.set_audio_bitrate_bps(0);
+                                // #110: a session that arrived carrying a codec
+                                // fallback (its browser refused VP9) seeds the
+                                // program it creates. `watcher_settings` is still
+                                // this session's own copy at this point — the
+                                // line below swaps it for the program's.
+                                acquired.pipeline.settings.set_codec(watcher_settings.codec());
                                 // #103: the lease lives on the program and is
                                 // claimed here rather than inferred from
                                 // `created` at every use site, so a takeover can
                                 // move it later without touching this session's
                                 // state.
-                                acquired.pipeline.set_controller(Some(watcher_session_id));
+                                //
+                                // #110: 只有能操作的令牌才认领。`viewer` 令牌
+                                // 若在这里认领，一个观众会握住租约、把后面连上
+                                // 来的操作者永远挡在门外（`try_claim_controller`
+                                // 是 claim-if-free，没人能把它挤掉）—— 症状是
+                                // "操作者连上了但键鼠没反应"，而日志里一切正常。
+                                if watcher_may_operate {
+                                    acquired.pipeline.set_controller(Some(watcher_session_id));
+                                }
                             } else {
                                 // #105: a joiner only inherits an *unowned* lease.
                                 // Without this, a program that outlived its
@@ -1146,7 +1244,27 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
                                 // `viewer` and no reconnect could fix it,
                                 // because the lease is keyed on the program and
                                 // only `created` ever wrote it.
-                                acquired.pipeline.try_claim_controller(watcher_session_id);
+                                //
+                                // #110: 同上 —— 观众不认领，否则它会占着空租约
+                                // 让真正的操作者进不来。
+                                if watcher_may_operate {
+                                    acquired.pipeline.try_claim_controller(watcher_session_id);
+                                }
+                                // #110: a joiner whose browser wanted a different
+                                // codec cannot reflow a program somebody else is
+                                // already watching — that is the whole point of
+                                // moving the pick off the process. Say so once:
+                                // a black picture with no log line is the worst
+                                // way for this to fail.
+                                let live = acquired.pipeline.settings.codec();
+                                if live != watcher_settings.codec() {
+                                    log::warn!(
+                                        "session {watcher_session_id} asked for {} but display {} is already encoding {} for the sessions on it; this browser may fail to decode",
+                                        watcher_settings.codec().wire(),
+                                        acquired.pipeline.display.0,
+                                        live.wire()
+                                    );
+                                }
                             }
                             if let Some(tx) = watcher_exit.clone() {
                                 acquired.pipeline.handle.add_exit_sink(tx);
@@ -1213,7 +1331,12 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
                             // #62: a second Connected (ICE re-connect after a
                             // transient Disconnected) never re-ran `on_open`, so
                             // the panel kept stale settings / capture state.
-                            resend_notices(&watcher_media, &watcher_settings).await;
+                            resend_notices(
+                                &watcher_media,
+                                &watcher_settings,
+                                watcher_principal.may_name_host(),
+                            )
+                            .await;
                         }
                         let (handle, gate) = {
                             let att = watcher_attach
@@ -1226,6 +1349,7 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
                                 program,
                                 session: watcher_session_id,
                                 denied: att.denied.clone(),
+                                may_operate: watcher_may_operate,
                             });
                             (att.handle.clone(), gate)
                         };
@@ -1248,6 +1372,7 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
                             &watcher_tasks,
                             &watcher_registry,
                             gate,
+                            &watcher_principal,
                             first_arm,
                         )
                         .await
@@ -1511,7 +1636,7 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
 /// `Ignore` 是设计上就该丢弃的 B 组噪音，`Unknown` 是解不出来的行 —— 给它们
 /// 记审计只会淹没真正的拒绝。**其余每一条都必须映射**，漏掉一条就等于那条
 /// 指令永远绕过策略。
-fn surface_of(action: &Action) -> Option<EventKind> {
+pub(crate) fn surface_of(action: &Action) -> Option<EventKind> {
     Some(match action {
         Action::StartVideo | Action::StopVideo => EventKind::Media(MediaDir::VideoOut),
         Action::SetAudioOn(_) | Action::SetAudioBitrate(_) => EventKind::Media(MediaDir::AudioOut),
@@ -1599,7 +1724,7 @@ fn device_of(line: &str) -> Device {
 /// video" by the controller is not durable while a visible viewer is watching —
 /// which is the right trade, because the alternative failure (a viewer that
 /// cannot recover) has no way out from the browser side.
-fn viewer_may_run(action: &Action) -> bool {
+pub(crate) fn viewer_may_run(action: &Action) -> bool {
     matches!(
         action,
         Action::StartVideo
@@ -1648,7 +1773,11 @@ async fn arm_connected_notices(
     // "owns" so a future path that arms earlier degrades to the old behaviour
     // rather than to a dead keyboard.
     gate: Option<ControlGate>,
-    // #101: whether this is the session's first `Connected` — only then is the
+    // #110: 这条连接的身份，DataChannel 的两个 hook 每帧都要用它过策略。
+    // 以前这里没有参数可传 —— hook 里硬写的是 `Principal::default()`，
+    // 于是"按角色分级"在 WebRTC 这条路上恒等于"所有人都是观众"。
+    principal: &Principal,
+    // #101: whether this is the session's *first* `Connected` — only then is the
     // recovery-event sink installed (see the call site).
     first_arm: bool,
 ) -> Result<()> {
@@ -1671,7 +1800,10 @@ async fn arm_connected_notices(
         // #109: the events below do not carry the display, but the snapshot
         // they build does; the settings object knows which screen this session
         // watches (set from the hello, before the attach).
+        // #110: same for the codec — `stream_info` reports what the program is
+        // encoding, and that is a per-program fact now.
         let event_display = settings.display();
+        let event_codec = settings.codec();
         push_task(
             tasks,
             tokio::spawn(async move {
@@ -1686,7 +1818,9 @@ async fn arm_connected_notices(
                         PipelineEvent::Lost(reason) => Some(system(&format!("capture_lost,{reason}"))),
                         PipelineEvent::Restored => Some(system("capture_restored")),
                         PipelineEvent::StreamInfo { is_gdi, reason } => Some(stream_info(
-                            &StreamInfo::from_capture(is_gdi, reason).with_display(event_display),
+                            &StreamInfo::from_capture(is_gdi, reason)
+                                .with_display(event_display)
+                                .with_codec(event_codec),
                         )),
                         PipelineEvent::Cursor(cd) => Some(cursor(&cd)),
                     };
@@ -1744,7 +1878,14 @@ async fn arm_connected_notices(
         // #109: the same snapshot now names the screen, so "connected but the
         // picture is of the wrong monitor" is answerable from the stream_info
         // alone.
-        stream_info(&StreamInfo::default().with_display(settings.display())),
+        stream_info(
+            &StreamInfo::default()
+                .with_display(settings.display())
+                .with_codec(settings.codec())
+                // #110: 机器名只发给主机级身份（或无门部署）。同一台机器上
+                // 两个租户时，这一栏是唯一会互相串味的东西。
+                .with_node_visible(principal.may_name_host()),
+        ),
         server_settings(settings),
         connection(false),
     ];
@@ -1791,11 +1932,11 @@ async fn arm_connected_notices(
     //
     // Only input is accepted here: `control` owns settings, clipboard and the
     // downstream channel, and none of that belongs on an unreliable stream.
-    // #88: DataChannel 层的 principal 是空的 —— peer 地址只在 TCP 建连那一刻
-    // 存在，属于 WS 升级时的上下文，这里拿不到；会话号也还没引入。未来做
-    // 鉴权时，正确做法是在 WS 升级把 token 解析成角色、随 MediaSession 带进
-    // 来，这里换掉 `Principal::default()` 即可，插桩点不用动。
-    let dc_principal = Principal::default();
+    // #110: DataChannel 的 principal 现在是真的 —— `peer`/会话号在 `run` 里
+    // 就填好了，租户与角色来自升级时那张令牌。以前这里是 `Principal::default()`
+    // （默认租户的观众），于是任何读身份的策略都会把持有主机级令牌的会话当成
+    // 观众，输入全部被拒。插桩点一行没改，因为它们本来就只问 `security::allow`。
+    let dc_principal = principal.clone();
     // 两个闭包都是 `move`，各拿一份；`Principal` 是小结构，clone 比 Arc 便宜。
     let pointer_principal = dc_principal.clone();
     let control_principal = dc_principal;
@@ -2003,10 +2144,15 @@ async fn arm_connected_notices(
                             "video codec -> {}: restarting the session so the new m-line can be negotiated",
                             codec.wire()
                         );
-                        // #101: the encoder is shared, so the new m-line has to
-                        // be negotiated by every session, not just this one.
+                        // #101/#110: a negotiated codec cannot change inside a
+                        // live PeerConnection, so the sessions that have to
+                        // renegotiate are the ones attached to *this* program —
+                        // the pick no longer reaches the other screen.
                         let n = codec_registry
-                            .kick("video codec changed; reconnecting", None)
+                            .kick_display(
+                                "video codec changed; reconnecting",
+                                settings.display(),
+                            )
                             .await;
                         if n == 0 {
                             log::warn!("codec changed but there is no live session to restart yet");
@@ -2146,16 +2292,17 @@ async fn arm_connected_notices(
                     log::info!("client sets crf -> {crf}");
                     settings.set_crf(crf);
                 }
-                // #80: sound on/off and its encoder bitrate. Process-wide
-                // statics rather than session state: the audio thread outlives
-                // the select loop and only reads them once per frame.
+                // #80/#110: sound on/off and its encoder bitrate. These are the
+                // *program's* values now: the audio thread reads the same atomics
+                // once per frame, and a session muting its stream must not mute
+                // the other screen.
                 Action::SetAudioOn(on) => {
                     log::info!("client sets audio -> {on}");
-                    crate::pipeline::audio::set_enabled(on);
+                    settings.set_audio_enabled(on);
                 }
                 Action::SetAudioBitrate(bps) => {
                     log::info!("client sets audio bitrate -> {bps} bps");
-                    crate::pipeline::audio::set_bitrate_bps(bps as i32);
+                    settings.set_audio_bitrate_bps(bps as i32);
                 }
                 // #57: pointer-rendering handover. `true` (pointer lock):
                 // frontend hides its pointer, server composites the OS cursor
@@ -2213,14 +2360,25 @@ async fn arm_connected_notices(
 /// the case where the PC reaches Connected a second time (transient ICE
 /// `Disconnected` -> `Connected`). `on_open` only fires on the first open, so
 /// the panel kept stale capture / settings values across a re-connect.
-async fn resend_notices(media: &Arc<Mutex<MediaSession>>, settings: &StreamSettings) {
+async fn resend_notices(
+    media: &Arc<Mutex<MediaSession>>,
+    settings: &StreamSettings,
+    // #110: 与首连的 `notices` 用同一条规则 —— 重连不该把刚才藏起来的机器名
+    // 又发一遍出去。
+    name_host: bool,
+) {
     let control = media.lock().await.channels().control().clone();
     if control.ready_state() != RTCDataChannelState::Open {
         log::debug!("re-connect notices skipped: control channel not open");
         return;
     }
     let notices = [
-        stream_info(&StreamInfo::default().with_display(settings.display())),
+        stream_info(
+            &StreamInfo::default()
+                .with_display(settings.display())
+                .with_codec(settings.codec())
+                .with_node_visible(name_host),
+        ),
         server_settings(settings),
         connection(false),
     ];
@@ -2449,8 +2607,8 @@ pub(crate) fn apply_settings_batch(settings: &StreamSettings, payload: &str) -> 
     if let Some(id) = map.get("encoder").and_then(|v| v.as_str()) {
         match crate::pipeline::codec::VideoCodec::from_encoder_id(id) {
             Some(pick) => {
-                let previous = crate::pipeline::codec::current();
-                if crate::pipeline::codec::set(pick) {
+                let previous = settings.codec();
+                if settings.set_codec(pick) {
                     log::info!("SETTINGS: video codec {} -> {}", previous.wire(), pick.wire());
                     codec_changed = Some(pick);
                 }
@@ -2477,13 +2635,11 @@ pub(crate) fn apply_settings_batch(settings: &StreamSettings, payload: &str) -> 
     // #91: the audio slider's pick. `ab,<bps>` carries the same number on the
     // live path, but a pick also rides this batch (`picked`), and a batch that
     // dropped it would leave the two channels disagreeing about the target.
-    // 0 means "back to the built-in default", which `set_bitrate_bps` encodes.
+    // 0 means "back to the built-in default", which `set_audio_bitrate_bps`
+    // encodes.
     if let Some(bps) = map.get("audio_bitrate").and_then(as_u32) {
-        crate::pipeline::audio::set_bitrate_bps(bps as i32);
-        log::info!(
-            "SETTINGS: audio bitrate -> {bps} bps (applied {})",
-            crate::pipeline::audio::current_bitrate_bps()
-        );
+        let applied = settings.set_audio_bitrate_bps(bps as i32);
+        log::info!("SETTINGS: audio bitrate -> {bps} bps (applied {applied})");
     }
     // #92: the panel's CRF pair rides the batch too. `_rc,` / `_crf,` carry the
     // same picks on the live path, but a batch that dropped them would leave the
@@ -2518,6 +2674,9 @@ pub(crate) fn apply_settings_batch(settings: &StreamSettings, payload: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // #110: only the tests need the enum by name — the production path asks
+    // `SharedPipeline::owns_input`, so the top-level import went away.
+    use crate::config::InputPolicy;
 
     /// #102：准入的边界必须恰好是 `max`，多一个都不行。
     ///
@@ -2605,6 +2764,13 @@ mod tests {
         assert!(!viewer_may_run(&Action::InputStub("kd,65".to_owned())));
         assert!(!viewer_may_run(&Action::SetFps(30)));
         assert!(!viewer_may_run(&Action::SetAudioOn(false)));
+        // #110: 这四条以前**没有**被拦，因为默认的 `shared` 让 `owns()` 恒为真，
+        // 白名单从不执行。编码器现在是每块屏一份，"观众改我的编码器"才成为一个
+        // 需要被拒绝的动作，而不是一次全机广播。
+        assert!(!viewer_may_run(&Action::SetSettings("{}".to_owned())));
+        assert!(!viewer_may_run(&Action::SetResolution(1280, 720)));
+        assert!(!viewer_may_run(&Action::SetDisplayResolution(1920, 1080)));
+        assert!(!viewer_may_run(&Action::SetBitrate(5_000)));
         // 读类照旧放行，否则第二个页签连统计面板都看不了。
         assert!(viewer_may_run(&Action::StatsOn));
         assert!(viewer_may_run(&Action::StatsOff));
@@ -2749,11 +2915,15 @@ mod tests {
             program: program.clone(),
             session: 1,
             denied: denied_a.clone(),
+            // #110: 这张测试问的是租约，所以角色给"能操作"；角色那一半由
+            // `a_viewer_token_never_owns_input` 单独验。
+            may_operate: true,
         };
         let b = ControlGate {
             program: program.clone(),
             session: 2,
             denied: denied_b.clone(),
+            may_operate: true,
         };
 
         program.set_controller(Some(1));
@@ -2792,6 +2962,7 @@ mod tests {
             program: program.clone(),
             session: 7,
             denied: Arc::new(AtomicU64::new(0)),
+            may_operate: true,
         };
         program.set_controller(Some(6));
         assert!(
@@ -2801,6 +2972,45 @@ mod tests {
         // 全公开的只读白名单在共享模式下不再有机会被触发，但保留它对
         // `exclusive` 仍然有效。
         assert!(viewer_may_run(&Action::StatsOn));
+    }
+
+    /// #110：`viewer` 令牌即使在共享模式下、即使租约就在自己手里，也不能动。
+    ///
+    /// 租约与角色是**两个**条件，缺一个就会漏：只看租约时，一个观众只要先
+    /// 连上就能拿到租约然后一直注入；只看角色时，同一台机器上两个操作者会
+    /// 同时抢指针。这条测试盯的是前一个洞 —— 它比后一个更难发现，因为症状
+    /// 是"能操作但身份写着 viewer"，看起来像是标签错了。
+    #[test]
+    fn a_viewer_token_never_owns_input() {
+        use crate::pipeline::SharedPipeline;
+
+        // 共享模式是最宽松的一档（任何人都算持有租约），所以用它来证明
+        // 拒绝确实来自角色而不是来自租约。
+        let program = SharedPipeline::stub(
+            PipelineHandle::new(),
+            StreamSettings::from_config(&Config::default()),
+            InputPolicy::Shared,
+        );
+        let viewer = ControlGate {
+            program: program.clone(),
+            session: 9,
+            denied: Arc::new(AtomicU64::new(0)),
+            may_operate: false,
+        };
+        program.set_controller(Some(9));
+        assert!(
+            !viewer.owns(),
+            "viewer 令牌不能因为先到而获得操作权"
+        );
+        // 同一份状态把角色翻过来就必须放行 —— 否则这条测试也能靠"租约没写好"
+        // 通过，什么都没证明。
+        let operator = ControlGate {
+            program: program.clone(),
+            session: 9,
+            denied: Arc::new(AtomicU64::new(0)),
+            may_operate: true,
+        };
+        assert!(operator.owns());
     }
 
     /// #103：持租约的会话退出时，租约交给同一块屏上**最早**的幸存者。

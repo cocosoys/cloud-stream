@@ -117,8 +117,14 @@ pub struct MediaSession {
 
 impl MediaSession {
     /// Stage6.1: build API / SettingEngine / MediaEngine / PC, open channels,
-    /// add the VP8 track, register the ICE and state callbacks.
-    pub async fn new() -> Result<Self> {
+    /// add the video track, register the ICE and state callbacks.
+    ///
+    /// #110: `codec` names the m-line this session offers. It is passed in
+    /// rather than read from a process-wide value: the program a session will
+    /// join does not exist yet at `SESSION` time, so the source of truth is the
+    /// session's own settings — which is also what the SDP-answer path consults
+    /// when a browser refuses the pick, so offer and refusal cannot disagree.
+    pub async fn new(codec: crate::pipeline::codec::VideoCodec) -> Result<Self> {
         let mut setting_engine = SettingEngine::default();
         // No detach_data_channels(): attached channels keep the internal read
         // loop that dispatches on_message; see the module-level note.
@@ -149,7 +155,7 @@ impl MediaSession {
         };
         let pc = Arc::new(api.new_peer_connection(config).await?);
 
-        let video = VideoTrack::new(crate::pipeline::codec::current())?;
+        let video = VideoTrack::new(codec)?;
         let sender = pc.add_track(video.as_track_local()).await?;
 
         // #77: the sound track first (produces `m=audio sendonly`), then an

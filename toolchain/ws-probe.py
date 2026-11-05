@@ -22,6 +22,12 @@ RFC 6455 拆帧——剩下的字节原样看。
 做的同一件事），然后断言收到的是 `0x03` 条纹、每条以 JPEG 的 SOI 开头、`y` 从 0
 开始且逐条递增 —— 这条路径是"任何浏览器都能看"的唯一保证，它坏了没有任何画面。
 
+麦克风上行（`0x02`）**必须恰好得到一个答复**：`MICROPHONE_READY,{target,…}`
+（上行已开，payload 里带着写到哪个端点、会不会自听）或 `MICROPHONE_DISABLED`
+（没租约 / 令牌是观众 / 目标不可用）。没有答复就是最坏的一种"看起来正常"：
+页面电平条照跳、对面一个字都听不到，客户端无处可查。答复两次则是回音壁
+（页面按帧发 `0x02`，每帧一句文本会把 socket 淹掉）。
+
 输出每一帧的 head 解析结果，最后给出结论行 `RESULT ok|fail <原因>`。
 """
 
@@ -40,6 +46,10 @@ WANT_FRAMES = int(sys.argv[3]) if len(sys.argv) > 3 else 5
 TARGET_DISPLAY = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] != "-" else None
 # JPEG 条纹兜底。
 JPEG = len(sys.argv) > 5 and sys.argv[5].lower() == "jpeg"
+# 默认把每条文本消息截到 160 字符（`server_settings` 一整行有几千字符，全打出来
+# 只会淹掉帧）。但**断言看全文、打印才截断** —— 需要人眼核对某个深在行尾的键
+# （`microphone_enabled` 就在最后一项）时，置 `WS_PROBE_FULL=1` 打全。
+FULL = os.environ.get("WS_PROBE_FULL") == "1"
 
 WIRE_CODECS = {1: "h264", 2: "vp8", 3: "vp9", 4: "av1", 5: "h265"}
 
@@ -146,9 +156,9 @@ def main():
     # `taggedClipboardFetch` 靠它结束等待；不回只是"剪贴板永远空着"，不报错。
     send_text(sock, "cr")
 
-    # #110: 麦克风上行服务端没有接收端，必须**明确回绝**（`MICROPHONE_DISABLED`），
-    # 否则页面会一直采集、电平条一直跳，而对面永远听不到。这里发一帧假的 `0x02`，
-    # 断言这句回绝真的回来了 —— 这是"广告了没货"那条最直接的证据。
+    # #110: 麦克风上行服务端必须**明确回话**：`MICROPHONE_READY`（上行开了，带目标
+    # 端点）或 `MICROPHONE_DISABLED`（没租约 / 观众令牌 / 目标不可用）。沉默是最
+    # 坏的一种：页面电平条照跳，对面永远没声音，而客户端没有任何线索。
     send_binary(sock, b"\x02" + b"\x00" * 8)
 
     # #109: 像页面一样选屏。`displayId` 是页面自己的字段名（signaling 的 hello
@@ -185,7 +195,7 @@ def main():
             # 120 个字符会让"有没有这条消息"的检查变成一个假阴性 —— 第一次跑
             # 就是这么误报的。
             text_seen.append(line)
-            print(f"text: {line[:160]}")
+            print(f"text: {line if FULL else line[:160]}")
             if reset_line and line.strip() == reset_line:
                 armed = True
                 STATE["armed"] = True
@@ -280,8 +290,25 @@ def main():
         fail("no server_settings payload")
     if "clipboard_reply,cr" not in text_seen:
         fail("no clipboard_reply,cr answer to the connect-time `cr`")
-    if "MICROPHONE_DISABLED" not in text_seen:
-        fail("no MICROPHONE_DISABLED answer to a 0x02 uplink: the page would keep capturing")
+    ready = [t for t in text_seen if t.startswith("MICROPHONE_READY")]
+    refuse = [t for t in text_seen if t.strip() == "MICROPHONE_DISABLED"]
+    if not ready and not refuse:
+        fail(
+            "no answer to a 0x02 mic uplink: the page would keep capturing and show a "
+            "live level meter while nobody hears anything"
+        )
+    if ready and refuse:
+        fail(
+            "both MICROPHONE_READY and MICROPHONE_DISABLED came back: the page turns the "
+            "mic off while the uplink is open"
+        )
+    if ready:
+        mic = "ready"
+        print(f"mic: {ready[0][:200]}")
+    else:
+        mic = "disabled"
+        print("mic: MICROPHONE_DISABLED (no lease, viewer token, or no uplink target)")
+
     if reset_line and reset_line not in text_seen:
         fail(f"no `{reset_line}` after SETTINGS displayId={TARGET_DISPLAY}")
     if JPEG:
@@ -308,7 +335,7 @@ def main():
         print(
             f"RESULT ok stripes={len(stripes)} frames={len(groups)} "
             f"bands={len(groups[0][1])} audio={audio} text={len(text_seen)} "
-            f"jpeg=1 pre_switch_vp8={vp8_in_jpeg}"
+            f"jpeg=1 mic={mic} pre_switch_vp8={vp8_in_jpeg}"
         )
         sock.close()
         return
@@ -322,7 +349,7 @@ def main():
     switched = f" display={TARGET_DISPLAY}" if TARGET_DISPLAY else ""
     print(
         f"RESULT ok frames={frames} keyframes={keyed} audio={audio} text={len(text_seen)}"
-        f"{switched}{size} pre_switch={pre_switch_frames}"
+        f"{switched}{size} mic={mic} pre_switch={pre_switch_frames}"
     )
     sock.close()
 

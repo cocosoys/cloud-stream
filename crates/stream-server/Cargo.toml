@@ -74,6 +74,12 @@ audiopus = "0.2"
 # `windows` crate pinned to the same 0.52 release as `windows-sys`.
 windows = { version = "0.52", features = [
     "Win32_Foundation",
+    # #109: PKEY_Device_FriendlyName 在 FunctionDiscovery 下；虚拟麦克风探测靠它
+    # 认端点名字（`CABLE Input`、`Steam Streaming Microphone`），没有它就只能
+    # 枚举出一串设备 id。
+    "Win32_Devices_FunctionDiscovery",
+    # #109: Parsec VUSB 驱动是否安装，读 `Enum\Root\Parsec\VUSBA` 一次即可。
+    "Win32_System_Registry",
     "Win32_Media_Audio",
     "Win32_Security",
     "Win32_System_Com",

@@ -716,9 +716,10 @@ fn run_blocking_loop(
             // later change comes back through `InnerOutcome::Rebuild`.
             settings.rate_control(),
             settings.crf(),
-            // #94: likewise fixed at open (it selects the libvpx encoder), and
-            // the same rebuild path covers a pick made while the stream is live.
-            codec::current(),
+            // #94/#110: likewise fixed at open (it selects the libvpx encoder),
+            // and the same rebuild path covers a pick made while the stream is
+            // live. Read from this program's settings, not a process-wide value.
+            settings.codec(),
         ) {
             Ok(encoder) => encoder,
             Err(err) => {
@@ -726,7 +727,7 @@ fn run_blocking_loop(
                 handle.emit_event(PipelineEvent::Lost(format!("encoder_open_failed: {reason}")));
                 anyhow::bail!(
                     "{} encoder open failed: {err:#}",
-                    codec::current().label()
+                    settings.codec().label()
                 );
             }
         };
@@ -1196,11 +1197,11 @@ fn run_inner_beat(
         // only way a *negotiated* codec can change), so this fires only if a
         // pick lands in the window before that restart; rebuilding keeps the
         // encoder from disagreeing with the track until then.
-        if codec::current() != encoder.codec() {
+        if settings.codec() != encoder.codec() {
             log::info!(
                 "client switched codec {} -> {}: rebuilding encoder (session restart follows)",
                 encoder.codec().wire(),
-                codec::current().wire()
+                settings.codec().wire()
             );
             return InnerOutcome::Rebuild { from_gdi: worker.is_gdi() };
         }

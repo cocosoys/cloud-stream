@@ -188,23 +188,29 @@ GET 该路径返回 405：一个永远成功的探针比没有探针更糟。
 python toolchain/ws-probe.py 192.168.59.148 8080 5
 ```
 
-线上实测（.148，1080p，桌面静态）：
+线上实测（.148，1080p，桌面静态，2026-11-05）：
 
 ```
 handshake: HTTP/1.1 101 Switching Protocols
+text: AUTH_SUCCESS,{"credential":"none","role":"controller","slot":1,"tenant":"default"}
 text: MODE websockets
-text: {"settings":{"audio_bitrate":{…},"encoder":{"value":"vp8enc",…},…},"type":"server_settings"}
-frame#0: type=0x04 codec=vp8 key=1 id=0 y=0 1920x1080 ref=0 payload=173437B fin=1
-frame#1: type=0x04 codec=vp8 key=1 id=1 y=0 1920x1080 ref=0 payload=173247B fin=1
-frame#2: type=0x04 codec=vp8 key=0 id=2 y=0 1920x1080 ref=1 payload=46550B fin=1
-frame#3: type=0x04 codec=vp8 key=0 id=3 y=0 1920x1080 ref=2 payload=31472B fin=1
-frame#4: type=0x04 codec=vp8 key=0 id=4 y=0 1920x1080 ref=3 payload=27759B fin=1
+text: {"settings":{"audio_bitrate":{…},"microphone_enabled":{"locked":false,"value":false},…}}
+text: {"info":{"backend":"windows","codec":"VP8","display":0,"encode_node":"CLIENT001",…}}
 text: clipboard_reply,cr
-RESULT ok frames=8 keyframes=1 audio=0 text=4
+text: MICROPHONE_DISABLED
+frame#0: type=0x04 codec=vp8 key=1 id=0 y=0 1920x1080 ref=0 payload=24165B fin=1
+frame#1: type=0x04 codec=vp8 key=0 id=1 y=0 1920x1080 ref=0 payload=75980B fin=1
+…
+RESULT ok frames=8 keyframes=1 audio=0 text=7 1920x1080 mic=disabled pre_switch=0
 ```
 
 `clipboard_reply,cr` 是连接建立时页面发的 `cr` 的回执：没有它，页面的
 `taggedClipboardFetch` 会一直等在那儿，剪贴板同步永远不开始。
+
+这次 `mic=disabled` 是因为探针连上去时**另一个会话正握着输入租约**（同一块屏的
+`exclusive` 模式）—— 探针是观众，麦克风这道门对它关着，服务端如实回绝而不是
+静默丢弃。日志同一时刻写着 `identified as tenant=default grant=viewer operates=yes
+cred=none` 与 `microphone refused (grant=viewer, operates=yes, lease=no)`。
 
 这台虚拟机上 `audio=0` 是预期结果 —— 机器不播放任何声音，loopback 没有事件可采。
 有声音的机器上同一个探针应给出非零值。
@@ -246,7 +252,7 @@ ws media: 192.168.59.146 detached (1 downlink(s) left, 0 frame(s) dropped)
 | `m` / `m2` / `kd` / `ku` / `kh` / `kr` / `p` / `sf` / `js` | `classify` → `InputStub`，按 `--input-policy` 放行或计入 `denied` |
 | `cw` / `cws` / `cwd` / `cwe` / `cb` / `cbs` / `cbd` / `cbe` | `ClipboardSink`：读请求、写开始、分块、结束 |
 | `LOST_FRAME` / `DECODE_PACE` / `CLIENT_FRAME_ACK` / `vp,…` | 忽略（前端自己的流控） |
-| 二进制 `0x02`（麦克风） | 回一条 `MICROPHONE_DISABLED`，见 §8 |
+| 二进制 `0x02`（麦克风） | 写虚拟录音设备，回 `MICROPHONE_READY,{…}` 或 `MICROPHONE_DISABLED`，见 §8 |
 | 二进制 `0x06`（摄像头） | 回一条 `WEBCAM_DISABLED`，见 §8 |
 
 ### 7.1 选屏：`SETTINGS.displayId`
@@ -276,28 +282,54 @@ WS 侧能选屏的唯一信息来源就是这一批 —— 这一版之前直接
 `clipboard_data,<b64>` / `clipboard_finish` / `clipboard_reply,cr` / `clipboard_secret`。
 发成 WebRTC 那套 `cb,…` 页面只会当成未知消息丢掉。
 
-## 8. 没做的两件事：麦克风与摄像头
+## 8. 麦克风与摄像头
 
-两条上行都**没有接收端**，所以现在的做法是**明确回绝**，而不是收下再丢掉：
+一条上行做了、一条没做，但两者的契约是同一条：**任何一次 `0x02` / `0x06` 都必须
+得到恰好一次答复**。沉默是最坏的结果 —— 页面电平条照跳、对面一个字听不到，而
+客户端没有任何线索可查。
 
 | 上行 | 页面收到 | 页面行为 |
 |---|---|---|
+| `0x02` 麦克风 Opus | `MICROPHONE_READY,{"target":…,"note":…,"echoes":…}` | 上行已开，电平条继续 |
 | `0x02` 麦克风 Opus | `MICROPHONE_DISABLED` | `microphoneEnabled = false`，停采集，状态条关掉 |
 | `0x06` 摄像头帧 | `WEBCAM_DISABLED` | `webcamEnabled = false`，停采集 |
 
 每条连接只回一次：页面的电平条按帧发 `0x02`，每帧回一条文本会把 socket 变成回音壁。
+所以两个答复都挂在 `mic_refused` / 状态机后面，不是"每帧答一次"。
 
-同时 `server_settings` 里两条声明都是 `{value: false, locked: true}`（前端的
-`lockedOff` 写法），挡住自动启动 —— 只发设置挡不住手动点，只回消息则启动时会先弹
-一次权限请求，两条都要有。
+### 8.1 麦克风：写虚拟录音设备
 
-为什么不做：麦克风要"把浏览器音频播进被控机的麦克风"，Windows 上没有这个接口
-（要么装虚拟声卡，要么走 `Stereo Mix` 之类的回环），摄像头要一条反向视频 track
-加一路解码。这两条都不是"再接一个分支"的量级，所以这一版宁可把开关关掉，也不留一个
-点了没反应的开关。
+`MicUplink`（`pipeline/audio.rs`）把 Opus 解成 48 kHz 立体声，写进由
+`platform/virtual_mic.rs` 决议出的**虚拟线缆 render 端**：Steam Streaming
+Microphone → VB-CABLE（`CABLE Input`）→ VoiceMeeter，都没有才退回默认播放端点
+（`--mic-device default`，只用于"对讲"，必定自听）。
 
-注意 `MICROPHONE_DISABLED` 只在 WebSocket 这条路上发：WebRTC 的页面
-（`selkies-wr-core.js`）没有这个分支，发过去只会被当成未知消息。
+为什么不写默认扬声器：下行 loopback 采的就是默认端点的后混音信号，注入的声音会被
+自己采回去，说话的人听到自己的声音延迟一个往返 —— 这是拓扑决定的，改延迟改码率都
+消不掉。`MICROPHONE_READY` 里的 `echoes: true` 就是这件事的机器可读形式。
+
+`MICROPHONE_DISABLED` 有三种来因，日志会写明是哪一种：
+
+1. **没有输入租约**（`exclusive` 下另一个会话正在操作）—— 麦克风是往主机送声音，
+   和键鼠同一道门；
+2. **令牌是 `viewer`** —— 任何策略下都不给；
+3. **目标不可用**（`--mic-device` 指的端点不存在，或虚拟线缆被设成了默认播放设备）。
+
+第 1、2 种以前是**静默丢弃 + denied 计数**，页面无从得知；现在一并回绝，因为
+"观众点了麦克风"在页面上的正确反应和"服务端没接收端"完全一样：关掉它。
+
+### 8.2 摄像头：仍然没做
+
+反向视频 track 全项目未实现（WebRTC 侧同样没有），所以 `0x06` 一律回绝。这一条
+与麦克风不同：不是"接一个分支"的量级，要一条反向 track 加一路解码。
+
+同时 `server_settings` 里麦克风的声明现在跟随 `--mic-device` 的决议结果（`locked`
+只在真的没有可用目标时才为 true），摄像头仍是 `{value: false, locked: true}`
+（前端的 `lockedOff` 写法）—— 只发设置挡不住手动点，只回消息则启动时会先弹一次
+权限请求，两条都要有。
+
+注意这些答复只在 WebSocket 这条路上发：WebRTC 的页面（`selkies-wr-core.js`）没有
+这些分支，发过去只会被当成未知消息。
 
 ## 9. 还差什么
 

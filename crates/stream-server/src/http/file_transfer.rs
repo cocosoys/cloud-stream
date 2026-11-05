@@ -42,6 +42,62 @@ pub const MAX_UPLOAD_BODY: usize = 256 * 1024 * 1024;
 /// Stream chunks used while downloading a file attachment.
 const DOWNLOAD_CHUNK: usize = 64 * 1024;
 
+/// #110: 一个租户在上传根下的目录。
+///
+/// 布局是 `<upload-dir>/<tenant>/…`，**包括**默认租户 —— 不留"默认租户直接用
+/// 根"的例外。那个例外看起来能兼容旧部署，实际是把默认租户变成能看见所有租户
+/// 目录名的那个租户（一次 `GET /api/files/` 就把别人的目录名全列出来）。
+/// 一致性比兼容重要：迁移只需把旧文件挪进 `<root>/default/`。
+///
+/// 目录名走 [`crate::security::TenantId::as_path_segment`]，所以命令行里写
+/// `--auth-grant ../..:host:x` 也跑不出上传根。
+pub fn tenant_root(root: &Path, tenant: &crate::security::TenantId) -> PathBuf {
+    root.join(tenant.as_path_segment())
+}
+
+/// 这个租户已经用掉多少字节，最多数到 `ceiling`。
+///
+/// 早退是刻意的：配额判断只需要知道"够不够超"，把一棵大目录完整数完再去比较
+/// 等于每次上传都扫一遍磁盘。符号链接**不跟随**（`symlink_metadata`）—— 跟着
+/// 它数，等于让一个放在租户目录里的链接把别人的体积算到自己头上，同时把
+/// 目标目录的存在性泄露出去。
+fn tenant_bytes_used(dir: &Path, ceiling: u64) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else {
+                // `metadata()` 跟随链接；先看 `file_type` 把它挡掉。
+                continue;
+            };
+            if entry.file_type().map(|t| t.is_symlink()).unwrap_or(false) {
+                continue;
+            }
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else {
+                total += meta.len();
+                if total >= ceiling {
+                    return total;
+                }
+            }
+        }
+    }
+    total
+}
+
+/// 这次写入会不会超出租户配额。`0` 表示不限。
+fn over_quota(cfg: &Config, root: &Path, incoming: u64) -> bool {
+    let quota = cfg.upload_quota_mb.saturating_mul(1024 * 1024);
+    if quota == 0 {
+        return false;
+    }
+    tenant_bytes_used(root, quota).saturating_add(incoming) > quota
+}
+
 /// In-flight chunked-upload state, keyed by the normalized destination path.
 #[derive(Debug, Clone)]
 pub struct ChunkState {
@@ -433,21 +489,31 @@ async fn file_download<S: AsyncWrite + Unpin>(stream: &mut S, target: &Path) -> 
 }
 
 /// `GET /api/files/{rel}` entry point.
+///
+/// #110: `rel` 是**相对租户根**的路径。以前它相对整个上传根，于是任何一个
+/// 拿着参观者令牌的人都能列出、下载别人传上来的每一份文件。
 pub async fn handle_files<S: AsyncWrite + Unpin>(
     stream: &mut S,
     rel: &str,
     cfg: &Config,
+    principal: &crate::security::Principal,
 ) -> io::Result<()> {
-    let Some(root) = &cfg.upload_dir else {
+    let Some(base) = &cfg.upload_dir else {
         return json_err(stream, 404, "Not Found", "file transfer disabled").await;
     };
+    let root = tenant_root(base, &principal.tenant);
+    // 第一次访问时把目录建出来：一个刚开的租户应该看到空列表，而不是 404 ——
+    // "这里本来就是空的"和"你走错地方了"在文件管理器里长得完全一样。
+    if let Err(_) = std::fs::create_dir_all(&root) {
+        return json_err(stream, 500, "Internal Server Error", "mkdir failed").await;
+    }
     let parts = match web_parts(rel) {
         Some(p) => p,
         None => {
             return json_err(stream, 403, "Forbidden", "Directory Traversal detected").await;
         }
     };
-    let target = match resolve_target(root, &parts) {
+    let target = match resolve_target(&root, &parts) {
         Ok(t) => t,
         Err(()) => {
             return json_err(stream, 403, "Forbidden", "Directory Traversal detected").await;
@@ -480,16 +546,22 @@ fn chunk_part_name(leaf: &str) -> String {
 
 /// `POST /api/upload` entry point. `body` holds the full request payload; the
 /// header contract is read through `headers`.
+///
+/// #110: 写入的是这个principal 所属租户的根，并且过一道配额。两者缺一不可 ——
+/// 只分目录不给配额，等于把"一个人写满磁盘"改成"任意一个人写满自己那份、总量
+/// 仍然无上限"。
 pub async fn handle_upload<S: AsyncWrite + Unpin>(
     stream: &mut S,
     headers: &[httparse::Header<'_>],
     body: &[u8],
     cfg: &Config,
     chunks: &ChunkStore,
+    principal: &crate::security::Principal,
 ) -> io::Result<()> {
-    let Some(root) = &cfg.upload_dir else {
+    let Some(base) = &cfg.upload_dir else {
         return json_err(stream, 403, "Forbidden", "uploads disabled").await;
     };
+    let root = tenant_root(base, &principal.tenant);
     let Some(path_hdr) = header_value(headers, "X-Upload-Path") else {
         return json_err(stream, 400, "Bad Request", "missing X-Upload-Path header").await;
     };
@@ -499,7 +571,7 @@ pub async fn handle_upload<S: AsyncWrite + Unpin>(
             return json_err(stream, 400, "Bad Request", "invalid upload path").await;
         }
     };
-    let target = match resolve_target(root, &parts) {
+    let target = match resolve_target(&root, &parts) {
         Ok(t) => t,
         Err(()) => {
             return json_err(stream, 403, "Forbidden", "path escape rejected").await;
@@ -521,10 +593,30 @@ pub async fn handle_upload<S: AsyncWrite + Unpin>(
         }
     }
 
-    let parent = target.parent().unwrap_or(root);
+    let parent = target.parent().unwrap_or(&root);
     if let Err(_) = std::fs::create_dir_all(parent) {
         return json_err(stream, 500, "Internal Server Error", "mkdir failed").await;
     }
+
+    // #110: 配额。放在 `create_dir_all` 之后、写盘之前 —— 目录已经存在，所以
+    // `tenant_bytes_used` 数到的是真实占用；而"先写完再检查"等于让一次超限的
+    // 上传先把磁盘占满、再被拒绝。
+    if over_quota(cfg, &root, body.len() as u64) {
+        log::warn!(
+            "upload refused: tenant {} is over its {} MiB quota ({} bytes more)",
+            principal.tenant.as_str(),
+            cfg.upload_quota_mb,
+            body.len()
+        );
+        return json_err(
+            stream,
+            507,
+            "Insufficient Storage",
+            "tenant storage quota exceeded",
+        )
+        .await;
+    }
+
     let leaf = target
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -686,6 +778,72 @@ async fn write_body(path: &Path, body: &[u8], append: bool) -> io::Result<usize>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #110: 两个租户落在两个目录里，而且租户名跑不出上传根。
+    #[test]
+    fn tenant_roots_are_separate_and_cannot_escape() {
+        use crate::security::TenantId;
+
+        let base = Path::new("C:\\uploads");
+        let alpha = tenant_root(base, &TenantId::new("alpha"));
+        let beta = tenant_root(base, &TenantId::new("beta"));
+        assert_ne!(alpha, beta);
+        assert!(alpha.starts_with(base) && beta.starts_with(base));
+
+        // 默认租户也走子目录 —— 见 `tenant_root` 的注释：不留"直接用根"的例外。
+        let dflt = tenant_root(base, &TenantId::default());
+        assert_eq!(dflt, base.join("default"));
+
+        // 这些名字是攻击输入，不是风格问题：拼进路径就跑出了上传根。
+        for hostile in ["..", "../..", "../../windows", "C:\\windows"] {
+            let root = tenant_root(base, &TenantId::new(hostile));
+            assert!(
+                root.starts_with(base),
+                "{hostile:?} escaped to {}",
+                root.display()
+            );
+            // 而且只多一层：`<base>/<name>`，不是一个更深的路径。
+            assert_eq!(root.parent(), Some(base), "{hostile:?} -> {}", root.display());
+        }
+    }
+
+    /// 配额：超额拒绝、未超额放行、`0` 表示不限。
+    #[test]
+    fn a_quota_is_measured_against_what_is_already_there() {
+        let dir = std::env::temp_dir().join(format!(
+            "cs-quota-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        // 1 MiB 配额，先放 3 MiB 进去 —— 已经超了。
+        std::fs::write(dir.join("big.bin"), vec![0u8; 3 * 1024 * 1024]).expect("write");
+        let mut cfg = Config::default();
+        cfg.upload_quota_mb = 1;
+        assert!(over_quota(&cfg, &dir, 1), "3 MiB 已超 1 MiB 配额");
+
+        // 配额放大到 8 MiB：3 MiB + 1 字节仍然放得下。
+        cfg.upload_quota_mb = 8;
+        assert!(!over_quota(&cfg, &dir, 1));
+        // 但再来 6 MiB 就不行了（3 + 6 > 8）。
+        assert!(over_quota(&cfg, &dir, 6 * 1024 * 1024));
+
+        // 0 是"不限"，不是"一律拒绝" —— 这两者差一次停服。
+        cfg.upload_quota_mb = 0;
+        assert!(!over_quota(&cfg, &dir, u64::MAX / 2));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 符号链接不计入体积：跟着它数，等于让一个链接把别人的文件算到自己头上，
+    /// 同时把目标目录的存在性泄露出去。
+    #[test]
+    fn symlinks_are_not_counted_towards_the_quota() {
+        let used = tenant_bytes_used(Path::new("C:\\definitely-not-here"), 1024);
+        assert_eq!(used, 0, "一个不存在的目录应当是 0 字节，而不是 panic");
+    }
 
     #[test]
     fn segments_reject_traversal_and_reserved() {

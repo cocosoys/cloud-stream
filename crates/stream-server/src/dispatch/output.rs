@@ -28,6 +28,20 @@ pub struct StreamInfo {
     /// wrong" and "the picture is of another screen" look identical on the
     /// wire, and this field tells them apart without reading the server log.
     pub display: u32,
+    /// #110: the codec this program encodes with.
+    ///
+    /// Carried on the snapshot rather than read from a process-wide atomic:
+    /// `stream_info` is per session, and the number it reports has to be the one
+    /// that session's program is actually producing.
+    pub codec: crate::pipeline::codec::VideoCodec,
+    /// #110: 这条连接能不能知道**这台机器叫什么**。
+    ///
+    /// 机器名是主机的身份，不是流的属性：一个租户的观众看到别人的机器名，
+    /// 等于免费拿到一份"这台机在哪个网段叫什么"的清单。默认 `true` ——
+    /// 构造点（`ws_media` / 信令）会用 [`crate::security::Principal::may_name_host`]
+    /// 把它降下来；默认开着是为了"没有门"的部署保持原样，那里连进来的人
+    /// 本来就是主人。
+    pub expose_node: bool,
 }
 
 impl Default for StreamInfo {
@@ -37,6 +51,8 @@ impl Default for StreamInfo {
             is_gdi: false,
             capture_reason: String::new(),
             display: 0,
+            codec: crate::pipeline::codec::VideoCodec::default(),
+            expose_node: true,
         }
     }
 }
@@ -51,12 +67,28 @@ impl StreamInfo {
             is_gdi,
             capture_reason: reason.into(),
             display: 0,
+            codec: crate::pipeline::codec::VideoCodec::default(),
+            expose_node: true,
         }
     }
 
     /// #109: attach the display this snapshot describes.
     pub fn with_display(mut self, display: u32) -> Self {
         self.display = display;
+        self
+    }
+
+    /// #110: attach the codec the described program is encoding with.
+    pub fn with_codec(mut self, codec: crate::pipeline::codec::VideoCodec) -> Self {
+        self.codec = codec;
+        self
+    }
+
+    /// #110: 这条连接该不该看到机器名。`false` 时 `stream_info` 干脆**不带**
+    /// `encode_node` 这个键 —— 发一个空串也行，但那样页面里"机器名"那一栏
+    /// 会显示成空而不是"没有这一项"，而这两件事在排障时不一样。
+    pub fn with_node_visible(mut self, visible: bool) -> Self {
+        self.expose_node = visible;
         self
     }
 }
@@ -155,36 +187,41 @@ pub fn pipeline(status: &str) -> String {
 /// One-shot `stream_info` snapshot sent after connected; a missing snapshot is
 /// exactly why the old panel showed "encoder unavailable / capture unavailable".
 pub fn stream_info(info: &StreamInfo) -> String {
-    json!({
-        "type": "stream_info",
-        "data": {
-            "backend": "windows",
-            "capture": info.capture,
-            "is_gdi": info.is_gdi,
-            "zero_copy": false,
-            "zero_copy_available": false,
-            "capture_reason": info.capture_reason,
-            // #109: which screen this is. Diagnostics only — the panel has no
-            // tile for it, and an old frontend simply ignores the key.
-            "display": info.display,
-            "encoder": "libvpx",
-            "hardware": false,
-            "gpu_present": false,
-            "hardware_expected": false,
-            "encoder_reason": "CPU software encoder; no GPU passthrough",
-            // #94: whichever libvpx encoder the session actually opened. The
-            // statistics tile reads this string, so it has to follow the live
-            // pick — a tile that says VP8 over a VP9 stream is the #91 bug.
-            "codec": crate::pipeline::codec::current().label(),
-            "fullcolor": false,
-            "bit_depth": 8,
-            "striped": false,
-            "gpu": "",
-            "driver": "",
-            "encode_node": node_name(),
+    let mut data = json!({
+        "backend": "windows",
+        "capture": info.capture,
+        "is_gdi": info.is_gdi,
+        "zero_copy": false,
+        "zero_copy_available": false,
+        "capture_reason": info.capture_reason,
+        // #109: which screen this is. Diagnostics only — the panel has no
+        // tile for it, and an old frontend simply ignores the key.
+        "display": info.display,
+        "encoder": "libvpx",
+        "hardware": false,
+        "gpu_present": false,
+        "hardware_expected": false,
+        "encoder_reason": "CPU software encoder; no GPU passthrough",
+        // #94/#110: whichever libvpx encoder *this program* actually opened.
+        // The statistics tile reads this string, so it has to follow that
+        // program's live pick — a tile that says VP8 over a VP9 stream is
+        // the #91 bug.
+        "codec": info.codec.label(),
+        "fullcolor": false,
+        "bit_depth": 8,
+        "striped": false,
+        "gpu": "",
+        "driver": "",
+        "encode_node": node_name(),
+    });
+    // #110: 机器名只发给有资格知道的人（见 `StreamInfo::expose_node`）。
+    // 删键而不是留空串：页面把空串画成"名字是空的"，把缺键画成"没有这一项"。
+    if !info.expose_node {
+        if let Some(object) = data.as_object_mut() {
+            object.remove("encode_node");
         }
-    })
-    .to_string()
+    }
+    json!({"type": "stream_info", "data": data}).to_string()
 }
 
 /// Periodic `stream_stats` sample; sent only while `_stats,1` is active.
@@ -279,6 +316,14 @@ pub fn connection(poor: bool) -> String {
 /// Leaving it `false` keeps the frontend on its window-following path, which is
 /// what this pipeline actually implements.
 pub fn server_settings(s: &crate::pipeline::StreamSettings) -> String {
+    // #110: 麦克风这一栏不再是常量。`virtual_mic` 在启动时决议出这台机器有没有
+    // 可写的虚拟录音设备（`--mic-device` 指定的，或 Steam / VB-CABLE / VoiceMeeter
+    // 里现成的一台），声明必须等于那个结果 —— 写死 `locked: true` 会把一条已经能
+    // 用的上行藏起来（页面上的开关根本不存在），写死 `locked: false` 会画出一个
+    // 点了没反应的开关。两种错都很安静：一个少机会，一个多谎话。
+    let mic_usable = crate::platform::virtual_mic::target()
+        .map(|t| t.usable)
+        .unwrap_or(false);
     json!({
         "type": "server_settings",
         "data": {
@@ -309,7 +354,7 @@ pub fn server_settings(s: &crate::pipeline::StreamSettings) -> String {
                 // this build has no encoder for them, and a menu entry that
                 // cannot be encoded is a knob that only pretends to work.
                 "encoder": {
-                    "value": crate::pipeline::codec::current().encoder_id(),
+                    "value": s.codec().encoder_id(),
                     "allowed": crate::pipeline::codec::VideoCodec::ALL
                         .iter()
                         .map(|c| c.encoder_id())
@@ -366,7 +411,7 @@ pub fn server_settings(s: &crate::pipeline::StreamSettings) -> String {
                 // (`audio::BITRATE_STEPS`), and `value` is the live target, not
                 // a remembered one.
                 "audio_bitrate": {
-                    "value": crate::pipeline::audio::current_bitrate_bps(),
+                    "value": s.audio_bitrate_bps(),
                     "allowed": crate::pipeline::audio::BITRATE_STEPS,
                     "min": crate::pipeline::audio::BITRATE_STEPS[0],
                     "max": crate::pipeline::audio::BITRATE_STEPS[crate::pipeline::audio::BITRATE_STEPS.len() - 1],
@@ -443,17 +488,19 @@ pub fn server_settings(s: &crate::pipeline::StreamSettings) -> String {
                 // 自动启动与按需启动。真要做摄像头上行（WebRTC 反向 track）时，
                 // 把这一行换回真实的 `webcam_encoder`，不要两行都留。
                 "webcam_enabled": { "value": false, "locked": true },
-                // 麦克风同理，而且是同一个坑的下一层：上行帧（WS 的 `0x02`、
-                // WebRTC 的反向 audio track）服务端没有接收端 —— 被控机上不存在
-                // "把浏览器音频播进主机麦克风"的接口。此前什么都不声明，页面就把
-                // 麦克风按钮画出来、开了、本地电平条跳动，而对面永远听不到。
+                // 麦克风是同一个坑的下一层，现在**已经有接收端**了（#109：Opus 解成
+                // 48 kHz 立体声写进虚拟线缆的 render 端），所以这一栏跟着决议结果走：
                 //
-                // `lockedOff('microphone_enabled')` 挡自动启动；手动点开关那一路由
-                // `ws_media` 在真的收到 `0x02` 时回一条 `MICROPHONE_DISABLED`
-                // 挡住（页面收到就把 `microphoneEnabled` 置 false 并停止采集）。
-                // 两条都要有：只发设置，用户手动点还能开；只回消息，页面启动时
-                // 会先弹一次权限请求。
-                "microphone_enabled": { "value": false, "locked": true }
+                //   * 有可用目标 → `{value: false, locked: false}`：默认关、允许手动开。
+                //     `value` 永远是 false —— 自动开麦会在连接时立刻弹一次浏览器权限
+                //     请求，而多数会话根本不用语音。
+                //   * 没有目标 → `{value: false, locked: true}`：前端 `lockedOff`
+                //     写法，把这一行藏起来，而不是画一个点了必然回绝的开关。
+                //
+                // 手动点开之后如果仍然走不通（没租约 / 令牌是 viewer / 目标在运行期
+                // 消失），`ws_media` 会回一条 `MICROPHONE_DISABLED` 让页面关掉它 ——
+                // 声明只回答"这台机器有没有这条路"，答不了"你现在能不能用"。
+                "microphone_enabled": { "value": false, "locked": !mic_usable }
             }
         }
     })
@@ -540,6 +587,34 @@ mod tests {
         // The envelope must stay the data-channel one; the WS transport strips
         // this layer itself and would break if the builder changed shape.
         assert_eq!(parsed["type"], json!("stream_info"), "wrong envelope: {line}");
+    }
+
+    /// #110: 机器名是主机级标识，不是流的属性。
+    ///
+    /// 这条钉两件事：默认（无门部署、主机级身份）**必须还发**，否则面板上
+    /// 那一栏会悄悄消失；被降下来时键要**整个不见**，而不是留一个空串 ——
+    /// 页面把空串画成"名字是空的"，把缺键画成"没有这一项"。
+    #[test]
+    fn the_machine_name_is_hidden_by_dropping_the_key() {
+        let shown: hbb_common::serde_json::Value =
+            hbb_common::serde_json::from_str(&stream_info(&StreamInfo::default()))
+                .expect("stream_info is JSON");
+        assert!(
+            shown["data"]["encode_node"].is_string(),
+            "无门部署必须照旧报机器名: {shown}"
+        );
+
+        let hidden: hbb_common::serde_json::Value = hbb_common::serde_json::from_str(&stream_info(
+            &StreamInfo::default().with_node_visible(false),
+        ))
+        .expect("stream_info is JSON");
+        assert!(
+            hidden["data"].get("encode_node").is_none(),
+            "降权后这个键必须不存在，而不是空串: {hidden}"
+        );
+        // 其余字段不受影响 —— 藏的是机器名，不是整个诊断面。
+        assert_eq!(hidden["data"]["encoder"], json!("libvpx"));
+        assert!(hidden["data"]["codec"].is_string());
     }
 
     /// The names are the frontend's (`lib/stream-stats-view.js` reads them off
@@ -678,15 +753,30 @@ mod tests {
             "a stop above the encoder's ceiling is one it silently clamps: {line}"
         );
 
-        // #106/#110: the two uplinks this server cannot receive a byte of must be
+        // #106: the webcam uplink this server cannot receive a byte of must be
         // advertised as `{value: false, locked: true}` — the frontend's `lockedOff`
         // shape, which hides the row instead of drawing a dead switch. Pinned here
-        // because "advertised but not implemented" is exactly what this pair of
-        // keys exists to stop, and a future refactor of the settings block must not
-        // quietly drop them back to a plausible-looking `*_encoder`.
-        for key in ["webcam_enabled", "microphone_enabled"] {
-            assert_eq!(settings[key]["value"], json!(false), "{key}: {line}");
-            assert_eq!(settings[key]["locked"], json!(true), "{key}: {line}");
-        }
+        // because "advertised but not implemented" is exactly what this key exists
+        // to stop, and a future refactor of the settings block must not quietly
+        // drop it back to a plausible-looking `webcam_encoder`.
+        assert_eq!(settings["webcam_enabled"]["value"], json!(false), "{line}");
+        assert_eq!(settings["webcam_enabled"]["locked"], json!(true), "{line}");
+
+        // #110: the microphone is no longer constant — the declaration has to equal
+        // what `virtual_mic` resolved on this host. Asserting a literal here would
+        // make the test pass on a machine with no virtual cable and lie on one that
+        // has it, which is precisely the drift this key exists to prevent. `value`
+        // stays false either way: auto-starting the mic means a permission prompt on
+        // every connect.
+        let mic_usable = crate::platform::virtual_mic::target()
+            .map(|t| t.usable)
+            .unwrap_or(false);
+        assert_eq!(settings["microphone_enabled"]["value"], json!(false), "{line}");
+        assert_eq!(
+            settings["microphone_enabled"]["locked"],
+            json!(!mic_usable),
+            "mic declared locked={} but virtual_mic resolved usable={mic_usable}: {line}",
+            settings["microphone_enabled"]["locked"]
+        );
     }
 }

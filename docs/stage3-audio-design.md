@@ -4,9 +4,10 @@
 > 已落地：WASAPI loopback 采集 + Opus 48k/立体声 + `audio-0` 轨道 + recvonly 麦克风
 > m-line 预留；`on_track` → Opus 解码 → WASAPI render 的上行；`START_AUDIO`/
 > `STOP_AUDIO` 与 `ab,<N>` 的接线。
-> **已知限制（未解决，见 §7）**：注入的麦克风落在默认 render 端点，与被 loopback
-> 采集的是同一个端点，因此玩家会听到自己一次（延迟一个往返）。耳机能切断声学回路，
-> 电气回路要靠回声消除。
+> **麦克风去向（#109，见 §8.2）**：注入**虚拟线缆的 render 端**（Steam Streaming
+> Microphone / CABLE Input / VoiceMeeter Input），程序从它的 capture 端读到麦克风，
+> 回路不存在。`--mic-device default` 才回到"注入默认扬声器"——那只服务对讲，且
+> 必定自听（旧实现只有这一条路）。
 
 ---
 
@@ -234,10 +235,10 @@ G.711 兜底，要么 vendor 一份预编译的 `opus.lib` 进仓库（与 `vend
 丢包用 Opus 的 PLC 补，一个缺失包补一帧、最多补 3 帧：长间隔是停顿或闭麦，
 不是丢包，凭空造 30 帧噪声比静音更糟。
 
-### 8.2 回声：这是物理问题，不是 bug
+### 8.2 回声：换成虚拟录音设备，回路就不存在（#109）
 
-麦克风注入的目标是**默认 render 端点**，而下行 loopback 采集的正是同一个端点的
-后混音信号。于是：
+最初的做法是把麦克风注入**默认 render 端点**，而下行 loopback 采集的正是同一个端点的
+后混音信号：
 
 ```
 浏览器麦克风 → 服务端注入默认扬声器 → loopback 采到 → 编码下行 → 浏览器播放
@@ -245,15 +246,130 @@ G.711 兜底，要么 vendor 一份预编译的 `opus.lib` 进仓库（与 `vend
                                                           玩家听到自己，延迟一个往返
 ```
 
-耳机能切断声学回路（扬声器 → 环境 → 麦克风），但**电气回路切不断**：注入的信号
-在混音之后才被采到，无法从混音里分出来。
+这不是 bug，是拓扑：注入在混音**之前**，采集在混音**之后**，没有算法能把两者分离。
+按代码常量算的往返是 150–330 ms（麦克风帧 20 + 取包 ≤5 + 设备缓冲 100 + loopback
+周期 10 + 下行帧 20 + 浏览器抖动缓冲 50–150 + 输出 20–40）。
 
-三条出路，成本递增：
+**决议（2026-11）**：不修延迟、不做 AEC，改注入目标。麦克风写到**虚拟线缆的 render
+端**，程序从它的 capture 端读到麦克风；注入信号从此不经过默认端点，回路不可达。
 
-| 方案 | 做法 | 代价 |
-| --- | --- | --- |
-| 接受 | 耳机 + 对讲场景 | 开麦时自听，长会话不可用 |
-| 进程回环 | `AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK` 只采 java.exe | 系统音/启动器声音丢失，Windows 10 2004+ |
-| 回声消除 | 用注入的 PCM 做参考信号相减 | 需要对齐 + 自适应滤波，工程量最大 |
+| 提供方 | 写入 | 程序选它当麦克风 | 装什么 |
+|---|---|---|---|
+| Steam | `Steam Streaming Microphone` | 同名 | Steam 自带 |
+| VB-CABLE | `CABLE Input` | `CABLE Output` | VB-Audio Virtual Cable |
+| VoiceMeeter | `VoiceMeeter Input` | `VoiceMeeter Output` | VoiceMeeter |
 
-当前取第一条，并在 `roadmap-future.md` 登记后两条的回访条件。
+探测与决议在 `platform/virtual_mic.rs`，`--mic-device` 可选 `auto`（默认）、`default`、
+家族名或具体端点名。`default` 保留旧行为给"对讲"（就是要从被控机扬声器出声、接受
+自听），其余情况下自听不应再出现。
+
+两条硬规则写进了代码：
+
+1. **虚拟线缆不能同时是默认播放端点**。是的话决议判 `usable: false` —— 那会让 loopback
+   采到我们写进去的东西，自听以"看起来全都装对了"的方式复发。
+2. **没有可用设备时不静默退回默认扬声器**。退回等于悄悄把回路接回来；宁可让上行失败
+   并说明装什么。
+
+历史：这条限制的来龙去脉见 `roadmap-future.md` §5；上游 Selkies 的做法是 PulseAudio
+的 null-sink + virtual-source（PR #188），本项目的分歧正在于此。
+
+### 8.3 WS 上行：两条传输共用一个"泵"（#110）
+
+在 #110 之前，上行只存在于 WebRTC（`TrackRemote` → Opus → 设备），WS 传输收到
+麦克风帧只回一句 `MICROPHONE_DISABLED`。现在两条传输都接了，实现上刻意不让它们分叉：
+
+```
+WebRTC: TrackRemote --(RTP 包)--> ┐
+                                  ├─> pump(stop, rx, idle) ─> Opus 解码 ─> 写端点
+WS:     `0x02` + Opus -----------> ┘
+```
+
+差别只在两处参数，不在算法：
+
+| | WebRTC | WS |
+|---|---|---|
+| 数据源 | `TrackRemote::read_rtp` | 页面二进制帧，首字节 `0x02` 后面全是 Opus |
+| 队列深度 | 64 包（1.28 s） | 8 包（160 ms）—— WS 不会乱序，迟到的语音比丢掉更糟 |
+| 设备开关 | 会话在就开着 | 第一包到达才开，空闲 1.5 s 后关 |
+| 丢包补偿 | 用 RTP 序号伪造 ≤3 帧 | 序号本地递增，永远不触发 |
+
+**页面的编码参数必须对上**：`selkies-core` 的 mic worker 写死 **24 kHz 单声道、
+20 ms 一帧**（`AudioEncoder` 无 WASM 回落时也是同一组参数）。设备要的是 48 kHz 立体声。
+不需要在服务端再写重采样器 —— Opus 允许解码到与编码不同的采样率与声道数，解码器自己
+重采样并把单声道复制到双声道。这条假设由 `a_24k_mono_packet_decodes_into_one_48k_stereo_frame`
+固定住：换掉解码器参数而不改这条测试，症状会是"有声音但音调快一倍"，极难往回追。
+
+页面的拒绝语义没变：目标端点不可用（没装虚拟线缆、或线缆成了默认播放设备）时回
+`MICROPHONE_DISABLED`，页面会把麦克风关掉。静默失败会让用户盯着一条白跳的电平条。
+
+### 8.4 设备缓冲：100 ms 是量出来的，但填满它是错的
+
+`Output::open()` 里 `Initialize` 请求 100 ms，实测 `GetBufferSize()` 就返回 4800 帧
+（100 ms）—— 这段延迟是真的，不是估算。
+
+但"把 free 全填上"是错的。旧实现每 5 ms 取一次 `free = buffer - padding` 并填满，
+缓冲里于是永远是 `数据 20 ms + 静音 80 ms` 的条纹：设备按实时速率消费，100 ms 里只有
+前 20 ms 有声音。实测 4.8 s 连续语音被补了 58560 个采样/声道（≈1.2 s）静音，听感是
+断续的"哒哒"声。麦克风是每 20 ms 来一包的数据源，不是随时有货的扬声器。
+
+现在两条规则：
+
+1. 只补到 **50 ms** 的排队深度（`RENDER_TARGET_MS`），不填满设备缓冲；
+2. 播放中**只写手上真有的帧**，没数据就什么都不写 —— 若照样补到目标深度，静音会始终
+   领在数据前面（实测改成 50 ms 后静音反而涨到 123840 个采样）。静音只用于"还没开播"
+   时给端点保活。
+
+同一条 4.8 s 语音的复测：数据 240 帧、静音恒为 4 帧（80 ms，只在开播前），不再随
+时长增长。副作用是注入延迟从 100 ms 降到 50 ms，对自听也是好事。
+
+### 8.5 虚拟线缆的正向验证：从 CABLE Output 读回波形（2026-11-05）
+
+到这一节为止，"注入成功"的证据只有"写端点的调用没报错"。写调用成功并不等于声音进了
+线缆：两头没接上、驱动没搬数据，返回值一样是 0。于是在被控机上补了真正的读数端。
+
+**装了什么**：VB-CABLE Driver Pack 45（`VBCABLE_Setup_x64.exe -i -h`，需管理员，
+不用重启；驱动包 `vbMmeCable64_win10.inf` 3.3.1.7，设备节点 `ROOT\MEDIA\0000`）。
+
+**端点变化**：
+
+| 方向 | 之前 | 之后 |
+|---|---|---|
+| 播放 | 扬声器 (High Definition Audio Device) | 多出 `CABLE Input`、`CABLE In 16ch` |
+| 录音 | 麦克风 (High Definition Audio Device) | 多出 `CABLE Output` |
+| 默认播放 | 扬声器 | **不变**（线缆绝不能抢默认，见 §8.2 硬规则 1） |
+
+`--mic-device auto` 的决议（health 里可直接看）：
+
+```json
+{"provider":"vb-cable","device":"CABLE Input (VB-Audio Virtual Cable)",
+ "capture":"CABLE Output (VB-Audio Virtual Cable)","usable":true,"echoes":false}
+```
+
+**端到端读数**：WS 推 251 帧 24 kHz 单声道 Opus（ffmpeg 生成的 440 Hz 正弦），同时
+`mic-probe.exe --capture CABLE` 从 `CABLE Output` 抓 16 s：
+
+```
+t=  8.6s rms= -37.9 dBFS peak= -18.0 dBFS   <- 首帧落地
+t=  9.1s rms= -21.8 dBFS peak= -17.4 dBFS
+...
+total: 16000 ms captured, 7580 ms above -50 dBFS
+VERDICT=SIGNAL
+```
+
+没开麦时同一端点是 `-96.7 dBFS`（驱动的抖动底噪）。**"有包"不等于"有声音"**：只看
+`GetBuffer` 有没有返回数据，静音线缆也一样通过，所以判定必须看电平（-50 dBFS）。
+
+信号持续 7.1 s，与客户端实际发送跨度 6.7 s 对得上 —— 差值来自探针客户端（`await send
++ sleep(20ms)` 实测 26.7 ms/帧），不是服务端拉长或压缩了时间轴。
+
+**两个工具**（都在仓库里，装完线缆的机器上先跑第一个）：
+
+- `crates/stream-server/src/bin/mic-probe.rs` → `mic-probe.exe [--list] [--capture SUBSTR]
+  [--seconds N]`：从录音端点抓 N 秒，每 500 ms 报 rms/peak，最后一行
+  `VERDICT=SIGNAL|SILENT`，可直接 grep。
+- `toolchain/mic-push.py`：像页面那样发 `[0x02] + Opus`。默认 `exclusive` 策略下，一条
+  新连接若已有页签持租约就是 viewer，`0x02` 会被回 `MICROPHONE_DISABLED` —— 脚本因此先
+  用 `POST /api/v1/control/session/take/<id>` 借走租约，测完还给原来那条。日志里
+  `microphone refused (grant=viewer, operates=yes, lease=no)` 这一行就是这件事的指纹：
+  `grant` 是令牌角色、`operates` 是能不能动手、`lease` 是租约在不在手上，三者必须分开看。
+
