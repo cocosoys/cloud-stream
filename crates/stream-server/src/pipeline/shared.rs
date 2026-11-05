@@ -27,7 +27,7 @@
 //! loop and drops the entry.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::Mutex as AsyncMutex;
@@ -41,6 +41,14 @@ use crate::webrtc::VideoTrack;
 // `start_program`).
 #[cfg(not(test))]
 use crate::pipeline::spawn_loop;
+
+/// How long a stats-window owner keeps its claim without publishing.
+///
+/// The tick is 1 s, so three missed ticks means the owner is gone (a closed
+/// tab, a torn-down session, a task the runtime dropped). Short enough that a
+/// reconnect gets its panel back; long enough that a slow tick does not hand
+/// the window to a second ticker mid-second.
+const STATS_LEASE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Which screen a pipeline captures.
 ///
@@ -125,10 +133,15 @@ pub struct SharedPipeline {
     /// Set when the program is torn down; the audio thread polls it.
     audio_stop: Arc<std::sync::atomic::AtomicBool>,
     refs: AtomicUsize,
-    /// Whether some session has claimed the 1 Hz stats window for this program.
-    /// The counters are reset by the window's owner, so a second ticker would
-    /// report roughly half the real rate for both (see `publish_snapshot`).
-    stats_owner: AtomicBool,
+    /// Until when some session holds the 1 Hz stats window for this program.
+    ///
+    /// A lease rather than a one-way flag: the counters are zeroed by the
+    /// window's owner, so two tickers must not both snapshot — but a flag that
+    /// never clears also means the *first* session to ask owns the window
+    /// forever, and everyone after it reads a snapshot that stopped updating
+    /// the moment that session closed. The owner refreshes the lease every time
+    /// it publishes, so a live owner keeps it and a departed one lets it lapse.
+    stats_lease: Mutex<Option<std::time::Instant>>,
     /// The most recent `stream_stats` window published by the owner.
     last_snapshot: Mutex<Option<PipelineSnapshot>>,
     /// Which session currently owns input on this program (#103).
@@ -251,19 +264,36 @@ impl SharedPipeline {
         self.video.len()
     }
 
-    /// Claim the stats window for this program. Only the first caller gets
-    /// `true`; everyone else reads [`Self::last_snapshot`].
+    /// Claim (or keep) the stats window for this program.
+    ///
+    /// Returns `true` while this caller owns the window; everyone else reads
+    /// [`Self::last_snapshot`]. The owner extends the lease by calling this,
+    /// or — which is what the running code does — by publishing.
     ///
     /// This is not politeness: `PipelineStats::snapshot` measures a window that
     /// is then zeroed (`reset_window`), so two tickers resetting each other's
     /// window would each report about half the frames — a wrong number that
     /// looks plausible, which is the worst kind.
     pub fn claim_stats(&self) -> bool {
-        !self.stats_owner.swap(true, Ordering::SeqCst)
+        let now = std::time::Instant::now();
+        let mut lease = self.stats_lease.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(until) = *lease {
+            if until > now {
+                // Someone else holds it and is still alive: read, do not reset.
+                return false;
+            }
+        }
+        *lease = Some(now + STATS_LEASE);
+        true
     }
 
-    /// Publish a window for the other sessions (and for `GET /api/v1/health`).
+    /// Publish a window for the other sessions (and for `GET /api/v1/health`),
+    /// and keep the lease alive: a publisher is by definition still ticking.
     pub fn publish_snapshot(&self, snapshot: PipelineSnapshot) {
+        {
+            let mut lease = self.stats_lease.lock().unwrap_or_else(|p| p.into_inner());
+            *lease = Some(std::time::Instant::now() + STATS_LEASE);
+        }
         let mut guard = self.last_snapshot.lock().unwrap_or_else(|p| p.into_inner());
         *guard = Some(snapshot);
     }
@@ -296,7 +326,7 @@ impl SharedPipeline {
             audio: Arc::new(AudioFanout::new()),
             audio_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             refs: AtomicUsize::new(1),
-            stats_owner: AtomicBool::new(false),
+            stats_lease: Mutex::new(None),
             last_snapshot: Mutex::new(None),
             controller: Mutex::new(None),
             input_policy: policy,
@@ -362,7 +392,7 @@ impl PipelineRegistry {
             audio,
             audio_stop,
             refs: AtomicUsize::new(1),
-            stats_owner: AtomicBool::new(false),
+            stats_lease: Mutex::new(None),
             last_snapshot: Mutex::new(None),
             controller: Mutex::new(None),
             input_policy: cfg.input_policy,
@@ -546,7 +576,7 @@ mod tests {
             audio: Arc::new(AudioFanout::new()),
             audio_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             refs: AtomicUsize::new(1),
-            stats_owner: AtomicBool::new(false),
+            stats_lease: Mutex::new(None),
             last_snapshot: Mutex::new(None),
             controller: Mutex::new(None),
             input_policy: InputPolicy::default(),
@@ -570,7 +600,7 @@ mod tests {
             audio: Arc::new(AudioFanout::new()),
             audio_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             refs: AtomicUsize::new(1),
-            stats_owner: AtomicBool::new(false),
+            stats_lease: Mutex::new(None),
             last_snapshot: Mutex::new(None),
             controller: Mutex::new(None),
             input_policy: InputPolicy::default(),
