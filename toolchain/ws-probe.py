@@ -6,9 +6,10 @@
 RFC 6455 拆帧——剩下的字节原样看。
 
 用法：
-    python ws-probe.py [host] [port] [帧数] [目标屏]
+    python ws-probe.py [host] [port] [帧数] [目标屏] [jpeg]
     python ws-probe.py 192.168.59.148 8080 5            # 只看默认屏
     python ws-probe.py 192.168.59.148 8080 5 display2   # 切到第二块屏再看
+    python ws-probe.py 192.168.59.148 8080 8 - jpeg     # JPEG 条纹兜底（0x03）
 
 给了「目标屏」时，探针会像页面那样发一条 `SETTINGS,{"displayId":…}`，然后**只统计
 `PIPELINE_RESETTING` 之后**的帧 —— 那之前的帧属于旧屏，混进来会把"换屏没生效"验成
@@ -16,6 +17,11 @@ RFC 6455 拆帧——剩下的字节原样看。
 
 多屏机上应当看到 `PIPELINE_RESETTING display2` + 之后每一帧都是第二块屏的尺寸；
 单屏机上应当看到同一行文本、然后**没有帧**（服务端如实失败，不会把主屏错发过来）。
+
+给了 `jpeg` 时，探针发 `SETTINGS,{"encoder":"jpeg"}`（页面在没有 WebCodecs 时
+做的同一件事），然后断言收到的是 `0x03` 条纹、每条以 JPEG 的 SOI 开头、`y` 从 0
+开始且逐条递增 —— 这条路径是"任何浏览器都能看"的唯一保证，它坏了没有任何画面。
+
 输出每一帧的 head 解析结果，最后给出结论行 `RESULT ok|fail <原因>`。
 """
 
@@ -30,8 +36,10 @@ import sys
 HOST = sys.argv[1] if len(sys.argv) > 1 else "192.168.59.148"
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8080
 WANT_FRAMES = int(sys.argv[3]) if len(sys.argv) > 3 else 5
-# `primary` / `display2` / … — 与页面 hash 里的关键字同一套。
-TARGET_DISPLAY = sys.argv[4] if len(sys.argv) > 4 else None
+# `primary` / `display2` / … — 与页面 hash 里的关键字同一套。`-` 表示不选屏。
+TARGET_DISPLAY = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] != "-" else None
+# JPEG 条纹兜底。
+JPEG = len(sys.argv) > 5 and sys.argv[5].lower() == "jpeg"
 
 WIRE_CODECS = {1: "h264", 2: "vp8", 3: "vp9", 4: "av1", 5: "h265"}
 
@@ -151,12 +159,20 @@ def main():
         send_text(sock, f"SETTINGS,{payload}")
         reset_line = f"PIPELINE_RESETTING {TARGET_DISPLAY}"
 
+    # #106: 兜底编码器。页面在没有 `VideoDecoder` 时发的是同一句（`encoder` 是
+    # 字符串，不是 `{value}` —— 那边两种形状都存在，服务端都得认）。
+    if JPEG:
+        send_text(sock, 'SETTINGS,{"encoder":"jpeg","tabId":"ws-probe"}')
+
     text_seen = []
     frames = 0
     last_id = None
     ids_ok = True
     keyed = 0
     audio = 0
+    # JPEG 模式：每条条纹记 (frameId, y, 字节数)。
+    stripes = []
+    vp8_in_jpeg = 0
     # 换屏前属于旧屏的帧要丢掉：把它们算进去，"换了屏但画面没换"会验成通过。
     armed = not TARGET_DISPLAY
     pre_switch_frames = 0
@@ -196,8 +212,31 @@ def main():
         if not armed:
             pre_switch_frames += 1
             continue
+        # #106: `0x03` = JPEG 条纹，头 6 字节（类型、保留、frameId、y）。
+        # 与整帧共用同一个 socket，所以不能拿 12 字节的头去卡它。
+        if ftype == 0x03:
+            if not JPEG:
+                fail("JPEG stripe on a connection that never asked for the fallback")
+            if len(payload) < 7:
+                fail(f"JPEG stripe shorter than the 6-byte header: {len(payload)}")
+            jid = struct.unpack(">H", payload[2:4])[0]
+            jy = struct.unpack(">H", payload[4:6])[0]
+            body = payload[6:]
+            if body[:2] != b"\xff\xd8":
+                fail(f"stripe at y={jy} does not start with a JPEG SOI (got {body[:2].hex()})")
+            if body[-2:] != b"\xff\xd9":
+                fail(f"stripe at y={jy} does not end with EOI (got {body[-2:].hex()})")
+            stripes.append((jid, jy, len(body)))
+            frames += 1
+            STATE["frames"] = frames
+            print(f"stripe#{len(stripes) - 1}: type=0x03 id={jid} y={jy} jpeg={len(body)}B")
+            continue
         if len(payload) < 12:
             fail(f"video frame shorter than the 12-byte header: {len(payload)}")
+        if JPEG:
+            # 切换生效前的那几帧仍是 VP8。它们不是错，但不该混进条纹的统计里。
+            vp8_in_jpeg += 1
+            continue
         type_byte = payload[1]
         codec = WIRE_CODECS.get(type_byte >> 4, f"?{type_byte >> 4}")
         is_key = (type_byte & 0x0F) == 0x01
@@ -245,6 +284,35 @@ def main():
         fail("no MICROPHONE_DISABLED answer to a 0x02 uplink: the page would keep capturing")
     if reset_line and reset_line not in text_seen:
         fail(f"no `{reset_line}` after SETTINGS displayId={TARGET_DISPLAY}")
+    if JPEG:
+        if not stripes:
+            fail(
+                "no JPEG stripe after SETTINGS encoder=jpeg: a browser without WebCodecs "
+                "would sit on a black page"
+            )
+        if not any('"jpeg"' in t and "server_settings" in t for t in text_seen):
+            fail("server_settings never announced encoder=jpeg; the page drops every 0x03")
+        # 同一帧的多条条纹共用一个 id，第一条必须从 y=0 开始（否则画面顶部永远空着），
+        # 且同一帧内 y 必须严格递增（页面按 y 往后缓冲上画）。
+        groups = []
+        for jid, jy, _ in stripes:
+            if groups and groups[-1][0] == jid:
+                groups[-1][1].append(jy)
+            else:
+                groups.append((jid, [jy]))
+        if groups[0][1][0] != 0:
+            fail(f"the first stripe of a frame starts at y={groups[0][1][0]}, not 0")
+        for jid, ys in groups:
+            if ys != sorted(ys) or len(set(ys)) != len(ys):
+                fail(f"frame {jid} has stripes out of order: {ys}")
+        print(
+            f"RESULT ok stripes={len(stripes)} frames={len(groups)} "
+            f"bands={len(groups[0][1])} audio={audio} text={len(text_seen)} "
+            f"jpeg=1 pre_switch_vp8={vp8_in_jpeg}"
+        )
+        sock.close()
+        return
+
     if not ids_ok:
         fail("frame ids are not contiguous")
     if keyed == 0:

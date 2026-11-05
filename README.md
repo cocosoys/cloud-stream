@@ -22,9 +22,9 @@ Windows 上的**云游戏 / 远程桌面串流服务端**：DXGI 采集 → 视�
 | 面 | 状态 | 说明 |
 |---|---|---|
 | DXGI 桌面复制采集 | ✅ | 分辨率/帧率可配，缩放到 `--width/--height` |
-| VP8 软件编码 | ✅ | vendored `scrap` + libvpx/libyuv；H.264 / VP9 / AV1 未接协商 |
+| VP8 / VP9 软件编码 | ✅ | vendored `scrap` + libvpx/libyuv；面板可切（#94）。H.264 / AV1 未接 |
 | WebRTC 推流（offer/answer/ICE） | ✅ | 单个视频 track + 两条 DataChannel |
-| WebSocket 推流（WebCodecs） | 🟡 | #106：`GET /api/websockets` 已通视频（12 字节头 + 裸码流），输入/音频/剪贴板尚未接 |
+| WebSocket 推流（WebCodecs） | ✅ | #106：视频 `0x04`、音频 `0x01`、输入、剪贴板、选屏全接；无 WebCodecs 的浏览器降 JPEG 条纹 `0x03` |
 | 键鼠注入 | ✅ | `SendInput` / `SetCursorPos`，含扫描码与修饰键状态 |
 | 触屏 / 虚拟摇杆 | ✅ | 触控走 `m`/`m2`，屏幕虚拟摇杆走 `js,a`（#17） |
 | 剪贴板 | ✅ | 文本双向 + 图片（二进制）双向 |
@@ -129,6 +129,7 @@ cd target\output\cloud-stream
 | `--policy` | `allow-all` | 监听面策略，`deny-all` 用于覆盖率探针 |
 | `--encoder` | `auto` | 编码后端策略：`auto` / `software` / `nvenc` / `amf` / `qsv`。`auto` 永不失败，只把探测结论写进日志；点名一个不存在的硬编会在启动时直接报错 |
 | `--display` | `0` | 默认采集哪块屏（索引 0 = 主屏，其余按枚举顺序）。页面的 `display_id`（`primary` / `display2`）会覆盖它；指定的屏不存在时采集如实失败，不会回落成主屏 |
+| `--mode` | `webrtc` | 新浏览器（本地还没有选择记录）默认用哪种传输：`webrtc` / `websockets`。页面从 `/api/status` 读它，面板切换的模式选择优先于它 |
 | `--tune` | `tuned` | 软编实时参数组；`legacy` 复现 #95 之前的参数，仅用于同机 A/B |
 | `--log` | `logs\stream-server.log` | 日志落盘路径 |
 | `--no-hdr` | — | 关闭 HDR 采集路径 |

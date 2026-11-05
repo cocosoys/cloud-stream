@@ -508,19 +508,24 @@ reconnect...`；控制台里 `GET /api/websockets 404`，`wss://.../api/websocke
 麦克风 / `0x06` 摄像头，外加 `MODE`、`AUTH_SUCCESS`、`VIDEO_STARTED` 等控制帧），
 不是加一条路由能糊过去的。
 
-**已修（前端侧，`addons/selkies-dashboard/index.html`）**：在 bundle 之前静态注入
+**当时的修法（前端侧，已废弃）**：在 bundle 之前静态注入
+`<script>window.__SELKIES_STREAMING_MODE__ = "webrtc";</script>`。
 
-```html
-<script>window.__SELKIES_STREAMING_MODE__ = "webrtc";</script>
-```
+**2026-11 起不再这么做**，因为两条传输都实现了（#106）：`/api/websockets` 现在是一整
+条可用的通路（视频、音频、输入、剪贴板、选屏，缺 WebCodecs 时还有 JPEG 条纹兜底）。
+静态注入反而有害 —— 它的优先级**高于** localStorage，用户在面板里切到 WebSockets、
+页面重载，又会被它按回 WebRTC。
 
-注入是 `determineStreamingMode()` 的第一优先级，所以新设备和已被写成
-`websockets` 的旧设备刷新后都走 WebRTC，不必手工清 localStorage。`__SELKIES_DUAL_MODE__`
-故意不设：服务端不下发 `enable_dual_mode`（`Sidebar.jsx:1101` 回落 `false`），
-面板里的模式切换按钮因此保持隐藏 —— 这个部署没有第二条传输可切。
+现在的行为（`selkies-dashboard/src/main.jsx` 的 `detectInitialMode()`）：
 
-**验证**：`curl -sk https://<host>:8080/ | grep -o '__SELKIES_STREAMING_MODE__[^<]*'`
-应当看到注入，且它必须排在 `<script type="module" src="./assets/index-*.js">` 之前。
+1. `?transport=webrtc|websockets` 一次性覆盖，写进 localStorage 后从地址栏移除；
+2. 否则读 `GET /api/status`（JSON：`current_mode` / `enable_dual_mode`），**只在这个
+   浏览器从没选过**时才把默认值写进 localStorage；
+3. `enable_dual_mode: true` 让面板的模式切换按钮出现，这是 WebRTC 连不上时唯一的退路。
+
+**验证**：`curl -sk https://<host>:8080/api/status` 应当回
+`{"status":"ok","current_mode":"webrtc","enable_dual_mode":true,…}`；页面源码里
+**不应再有**那行静态注入。
 
 
 ### 7.13 `-SkipBuild` 会复用上一次的前端 zip（已修）

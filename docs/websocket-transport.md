@@ -38,6 +38,40 @@ WebRTC 必须有 UDP，或者一台 TURN 中继。局域网里从来不是问题
 一条 loopback 采到的 PCM 只在程序级编码一次，结果按 sink 分发（`AudioFanout`），
 和视频的 fan-out 同构 —— 观众数不线性放大 CPU。
 
+`0x03` 是 JPEG 条纹，头只有 6 字节（类型、保留、frameId、y），见 §2.2。
+
+### 2.2 JPEG 条纹（`0x03`）：没有 WebCodecs 时的唯一出路
+
+`0x04` 的 VP8 码流需要 `VideoDecoder`。`ImageDecoder` / `createImageBitmap` 解码
+JPEG 则在任何现代引擎上都有 —— 所以当页面报告自己没有 `VideoDecoder` 时（它会把
+编码器切成 `jpeg` 并随 `SETTINGS` 发上来），这条连接改走条纹：
+
+```
+[0x03, 保留, frameId_hi, frameId_lo, y_hi, y_lo] + 一整段 JPEG
+```
+
+- 一帧切成 4 条横带（`JPEG_BANDS`），每条自带 JPEG 头，**同一条帧共用一个 frameId**
+- `y` 是这条带顶端在画面里的行号；页面把每条画到后缓冲的 `y` 行，最后一条覆盖到
+  底边时整帧才呈现（`stripeMaybePresent`）
+- 每条都是完整 JPEG（SOI…EOI），所以丢一条只损失那几行，下一帧就补上 ——
+  不像 `0x04` 那样丢一帧会污染整条参考链
+- 页面按 `y` 有重排窗口（`JPEG_STRIPE_REORDER_WINDOW`），乱序到达不会花屏
+
+服务端这一侧是**每会话**的，不是全局编码器：
+
+1. `SETTINGS` 里 `encoder: "jpeg"` → `ws_media::Intent { jpeg: Some(true) }`
+2. 主循环订阅 `pipeline::raw`（采集循环的 BGRA 旁路），起一个
+   `spawn_blocking` 的 JPEG 编码任务，**同时只许一个**在飞
+3. 编好的 4 条按 `y` 顺序写回 socket；VP8 下行这条连接直接跳过
+
+所以一个"老浏览器"观众不会把别的观众拖进 JPEG —— 采集与 VP8 编码照旧，多出来的
+只是这条连接自己的一次拷贝与一次 JPEG 编码。反过来说，**没有订阅者时旁路是零成本**：
+`raw::publish` 先读一个原子计数，为 0 就直接返回。
+
+`server_settings` 在切过去时必须报 `encoder: "jpeg"`（`allowed` 也只留 `jpeg`）：
+前端只在 `currentEncoderMode === 'jpeg'` 时处理 `0x03`，报 `vp8enc` 而发 JPEG 的
+结果是"每一条都被丢掉"，比黑屏更难查 —— 帧确实到了。
+
 `reference` 不是装饰。前端解码闸门（`lib/decode-gate.js:99`）在
 `reference !== frameId` 时才做丢帧跟踪：发现依赖缺席就不解这一帧并要求关键帧。
 整帧流里每帧依赖上一帧，所以填 `frameId - 1` 是唯一正确的答案；填 `frameId`
@@ -58,24 +92,66 @@ VP9 那条容易踩：`bit2` 紧挨着 `profile` 位，取错一位就把每个�
 
 ```
 client → GET /api/websockets (Upgrade: websocket)
-server → AUTH_SUCCESS,{"role":"controller","slot":1,"credential":"bearer"}   # 仅当配置了口令
+server → AUTH_SUCCESS,{"role":"controller","slot":1,"credential":"none"}
 server → MODE websockets
 server → {"type":"server_settings","settings":{...}}
+server → {"type":"stream_info","info":{...}}
 server → 二进制帧 …
 ```
 
-三处容易错的细节：
+四处容易错的细节：
 
 1. **`server_settings` 的形状和 WebRTC 不同。** 数据通道上是
    `{"type":…,"data":{"settings":{…}}}`，WebSocket 上读的是**扁平**的
    `obj.settings`（`selkies-ws-core.js:8644`）。发错一层，页面不会报错 —— 分辨率、
    编码器、帧率全部停在它自己的默认值，下拉框全是假的。
    `ws_media::settings_frame` 就地把 `output::server_settings` 拆一层，单一事实来源
-   仍留在 `dispatch/output.rs`。
-2. **`AUTH_SUCCESS` 只在有口令时发。** token 模式下前端不从 URL 片段推角色
-   （`selkies-ws-core.js:8407`），不发就等于"连上了但没有身份"。
+   仍留在 `dispatch/output.rs`。`stream_info`（`obj.info`）与 `stream_stats`
+   （`obj.stats`）是同一个坑的另外两个入口，`settings_frame` 的注释里写着为什么
+   必须**拆包**而不是复制一份。
+2. **`AUTH_SUCCESS` 必须带前缀，且现在无条件发送。** 前端是
+   `startsWith('AUTH_SUCCESS,')` 之后 `substring(13)` 再 parse
+   （`selkies-ws-core.js:8407`）。发裸 JSON 会落进 `event.data.startsWith('{')`
+   那个分支，`obj.type` 是 undefined，被静默丢掉 —— 页面永远 `clientRole === null`，
+   `updateControllerSlot` 不调用，viewer 语义与手柄槽位全失效，而画面完全正常。
+   现在无口令部署也发（`credential: "none"`）：单用户机器就是控制器，不发只会让
+   页面在"未认证"状态里空转。
 3. **先身份、再 MODE、最后设置。** 前端收到 MODE 就开始初始化输入与音频，此时
    角色还不知道的话，它会按未认证走一遍再补一遍。
+4. **`stream_stats` 只在 `_stats,1` 之后每秒一条。** 面板打开才订阅
+   （`lib/stream-stats.js`），关掉就静默；这是 `select!` 的分支守卫，不是分支内的
+   判断，所以空闲连接不会每秒醒一次。
+
+## 3.1 页面怎么决定用哪种传输
+
+这条线以前是**构建期钉死**的：`selkies-dashboard/index.html` 里一行
+`window.__SELKIES_STREAMING_MODE__ = "webrtc"`。理由当时成立 —— 服务端只有 WebRTC，
+而 selkies-core 的硬默认是 WebSockets，新设备会去连一个不存在的端点。
+
+两条都实现之后那行就是多余且有害的：它的优先级**高于** localStorage，用户在面板里
+切到 WebSockets、页面重载，又会被它按回 WebRTC。现在的顺序是：
+
+| 来源 | 作用 |
+|---|---|
+| `?transport=webrtc\|websockets` | 一次性覆盖：写进 localStorage 后**从地址栏移除**（否则重载时又赢了） |
+| `GET /api/status` → `current_mode` | 只有这个浏览器**从没选过**时才写进 localStorage |
+| localStorage | 用户/上一次的选择，最终生效 |
+
+`/api/status` 同时回 `enable_dual_mode: true`，面板的模式切换按钮据此渲染
+（`Sidebar.jsx:2804` 的 `canSwitchMode`）。`server_settings` 里也有同名键 ——
+前者让切换在**连上之前**就可见（WebRTC 连不上时这是唯一的退路），后者在流建立后
+再确认一次。
+
+`/api/status` 的响应体从纯文本 `ok` 变成了 JSON：
+
+```json
+{"status":"ok","current_mode":"webrtc","enable_dual_mode":true,
+ "transports":["webrtc","websockets"]}
+```
+
+探针/看门狗只看状态码，不受影响；`main.jsx` 的 `detectInitialMode()` 以前
+`resp.json()` 抛异常被 catch 吞掉，所以那个探测从来没生效过。`--mode webrtc|websockets`
+可以把这个默认值改掉（例如一条只有 443 的链路上，让新设备直接走 WebSocket）。
 
 ## 4. `/api/switch`
 
@@ -132,6 +208,17 @@ RESULT ok frames=8 keyframes=1 audio=0 text=4
 
 这台虚拟机上 `audio=0` 是预期结果 —— 机器不播放任何声音，loopback 没有事件可采。
 有声音的机器上同一个探针应给出非零值。
+
+另一条断言是 JPEG 兜底（§2.2），也是"老浏览器能不能看"的唯一自动证据：
+
+```
+python toolchain/ws-probe.py 192.168.59.148 8080 8 - jpeg
+stripes=8 frames=2 bands=4 jpeg=1
+RESULT ok stripes=8 frames=2 bands=4 audio=0 text=5 jpeg=1 pre_switch_vp8=0
+```
+
+`pre_switch_vp8` 是切换生效前漏出来的整帧数：改成 0 说明 `SETTINGS` 一到就切过去了，
+多于一两个说明服务端在犹豫（那条连接上有几帧是页面根本解不了的 VP8）。
 
 同一次连接在服务端留下的日志（注意 `sink 1` 是已在线的 WebRTC 页签，`stream sink 2`
 是这次 WS 探针 —— 同一个 program，一个编码器）：
@@ -212,17 +299,21 @@ WS 侧能选屏的唯一信息来源就是这一批 —— 这一版之前直接
 注意 `MICROPHONE_DISABLED` 只在 WebSocket 这条路上发：WebRTC 的页面
 （`selkies-wr-core.js`）没有这个分支，发过去只会被当成未知消息。
 
-## 9. 还差什么：多屏的物理验收
+## 9. 还差什么
 
-代码、协议与坐标数学都到位了（`win_input::tests` 用合成的虚拟桌面覆盖了主屏/右侧屏/
-左侧屏三种归一化，含"左侧屏的第一个像素就是桌面的第一个像素"这条最容易写错的），
-但**没有第二块物理屏就点不了**。真机验收两步：
+**多屏的物理验收。** 代码、协议与坐标数学都到位了（`win_input::tests` 用合成的虚拟
+桌面覆盖了主屏/右侧屏/左侧屏三种归一化，含"左侧屏的第一个像素就是桌面的第一个像素"
+这条最容易写错的），但**没有第二块物理屏就点不了**。真机验收两步：
 
 1. `python toolchain/ws-probe.py <host> 8080 5 display2` —— 期望 `PIPELINE_RESETTING
    display2` + 之后每帧都是第二块屏的尺寸；单屏机上期望"同一行文本 + 没有帧"（服务端
    如实失败，不会把主屏错发过来）。
 2. 在这个页面上把鼠标点到第二块屏的四角：落点必须在该屏的四角。左/上超过主屏的
    显示器是最容易错的那台（虚拟桌面原点是负的）。
+
+**真正的人力浏览器验收。** 探针验证的是字节，不是产品：`?transport=websockets`
+打开一次、看面板有没有编码器/码率/CPU、切一次屏、按一次输入 —— 这几步至今只在
+探针层面验过。
 
 ## 10. 踩过的坑
 
@@ -242,3 +333,11 @@ WS 侧能选屏的唯一信息来源就是这一批 —— 这一版之前直接
   最后。前端用 `JSON.parse` 不看顺序，但任何"以某字段开头"的字符串匹配都会误判。
 - **`Cargo` 的 `S: Send` 边界**：`ws_media::run` 里没有 spawn，就不该要求 `Send`，
   否则 `handle_inner` 的泛型参数对不上（`S cannot be sent between threads safely`）。
+- **`AUTH_SUCCESS` 少了前缀**：裸 JSON 被前端静默丢掉，症状是"画面好的、但角色永远
+  是 null"——而角色决定 viewer 能否注入输入。这类"少一个字符串前缀"的错，日志里
+  一个字节都不留，只有对照前端的 `startsWith` 才能发现。
+- **`jpeg-encoder` 0.7 要 edition 2024**：本仓的 Cargo 是 1.75，拉 0.7 会在
+  "解析 manifest"这一步失败（错误信息看着像网络问题，其实是工具链太旧）。钉 0.6。
+- **统计窗口的所有权不能是单向开关**：它原来是 `AtomicBool::swap(true)`，第一个
+  订阅者永久拥有；那个会话关掉之后，快照就停在最后一秒，后来的人看到的面板是冻结的。
+  现在是 3 秒租约，发布即续租（`STATS_LEASE`）。
