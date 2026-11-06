@@ -329,21 +329,37 @@ impl SessionRegistry {
     }
 
     /// The session that should inherit the input lease when `leaving` goes away:
-    /// the oldest other session attached to the same display, if any (#103).
+    /// the best remaining session attached to the same display, if any (#103).
     ///
     /// Handing the lease to nobody would leave the program injecting nothing —
     /// the survivor would keep watching a desktop it cannot touch, and no
     /// reconnect would fix it because the lease is keyed on the program, not on
-    /// the socket. Oldest rather than newest so the choice does not depend on
-    /// who happened to connect last.
+    /// the socket.
+    ///
+    /// #113: "oldest" was the wrong tie-break. On a transport switch the oldest
+    /// session is precisely the **abandoned** transport — in the field it handed
+    /// the lease from the WebSocket media session straight back to a WebRTC
+    /// session whose page had already left it, which is the exact state the new
+    /// connection then could not break out of. Ranking now goes:
+    ///
+    /// 1. sessions that actually receive video (`sink` is set) — an id that
+    ///    never got past `Connected` has no picture and therefore no pointer to
+    ///    drive;
+    /// 2. among those, the newest — a reload/switch produces a newer session, and
+    ///    the user is looking at the newest page.
+    ///
+    /// The ordering is stable because ids are monotonic per process.
     pub async fn successor(&self, leaving: u64, display: u32) -> Option<u64> {
         let guard = self.inner.lock().await;
-        guard
+        let mut candidates: Vec<(bool, u64)> = guard
             .values()
             .filter(|live| live.info.id != leaving)
             .filter(|live| live.info.display == Some(display))
-            .map(|live| live.info.id)
-            .min()
+            .map(|live| (live.info.sink.is_some(), live.info.id))
+            .collect();
+        // 收画面的一律排在"没有下行的"前面；同档里 id 大的（后连的）优先。
+        candidates.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+        candidates.first().map(|(_, id)| *id)
     }
 
     /// Every live session, oldest first. The health endpoint reports this list;
@@ -597,7 +613,13 @@ impl SessionCtx {
     ) -> Self {
         // #62: the sink needs the live frame size so it can map the frontend's
         // frame-space pointer coordinates onto the physical screen.
-        let settings = StreamSettings::from_config(&cfg);
+        let mut settings = StreamSettings::from_config(&cfg);
+        // #112: 起步编码器跟着"上次点了什么"走。WebRTC 换编码器只能靠"断开重连、
+        // 让新会话的 m-line 带上新编码器"，而新会话是从这里造出来的 —— 少了这一句
+        // 它就又报 VP8，页面又把它点成 VP9，服务端又踢一次：一个永不收敛的重启环，
+        // 页面上是"黑屏 + 一直重连"。WS → WebRTC 的切换必现，因为 WS 刚把编码器
+        // 点成了 VP9。
+        settings.set_codec(crate::pipeline::settings::preferred_codec_or(settings.codec()));
         // #17: the gamepad bus loads ViGEmClient.dll and connects to ViGEmBus on
         // its own thread, so a machine without the driver connects normally and
         // simply has no virtual pads. The reason lands in the log once.
@@ -712,7 +734,26 @@ impl ControlGate {
         // #110: 两道关。角色在前 —— 它是不变的那一半，租约是运行期会移动的
         // 那一半；先判常量能让一次 `viewer` 的注入在读完一个 `AtomicU64`
         // 之前就被挡住，日志里也不会出现"租约明明是它的"这种误导。
-        self.may_operate && self.program.owns_input(self.session)
+        //
+        // #112: 走 `may_inject` 而不是 `owns_input`，与 WS 那条路径同一套语义：
+        // 租约空着就顺手认领，悬空的租约自愈。两条传输用两道门禁，就会出现
+        // "WS 能动手、WebRTC 不能"这种只能靠猜的现象。
+        //
+        // #113: 指针通道上来的每一条都是真输入，所以这里传 `true` —— 它有权
+        // 从一条没人用的租约手里接管。控制通道走 [`Self::may_configure`]。
+        self.may_act(true)
+    }
+
+    /// 控制通道的门禁（设置、码率、剪贴板……）。**不**参与租约接管：
+    /// 这些指令不驱动指针，`pong` 更是按秒回一次 —— 让它们触发接管，租约会被
+    /// 一条只会回 `pong` 的死会话持续点亮，失效逻辑等于没做。
+    fn may_configure(&self) -> bool {
+        self.may_act(false)
+    }
+
+    fn may_act(&self, is_input: bool) -> bool {
+        self.program
+            .may_inject(self.session, self.may_operate, is_input)
     }
 
     /// Count a message the lease refused. Called on every dropped input, so it
@@ -720,6 +761,15 @@ impl ControlGate {
     /// channel's rate and the only way the count stays truthful.
     fn refuse(&self) {
         self.denied.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// #113: 这条连接刚刚真的投了一条输入 —— 门禁放行之后才调。
+    ///
+    /// 门禁本身（[`Self::owns`]）被控制通道的**每一条**消息问一次，
+    /// 包括 `pong` 和 `SETTINGS` 回执；在那里盖章会让一条只会回 `pong` 的
+    /// 死会话永久保持"在用"，租约失效就成了摆设。所以时间戳只认注入点。
+    fn note_input(&self) {
+        self.program.note_input();
     }
 }
 
@@ -1091,6 +1141,12 @@ where
                 );
                 if codec != crate::pipeline::codec::VideoCodec::Vp8 {
                     ctx.settings.set_codec(crate::pipeline::codec::VideoCodec::Vp8);
+                    // #112: 把这次拒绝也记进"用户偏好"。这一条 PC 已经按旧编码器
+                    // 建好了，救不回来；但下一次连接（页面刷新、换传输、被踢之后
+                    // 的自动重连）会从 VP8 报价，而不是把同一个黑屏再来一遍。
+                    crate::pipeline::settings::note_preferred_codec(
+                        crate::pipeline::codec::VideoCodec::Vp8,
+                    );
                     log::info!(
                         "this browser cannot decode {}: its program will be created on vp8",
                         codec.label()
@@ -1265,6 +1321,27 @@ async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
                                         live.wire()
                                     );
                                 }
+                            }
+                            // #113: 落座时把一条"没人用"的租约接过来。
+                            //
+                            // 认领（`try_claim_controller`）只赢在**没人持有**，
+                            // 而换传输之后租约在旧会话手里：它活着、还在收字节、
+                            // 只是页面已经不在了。于是切回 WebSocket 的页面每次
+                            // 认领都撞车，键鼠全被门禁丢掉 —— 表现是"画面在流、
+                            // 指针会动、桌面没反应"，重连治不好。
+                            //
+                            // 判据是旧持有者**多久没投过输入**，不是身份：
+                            // `tabId` 要到 `SETTINGS` 才来，而第一下点击在它之前。
+                            if watcher_may_operate
+                                && acquired.pipeline.adopt_lease_if_stale(
+                                    watcher_session_id,
+                                    crate::pipeline::LEASE_ADOPT_IDLE,
+                                )
+                            {
+                                log::info!(
+                                    "session {watcher_session_id}: adopted the input lease on display {} (the previous holder was not injecting)",
+                                    acquired.pipeline.display.0
+                                );
                             }
                             if let Some(tx) = watcher_exit.clone() {
                                 acquired.pipeline.handle.add_exit_sink(tx);
@@ -1981,7 +2058,13 @@ async fn arm_connected_notices(
                 }
             }
             match action {
-                Action::InputStub(raw) => input.handle_line(&raw),
+                Action::InputStub(raw) => {
+                    // #113: 放行即"在用"，租约的失效判据只认这一处。
+                    if let Some(gate) = gate.as_ref() {
+                        gate.note_input();
+                    }
+                    input.handle_line(&raw)
+                }
                 _ => log::debug!("non-input message on pointer channel dropped: {line}"),
             }
         })
@@ -2014,7 +2097,7 @@ async fn arm_connected_notices(
             // gate so a refusal is a role refusal (logged as such) and not a
             // policy denial the operator would go looking for in the rules.
             // #103: the lease is asked per message, so a takeover lands here.
-            let owns = gate.as_ref().map(|gate| gate.owns()).unwrap_or(true);
+            let owns = gate.as_ref().map(|gate| gate.may_configure()).unwrap_or(true);
             if !owns && !viewer_may_run(&action) {
                 if let Some(gate) = gate.as_ref() {
                     gate.refuse();
@@ -2585,6 +2668,11 @@ fn refused_video_codec(answer: &str, codec: crate::pipeline::codec::VideoCodec) 
 /// changes. The returned `Some(codec)` is that signal; `None` means nothing that
 /// needs a reconnect moved.
 pub(crate) fn apply_settings_batch(settings: &StreamSettings, payload: &str) -> Option<crate::pipeline::codec::VideoCodec> {
+    // #111: 进来先拍一张值快照，出去再拍一张。这份函数的逐字段日志曾经是
+    // **日志放大器**：页面对每条回执回写一整批，同一个 "framerate -> 60" 一秒
+    // 打 400 次，日志涨到 4 GB/h，而里面没有一条是新信息。所以这里的原则是
+    // "值没变就不出声"—— 逐字段降到 debug，收尾按快照差异留一条 info。
+    let before = settings.prefs();
     let value: Result<hbb_common::serde_json::Value, _> = hbb_common::serde_json::from_str(payload);
     let Ok(value) = value else {
         log::debug!("SETTINGS payload is not JSON: {payload}");
@@ -2607,6 +2695,10 @@ pub(crate) fn apply_settings_batch(settings: &StreamSettings, payload: &str) -> 
     if let Some(id) = map.get("encoder").and_then(|v| v.as_str()) {
         match crate::pipeline::codec::VideoCodec::from_encoder_id(id) {
             Some(pick) => {
+                // #112: 先记进"用户偏好"再改本程序。重连之后的那个新会话
+                // （`ctx.settings` 是 `from_config` 造的）要靠它才知道该用哪
+                // 个编码器报价 —— 否则下面那个"重启协商"永远协商不回来。
+                crate::pipeline::settings::note_preferred_codec(pick);
                 let previous = settings.codec();
                 if settings.set_codec(pick) {
                     log::info!("SETTINGS: video codec {} -> {}", previous.wire(), pick.wire());
@@ -2630,7 +2722,7 @@ pub(crate) fn apply_settings_batch(settings: &StreamSettings, payload: &str) -> 
 
     if let Some(fps) = map.get("framerate").and_then(as_u32) {
         settings.set_fps(fps);
-        log::info!("SETTINGS: framerate -> {fps}");
+        log::debug!("SETTINGS: framerate -> {fps}");
     }
     // #91: the audio slider's pick. `ab,<bps>` carries the same number on the
     // live path, but a pick also rides this batch (`picked`), and a batch that
@@ -2639,7 +2731,7 @@ pub(crate) fn apply_settings_batch(settings: &StreamSettings, payload: &str) -> 
     // encodes.
     if let Some(bps) = map.get("audio_bitrate").and_then(as_u32) {
         let applied = settings.set_audio_bitrate_bps(bps as i32);
-        log::info!("SETTINGS: audio bitrate -> {bps} bps (applied {applied})");
+        log::debug!("SETTINGS: audio bitrate -> {bps} bps (applied {applied})");
     }
     // #92: the panel's CRF pair rides the batch too. `_rc,` / `_crf,` carry the
     // same picks on the live path, but a batch that dropped them would leave the
@@ -2648,14 +2740,14 @@ pub(crate) fn apply_settings_batch(settings: &StreamSettings, payload: &str) -> 
         match crate::pipeline::settings::RateControl::from_wire(mode) {
             Some(rc) => {
                 settings.set_rate_control(rc);
-                log::info!("SETTINGS: rate control -> {}", rc.as_str());
+                log::debug!("SETTINGS: rate control -> {}", rc.as_str());
             }
             None => log::warn!("SETTINGS: unknown rate control mode {mode:?}"),
         }
     }
     if let Some(crf) = map.get("video_crf").and_then(as_u32) {
         settings.set_crf(crf);
-        log::info!("SETTINGS: crf -> {}", settings.crf());
+        log::debug!("SETTINGS: crf -> {}", settings.crf());
     }
     // manual_resolution=true switches the frontend to fixed dimensions; the
     // width/height pair is honored together when both are present.
@@ -2665,8 +2757,24 @@ pub(crate) fn apply_settings_batch(settings: &StreamSettings, payload: &str) -> 
             map.get("manual_height").and_then(as_u32),
         ) {
             settings.set_resolution(w, h);
-            log::info!("SETTINGS: manual resolution -> {w}x{h}");
+            log::debug!("SETTINGS: manual resolution -> {w}x{h}");
         }
+    }
+    // #111: 一条聚合回执，只在快照真的变了时出现。行内直接写"现在是多少"，
+    // 因为排查时要的是终值，不是五条增量。
+    let after = settings.prefs();
+    if before != after {
+        log::info!(
+            "SETTINGS: applied fps={} {}x{} rc={} crf={} codec={} audio={}bps/{}",
+            after.fps,
+            after.width,
+            after.height,
+            settings.rate_control().as_str(),
+            after.crf,
+            after.codec.wire(),
+            after.audio_bps,
+            if after.audio_enabled { "on" } else { "off" }
+        );
     }
     codec_changed
 }
@@ -2926,13 +3034,18 @@ mod tests {
             may_operate: true,
         };
 
+        // #113: 先把"1 正在投输入"这件事写下来 —— 只认领不注入的持有者对
+        // 用户等于没有主人，`b.owns()` 会依法把它接过来（那正是这次线上的
+        // 那条路），所以这一条要验的是"活着的主人守得住"。
         program.set_controller(Some(1));
+        program.note_input();
         assert!(a.owns());
         assert!(!b.owns());
 
         // The switch is visible to both sides on the next message: no reconnect,
         // and no window in which two sessions both believe they own the pointer.
         program.set_controller(Some(2));
+        program.note_input();
         assert!(!a.owns());
         assert!(b.owns());
 
@@ -3018,7 +3131,7 @@ mod tests {
     /// 交给 `None` 也能编译、也能让程序继续出图，但剩下的人会看着一个碰不了
     /// 的桌面，而且重连也修不好——租约按程序记，不按 socket 记。
     #[tokio::test]
-    async fn the_lease_passes_to_the_oldest_survivor_when_its_holder_leaves() {
+    async fn the_lease_passes_to_a_survivor_that_is_actually_streaming() {
         let registry = SessionRegistry::default();
         for id in 1..=3u64 {
             let (notice, _rx) = mpsc::unbounded_channel();
@@ -3034,13 +3147,40 @@ mod tests {
                 })
                 .await;
         }
-
-        // The middle session leaves: session 1 is older and still attached.
-        assert_eq!(registry.successor(2, 0).await, Some(1));
-        registry.remove(2).await;
-        // The oldest leaves: only session 3 is left on this display.
+        // 三条都还没 attach：没人有下行，同档里取最新的（用户正看着的那一页）。
         assert_eq!(registry.successor(1, 0).await, Some(3));
-        // Another display has no survivor on this program.
+        // 另一块屏上这条程序没有别的会话。
         assert_eq!(registry.successor(1, 1).await, None);
+    }
+
+    /// #113: 排序首先看"有没有画面"，其次才看新旧。
+    ///
+    /// 线上故障的形状：WebSocket 媒体会话退出时，租约被交回给**最老**的那条
+    /// —— 一次传输切换留下的 WebRTC 会话。它早就没人看了，却因此把指针锁死。
+    /// 有下行的会话才是用户正在看的那一页。
+    #[tokio::test]
+    async fn successor_prefers_the_survivor_that_receives_video() {
+        let registry = SessionRegistry::default();
+        for id in 1..=3u64 {
+            let (notice, _rx) = mpsc::unbounded_channel();
+            registry.register(id, notice).await;
+            registry
+                .publish(SessionInfo {
+                    id,
+                    tab_id: format!("tab-{id}"),
+                    display: Some(0),
+                    // 只有 1 号有下行（attach 过的），2/3 还停在 Connected 之前。
+                    sink: if id == 1 { Some(Default::default()) } else { None },
+                    ..Default::default()
+                })
+                .await;
+        }
+        assert_eq!(
+            registry.successor(3, 0).await,
+            Some(1),
+            "a session with a picture beats a newer one without"
+        );
+        registry.remove(1).await;
+        assert_eq!(registry.successor(3, 0).await, Some(2));
     }
 }

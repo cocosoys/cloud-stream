@@ -131,12 +131,12 @@ pub struct Config {
     ///
     /// 512 MiB 是个偏保守的默认：够传存档、截图、日志，不够把系统盘写死。
     pub upload_quota_mb: u64,
-    /// #94: the video codec sessions negotiate with, `vp8` (default) or `vp9`.
+    /// #94: the video codec sessions negotiate with, `vp9` (default) or `vp8`.
     ///
     /// Only the starting value: the panel can change it at runtime, and the
     /// choice lives in `pipeline::codec` (a pick has to outlive the session that
     /// carried it, or the reload it triggers would revert it). This flag exists
-    /// so a fresh process can start on VP9 without anyone touching the UI.
+    /// so a fresh process can start on VP8 without anyone touching the UI.
     pub video_codec: String,
     /// #96: how long the client's game-mode ghost pointer stays on screen
     /// without an effective move, in seconds (default 5).
@@ -248,11 +248,14 @@ impl Default for Config {
             // somewhere else — the kind of failure that looks like a broken build.
             dist: PathBuf::from("selkies-web"),
             app_name: "webrtc".to_owned(),
-            // WebRTC wins the first load: it is the path with NACK/PLI/FEC and
-            // the one every earlier deployment was tested against. A page can
-            // still switch, and `--mode websockets` flips this default for a
-            // network where WebRTC cannot get through.
-            default_mode: "webrtc".to_owned(),
+            // #117: WebSockets is the first load now. It needs one TCP port
+            // (the one already serving the page) instead of a UDP range, so a
+            // fresh browser on a strange network gets a picture without any
+            // port forwarding first — the case every earlier deployment had to
+            // discover the hard way. WebRTC is still a click away in the panel,
+            // and `--mode webrtc` restores the old default for a deployment
+            // that wants NACK/PLI/FEC from the very first frame.
+            default_mode: "websockets".to_owned(),
             width: 1920,
             height: 1080,
             fps: 30,
@@ -268,7 +271,15 @@ impl Default for Config {
             keyframe_secs: 10,
             upload_dir: None,
             upload_quota_mb: 512,
-            video_codec: "vp8".to_owned(),
+            // #117: VP9 is the codec a fresh process opens with. The panel's
+            // encoder row echoes `s.codec().encoder_id()` — the codec actually
+            // running — so this default is also what that row says before
+            // anyone touches it; leaving VP8 here meant the menu read "VP8" on
+            // a clean profile while the statistics tile promised a modern
+            // codec. `--video-codec vp8` is the way back: VP9 costs noticeably
+            // more CPU per frame on the software encoder, which matters on a
+            // small host asked for 1080p60.
+            video_codec: "vp9".to_owned(),
             ghost_cursor_idle_secs: crate::dispatch::ghost::DEFAULT_IDLE_SECS,
             policy: "auto".to_owned(),
             auth_token: None,
@@ -626,6 +637,23 @@ mod tests {
     #[test]
     fn ghost_cursor_idle_defaults_to_five_seconds() {
         assert_eq!(parse(&[]).ghost_cursor_idle_secs, 5);
+    }
+
+    /// #117: 首屏默认是 WebSocket + VP9，这是一条产品决定，不是随手写的初值。
+    ///
+    /// 理由分开看：WebSocket 只占页面已经在用的那个 TCP 端口，新机器不必先
+    /// 放通 UDP 段就能出画面；VP9 是面板编码器行会被回显的那个值（`encoder`
+    /// 报的是**正在跑**的编码器），默认留在 VP8 会让干净配置的菜单写着 VP8。
+    /// 两个旗标仍然能覆盖它们 —— 默认值是起点，不是锁。
+    #[test]
+    fn websockets_and_vp9_are_the_first_load_defaults() {
+        let cfg = parse(&[]);
+        assert_eq!(cfg.default_mode, "websockets");
+        assert_eq!(cfg.video_codec, "vp9");
+
+        let flipped = parse(&["--mode", "webrtc", "--video-codec", "vp8"]);
+        assert_eq!(flipped.default_mode, "webrtc");
+        assert_eq!(flipped.video_codec, "vp8");
     }
 
     /// A value outside the range is clamped rather than announced: 0 would read

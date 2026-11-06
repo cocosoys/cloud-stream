@@ -145,13 +145,15 @@ server → 二进制帧 …
 `/api/status` 的响应体从纯文本 `ok` 变成了 JSON：
 
 ```json
-{"status":"ok","current_mode":"webrtc","enable_dual_mode":true,
+{"status":"ok","current_mode":"websockets","enable_dual_mode":true,
  "transports":["webrtc","websockets"]}
 ```
 
 探针/看门狗只看状态码，不受影响；`main.jsx` 的 `detectInitialMode()` 以前
-`resp.json()` 抛异常被 catch 吞掉，所以那个探测从来没生效过。`--mode webrtc|websockets`
-可以把这个默认值改掉（例如一条只有 443 的链路上，让新设备直接走 WebSocket）。
+`resp.json()` 抛异常被 catch 吞掉，所以那个探测从来没生效过。`current_mode` 的
+来源是 `--mode webrtc|websockets`，**#117 起默认 `websockets`**：新设备首屏只占用
+页面已经在用的那个 TCP 端口，不必先放通 UDP 段。要让新设备直接走 WebRTC
+（需要 NACK/PLI/FEC 的那类链路），启动参数写 `--mode webrtc`。
 
 ## 4. `/api/switch`
 
@@ -178,6 +180,41 @@ GET 该路径返回 405：一个永远成功的探针比没有探针更糟。
 
 所以"一个页签 WebRTC、另一个 WebSocket"天然成立，这不是巧合，是 fan-out 本来
 该有的形状。
+
+### 5.1 控制类下行：管线事件
+
+视频/音频是"流"，而有些东西是"状态"：被控机的**指针形状**、采集降级/恢复。
+WebRTC 用控制数据通道发它们（`websession.rs` 里那个 `PipelineEvent` 转发循环），
+WS 版本起初一条都没有 —— `run()` 里根本没有 `add_event_sink`。
+
+症状不是"报错"，是"少了一个东西"：页面的 `updateServerCursor` 从没被调用，
+于是指针要么是浏览器的默认箭头、要么（在页面已经把本地箭头藏起来的模式里）
+干脆没有。服务端日志一个字节都不留，因为没有一条路径在等它。
+
+现在按**程序**（不是按连接）订阅：
+
+- `pipeline.handle.add_event_sink(tx)` 拿到一个 `UnboundedSender`，
+  `select!` 里多一支 `events.recv()`，只消费 `Cursor` 就发 `cursor,{…}`；
+- sink 属于程序，换屏换程序时必须 `remove_event_sink(old)` + 重新挂；
+- 订阅只收"以后"的事件，所以每个新连接/新程序还要补发一次**当前**形状
+  （`handle.last_cursor()`，在 `emit_event` 里顺手缓存）。
+
+补发这里有个顺序陷阱：`last_cursor()` 要等采集循环第一次 beat 才有值，而那一
+beat 在 `handle.start()` 之后，补发跑在它前面 —— 十有八九拿到 `None`。指针形状
+又不会自己变（`update_cursor` 只在 `id` 变化时 emit），所以"等下一次变化"可能
+永远等不到。加了一个 250 ms 的补位定时器，拿到一条就把这一支永久关掉。
+
+订上事件通道之后，.148 上还是 0 条。一行一次性诊断把原因分开了：
+
+```text
+WARN #111 host cursor: id 0x10005 is single-colour or unusable
+```
+
+被控机上那个光标是 `CreateCursor()` 造出来的**单色光标**（`hbmColor == 0`，
+只有 AND/XOR 两张 1bpp 掩码）—— 文本 I 形、十字、缩放箭头、以及 VMware /
+VirtualBox 这类虚拟机的控制台指针全都走这条路。`cursor_data` 原来对它是直接
+`Ok(None)` 跳过的（注释还写着"现代 Windows 上很罕见"），于是事件永远是空的。
+这一条补上之后同一条连接立刻拿到 `cursor,`、32×32、hot=(8,9)。
 
 ## 6. 验证
 
@@ -239,6 +276,26 @@ video fanout: sink 2 detached (1 live)
 ws media: 192.168.59.146 detached (1 downlink(s) left, 0 frame(s) dropped)
 ```
 
+第三条自动证据是**输入租约的交接**（§7.2），它验的是"指针到底能不能驱动桌面"：
+
+```
+python toolchain/lease-adopt-probe.py 192.168.59.148 8080
+server: pid=11180 input_policy=exclusive
+A: id=7 role=controller denied=0
+B: id=8 role=controller denied=0
+A after B: role=viewer
+after closing B: A role=controller B=gone
+A input: denied 0 -> 0
+RESULT ok transport-switch lease handover works
+```
+
+`A input: denied 0 -> 0` 之后，服务端下一个 5 s 窗口的统计行必须是 `m=30`（正好是探针
+发出的条数）—— `role=controller` 只说明门禁放行，`m=` 才说明字节走到了注入器：
+
+```text
+pipeline 5.0s: loop=60.0Hz new=4 repeat=296 … paint=0 m=30 m2=0 dm=0 pm=0
+```
+
 ## 7. 上行：输入与剪贴板
 
 上行**不另写解析器**：`lib/input.js` 在两种传输下是同一份，所以 WS 侧直接复用
@@ -275,6 +332,65 @@ WS 侧能选屏的唯一信息来源就是这一批 —— 这一版之前直接
 
 `tabId` 同样在这一批里，到了就 `registry.update_meta(...)` 补登记 —— 此前 WS 会话在
 `health` 里 `tab_id` 永远是空串，"同一个页签重连"与"第二个观众"分不开。
+
+### 7.2 输入租约：`lease` 是**会失效**的
+
+`--input-policy exclusive`（#110 起的默认）下，键鼠只有租约持有者能投。租约挂在
+**程序**上而不是会话上，所以接管对下一条消息立刻生效、不需要重连。
+
+问题在于它一度是**永久所有权**：`try_claim_controller` 是 claim-if-free，谁也挤不掉，
+只在连接收尾时才 `successor()` 归还。而"页面换传输"这件事同时制造了两个条件 ——
+
+- 旧传输的会话**还活着**（PeerConnection 没拆、下行 sink 还在收字节，所以 `successor`
+  也认它），
+- 它**再也不会投一条输入**（页面已经在另一条传输上了）。
+
+于是切到 WebSocket 之后租约锁在旧会话手里，新 media 连接的每一条 `m,` 都被门禁丢掉。
+页面上的现象：画面在流、指针跟着鼠标动（那是页面自己画的）、桌面一动不动 —— 用户
+描述成"指针像是再次渲染上去的，悬停和点击都没有反馈"，而且重连治不好。
+
+修法是给租约加**失效判据**，只用一条硬事实：持有者多久没真的投过输入。
+
+| 常量 | 值 | 用在哪 |
+|---|---|---|
+| `LEASE_ADOPT_IDLE` | 1.5 s | 连接落座时 `adopt_lease_if_stale`：旧持有者这么久没投过输入 → 接过来 |
+| `LEASE_TAKEOVER_IDLE` | 3 s | 每条真输入时 `may_inject` 的兜底：静默这么久 → 接管 |
+
+三条配套规则，缺一条都会退化成"指针时灵时不灵"：
+
+1. **时间戳只认注入点。** `note_input()` 只在 `Action::InputStub` 分发之前调（WS 的
+   `handle_text` 与 WebRTC 指针通道各一次）。门禁本身也被控制通道的每条消息问一次
+   （`pong`、`SETTINGS` 回执），在那里盖章会让一条只会回 `pong` 的死会话永远"在用"。
+2. **只有真输入能触发接管。** `may_inject(session, may_operate, is_input)` 的第三个
+   参数就是这个：控制类指令不驱动指针，让它们接管只会造出"有人接管了但什么都没发生"。
+3. **认领过但一次都没投过输入，等于悬空。** `input_idle() == None` 与"陈旧"同义。
+   不这么判，两条都不注入的连接会各握半边锁，谁也投不进去 —— 而且永远不会自愈。
+
+接管本身是显式的（`set_controller` + 一行 info），日志里要能直接读出结论：
+
+```text
+ws media: … grant=viewer operates=yes lease=yes cred=none prev_idle=never
+pipeline 0: input lease Some(7) -> Some(8) (holder was not injecting; new connection adopted it)
+ws media: session 8 adopted the input lease (the previous holder was not injecting)
+```
+
+`prev_idle=` 这一栏是刻意加的：只看 `lease=no` 分不清"换传输留下的悬空租约"和
+"正常的两页签"，而这两种情况的处置完全相反。
+
+`successor()`（持有者收尾时的交接）同时改了排序：**先看有没有下行（`sink`），再看
+新旧**。原来是"最老的那条"，而换传输之后最老的恰恰是被抛弃的那条传输 —— 线上就是
+它把租约从 WebSocket 会话手里接回去的。
+
+验收工具：`toolchain/lease-adopt-probe.py`（A 认领后不投输入，B 必须能接管，
+且接管后的 30 条 `m,` 一条都不许被拒）。
+
+**代价，写清楚：** 这两个阈值把 `exclusive` 从"先到先得、永久"改成了"谁在投输入
+谁说了算"。同一台机器上只有一个操作者时，这严格更好（换传输、换页签、重连都不用
+管租约了）；真正有两个人在抢同一个指针时，静默超过 3 s 的一方会丢掉租约，而他下
+一条输入会在 3 s 内再拿回来 —— 表现是轮流生效，而不是一方被永久锁死。上一版的
+"永久"在持有者活着但不再注入时就是一把打不开的锁，那个失败模式比轮流更糟。
+两个常量没有做成配置项：它们描述的是"人停手"的量级，不是部署差异；真要调，改
+`pipeline/shared.rs` 里那两行，测试会跟着走。
 
 
 下行剪贴板与 WebRTC **不是同一族**，必须按 WS 的发：
@@ -373,3 +489,125 @@ Microphone → VB-CABLE（`CABLE Input`）→ VoiceMeeter，都没有才退回�
 - **统计窗口的所有权不能是单向开关**：它原来是 `AtomicBool::swap(true)`，第一个
   订阅者永久拥有；那个会话关掉之后，快照就停在最后一秒，后来的人看到的面板是冻结的。
   现在是 3 秒租约，发布即续租（`STATS_LEASE`）。
+- **`server_settings` 回执必须是边沿触发的**（#111，本文件最贵的一次自激）。原来的
+  设计是"每收到一批 `SETTINGS` 就回一条 `server_settings`"，看着无害；但页面对回执
+  会 sanitize 一遍，把"被服务端改写过的键"再发回来，而回执里那四个锁定布尔
+  （`use_cpu` / `video_fullcolor` / `video_10bit` / `webcam_enabled`）在前端 locked
+  分支里拿 `!serverValue` 当默认值比较、又因为 `fromServer=true` 使所有 store 变成
+  空操作 —— 于是**每轮回执都重新报"设置被改了"，永远收敛不了**：
+
+  ```text
+  SETTINGS → server_settings（1392 B）→ 页面 sanitize 报 changes → SETTINGS → …
+  ```
+
+  实测这个环跑到 **400–550 批/秒**：`stream-server.log` 涨到 337 MB、+167 KB/s
+  （≈4 GB/h），下行约 4.7 Mbps 是同一条 JSON，进程 CPU 86%，主线程抢不到时间渲染
+  第一帧 —— 用户看到的是"一直 Waiting for stream"，而画面数据其实一直在流
+  （60 fps / 5.6 Mbps / `write_err=0`）。只在 WS 上出现：WebRTC 没有"每批回执"这个
+  设计，回路形不成。
+
+  两侧同时修：服务端 `EchoState` 记住上一条回执原文，内容不变就不发，另加 100 ms
+  内**完全相同 payload 直接丢弃**（连 JSON 都不解析）；逐字段的 `SETTINGS:` 日志降到
+  debug，收尾按 `StreamPrefs` 前后差异留一条聚合 info。前端 locked 分支的默认值改成
+  `serverValue`，并让 `fromServer` 的 payload **一律不回写**（回执不是用户操作）。
+  验收工具：`toolchain/echo-probe.py`（200 批逐字节相同的 SETTINGS → 0 条回执，真实
+  改一档 → 1 条）。
+- **`cursor,` 这条线上有三个各自独立的坑，凑齐才"有指针"**（#111）：
+  1. WS 路径**没订管线事件** —— 不是坏了，是从来没做过；服务端零日志，页面零报错。
+  2. 补发赶在采集第一 beat 之前 → `last_cursor()` 是 `None`，而形状又不会自己变。
+  3. 单色光标被 `cursor_data` 跳过 —— 虚拟机上最常见的那一类。
+
+  另外两个只在真机上才炸的细节：`cursor_png_b64` 把 BGRA 直接写进声明为 RGBA 的
+  PNG（红蓝对调，白箭头看不出来）；`base64_encode` 不补 `=`，而这段 base64 进的是
+  CSS `url("data:image/png;base64,…")`，没有 `atob` 的宽容规则 —— 静默退回默认箭头。
+  验收工具：`toolchain/cursor-probe.py`（`WSPLAIN=1` 可用于本地明文服）。
+- **"指针是叠上去的"其实是租约锁在旧传输上**（#113，见 §7.2）。这一条值得单独记：
+  现象全在浏览器侧（指针跟手、悬停无反馈），证据全在服务端（`lease=no`、`denied`
+  在涨），而最初的排查方向被上一轮自己写的日志骗了一次 —— `operates` 那栏当时写的是
+  **角色**，不是"能不能动手"，于是"租约被别人握着"被打印成了 `yes`。日志要回答的
+  是当下的事实，不是配置。
+
+- **"客户端 FPS 0 而服务端 60"不是一路数**（#114）。面板上那两条线来自两个完全不同的
+  地方：`encoded_fps` 是服务端每秒发来的样本，`fps` 是**页面自己数的呈现帧**。后者挂在
+  一个很容易断的链条上 —— `videoWatch` 只在统计打开的那一刻绑一次（那一刻 `<video>`
+  可能还不存在）、worker 只有被明确告知"统计开着"才会计数、canvas 在自己的绘制点计数。
+  任何一环没接上，计数就整场为 0，而画面明明是好的。现在规则是：**这一秒没有任何呈现
+  证据时，报线上帧率 `window.fps`**，不报 0 —— 0 是一句假话，而且它会把读的人引向
+  一条完全正常的流。同时补绑 `videoWatch`（元素后到也能跟上）。
+  排查工具：`toolchain/ws-fps-probe.py`（服务端帧号是否每秒 60 个不同值）、
+  `toolchain/page-probe.py`（无头 Edge + CDP，直接读页面里的 `window.fps` /
+  `stream_stats.latest`，并区分"帧没到"与"到了没记账"）。
+
+- **一次队列排空就把这条连接永久降级成"只发关键帧"**（#116）。这是本轮找到的
+  真根因，也是上面 #114 那条一直没解释干净的半边。
+
+  下行循环里那句判断写的是"这一批丢过帧，所以下一帧必须能独立解码"，用的却是
+  **整条连接的累计数**：
+
+  ```rust
+  let mut latest = first;
+  while let Ok(next) = rx.try_recv() { latest = next; dropped += 1; }   // dropped 在循环外
+  if dropped > 0 && need_key == false { need_key = true; }              // 于是"丢过一次"= "永远丢"
+  ```
+
+  `dropped` 只增不减，所以排空过一次队列之后，此后**每一拍**都会重新上闸 ——
+  哪怕这一拍只有一帧、队列是空的。闸上之后只有关键帧能过，而周期 IDR 是
+  `keyframe_secs`（默认 10 秒）一个：60 帧/秒被削成 0.1 帧/秒。面板取整就是 0，
+  偶尔有一个落在 1 秒窗口里就是 1 —— 用户看到的"**一直在 0 和 1 之间浮动**"。
+  它是**永久**的：只有重连（`dropped` 归 0）才恢复。
+
+  触发点就是用户说的"在桌面上随便动一动"：右击弹出菜单是一次大面积变化，帧变大、
+  浏览器有一拍跟不上，4 深的队列就积起来了。
+
+  为什么两个数字当时都"对"：`health` 的 `frames_total` / `avg_mbps` 取自
+  `fanout.rs` 里 `try_send` **入队成功**那一刻的计数，不是真正写进 socket 的字节。
+  入队的 60 帧里绝大多数随后被这道闸丢掉，于是"服务端 60、客户端 0"两边都不算错，
+  只是量的不是同一件事。
+
+  修法两条：闸只看**这一批**（`key_gate_after_batch(queued, need_key)`），上闸的
+  那一刻顺手 `request_keyframe()` —— 真实的丢帧仍然要等关键帧，但不该等 10 秒。
+  回归工具 `toolchain/gate-latch.py`：连上去正常读两秒，然后**两秒不 recv**（真实
+  的 TCP 背压 → 服务端队列积压），再恢复读，数后面每秒还能收多少帧。修复前停读
+  一次就再也回不到 60；修复后实测"恢复第 1 秒 181 帧（积压+关键帧），第 2 秒起
+  稳定 59-63 帧/秒"。
+
+  同一轮还给前端补了一句"报 0 的时候把缘由写出来"：那一拍里明明收到了视频分块却
+  报 0，只可能是三种成因（共享观众、条纹模式、报文头不可用），事后面板上一个都看
+  不出来。日志要回答当下的事实 —— 这条教训在 #113 已经付过一次学费了。
+
+## #117 默认值：WebSockets + VP9
+
+产品默认变了，三层各改一处，任何一层漏改都会表现为"默认没变"：
+
+| 层 | 位置 | 改前 | 改后 |
+|---|---|---|---|
+| 服务端传输 | `config.rs` 的 `default_mode`（`--mode`） | `webrtc` | `websockets` |
+| 服务端编码器 | `config.rs` 的 `video_codec`（`--video-codec`） | `vp8` | `vp9` |
+| 面板编码器回退值 | `Sidebar.jsx` 的 `DEFAULT_ENCODER` | `encoderOptions[0]`（= `h264enc`） | `vp9enc` |
+| 核心本地回退值 | `selkies-ws-core.js` / `selkies-wr-core.js` 的 `encoder` | `h264enc` | `vp9enc` |
+
+为什么不是只改面板：`server_settings.encoder.value` 回显的是**正在跑**的编码器
+（`dispatch/output.rs` 的 `s.codec().encoder_id()`），并且 #94 起服务端说的优先于
+本地存的。所以只改面板默认值，会先显示 VP9、随即被服务端的 VP8 覆盖回去。
+
+`encoderOptions[0]` 是 `h264enc` 这件事本身也是坑：那是上游 selkies 的菜单顺序，
+这个构建只有 libvpx（VP8/VP9），任何"退到第一个选项"的路径都会落到一个编不出来
+的编码器上。
+
+**验证**（`toolchain/defaults-probe.py`，用一次性 profile 起无头 Edge，展开"视频
+设置"分组后读 DOM）：
+
+```
+storedMode    websockets      ← main.jsx 从 /api/status 播下去的值
+panelMode     websockets      ← #streamModeSelect
+panelEncoder  vp9enc          ← #encoderSelect
+transport     1 (OPEN)        ← 实际连的是 WS
+```
+
+服务端侧：`/api/status` → `current_mode: websockets`；连接后 `/api/v1/health` 的
+`stream.codec` 为 `vp9`；`ws-fps-probe.py` 稳态 60 个不同帧号/秒。
+
+回退方式仍然是命令行：`--mode webrtc`、`--video-codec vp8`，或者面板里直接选。
+已有浏览器**保留自己存的选择**（`main.jsx` 只在 localStorage 为空时播种），所以
+这套默认值只影响"从没选过"的浏览器 —— 想立刻看到效果就清掉站点数据或换一个
+profile。

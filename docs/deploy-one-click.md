@@ -524,8 +524,8 @@ reconnect...`；控制台里 `GET /api/websockets 404`，`wss://.../api/websocke
 3. `enable_dual_mode: true` 让面板的模式切换按钮出现，这是 WebRTC 连不上时唯一的退路。
 
 **验证**：`curl -sk https://<host>:8080/api/status` 应当回
-`{"status":"ok","current_mode":"webrtc","enable_dual_mode":true,…}`；页面源码里
-**不应再有**那行静态注入。
+`{"status":"ok","current_mode":"websockets","enable_dual_mode":true,…}`（#117 起默认
+传输是 WebSockets；`--mode webrtc` 换回旧默认）；页面源码里**不应再有**那行静态注入。
 
 
 ### 7.13 `-SkipBuild` 会复用上一次的前端 zip（已修）

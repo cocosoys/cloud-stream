@@ -78,8 +78,8 @@ pub use encoder::VideoEncoder;
 pub use fanout::{SinkCounters, SinkHandle, VideoFanout};
 pub use sample_map::video_frame_to_chunks;
 pub use scale::bgra_scale;
-pub use settings::StreamSettings;
-pub use shared::{DisplayKey, PipelineRegistry, SharedPipeline};
+pub use settings::{StreamPrefs, StreamSettings};
+pub use shared::{DisplayKey, PipelineRegistry, SharedPipeline, LEASE_ADOPT_IDLE};
 use settings::RateControl;
 
 use std::path::PathBuf;
@@ -262,6 +262,13 @@ pub struct PipelineHandle {
     /// no event sink at all. Keeping the last one here turns "what the
     /// capturer is doing" into a value anybody can read at any time.
     stream_info: Arc<Mutex<(bool, String)>>,
+    /// #111: 最后一次 `Cursor` 事件的形状，供**后来才连上**的会话补发一次。
+    ///
+    /// `Cursor` 只在光标**形状变化**时 emit（同一形状的位置变化不走事件），
+    /// 所以订阅得晚的连接永远等不到第一次形状 —— 页面上就只剩浏览器默认箭头，
+    /// 而用户看到的是"画面里的指针不对/没有"。和上面 `stream_info` 同一条理由：
+    /// 事件只能通知"当时在场的人"，后来者需要一个可以随时读的值。
+    last_cursor: Arc<Mutex<Option<CursorData>>>,
 }
 
 impl Default for PipelineHandle {
@@ -290,6 +297,7 @@ impl PipelineHandle {
             rebuild: Arc::new(AtomicBool::new(false)),
             exit_sink: Arc::new(Mutex::new(Vec::new())),
             stream_info: Arc::new(Mutex::new((false, String::new()))),
+            last_cursor: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -362,6 +370,18 @@ impl PipelineHandle {
         self.cursor_inject.load(Ordering::SeqCst)
     }
 
+    /// #111: 被控机当前的指针形状，给刚连上的会话补发一次。
+    ///
+    /// `None` 表示采集循环还没读到过光标（刚启动、或一直读取失败），
+    /// `Some(id == 0)` 表示"光标现在是隐藏的" —— 两者对页面意味着不同的事：
+    /// 前者不该动页面手上的形状，后者要让它把自己的指针藏起来。
+    pub fn last_cursor(&self) -> Option<CursorData> {
+        self.last_cursor
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
     /// #84: published as `stream_stats.throttled` and set by the QoS
     /// controller when it backs the encoder off its base rate.
     pub fn set_throttled(&self, on: bool) {
@@ -416,6 +436,11 @@ impl PipelineHandle {
         if let PipelineEvent::StreamInfo { is_gdi, ref reason } = ev {
             *self.stream_info.lock().unwrap_or_else(|p| p.into_inner()) =
                 (is_gdi, reason.clone());
+        }
+        // #111: 同理留一份光标形状。`Cursor` 每次变化只 emit 一次，晚到的会话
+        // 否则就永远不知道被控机的指针长什么样。
+        if let PipelineEvent::Cursor(ref cd) = ev {
+            *self.last_cursor.lock().unwrap_or_else(|p| p.into_inner()) = Some(cd.clone());
         }
         let mut dead: Vec<u64> = Vec::new();
         {
@@ -827,6 +852,11 @@ fn run_inner_beat(
     // change) + the last emitted id so hide transitions fire once.
     let mut cursor_cache: Option<CursorData> = None;
     let mut last_cursor_id: Option<u64> = None;
+    // #111: "页面上为什么没有指针" 只有一次机会能分开三种原因 —— 隐藏、单色光标
+    // （`hbmColor == 0`，`cursor_data` 会跳过）、读失败。它们往下游看全是 `None`，
+    // 而下游只在**变化**时才发事件，于是新程序的首帧如果读到其中任一，事件通道
+    // 永远安静。第一次 beat 打一行，之后不再重复。
+    let mut cursor_read_logged = false;
     // #70 pointer-lock cursor sync. `pristine_bgra` is the last frame *without*
     // the cursor painted on it, in target geometry, refreshed on **every** new
     // frame whatever `cursor_inject` currently says (see the snapshot note in
@@ -1104,9 +1134,24 @@ fn run_inner_beat(
         // #62: debounced. The browser emits one PLI per lost frame and a
         // keyframe is far bigger than a P-frame, so an unthrottled answer
         // re-creates the loss that asked for it (self-sustaining oscillation).
+        //
+        // #112: 去抖间隔不能是常数 —— 它必须至少覆盖"上一个关键帧花掉的时间"。
+        // VP9 的 1080p 关键帧在这台机器上要 600 ms，而 500 ms 的固定间隔意味着
+        // **每一拍都排到了关键帧**：客户端一帧 delta 都收不到，于是继续 PLI，
+        // 循环自我维持（实测 loop 掉到 1.6 Hz、`enc_avg` 608 ms、PLI 连成线，
+        // 页面上就是黑屏）。按实测编码耗时把间隔放大到它的两倍，中间那些 delta
+        // 帧才有机会出场，解出第一帧之后 PLI 自己就停了。
+        let keyframe_gap = {
+            let enc_ms = stats
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .encode_timing
+                .avg_ms();
+            KEYFRAME_MIN_INTERVAL.max(Duration::from_millis((enc_ms * 2.0) as u64))
+        };
         if handle.keyframe_requested.swap(false, Ordering::SeqCst) {
             let due = match last_keyframe {
-                Some(t) => t.elapsed() >= KEYFRAME_MIN_INTERVAL,
+                Some(t) => t.elapsed() >= keyframe_gap,
                 None => true,
             };
             if due {
@@ -1118,7 +1163,9 @@ fn run_inner_beat(
                 // on, otherwise a PLI during a still picture is never answered.
                 repeat_budget = REPEAT_ENCODE_MAX;
             } else {
-                log::debug!("PLI coalesced: keyframe sent less than {KEYFRAME_MIN_INTERVAL:?} ago");
+                log::debug!(
+                    "PLI coalesced: a keyframe went out less than {keyframe_gap:?} ago"
+                );
             }
         }
         // #56: `vb,<N>` from the settings panel -> re-target the encoder; a
@@ -1309,6 +1356,30 @@ fn run_inner_beat(
         // is exactly the case DXGI reports as "no new frame". `update_cursor`
         // is cheap: one `GetCursorInfo`; bitmap work happens only when the
         // cursor identity changes.
+        // #111: 一次性的光标自述。放在 `update_cursor` 之前，因为后者只在
+        // "形状变了"时才 emit —— 新会话要等的那条事件可能永远不会来。
+        if !cursor_read_logged {
+            cursor_read_logged = true;
+            match cursor_info() {
+                Ok(Some(id)) => match cursor_data(id) {
+                    Ok(Some(cd)) => log::info!(
+                        "#111 host cursor: id {id:#x} {}x{} hot=({},{})",
+                        cd.width,
+                        cd.height,
+                        cd.hotx,
+                        cd.hoty
+                    ),
+                    Ok(None) => log::warn!(
+                        "#111 host cursor: id {id:#x} is single-colour or unusable; \
+                         the page will keep its own pointer shape"
+                    ),
+                    Err(err) => log::warn!("#111 host cursor: bitmap capture failed: {err:#}"),
+                },
+                Ok(None) => log::info!("#111 host cursor: hidden on the host right now"),
+                Err(err) => log::warn!("#111 host cursor: GetCursorInfo failed: {err:#}"),
+            }
+        }
+
         let cursor = update_cursor(&mut cursor_cache, &mut last_cursor_id, &handle);
         let cursor_on = handle.cursor_inject_on();
         if cursor_on != cursor_was_on {
@@ -2072,6 +2143,42 @@ fn short_reason(err: &dyn std::error::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #111：晚到的会话靠 `last_cursor()` 补齐指针形状。
+    ///
+    /// 两处语义必须分开：`None` 是"采集循环还没读到过"（什么都别发，页面的
+    /// 形状保持原样），`Some(id == 0)` 是"被控机的指针现在是隐藏的"（要让页面
+    /// 把自己的箭头也收起）。把前者当成后者，新观众一进来就会被藏掉指针。
+    #[test]
+    fn last_cursor_remembers_the_latest_shape_including_hidden() {
+        let handle = PipelineHandle::new();
+        assert!(
+            handle.last_cursor().is_none(),
+            "nothing read yet is not the same as hidden"
+        );
+        handle.emit_event(PipelineEvent::Cursor(CursorData {
+            id: 7,
+            colors: vec![0; 16],
+            width: 2,
+            height: 2,
+            hotx: 0,
+            hoty: 0,
+        }));
+        assert_eq!(handle.last_cursor().map(|c| c.id), Some(7));
+        handle.emit_event(PipelineEvent::Cursor(CursorData {
+            id: 0,
+            colors: Vec::new(),
+            width: 0,
+            height: 0,
+            hotx: 0,
+            hoty: 0,
+        }));
+        assert_eq!(
+            handle.last_cursor().map(|c| c.id),
+            Some(0),
+            "a hidden pointer is a state worth remembering"
+        );
+    }
 
     #[test]
     fn dxgi_budget_allows_three_then_blocks() {

@@ -78,7 +78,7 @@ use crate::dispatch::input_stub::InputSink;
 use crate::dispatch::win_input::WinInputSink;
 use crate::pipeline::codec::VideoCodec;
 use crate::pipeline::shared::{DisplayKey, SharedPipeline};
-use crate::pipeline::{audio, PipelineRegistry, StreamSettings};
+use crate::pipeline::{audio, PipelineEvent, PipelineRegistry, StreamSettings};
 use crate::signaling::websession::{
     apply_settings_batch, AdmissionPermit, SessionInfo, SessionRegistry,
 };
@@ -152,6 +152,25 @@ pub fn is_keyframe(data: &[u8], codec: VideoCodec) -> bool {
         // 不校验 marker —— 校验错了会变成"每帧都当残差丢掉"的黑屏。
         VideoCodec::Vp9 => ((b0 >> 2) & 0x01) == 0,
     }
+}
+
+/// 一批帧排空之后，关键帧闸还该不该上。
+///
+/// 判断依据只能是**这一批**有没有丢帧：丢了，参考链就断了，下一帧必须能独立
+/// 解码（残差帧在没有参考的情况下解出来是花屏，而花屏比黑屏更像"串流坏了"）；
+/// 没丢，闸就不该上。
+///
+/// #116 之前这里拿的是**整条连接的累计丢弃数**（`dropped`），于是"丢过一次"
+/// 变成了"永远丢"：此后每一拍，哪怕这一拍只有一帧、队列是空的，也会重新上闸，
+/// 只有每 `keyframe_secs`（默认 10 秒）一个的 IDR 能过。现场表现就是
+/// 「服务端 FPS 60、客户端 FPS 从 60 一路跌到 0/1 并停在那里，重连才恢复」。
+///
+/// 这个 bug 之所以能藏这么久，是因为它同时让**两个**数字看起来正常：
+/// `health` 的 `frames_total` / `avg_mbps` 统计的是 fanout 里 `try_send` 的
+/// 入队成功（`fanout.rs`），入队的 60 帧里绝大多数随后被这道闸丢掉。于是
+/// "服务端 60 / 客户端 0"两个数都"没错"，只是量的不是同一件事。
+fn key_gate_after_batch(queued: u32, need_key: bool) -> bool {
+    need_key || queued > 0
 }
 
 /// 把一帧编码数据封成前端认的线上格式。
@@ -243,6 +262,72 @@ fn encode_jpeg_stripes(frame: &crate::pipeline::raw::RawFrame, frame_id: u16) ->
     out
 }
 
+/// 一条连接上的 `server_settings` 回执记账（**边沿触发**）。
+///
+/// # 为什么需要它
+///
+/// 页面把 `SETTINGS` 当成"告诉服务端我在用什么"，而这里以前**每收到一批就回
+/// 一条** `server_settings`。两边各自都守规矩，回路却是无限的：页面对回执会
+/// sanitize 一遍，把"被服务端改写过的键"再发回来；于是
+///
+/// ```text
+/// SETTINGS → server_settings（1392 B）→ 页面 sanitize 报 changes → SETTINGS → …
+/// ```
+///
+/// 实测这个环跑到 **400–550 批/秒**：日志 +167 KB/s（约 4 GB/h），下行有一半
+/// 带宽是控制面 JSON，进程 CPU 86%，主线程抢不到时间渲染第一帧 —— 表现出来
+/// 就是"一直 Waiting for stream"。而画面数据其实一直在流。
+///
+/// 回执的用途只有一个：让页面知道"你点的这一档，我实际用了什么"。这天然是
+/// 边沿触发的 —— 内容没变就不该再发，发第二遍一模一样的东西不会让任何人多
+/// 知道一点。
+///
+/// # 为什么整串比较而不是逐字段比 `StreamPrefs`
+///
+/// 回执里除了那 8 个值，还有锁定清单、`allowed`、宿主 DPI、麦克风可用性等
+/// 一堆字段，其中几项（`scaling_dpi`/`mouse_dpi`）是从宿主**读**出来的。逐字段
+/// 比较等于把 `output::server_settings` 抄第二遍，抄漏一个字段就是一条永远
+/// 收敛不了的差异；整串比较则天然覆盖全部，且宿主真变了也能重发。
+#[derive(Default)]
+struct EchoState {
+    /// 上一次真发出去的那条回执原文。
+    last: Option<String>,
+    /// 上一批 `SETTINGS` 的原文与到达时间（用来吸收完全相同的重复批）。
+    last_payload: Option<String>,
+    last_payload_at: Option<std::time::Instant>,
+}
+
+impl EchoState {
+    /// 窗口取 100 ms：同一份 payload 在这个窗口内重复到达，是放大器而不是
+    /// 用户操作 —— 人手最快也点不出 10 次/秒的同一个开关。
+    const DUP_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
+
+    /// 这批 `SETTINGS` 是不是上一批的复读？是则调用方可以直接丢弃 ——
+    /// 连 JSON 都不必解析，因为同样的批上一次已经应用过、也已经记过账。
+    fn is_repeat(&mut self, payload: &str) -> bool {
+        let now = std::time::Instant::now();
+        let repeat = self.last_payload.as_deref() == Some(payload)
+            && self
+                .last_payload_at
+                .map_or(false, |at| now.duration_since(at) < Self::DUP_WINDOW);
+        if !repeat {
+            self.last_payload = Some(payload.to_owned());
+            self.last_payload_at = Some(now);
+        }
+        repeat
+    }
+
+    /// 这条回执要不要发？内容与上一条一致就静默。
+    fn should_send(&self, text: &str) -> bool {
+        self.last.as_deref() != Some(text)
+    }
+
+    /// 记下一条**已经发出去**的回执。
+    fn remember(&mut self, text: &str) {
+        self.last = Some(text.to_owned());
+    }
+}
+
 /// `server_settings` 在两条传输上的形状不一样，这是必须记住的一处差异。
 ///
 /// WebRTC 走数据通道，格式是 `{"type":...,"data":{"settings":{...}}}`（前端
@@ -317,6 +402,24 @@ fn jpeg_settings_frame(settings: &StreamSettings) -> Option<String> {
     let flat = full.get_mut("data")?.get_mut("settings")?;
     flat["encoder"] = serde_json::json!({ "value": "jpeg", "allowed": ["jpeg"], "locked": false });
     Some(serde_json::json!({ "type": "server_settings", "settings": flat.clone() }).to_string())
+}
+
+/// `cursor` 在 WS 上是 **`cursor,{json}`**（逗号前缀），和上面那几种扁平封套
+/// 不是同一种写法。
+///
+/// 页面用 `event.data.startsWith('cursor,')` 分流，再 `JSON.parse(substring(7))`
+/// 得到对象、直接交给 `updateServerCursor`，读的是 `curdata / width / height /
+/// hotx / hoty / handle` 这一层 —— 所以这里必须把 `output::cursor` 的
+/// `{type,data}` 拆开，多包一层页面就只看到 `undefined`。
+///
+/// 不发它的后果不是黑屏，而是**画面上的指针永远是浏览器默认箭头**：被控机的
+/// 光标形状、隐藏状态、"这里是手型/十字"全都没了。WebRTC 那条路一直靠事件
+/// sink 在发，WS 这一版此前一个事件都没订阅，整条链是空的。
+fn cursor_frame(cd: &crate::pipeline::CursorData) -> Option<String> {
+    let full: serde_json::Value =
+        serde_json::from_str(&crate::dispatch::output::cursor(cd)).ok()?;
+    let flat = full.get("data")?.clone();
+    Some(format!("cursor,{flat}"))
 }
 
 /// 这一批 `SETTINGS` 里点名要的编码器（字符串或 `{value:...}` 两种形状都认）。
@@ -499,7 +602,11 @@ where
     // after every display switch.
     let mut codec_now = pipeline.settings.codec();
 
+    // #111: 这条连接的回执记忆。第一次同步下面就会记上，于是页面随后发来的
+    // 第一批 `SETTINGS` 只要不改变任何东西，就不会再收到一条一模一样的回执。
+    let mut echo = EchoState::default();
     if let Some(settings) = settings_frame(&pipeline.settings) {
+        echo.remember(&settings);
         sink.send(Message::Text(settings.into())).await?;
     } else {
         log::warn!("ws media: server_settings could not be reshaped; the page keeps its own defaults");
@@ -508,6 +615,32 @@ where
     // `PIPELINE_RESETTING` 之后的重新连接重发；它不带时间敏感的数值。
     if let Some(info) = stream_info_frame(&pipeline, principal.may_name_host()) {
         sink.send(Message::Text(info.into())).await?;
+    }
+
+    // #111: 订阅管线事件。WS 这一版从做出来到今天**一个事件都没订**，于是
+    // `cursor`（被控机指针形状）和 `system`（采集恢复/降级）在这条传输上永远
+    // 收不到 —— 页面上表现为"视频里的指针是浏览器默认箭头"。判据很硬：日志里
+    // 连一行 `#70 pointer handover` 都没有，因为页面的 `SET_NATIVE_CURSOR_RENDERING`
+    // 在那边也没有对手方。
+    //
+    // sink 是**per-program** 的：换屏那段要摘掉旧的、挂上新的。
+    let (event_tx, mut events) = mpsc::unbounded_channel();
+    let mut event_id = pipeline.handle.add_event_sink(event_tx);
+    // 订阅只收"以后"的事件，而光标早就已经在那儿了：补发一次当前形状。
+    // `Some(id == 0)` 是"现在隐藏"——页面据此收起自己的箭头，和"还没读到过"
+    // （`None`，什么都不发）是两件事。
+    //
+    // 但补发这一次经常**空手**：`last_cursor()` 要等采集循环第一次 beat，而
+    // 那一 beat 在下面的 `handle.start()` 之后。指针形状又不会自己变（箭头一直
+    // 是箭头，`update_cursor` 只在 id 变化时 emit），所以"等下一次变化"可能永远
+    // 等不到 —— 页面上就是"没有指针"。`cursor_sent=false` 时 loop 里那个 250 ms
+    // 的补位定时器会接着问。
+    let mut cursor_sent = false;
+    if let Some(cd) = pipeline.handle.last_cursor() {
+        if let Some(line) = cursor_frame(&cd) {
+            send_text(&mut sink, line).await?;
+            cursor_sent = true;
+        }
     }
 
     // 网关打开，编码器开始出帧。
@@ -533,22 +666,50 @@ where
     // 会握住租约、把之后连上来的操作者永远挡在门外（认领是 claim-if-free，
     // 没人能把它挤掉）—— 那会表现成"操作者连上了，键鼠没反应"。
     let may_operate = principal.may_operate();
+    // #113: 先量一下上一任持有者静默了多久 —— 必须在认领/接管**之前**取，
+    // 之后这份时间戳已经被接管路径刷新成"刚刚"了。
+    let idle_before = match pipeline.input_idle() {
+        Some(idle) => format!("{:.1}s", idle.as_secs_f32()),
+        None => String::from("never"),
+    };
     if may_operate {
         pipeline.try_claim_controller(session_id);
+    }
+
+    // #113: 认领只赢在"没人持有"。换传输之后租约在旧会话手里（它还活着、还在
+    // 收字节，只是再也不会投输入），claim-if-free 就成了一道锁 —— 实测症状是
+    // 切回 WebSocket 后 `lease=no`，页面上指针跟着鼠标动、桌面一动不动。
+    // 判据是"旧持有者多久没投过输入"，不是身份：tab id 要到 `SETTINGS` 才来，
+    // 而第一下点击在这之前。
+    if may_operate && pipeline.adopt_lease_if_stale(session_id, crate::pipeline::LEASE_ADOPT_IDLE) {
+        log::info!(
+            "ws media: session {session_id} adopted the input lease (the previous holder was not injecting)"
+        );
     }
 
     // #110: 会话号登记完才补得上 —— 身份本身（租户/角色）在连接开头就定了，
     // 那时还没有 session 可填。
     principal.session = Some(session_id);
     // #110: 两个问题是分开的，日志也必须分两栏写。`grant` 是令牌上写的角色，
-    // `operates` 是这条连接实际能不能动手 —— 无门部署（`cred=none`）里前者是
-    // `viewer`、后者是 true，只写一栏的话每次复盘都要重新推一遍这个差。
+    // `operates` 是这条连接**实际**能不能动手：角色够格 **且** 手里有租约。
+    // 无门部署（`cred=none`）里 grant 是 `viewer`、operates 是 yes，只写一栏的话
+    // 每次复盘都要重新推一遍这个差。
+    //
+    // #112: `operates` 以前只写角色（`may_operate`），于是"租约被别人握着"这种
+    // 最需要它说话的情况刚好被写成 yes —— 排查时我按这一行否掉了租约这条线，
+    // 多绕了一圈。现在它回答的是"现在能不能动手"。
+    //
+    // #113: 再补一栏 `prev_idle` —— 上一任持有者静默了多久。这一栏是"换传输
+    // 之后为什么指针没反应"的唯一直接证据：没有它就只能从 `lease=no` 反推，而
+    // `lease=no` 在正常的两页签场景里同样是 `no`。
     log::info!(
-        "ws media: {peer} identified as tenant={} grant={} operates={} cred={}",
+        "ws media: {peer} identified as tenant={} grant={} operates={} lease={} cred={} prev_idle={}",
         principal.tenant.as_str(),
         principal.role.as_str(),
         if may_operate { "yes" } else { "no" },
-        principal.credential.label()
+        if pipeline.owns_input(session_id) { "yes" } else { "no" },
+        principal.credential.label(),
+        idle_before
     );
 
     let (tx, mut rx) = mpsc::channel::<Bytes>(QUEUE);
@@ -622,6 +783,14 @@ where
     // "通道满"失败 —— 失败一次就再也不会复位 `jpeg_busy`，那条连接从此没有画面。
     let mut jpeg_tx: Option<mpsc::UnboundedSender<Vec<Bytes>>> = None;
     let mut jpeg_rx: Option<mpsc::UnboundedReceiver<Vec<Bytes>>> = None;
+    // #111: 光标的补位定时器。存在的唯一理由是顺序：`last_cursor()` 在
+    // `handle.start()` 之前多半还是 `None`（第一次 beat 还没跑），而形状不会
+    // 自己变，于是"等事件"就变成了"永远没有指针"。250 ms 问一次，拿到就停。
+    let mut cursor_tick = tokio::time::interval(std::time::Duration::from_millis(250));
+    cursor_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // `interval` 的第一次 tick 立即就绪；先吃掉它，这一支要表达的是"250 ms 后
+    // 再看"，不是"立刻再看"。
+    cursor_tick.tick().await;
 
     let outcome: Result<()> = async {
         loop {
@@ -640,13 +809,22 @@ where
                     // 只要最新的一帧。慢观众的正确惩罚是"少看几帧"，不是"看几秒前的画面"；
                     // 队列里留着旧帧反而会让延迟越积越长，最后看起来像卡死。
                     let mut latest = first;
+                    let mut queued: u32 = 0;
                     while let Ok(next) = rx.try_recv() {
                         latest = next;
-                        dropped += 1;
+                        queued += 1;
                     }
-                    if dropped > 0 && need_key == false {
-                        need_key = true;
+                    dropped += u64::from(queued);
+                    // #116: 上闸的依据只能是**这一批**有没有丢帧。
+                    let gate = key_gate_after_batch(queued, need_key);
+                    if gate && !need_key {
+                        // 上闸等于"等到下一个 IDR 之前什么都别发"，而周期 IDR 是
+                        // `keyframe_secs`（默认 10 秒）一个 —— 不主动要一个，观众
+                        // 就要卡 10 秒。这一批已经证明参考链断了，要一次就够：
+                        // 多要只会让编码器多做几次全帧。
+                        pipeline.handle.request_keyframe();
                     }
+                    need_key = gate;
                     if !streaming {
                         continue;
                     }
@@ -756,6 +934,30 @@ where
                     }
                 }
 
+                // #111: 管线事件。目前只消费 `Cursor` —— 它决定页面画的是被控机
+                // 的真实指针（手型、十字、隐藏），还是浏览器自己的默认箭头。
+                // 其余几类（`RecoveryStart`/`FallbackGdi`/`Lost`/`Restored`）
+                // 对应前端的 `system,` 消息，接上要一并核对页面文案，留作下一步。
+                Some(ev) = events.recv() => {
+                    if let PipelineEvent::Cursor(cd) = ev {
+                        if let Some(line) = cursor_frame(&cd) {
+                            send_text(&mut sink, line).await?;
+                            cursor_sent = true;
+                        }
+                    }
+                }
+
+                // #111: 补位（见 `cursor_sent` 与 `cursor_tick` 的注释）。拿到
+                // 一条就把这一支永久关掉 —— 之后的变化都走上面那个事件通道。
+                _ = cursor_tick.tick(), if !cursor_sent => {
+                    if let Some(cd) = pipeline.handle.last_cursor() {
+                        if let Some(line) = cursor_frame(&cd) {
+                            send_text(&mut sink, line).await?;
+                            cursor_sent = true;
+                        }
+                    }
+                }
+
                 msg = source.next() => {
                     match msg {
                         Some(Ok(Message::Text(line))) => {
@@ -773,6 +975,7 @@ where
                                 &denied,
                                 session_id,
                                 &principal,
+                                &mut echo,
                             )
                             .await?;
                         }
@@ -800,7 +1003,11 @@ where
                                     // "开了麦没声音"分不清是没到还是被挡了。
                                     // #110: 角色是这道门的另一半 —— 麦克风是往主机
                                     // 送声音，`viewer` 令牌在任何策略下都不该有它。
-                                    let may = may_operate && pipeline.owns_input(session_id);
+                                    // #112: 与键鼠同一条门禁（含自愈），否则会出现
+                                    // "键鼠能动手、麦克风被挡"这种一眼看不出原因的差。
+                                    // #113: 上行声音也算"在投输入" —— 用户可能只在开麦说话，
+                                    // 此时他显然是在用这条连接，不该被一条静默的租约挡住。
+                                    let may = pipeline.may_inject(session_id, may_operate, true);
                                     if !may {
                                         // 回绝而不是静默丢弃。两种拒绝（没租约、令牌是
                                         // 观众）在页面上的正确反应都是"关麦"：继续采
@@ -927,6 +1134,9 @@ where
                     // 页面据此把 `currentEncoderMode` 切到 jpeg 并开始处理 0x03；
                     // 不告诉它，它会把每一条条纹都丢掉。
                     if let Some(settings) = jpeg_settings_frame(&pipeline.settings) {
+                        // 记进 `echo`：这条内容是真的变了（encoder=jpeg），必须发；
+                        // 记下来之后，紧接着那批 `SETTINGS` 的回执就不会再重复它。
+                        echo.remember(&settings);
                         let _ = sink.send(Message::Text(settings.into())).await;
                     }
                     // 兜底路径从下一帧开始，不必等关键帧：JPEG 每帧都是自足的。
@@ -944,6 +1154,7 @@ where
                     need_key = true;
                     pipeline.handle.request_keyframe();
                     if let Some(settings) = settings_frame(&pipeline.settings) {
+                        echo.remember(&settings);
                         let _ = sink.send(Message::Text(settings.into())).await;
                     }
                     log::info!("ws media: session {session_id} left JPEG stripes");
@@ -995,6 +1206,10 @@ where
                 frame_id = 0;
                 reference = 0;
                 need_key = true;
+                // #111: 事件 sink 属于**程序**，不是这条连接。换屏就是换 program，
+                // 旧 handle 的 sink 必须摘掉（它的 receiver 马上就要被替换，留着
+                // 只是一个每次 emit 都要失败的条目），新的在下面重新挂。
+                pipeline.handle.remove_event_sink(event_id);
                 pipeline = next;
                 // #110: the new program may encode with a different codec, and
                 // the framing below reads this value.
@@ -1008,6 +1223,7 @@ where
                 } else {
                     settings_frame(&pipeline.settings)
                 } {
+                    echo.remember(&settings);
                     let _ = sink.send(Message::Text(settings.into())).await;
                 }
                 // 帧号与新程序的编码器对齐；JPEG 模式的帧号也是同一条线。
@@ -1017,6 +1233,19 @@ where
                 // 它拿这个名字和自己的 `displayId` 比，发索引等于什么都没做。
                 let reset = format!("PIPELINE_RESETTING {}", pipeline.display.hello_name());
                 let _ = sink.send(Message::Text(reset.into())).await;
+                // #111: 新程序的事件 sink，外加它当前的光标形状（订阅只收以后
+                // 的变化，而这块屏的指针形状早就有了）。
+                let (next_ev_tx, next_ev_rx) = mpsc::unbounded_channel();
+                event_id = pipeline.handle.add_event_sink(next_ev_tx);
+                events = next_ev_rx;
+                // 换了一块屏 = 换了一份指针形状，重新补位。
+                cursor_sent = false;
+                if let Some(cd) = pipeline.handle.last_cursor() {
+                    if let Some(line) = cursor_frame(&cd) {
+                        let _ = sink.send(Message::Text(line.into())).await;
+                        cursor_sent = true;
+                    }
+                }
                 log::info!(
                     "ws media: session {session_id} moved from display {} to {}",
                     previous.0,
@@ -1028,11 +1257,40 @@ where
     }
     .await;
 
+    // #112: 租约不能随连接一起消失。这是信令路径 #103 的同一条规矩，WS 这条路
+    // 一直漏着 —— 只挂一个页面时看不出来（程序跟着走，租约一起销毁），一旦同时
+    // 挂着第二条连接就现形：换传输的那几十秒里旧 socket 还没关、新页面已经连上，
+    // 新连接的 `try_claim_controller` 撞上"有人持有"而放弃，随后旧连接收尾又
+    // **没有归还** —— 于是剩下的人看着一块摸不动的桌面，重连也修不好（租约挂在
+    // 程序上，不在 socket 上）。
+    //
+    // 交给同屏最老的另一条连接，没人接手就明确置空（让 `may_inject` 的自愈
+    // 有东西可以认领）。必须在 `registry.remove` **之前**算，否则"下一个是谁"
+    // 里会剩下自己。
+    let held_lease = pipeline.controller_id() == Some(session_id);
+    let display_index = pipeline.display.0;
+    let inherited = if held_lease {
+        registry.successor(session_id, display_index).await
+    } else {
+        None
+    };
+
     // 松开所有还按着的键：页面崩掉不会发 `kr`，而被控机上按键是全局状态。
     input.reset();
     pipeline.audio.detach(audio_sink);
     pipeline.detach(sink_handle.id());
     registry.remove(session_id).await;
+    if held_lease {
+        pipeline.set_controller(inherited);
+        match inherited {
+            Some(next) => log::info!(
+                "pipeline {display_index}: input lease handed to session {next} (holder left)"
+            ),
+            None => log::info!(
+                "pipeline {display_index}: input lease released (holder left, nobody to hand it to)"
+            ),
+        }
+    }
     // 不能漏：`acquire` 加了一次引用，最后一个走的负责停掉采集循环。
     // #109: 必须释放**这一条**连接真正加入的那个 key，不能写死成 PRIMARY ——
     // 否则 `--display 1` 下程序永远不会被回收，而 PRIMARY 的计数会被扣成负数。
@@ -1090,6 +1348,9 @@ async fn handle_text<S>(
     // installed to stop input or settings changes simply did not apply to a
     // WebSocket viewer.
     principal: &crate::security::Principal,
+    // 这条连接的回执记账：`SETTINGS` 是回执触发的，而回执本身会被页面当成
+    // "我的设置被改了"再发回来 —— 见 [`EchoState`]。
+    echo: &mut EchoState,
 ) -> Result<Intent>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -1138,7 +1399,16 @@ where
     // #110: "能不能动这块屏"是**两个**条件 —— 租约（两个操作者里谁说了算）
     // 与角色（你是不是操作者）。以前只有前者，于是 `--input-policy shared`
     // 下任何持 `viewer` 令牌的连接都能注入输入。
-    let operates = principal.may_operate() && pipeline.owns_input(session_id);
+    //
+    // #112: 用 `may_inject` 而不是 `owns_input`：租约空着就顺手认领。悬空的
+    // 租约（前一条连接换了传输、socket 半开就走了）在这里自愈，否则这一路
+    // 键鼠全被丢掉，而页面上只是"指针会动、桌面没反应"。
+    //
+    // #113: 第三个参数说明"这一行是不是真的输入"。只有真输入才有资格把租约
+    // 从一条没人用的持有者手里接过来 —— 让 `pong`/`_stats`/`SETTINGS` 也触发
+    // 接管，接管日志会指向一条根本没在动指针的连接。
+    let is_input = matches!(action, Action::InputStub(_));
+    let operates = pipeline.may_inject(session_id, principal.may_operate(), is_input);
     if !compound && !operates && !crate::signaling::viewer_may_run(&action) {
         denied.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         log::debug!("ws media: viewer refused `{}`", short(line));
@@ -1202,6 +1472,14 @@ where
             log::info!("ws media: native cursor rendering -> {on}");
         }
         Action::SetSettings(payload) => {
+            // #111: 先挡住**复读**。页面的回写是"收到回执 → sanitize → 再发一整批"，
+            // 批的内容逐字节相同；这种东西一秒能来 400 次。同样的批上一次已经
+            // 应用过、记过账，再解析一遍只会把 CPU 和日志一起烧掉（实测日志
+            // 4 GB/h、CPU 86%）。丢弃是安全的：它不是用户操作，不需要第二次确认。
+            if echo.is_repeat(&payload) {
+                log::debug!("ws media: dropping a repeated SETTINGS batch ({} B)", payload.len());
+                return Ok(Intent::default());
+            }
             // #106: 页面在挑不到编码器时会点名 `jpeg`（`Kc()` → `fa('jpeg', …)`）。
             // 这不是全局编码器，而是**这条连接**的兜底：JPEG 条纹由本会话自己
             // 从原始帧编，别的观众照旧收 VP8。所以它不进 `apply_settings_batch`
@@ -1221,7 +1499,12 @@ where
                 log::debug!("ws media: viewer refused a program settings change");
                 // 回一份**真实**值：面板刚点下去的那一档必须被顶回去，否则它
                 // 会一直显示一个没有生效的帧率。
+                //
+                // 这一条**不走边沿触发**：内容很可能和上一条完全相同（观众反复
+                // 点同一档），但页面此刻的本地状态是新点的值，它需要被纠正一次。
+                // 记进 `echo` 只是为了让之后那条正常回执不必再重复。
                 if let Some(settings) = settings_frame(&pipeline.settings) {
+                    echo.remember(&settings);
                     send_text(sink, settings).await?;
                 }
                 let identity = crate::dispatch::settings_identity(&payload);
@@ -1252,8 +1535,16 @@ where
             } else {
                 settings_frame(&pipeline.settings)
             };
+            // #111: **边沿触发**。内容与上一条一致就不发 —— 这条判断就是那个
+            // 400 批/秒自激环的闸门（详见 [`EchoState`]）。语义上它也没有丢掉
+            // 信息：页面手上的值和这条要发的一模一样。
             if let Some(settings) = echoed {
-                send_text(sink, settings).await?;
+                if echo.should_send(&settings) {
+                    echo.remember(&settings);
+                    send_text(sink, settings).await?;
+                } else {
+                    log::debug!("ws media: settings unchanged; suppressing an identical echo");
+                }
             }
             // 换屏交给调用方：这里没有第二个 receiver，也没有 acquire 的引用计数，
             // 就地重建会把这几个状态撕成两半。返回意图、循环里统一处理。
@@ -1269,8 +1560,13 @@ where
         }
         Action::ClipboardChunk(raw) => clipboard.handle_line(&raw),
         Action::InputStub(raw) => {
-            // 角色门禁在上面统一做过了（`owns_input` + `viewer_may_run`），拒绝
+            // 角色门禁在上面统一做过了（`may_inject` + `viewer_may_run`），拒绝
             // 时已经记进 `denied`。这里只剩"放行"这一种情况。
+            //
+            // #113: 放行即"在用" —— 这一条时间戳是租约能不能失效的唯一依据。
+            // 只在这里盖，不在门禁里盖：门禁也被 `SETTINGS`/`pong` 问，那样一条
+            // 只会回 `pong` 的死会话会被永远喂热。
+            pipeline.note_input();
             input.handle_line(&raw);
         }
         other => log::debug!("ws media: ignoring `{:?}`", other),
@@ -1373,6 +1669,50 @@ fn short(s: &str) -> &str {
 mod tests {
     use super::*;
 
+    /// #111：`cursor,{json}` 必须是页面认的那个形状。
+    ///
+    /// 页面侧（`selkies-ws-core.js:8931`）只认 `cursor,` 前缀，再把 `substring(7)`
+    /// 当 JSON 解，直接喂给 `updateServerCursor`。这里少一个字段，指针就会画到
+    /// 左上角、或者干脆不画 —— 而服务端没有任何报错，因为字节是合法的。
+    #[test]
+    fn a_cursor_frame_carries_the_pages_flat_shape() {
+        let cd = crate::pipeline::CursorData {
+            id: 0x1234,
+            // 2x2 BGRA：大红、大绿、大蓝、白。内容不重要，长度要对。
+            colors: vec![
+                0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255, 255, 255, 255, 255,
+            ],
+            width: 2,
+            height: 2,
+            hotx: 1,
+            hoty: 2,
+        };
+        let line = cursor_frame(&cd).expect("a visible cursor must frame");
+        let body = line
+            .strip_prefix("cursor,")
+            .expect("the prefix the page matches on");
+        let v: serde_json::Value = serde_json::from_str(body).expect("body is JSON");
+        assert_eq!(v["handle"], 0x1234);
+        assert_eq!(v["width"], 2);
+        assert_eq!(v["height"], 2);
+        assert_eq!(v["hotx"], 1);
+        assert_eq!(v["hoty"], 2);
+        assert!(
+            v["curdata"].as_str().map(|s| s.len()).unwrap_or(0) > 40,
+            "curdata is a base64 PNG, not a path: {v}"
+        );
+
+        // 隐藏是指针的另一个状态，不是"没有指针"：空图 + 0 尺寸 + handle 0，
+        // 页面据此收起自己的箭头。
+        let hidden =
+            cursor_frame(&crate::pipeline::CursorData { id: 0, ..cd }).expect("0 is a state, not a gap");
+        let body = hidden.strip_prefix("cursor,").expect("same shape");
+        let v: serde_json::Value = serde_json::from_str(body).expect("body is JSON");
+        assert_eq!(v["curdata"], "");
+        assert_eq!(v["width"], 0);
+        assert_eq!(v["handle"], 0);
+    }
+
     fn le(n: usize) -> Bytes {
         Bytes::from(vec![0u8; n])
     }
@@ -1404,6 +1744,47 @@ mod tests {
         // 自己记一条 debug，这里不该把它当成越权。
         assert!(!touches_program_settings("not json"));
         assert!(!touches_program_settings("[]"));
+    }
+
+    /// #111：回执必须**边沿触发**。
+    ///
+    /// 这条盯的就是那个 400 批/秒的自激环：同样的 `SETTINGS` 反复到达，不该
+    /// 反复产生回执 —— 页面对每条回执都会回写一整批，回执就是放大器的心跳。
+    #[test]
+    fn an_identical_echo_is_only_sent_once() {
+        let mut echo = EchoState::default();
+        // 连上时那一次同步：页面手上没有值，必须发。
+        let first = r#"{"type":"server_settings","settings":{"framerate":{"value":60}}}"#;
+        assert!(echo.should_send(first), "the first sync is always sent");
+        echo.remember(first);
+        // 同样的内容再来：页面已经知道了，再发一遍只是把环路点起来。
+        assert!(!echo.should_send(first));
+        // 真的有变化（JPEG 兜底 / 换编码器）：必须发。
+        let changed = r#"{"type":"server_settings","settings":{"encoder":{"value":"jpeg"}}}"#;
+        assert!(echo.should_send(changed));
+        echo.remember(changed);
+        // 变回去同样算变化 —— 记的是"最后发出去的是什么"，不是"发过没有"。
+        assert!(echo.should_send(first));
+    }
+
+    /// 复读批只在窗口内被丢弃。
+    ///
+    /// 100 ms 之外的同一批**不能**丢：用户过一会儿又点回同一档是正常操作，
+    /// 而那时程序可能已经换过（换屏、重连），这一批仍然需要应用一次。
+    #[test]
+    fn repeated_batches_are_dropped_only_inside_the_window() {
+        let mut echo = EchoState::default();
+        let batch = r#"{"tabId":"t1","framerate":60}"#;
+        assert!(!echo.is_repeat(batch), "the first arrival is real work");
+        assert!(echo.is_repeat(batch), "the same bytes 0 ms later are the amplifier");
+        // 另一批不是复读，并且会把窗口重置到它自己身上。
+        assert!(!echo.is_repeat(r#"{"framerate":30}"#));
+        assert!(echo.is_repeat(r#"{"framerate":30}"#));
+        // 窗口过去之后，同一批重新算一次真活。
+        echo.last_payload_at = Some(
+            std::time::Instant::now() - EchoState::DUP_WINDOW - std::time::Duration::from_millis(1),
+        );
+        assert!(!echo.is_repeat(batch));
     }
 
     /// 一块 `w`x`h` 的假 BGRA 画面：从上到下渐变，好让条纹之间不撞码流。
@@ -1570,5 +1951,36 @@ mod tests {
         let cut = short(&long);
         assert!(cut.len() <= 120, "截断后长度受控");
         assert!(cut.chars().all(|c| c == '中'), "没有切出半个字符");
+    }
+
+    /// #116 的回归。现场的症状是"服务端 60 fps、客户端 0/1 浮动、重连才恢复"，
+    /// 成因是上闸用了累计丢弃数：丢过一次之后每一拍都重新上闸，只剩周期 IDR
+    /// 能过。这一组断言把"批次"与"累计"的差别钉死。
+    #[test]
+    fn one_skipped_batch_does_not_gate_the_stream_forever() {
+        // 第一拍排空出了多余帧 → 上闸（这一批确实丢了，参考链断了）。
+        let gated = key_gate_after_batch(2, false);
+        assert!(gated, "丢过帧的这一批要上闸");
+
+        // 关键帧到达、闸被放下之后，下一拍队列是空的（`queued == 0`）。
+        // 旧实现这里传的是累计 `dropped`（=2），于是又上一道闸 —— 永远出不去。
+        assert!(
+            !key_gate_after_batch(0, false),
+            "这一拍没丢帧就不该上闸，否则这条连接从此刻起只发关键帧"
+        );
+
+        // 闸已经在上面时保持不动：`queued` 为 0 也不该把它放下来。
+        assert!(key_gate_after_batch(0, true), "已在闸上就要等关键帧");
+    }
+
+    /// 稳态：队列一拍恰好一帧，永远不上闸。这是静态桌面的常态（每秒 60 拍），
+    /// 也是被这个 bug 打成 0/1 的那条路径。
+    #[test]
+    fn a_steady_one_frame_per_beat_never_gates() {
+        let mut need_key = false;
+        for _ in 0..600 {
+            need_key = key_gate_after_batch(0, need_key);
+            assert!(!need_key);
+        }
     }
 }

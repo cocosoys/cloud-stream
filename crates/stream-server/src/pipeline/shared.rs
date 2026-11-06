@@ -35,7 +35,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::config::{Config, InputPolicy};
 use crate::pipeline::audio::AudioFanout;
 use crate::pipeline::fanout::{SinkHandle, SinkId, VideoFanout};
-use crate::pipeline::{PipelineHandle, PipelineSnapshot, StreamSettings};
+use crate::pipeline::{PipelineHandle, PipelineSnapshot, StreamPrefs, StreamSettings};
 use crate::webrtc::VideoTrack;
 // Only the production build starts a capture; the test build must not (see
 // `start_program`).
@@ -162,7 +162,37 @@ pub struct SharedPipeline {
     /// two sessions on one program must read the same answer, and a future
     /// per-display override has an obvious place to land.
     input_policy: InputPolicy,
+    /// #113: 租约持有者**最近一次真的投进输入**的时刻。
+    ///
+    /// 租约以前只有"谁认领了"，没有"还在不在用"。`exclusive` 下这是个永久
+    /// 所有权：claim-if-free、没人能挤掉、收尾时才归还 —— 于是任何一条**活着
+    /// 但不再投输入**的连接都会把指针锁死到进程重启为止。切换传输就是这条路：
+    /// 页面换到 WebSocket 之后，上一次的 WebRTC 会话还挂在注册表里（它的
+    /// PeerConnection 没拆、下行的 sink 还在收字节），租约归它、新的 media
+    /// 连接每次认领都撞车。
+    ///
+    /// 症状（实测日志）：`ws media … lease=no` + 页面上"指针跟着鼠标动、
+    /// 悬停和点击全无反馈" —— 指针是页面自己画的，桌面一个事件都没收到。
+    ///
+    /// 所以租约必须能失效。判据不用猜身份（tab id 在 `SETTINGS` 里，太晚），
+    /// 只用一条硬事实：**持有者多久没投过输入了**。`None` 表示程序建起来之后
+    /// 一次都没投过 —— 那和悬空等价。
+    input_at: Mutex<Option<std::time::Instant>>,
 }
+
+/// #113: 新连接落座时，从一条"没人用"的租约手里接过来。
+///
+/// 1.5 s 而不是 0：同一页面的两个页签是常态，先到的那个正在用（每几毫秒一条
+/// `m,`），第二个页签不该把它顶掉；而换传输时旧会话最后一次输入至少是几秒前
+/// （页面重载、协商、首帧），1.5 s 足够分辨这两件事。
+pub const LEASE_ADOPT_IDLE: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// #113: 每收一条输入时的兜底 —— 持有者静默这么久就把租约接过来。
+///
+/// 比 [`LEASE_ADOPT_IDLE`] 宽，因为这条路径是"抢活人"：正常两页签场景里，
+/// 用户晃一下鼠标就该轮到他，而不是等 3 s。3 s 的选择是"人停手读屏幕"的量级，
+/// 再短会在两个同时打开的页签之间来回跳。
+pub const LEASE_TAKEOVER_IDLE: std::time::Duration = std::time::Duration::from_millis(3000);
 
 impl SharedPipeline {
     /// How many sessions hold this pipeline, this one included.
@@ -194,6 +224,135 @@ impl SharedPipeline {
             InputPolicy::Shared => true,
             InputPolicy::Exclusive => self.controller_id() == Some(session),
         }
+    }
+
+    /// #112: 输入门禁，带**自愈**。
+    ///
+    /// `owns_input` 只回答"现在是不是你的"。租约一旦因为持有者消失而悬空 ——
+    /// socket 半开、页面换传输那几十秒、某条收尾路径忘了归还 —— 它就永远回答
+    /// `false`，而 `try_claim_controller` 是 claim-if-free：只有**主动去认领**
+    /// 的人才能把它救回来，而一条连接只在 `acquire` 之后认领一次。
+    ///
+    /// 症状很有欺骗性：画面照流、页面把自己画的指针跟着鼠标挪，桌面却一点反应
+    /// 都没有（键鼠全被门禁丢掉，`denied` 在涨），而且重连治不好。用户看到的就是
+    /// "指针是叠上去的，悬停没有反馈"。
+    ///
+    /// 所以每收一条输入就顺手补一次：空着就归我。活着的主人抢不走 ——
+    /// `try_claim_controller` 的 compare-and-set 语义一个字没改。
+    ///
+    /// #113: "活着的主人"不等于"在用的人"。换传输之后旧会话既活着、又握着租约，
+    /// 却再也不会投一条输入 —— 这时 claim-if-free 就是一道锁。所以再加第三档：
+    /// 持有者已经静默 [`LEASE_TAKEOVER_IDLE`] 就把租约接过来。接管是**显式**的
+    /// （走 `set_controller`，日志里留一行 `holder idle …`），不是绕过 CAS。
+    ///
+    /// 这里**不盖时间戳**：门禁也被控制通道的每条消息问一次（`pong`、`SETTINGS`
+    /// 回执），在那里盖章会把一条只会回 `pong` 的死会话永远喂热，失效逻辑就白
+    /// 做了。盖章由真正的注入点做（见 [`Self::note_input`]），而接管只允许从
+    /// 真正的输入发起（`is_input`）。
+    pub fn may_inject(&self, session: u64, may_operate: bool, is_input: bool) -> bool {
+        self.may_inject_within(session, may_operate, is_input, LEASE_TAKEOVER_IDLE)
+    }
+
+    /// [`Self::may_inject`] 的本体，阈值由调用方给 —— 单测据此构造时间线，
+    /// 生产代码永远走上面那个常量。
+    fn may_inject_within(
+        &self,
+        session: u64,
+        may_operate: bool,
+        is_input: bool,
+        idle_limit: std::time::Duration,
+    ) -> bool {
+        if !may_operate {
+            return false;
+        }
+        if self.owns_input(session) {
+            return true;
+        }
+        if self.try_claim_controller(session) {
+            return true;
+        }
+        // 只有"我正在投输入"才有资格把租约从一条没人用的持有者手里接过来。
+        // 控制类指令（`pong`、`_stats`、`SETTINGS`）不参与：它们不驱动指针，
+        // 让它们触发接管只会在日志里造出"有人接管了但什么都没发生"的假象。
+        if !is_input {
+            return false;
+        }
+        if self.lease_is_stale(idle_limit) {
+            let idle = self.input_idle();
+            let previous = self.set_controller(Some(session));
+            log::info!(
+                "pipeline {}: input lease {previous:?} -> Some({session}) (holder idle {}, taking over)",
+                self.display.0,
+                match idle {
+                    Some(d) => format!("{:.1}s", d.as_secs_f32()),
+                    None => String::from("since the program started"),
+                }
+            );
+            // 接管即"从现在起是我在驱动"，盖一次时间戳。不盖的话，两条都不投
+            // 输入的连接会在每一条消息上互相抢 —— 每一次都以为自己更该动手，
+            // 结果两边的输入各丢一半。
+            self.note_input();
+            return true;
+        }
+        false
+    }
+
+    /// #113: 这条租约还算不算"有人用"。
+    ///
+    /// `None`（程序起来之后一次输入都没有）**与陈旧等价**：一个认领了却从不
+    /// 注入的持有者，和悬空的租约对用户是同一种结果 —— 指针不动。把它当"活着"
+    /// 处理，就是两条各握着半边锁的连接互相等，谁也投不进去。
+    fn lease_is_stale(&self, limit: std::time::Duration) -> bool {
+        match self.input_idle() {
+            None => true,
+            Some(idle) => idle >= limit,
+        }
+    }
+
+    /// #113: 记下"这条连接刚刚真的投了一条输入"。
+    ///
+    /// 只在注入点调用 —— WS 的 `Action::InputStub` 分支和 WebRTC 指针通道在
+    /// `InputStub` 之后各一次。时间戳只服务一件事：让租约能失效。
+    pub fn note_input(&self) {
+        *self.input_at.lock().unwrap_or_else(|p| p.into_inner()) = Some(std::time::Instant::now());
+    }
+
+    /// #113: 租约持有者静默了多久。`None` = 程序起来之后一次输入都没有过，
+    /// 与"悬空"同义。
+    pub fn input_idle(&self) -> Option<std::time::Duration> {
+        self.input_at
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .map(|t| t.elapsed())
+    }
+
+    /// #113: 新连接落座时调用**一次** —— 租约若是一条没人用的，接过来。
+    ///
+    /// 与 [`Self::may_inject`] 的兜底是两件事，都需要：
+    /// - 这条路径是"落座即接管"，判决依据是**旧持有者的输入年龄**，所以换传输
+    ///   之后的第一下鼠标就能生效，不用等 3 s 的兜底，也不用等用户动第二次；
+    /// - 兜底那条处理"落座时还没到 1.5 s、之后才彻底静下来"的情形。
+    ///
+    /// 返回是否接管了。`max_idle` 由调用方给（见 [`LEASE_ADOPT_IDLE`]），单测
+    /// 才好构造两条时间线。
+    pub fn adopt_lease_if_stale(&self, session: u64, max_idle: std::time::Duration) -> bool {
+        if self.controller_id() == Some(session) {
+            return false;
+        }
+        if !self.lease_is_stale(max_idle) {
+            return false;
+        }
+        let previous = self.set_controller(Some(session));
+        if previous.is_some() {
+            log::info!(
+                "pipeline {}: input lease {previous:?} -> Some({session}) (holder was not injecting; new connection adopted it)",
+                self.display.0
+            );
+        }
+        // 接管**不**盖时间戳。盖了就等于宣称"这条连接在用"，而它可能一次都
+        // 没投过 —— 页面加载时同一页会连两条（信令 + 媒体），盖了的话先落座的
+        // 那条会把后落座的那条挡在门外，而真正投输入的恰恰是后者。
+        true
     }
 
     /// Take the lease only if nobody holds it. Returns whether this session now
@@ -344,6 +503,7 @@ impl SharedPipeline {
             last_snapshot: Mutex::new(None),
             controller: Mutex::new(None),
             input_policy: policy,
+            input_at: Mutex::new(None),
         })
     }
 }
@@ -363,6 +523,18 @@ pub struct PipelineRegistry {
     /// and both must not interleave with each other or a stop would land on the
     /// entry another session just created.
     inner: Arc<AsyncMutex<HashMap<DisplayKey, Arc<SharedPipeline>>>>,
+    /// 每块屏**上一个**程序的操作参数，新建程序时继承。
+    ///
+    /// 只在"最后一个会话离开、程序被摘掉"那一刻写：程序活着的时候它自己的
+    /// `settings` 就是真相，注册表里的旧值没有意义。没有这一份，切换编码器
+    /// 就会失败 —— 选中的编码器会强制断开那条唯一的连接，新程序从 `Config`
+    /// 重建回 CLI 默认（VP8），页面再推一次 VP9、再被断开，循环到超时。
+    /// 详见 [`StreamPrefs`]。
+    ///
+    /// 用普通 `Mutex` 而不是 `AsyncMutex`：临界区只有一次 HashMap 读写，没有
+    /// `.await`，且 `acquire` / `release` 都是在持有 `inner` 时顺带看一眼，
+    /// 两处加锁顺序一致（inner → prefs），不会反向嵌套。
+    prefs: Arc<Mutex<HashMap<DisplayKey, StreamPrefs>>>,
 }
 
 impl PipelineRegistry {
@@ -388,6 +560,31 @@ impl PipelineRegistry {
         // pointer. `from_config` seeds the CLI default; the key this call was
         // made with is the truth.
         let mut settings = StreamSettings::from_config(cfg);
+        // 这块屏上一个程序留下的操作参数。第一次开这块屏时没有记录，那就是
+        // CLI 默认值 —— 与修复前行为一致，只有"曾经有人改过"才不同。
+        //
+        // 这一行是"切换编码器不再无限重连"的关键：换编码器会断开唯一那条连接，
+        // 程序随之被摘掉，若不带回上一次的选择，新程序就是 VP8，页面再推 VP9、
+        // 再被断开。详见 `StreamPrefs`。
+        let inherited = self
+            .prefs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&display)
+            .copied();
+        if let Some(prefs) = inherited {
+            settings.apply_prefs(prefs);
+            log::info!(
+                "pipeline {}: inheriting the previous program's settings (codec {}, {} fps, {}x{}, audio {} @ {} bps)",
+                display.0,
+                prefs.codec.wire(),
+                prefs.fps,
+                prefs.width,
+                prefs.height,
+                if prefs.audio_enabled { "on" } else { "off" },
+                prefs.audio_bps
+            );
+        }
         settings.set_display(display.0);
         let handle = PipelineHandle::new();
         let video = Arc::new(VideoFanout::new());
@@ -410,6 +607,7 @@ impl PipelineRegistry {
             last_snapshot: Mutex::new(None),
             controller: Mutex::new(None),
             input_policy: cfg.input_policy,
+            input_at: Mutex::new(None),
         });
         guard.insert(display, entry.clone());
         log::info!("pipeline {}: program created, capture loop spawned", display.0);
@@ -429,12 +627,21 @@ impl PipelineRegistry {
         };
         let live = entry.refs.load(Ordering::SeqCst);
         if live <= 1 {
+            // 程序要走了，把它这一轮的操作参数留给下一个（见 `StreamPrefs`）。
+            // 先读再摘：`entry` 是 Arc，摘掉之后对象还在手上，但"摘之前读"让
+            // 这段的意图不用猜 —— 值取自即将销毁的那个程序，不是之后补的。
+            let carried = entry.settings.prefs();
             guard.remove(&display);
+            self.prefs
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(display, carried);
             entry.handle.stop_loop();
             entry.audio_stop.store(true, Ordering::SeqCst);
             log::info!(
-                "pipeline {}: last session left, capture loop stopped",
-                display.0
+                "pipeline {}: last session left, capture loop stopped (settings kept for the next program: codec {})",
+                display.0,
+                carried.codec.wire()
             );
             return;
         }
@@ -571,6 +778,61 @@ mod tests {
         assert!(!first.pipeline.handle.is_on());
     }
 
+    /// 这是 "WebSocket disconnected. Attempting to reconnect..." 的回归测试。
+    ///
+    /// 换编码器一定会断开当前那条唯一的连接（m-line 与 libvpx 上下文是握手期
+    /// 定下的），于是这个会话成了最后一个持有者、程序被摘掉。如果新程序不继承
+    /// 上一次的选择，页面重连后会再推一次同样的选择、再被断开 —— 页面永远停在
+    /// 重连提示上，一帧都看不到。
+    #[tokio::test]
+    async fn a_codec_pick_outlives_the_reconnect_it_forces() {
+        let registry = PipelineRegistry::default();
+        let first = registry.acquire(DisplayKey::PRIMARY, &cfg()).await;
+        assert_eq!(
+            first.pipeline.settings.codec(),
+            VideoCodec::Vp9,
+            "#117: CLI 默认已是 vp9"
+        );
+        assert!(first.pipeline.settings.set_codec(VideoCodec::Vp8));
+        // 顺手改两个别的参数，确认继承的是整份快照而不是只有编码器。
+        first.pipeline.settings.set_fps(45);
+        first.pipeline.settings.set_resolution(1280, 720);
+        first.pipeline.settings.set_audio_enabled(false);
+
+        // 页面切编码器后服务端关掉这条连接：它正是最后一个持有者。
+        registry.release(DisplayKey::PRIMARY).await;
+        assert!(registry.get(DisplayKey::PRIMARY).await.is_none());
+
+        let second = registry.acquire(DisplayKey::PRIMARY, &cfg()).await;
+        assert!(second.created, "程序已被摘掉，这次必须重新开一路");
+        assert_eq!(
+            second.pipeline.settings.codec(),
+            VideoCodec::Vp8,
+            "新程序必须继承上一次的编码器选择"
+        );
+        assert_eq!(second.pipeline.settings.fps(), 45);
+        assert_eq!(second.pipeline.settings.width(), 1280);
+        assert_eq!(second.pipeline.settings.height(), 720);
+        assert!(!second.pipeline.settings.audio_enabled());
+    }
+
+    /// 另一个方向：继承是按屏记的，别把主屏的选择带给第二块屏。
+    #[tokio::test]
+    async fn a_pick_is_not_inherited_across_displays() {
+        let registry = PipelineRegistry::default();
+        let primary = registry.acquire(DisplayKey::PRIMARY, &cfg()).await;
+        // 与 CLI 默认相反的那个方向，别让"两边都是 vp9"把这条测试变成同义反复。
+        primary.pipeline.settings.set_codec(VideoCodec::Vp8);
+        registry.release(DisplayKey::PRIMARY).await;
+
+        let other = registry.acquire(DisplayKey(1), &cfg()).await;
+        assert_eq!(
+            other.pipeline.settings.codec(),
+            VideoCodec::Vp9,
+            "第二块屏没有任何历史，必须从 CLI 默认开始"
+        );
+    }
+
     #[tokio::test]
     async fn releasing_twice_does_not_underflow() {
         // A teardown path can run twice (PC terminal state + WS loop exit); the
@@ -608,6 +870,7 @@ mod tests {
             last_snapshot: Mutex::new(None),
             controller: Mutex::new(None),
             input_policy: InputPolicy::default(),
+            input_at: Mutex::new(None),
         };
         assert!(entry.claim_stats());
         assert!(!entry.claim_stats(), "a second ticker must read, not reset");
@@ -632,6 +895,7 @@ mod tests {
             last_snapshot: Mutex::new(None),
             controller: Mutex::new(None),
             input_policy: InputPolicy::default(),
+            input_at: Mutex::new(None),
         };
         let track = VideoTrack::new(VideoCodec::Vp8).expect("VP8 track");
         let handle = entry.attach(track, false);
@@ -684,6 +948,160 @@ mod tests {
         entry.set_controller(None);
         assert!(entry.try_claim_controller(7));
         assert_eq!(entry.controller_id(), Some(7));
+    }
+
+    /// #112：门禁要能救回一条**悬空**的租约。
+    ///
+    /// 线上形态（换传输必现）：WS 那条连接持着租约，用户切到 WebRTC，新页面
+    /// 先连上来，旧 socket 还半开着 —— 新连接的 `try_claim_controller` 撞上
+    /// "有人持有"而放弃，旧连接收尾时又没归还（那条路以前确实漏了）。之后
+    /// 剩下的人看着一块摸不动的桌面：画面在流、页面把自己画的指针跟着鼠标挪，
+    /// 键鼠全被门禁丢掉，重连也治不好。用户看到的现象是"指针是叠上去的、
+    /// 悬停没有反馈"。
+    ///
+    /// `may_inject` 就是"每收一条输入顺手补一次"：空着就归我，绝不动活着的
+    /// 持有者。
+    #[test]
+    fn the_gate_repairs_a_lease_that_its_holder_never_released() {
+        let entry = SharedPipeline::stub(
+            PipelineHandle::new(),
+            StreamSettings::from_config(&cfg()),
+            InputPolicy::Exclusive,
+        );
+        // 旧连接握着租约，然后无声无息地走了。
+        assert!(entry.try_claim_controller(3));
+        // 新连接先撞了一次墙（认领失败就放弃是 `try_claim_controller` 的语义）。
+        assert!(!entry.try_claim_controller(4));
+
+        // 旧连接收尾：没人可以交接，明确置空 —— 这就是"归还"。
+        entry.set_controller(None);
+        // 新连接的下一条输入就把它认领回来。
+        assert!(entry.may_inject(4, true, true), "an unowned lease must be claimed on use");
+        assert_eq!(entry.controller_id(), Some(4));
+        assert!(entry.may_inject(4, true, true), "held by me: still mine");
+        // #113: "活着"的判据是**正在投输入**，不是"认领过"。旧测试在这一步之前
+        // 没有盖章，于是它验的是"认领过就永久归它" —— 那正是这次的故障。
+        entry.note_input();
+        assert!(!entry.may_inject(5, true, true), "never steal from an injecting holder");
+        assert_eq!(entry.controller_id(), Some(4));
+        // 角色不够格的人拿到空租约也不行（`viewer` 令牌）。
+        entry.set_controller(None);
+        assert!(!entry.may_inject(5, false, true), "a viewer must not claim by trying");
+        assert_eq!(entry.controller_id(), None);
+    }
+
+    /// #113: 换传输之后的那条时间线 —— 旧会话活着、握着租约、但一条输入都不投。
+    /// 以前这份租约是永久的，新的 WebSocket 连接每次认领都撞车，"指针会动、
+    /// 桌面没反应"于是只能靠重启进程解决。
+    #[test]
+    fn a_new_connection_adopts_a_lease_nobody_is_using() {
+        let entry = SharedPipeline::stub(
+            PipelineHandle::new(),
+            StreamSettings::from_config(&cfg()),
+            InputPolicy::Exclusive,
+        );
+        // 新的 WebRTC 会话在建程序时认领，然后页面切成 WebSocket 再没投过输入。
+        assert!(entry.try_claim_controller(2));
+        assert_eq!(entry.input_idle(), None, "程序起来之后还没人投过输入");
+
+        // 新连接落座：这条租约与悬空等价，直接接过来。
+        assert!(
+            entry.adopt_lease_if_stale(3, LEASE_ADOPT_IDLE),
+            "a lease whose holder never injected must be adoptable"
+        );
+        assert_eq!(entry.controller_id(), Some(3));
+
+        // 页面加载时同一页会连两条（信令 + 媒体）。接管不盖时间戳，所以后落座
+        // 的那条**也能**拿到 —— 真正投输入的是它，把租约留给先落座的信令会话
+        // 就是这次线上故障的形状。
+        assert!(
+            entry.adopt_lease_if_stale(4, LEASE_ADOPT_IDLE),
+            "still nobody injecting: the newest connection takes it"
+        );
+        assert_eq!(entry.controller_id(), Some(4));
+
+        // 一旦真的开始投输入，后来者就不能再抢了。
+        entry.note_input();
+        assert!(
+            !entry.adopt_lease_if_stale(5, LEASE_ADOPT_IDLE),
+            "an injecting holder keeps the lease"
+        );
+        assert_eq!(entry.controller_id(), Some(4));
+    }
+
+    /// 反过来的那一半同样重要：**正在用的人不能被顶掉**。两个页签是常态，
+    /// 先到的那个每几毫秒一条 `m,`，第二个页签落座时必须看见一个新鲜的租约。
+    #[test]
+    fn adoption_leaves_an_active_holder_alone() {
+        let entry = SharedPipeline::stub(
+            PipelineHandle::new(),
+            StreamSettings::from_config(&cfg()),
+            InputPolicy::Exclusive,
+        );
+        assert!(entry.try_claim_controller(2));
+        entry.note_input();
+
+        assert!(
+            !entry.adopt_lease_if_stale(3, LEASE_ADOPT_IDLE),
+            "an injecting holder keeps the lease"
+        );
+        assert_eq!(entry.controller_id(), Some(2));
+    }
+
+    /// 落座时没赶上（旧持有者在 1.5 s 内还动过），之后才彻底静下来 —— 兜底那条
+    /// 路径要在下一条输入上把租约收回来，否则又变成"重连治不好"。
+    #[test]
+    fn a_gate_takes_the_lease_from_a_holder_that_stopped_injecting() {
+        let entry = SharedPipeline::stub(
+            PipelineHandle::new(),
+            StreamSettings::from_config(&cfg()),
+            InputPolicy::Exclusive,
+        );
+        assert!(entry.try_claim_controller(2));
+        entry.note_input();
+        // 2 刚刚还动过 → 没到阈值，谁也不许抢。
+        assert!(!entry.may_inject_within(3, true, true, LEASE_TAKEOVER_IDLE));
+        assert_eq!(entry.controller_id(), Some(2));
+
+        // 控制类指令不参与接管：`pong` 按秒回一次，让它接管等于给死会话续命。
+        assert!(
+            !entry.may_inject_within(3, true, false, std::time::Duration::from_nanos(1)),
+            "a control line must never take the lease over"
+        );
+        assert_eq!(entry.controller_id(), Some(2));
+
+        // 时间过去（阈值缩到纳秒，避免单测真的睡 3 秒）。
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert!(
+            entry.may_inject_within(3, true, true, std::time::Duration::from_nanos(1)),
+            "a holder that stopped injecting must not pin the pointer"
+        );
+        assert_eq!(entry.controller_id(), Some(3));
+        // 接管即"从现在起是我在驱动"，所以紧接着的下一条不会被别人抢走 ——
+        // 否则两条真在投输入的连接会每一条消息换一次主人，各丢一半。
+        // 这里必须用**生产阈值**问：拿纳秒阈值问的话，接管后的一刻当然又"陈旧"了。
+        assert!(!entry.may_inject_within(4, true, true, LEASE_TAKEOVER_IDLE));
+        // 角色不够格的人永远走不到接管那一步。
+        assert!(!entry.may_inject_within(4, false, true, std::time::Duration::from_nanos(1)));
+        assert_eq!(entry.controller_id(), Some(3));
+    }
+
+    /// #113: 认领过但一次都没投过输入的持有者，对用户等于"没有主人"。
+    /// 不这么判，两条都不注入的连接会各握半边锁，谁也投不进去。
+    #[test]
+    fn a_claim_without_any_input_never_counts_as_a_live_holder() {
+        let entry = SharedPipeline::stub(
+            PipelineHandle::new(),
+            StreamSettings::from_config(&cfg()),
+            InputPolicy::Exclusive,
+        );
+        assert!(entry.try_claim_controller(2));
+        assert_eq!(entry.input_idle(), None);
+        assert!(
+            entry.may_inject(3, true, true),
+            "a holder that never injected is as good as a dangling lease"
+        );
+        assert_eq!(entry.controller_id(), Some(3));
     }
 
     /// #109: the hello's `display_id` is a *name*, not an index, and the page
