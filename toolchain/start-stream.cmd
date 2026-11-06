@@ -99,6 +99,15 @@ rem with the install hint -- it does NOT silently fall back to the speakers,
 rem because that fallback is exactly the self-hearing bug. --mic-device default
 rem brings that behaviour back on purpose (talk-back only).
 
+rem P1: the default *recording* device is pointed at that same cable on startup
+rem (--mic-default-device auto, already the default). Games read the default
+rem device once at launch and cache it, so switching at session start would be
+rem too late; the cost is that local recording apps see the cable while the
+rem server runs. The previous device is written to logs\mic-default.json, which
+rem is what makes a forced kill recoverable -- this process is stopped with
+rem Stop-Process -Force and never runs its own cleanup. Run with
+rem --mic-default-device off to leave the system alone and restore that record.
+
 rem Labelled instead of an if/else block: cmd expands %ARGS% once per *block*,
 rem so a set inside parentheses would append to the value from before the block.
 rem A bundle built without certificates still has to run (plain HTTP); clipboard

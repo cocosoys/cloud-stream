@@ -226,6 +226,13 @@ pub struct Config {
     /// 默认不再是"写默认扬声器"：那条路会把注入的声音交给下行的 loopback 采回来，
     /// 开麦就听到自己，而且改延迟、改码率都消不掉。见 `platform::virtual_mic`。
     pub mic_device: String,
+    /// P1: 要不要把系统默认**录音**设备切到虚拟麦 —— `auto`（默认）、`off`。
+    ///
+    /// `auto` 在启动时切换（游戏在启动时读默认设备并缓存，会话开始才切已经晚了），
+    /// 退出时还原；`off` 完全不碰系统设置，玩家自己在游戏里选麦克风。三条 role
+    /// （console / multimedia / communications）都会切，否则走通信角色的
+    /// Discord / Steam 语音仍指着物理麦。见 `platform::default_mic`。
+    pub mic_default_device: String,
     /// #95: realtime knob set for the software encoder — `tuned` (default) or
     /// `legacy` (exactly what shipped before #95).
     ///
@@ -290,6 +297,7 @@ impl Default for Config {
             input_policy: InputPolicy::default(),
             max_sessions: 8,
             mic_device: "auto".to_owned(),
+            mic_default_device: "auto".to_owned(),
         }
     }
 }
@@ -518,6 +526,20 @@ impl Config {
                         if !v.is_empty() {
                             cfg.mic_device = v;
                         }
+                    }
+                }
+                "--mic-default-device" => {
+                    // P1：白名单校验，但写错只告警不退出 —— 与 `--input-policy`
+                    // 同一条规则（启动参数写错不该让被控机起不来）。
+                    match iter.next() {
+                        Some(v) => match crate::platform::default_mic::Policy::from_name(&v) {
+                            Some(p) => cfg.mic_default_device = p.as_str().to_owned(),
+                            None => log::warn!(
+                                "unknown --mic-default-device {v:?} (expected auto|off), keeping {}",
+                                cfg.mic_default_device
+                            ),
+                        },
+                        None => log::warn!("--mic-default-device needs a value (auto|off)"),
                     }
                 }
                 "--upload-dir" => {

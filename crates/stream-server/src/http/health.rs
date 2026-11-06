@@ -340,6 +340,10 @@ fn uplink_json() -> Value {
             "echoes": target.echoes(),
             "note": target.note,
             "live": live,
+            // P1：系统默认录音设备现在指向谁。决议说"该选 CABLE Output"，
+            // 这一段说的是"系统实际选的是谁"—— 两者不一致时，游戏收到的
+            // 就还是物理麦，而 health 其余部分一切正常。
+            "default_device": default_mic_json(),
         }),
         None => json!({
             "provider": "unknown",
@@ -349,7 +353,29 @@ fn uplink_json() -> Value {
             "echoes": false,
             "note": "麦克风目标尚未探测",
             "live": live,
+            "default_device": default_mic_json(),
         }),
+    }
+}
+
+/// P1：默认录音设备的切换状态。
+///
+/// `action` 是这一段的重点：`switched` 说明系统设置真的被改了（退出会还原）、
+/// `already` 说明本来就是这个设备、`skipped` / `disabled` 说明没动、`failed`
+/// 说明动了但没成功。只报一个 `device` 字段的话，"切了"和"以为切了"分不出来。
+fn default_mic_json() -> Value {
+    match crate::platform::default_mic::status() {
+        Some(s) => json!({
+            "policy": s.policy,
+            "action": s.action,
+            "device": s.device,
+            // 系统切换后自己报的默认录音。切了没生效时这里会是切换前的设备。
+            "current": s.current,
+            "previous": s.previous,
+            "restored": s.restored,
+            "note": s.note,
+        }),
+        None => Value::Null,
     }
 }
 

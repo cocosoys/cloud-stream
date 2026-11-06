@@ -373,3 +373,61 @@ VERDICT=SIGNAL
   `microphone refused (grant=viewer, operates=yes, lease=no)` 这一行就是这件事的指纹：
   `grant` 是令牌角色、`operates` 是能不能动手、`lease` 是租约在不在手上，三者必须分开看。
 
+### 8.6 把默认录音设备切过去（P1，2026-11-05）
+
+§8.5 证明的是"声音进了线缆"。但游戏读的不是线缆，是**系统默认录音设备**。不把默认
+改过去，链条止步于"装好了但对方听不见"，而 health 里每一格都是绿的 —— 这是最难查的
+那种状态。
+
+**为什么是启动时切，而不是第一个麦克风包到达时**
+
+游戏在启动时读一次默认设备并缓存（Vibepollo 要用 2/5/10/20 s 重试绕开的就是这个
+缓存）。等用户点麦克风才切，游戏早就记住了物理麦。所以切换放在启动、决议之后。
+代价是被控机本地的录音软件在服务运行期间也会拿到虚拟麦 —— 这是功能本身的语义
+（接管默认录音设备），因此必须能还原。
+
+**技术路径**：Windows 没有公开 API 能设置默认音频端点。所有能做这件事的工具
+（NirSoft SoundVolumeView、AudioDeviceCmdlets、nircmd）用的都是 `PolicyConfig`
+COM 对象上的 `IPolicyConfig::SetDefaultEndpoint`。它不在 Windows 元数据里，所以
+`windows` crate 没有生成绑定；`platform/default_mic.rs` 手写 vtable（结构照抄该
+crate 自己生成的写法），只给真正要调的那一个方法做 wrapper。方法顺序是硬约束：
+`SetDefaultEndpoint` 是 IUnknown 三个槽之后的第 12 个，前 11 个只占位、永不调用。
+
+三个 role 都要切（console / multimedia / communications）。Windows 的"默认设备"
+下拉同时写 console 与 multimedia，"默认通信设备"单独写 communications；只切前两个
+的话，Discord、Steam 语音这类走通信角色的程序仍指着物理麦。
+
+**强杀问题**：停止服务用的是 `Stop-Process -Force`（部署脚本、看门狗、关机都是），
+进程拿不到 `Ctrl+C`，`restore()` 永远不执行。只靠"退出时还原"的话，一次部署就把
+默认录音永远留在虚拟麦上 —— 本地麦克风全静音，看起来像驱动坏了。所以补了原值落盘：
+
+```
+logs/mic-default.json
+{"device":"CABLE Output (VB-Audio Virtual Cable)",
+ "previous":[{"role":0,"id":"{0.0.1.00000000}.{4d13383e-...}"}, ...]}
+```
+
+- 切换前写，正常退出时删。
+- **下次启动读到它 = 上次没还原**：这时它才是真正的原始设备（当前读到的可能已经
+  是上次自己切过去的），于是接管还原责任。即使每次都强杀，只要之后有一次
+  `--mic-default-device off`，设备就能回到原位。
+- `--mic-default-device off` 兼作撤销：有遗留文件就先还原再什么都不做。
+
+**验证记录（192.168.59.148）**
+
+| 步骤 | 结果 |
+|---|---|
+| 默认录音是物理麦时启动 | `action=switched`，`previous=console=麦克风 (High Definition Audio Device)`，`current=CABLE Output (...)`，写出 `mic-default.json`（3 个 role） |
+| `taskkill /F` 后重启 | `action=already`，note 明确写"发现上次未还原的记录：本次退出时还原到原始设备" |
+| `--mic-default-device off` | `action=restored`，"已把上次遗留的默认录音设备还原（3 个角色）"，文件被删 |
+| 再正常启动 | `previous` 又是 `麦克风 (High Definition Audio Device)` —— 反证 off 的还原真的生效 |
+
+`current` 与 `device` 分开报是刻意的：前者是切完之后**系统自己说**的默认录音，后者
+只是我们的意图。设备被独占或权限不足时两者会不一致，只报后者会让静默失败看起来
+像成功。
+
+**独立旁路工具**：`toolchain/mic-default.ps1 -List | -Name <子串> | -Id <端点 id>`。
+它不依赖服务，用 C# 里同一套 `IPolicyConfig` 声明读写默认端点 —— 既用于核对
+"系统现在到底认哪个麦克风"，也是强杀之后的手动回退。两套独立实现（Rust 手写 vtable
+与 C# 互操作声明）都能成功切换，等于互相校验了 vtable 顺序。
+

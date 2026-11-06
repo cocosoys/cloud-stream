@@ -150,8 +150,9 @@ L2/L3 的缺口清单见 `roadmap-l2-l3-gaps.md`（全量 34 项盘点 + 11 项�
 
 ## 5. 麦克风上行：从"注入扬声器"改为"虚拟录音设备"
 
-> 状态：**探测层（#109）与 WS 上行（#110）都已落地并在 .148 上验到"写进端点"。**
-> 剩 P1 会话开始切默认录音设备、P2 Parsec IOCTL、P3 Linux 两行 pactl。
+> 状态：**探测层（#109）、WS 上行（#110）与默认录音设备切换（P1）都已落地并在 .148 上
+> 验穿**（切过去 → 强杀后接管 → `off` 还原 → 再切回去，四步都留了日志与 health 证据）。
+> 剩 P2 Parsec IOCTL、P3 Linux 两行 pactl。
 
 **原位问题**：麦克风注入到**默认 render 端点**，而下行 loopback 采集的正是同一端点的
 后混音信号，于是开麦时玩家听到自己，延迟一个往返（按代码常量估算 150–330 ms，
@@ -204,12 +205,24 @@ Steam 排第一是因为它不需要额外安装：玩家机器上本来就有�
   `crates/stream-server/src/bin/mic-probe.rs`、`toolchain/mic-push.py`。细节见
   `stage3-audio-design.md` §8.5。
 
+- **P1 默认录音设备切换（2026-11-05）**：`platform/default_mic.rs` 用未文档化的
+  `IPolicyConfig::SetDefaultEndpoint` 把 console / multimedia / communications 三个
+  role 一起切到虚拟麦的 capture 端点（只切前两个的话，走通信角色的 Discord、Steam
+  语音仍指着物理麦）。**启动时切**，因为游戏在启动时读一次就缓存。原值落盘
+  `logs/mic-default.json` —— `Stop-Process -Force` 不给进程清理机会，文件是唯一能
+  把原值带过下一次启动的东西；下次启动读到它就接管还原责任。`--mic-default-device
+  off` 兼作撤销（先还原遗留再什么都不做）。health 的
+  `stream.audio.uplink.default_device` 报 `action / policy / device / current /
+  previous / restored`，其中 `current` 是切完之后系统自己报的默认录音 —— 只有它能
+  把"真的改了"和"以为改了"分开。旁路工具 `toolchain/mic-default.ps1`（`-List` /
+  `-Name` / `-Id`）不依赖服务，用于核对与手动回退。
+
 **还剩**：
 
 | 项 | 为什么必须 | 量级 |
 |---|---|---|
 | ~~P0 WS 上行~~ `0x02` Opus → 解码 → 写目标端点 | 不分传输就永远只有 WebRTC 能用 | **已完成**（#110）：两条传输共用一个 `pump`，见 `stage3-audio-design.md` §8.3 |
-| P1 会话开始时切换默认录音设备 | 游戏/Discord 缓存设备名，不切就选不到虚拟麦（Vibepollo 用 2/5/10/20 s 重试绕开） | 小 |
+| P1 切换默认录音设备 | 游戏/Discord 缓存设备名，不切就选不到虚拟麦（Vibepollo 用 2/5/10/20 s 重试绕开） | **已完成**：启动时切（不是会话开始——游戏在启动时读一次就缓存了），三个 role 一起切，原值落盘 `logs/mic-default.json` 以应对强杀，见 `stage3-audio-design.md` §8.6 |
 | P2 Parsec VUSB IOCTL 后端 | 驱动在但没端点；需要逆向文档里的 IOCTL 序列 + 管理员 | 大，按需 |
 | P3 Linux 侧 | 那边是 `module-null-sink` + `module-remap-source` 两行命令，随平台移植一起做 | 随移植 |
 

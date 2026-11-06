@@ -1,5 +1,6 @@
 //! Platform identity and host metrics for the stage1 stream server.
 
+pub mod default_mic;
 pub mod host;
 pub mod hwenc;
 pub mod sysinfo;

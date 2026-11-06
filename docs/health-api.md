@@ -123,6 +123,16 @@ RTP track 的时刻。新帧算，重复帧也算（静止桌面本来就只发�
           "concealed": 0,          // 丢包伪造的帧（只有 WebRTC 会非零）
           "silence": 3840,         // 端点里补零的采样/声道
           "last_packet_age_ms": 6  // null = 这条进程还没收到过任何麦克风包
+        },
+        "default_device": {      // P1：系统默认录音设备现在指向谁
+          "policy": "auto",      // auto / off（--mic-default-device）
+          "action": "switched",  // switched / already / disabled / restored / skipped / failed
+          "device": "CABLE Output (VB-Audio Virtual Cable)",  // 我们请求切到哪
+          "current": "CABLE Output (VB-Audio Virtual Cable)", // 切完后系统自己报的默认录音
+                                // 两者不一致 = 切换没生效（权限/设备被独占），此时游戏仍读物理麦
+          "previous": ["console=麦克风 (High Definition Audio Device)"],  // 切换前是谁
+          "restored": false,    // 退出时是否已还原（restore() 跑过才变 true）
+          "note": "默认录音设备已切到 …，退出或下次 --mic-default-device off 时还原"
         }
       }
     }

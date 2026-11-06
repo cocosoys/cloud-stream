@@ -234,6 +234,35 @@ async fn main() -> anyhow::Result<()> {
     }
     platform::virtual_mic::install(mic_target);
 
+    // P1：把系统默认录音设备切到虚拟麦。
+    //
+    // 放在启动、不在"第一个麦克风包到达时"，是因为游戏在启动时读一次默认设备
+    // 并缓存 —— 等用户点麦克风才切，游戏早就记住了物理麦。`off` 完全不碰系统
+    // 设置。失败只降级成告警：视频、输入、文件传输都不依赖它，为了"改不了默认
+    // 录音设备"让整个服务起不来是本末倒置。
+    let mic_policy = platform::default_mic::Policy::from_name(&cfg.mic_default_device)
+        .unwrap_or(platform::default_mic::Policy::Auto);
+    // 原值落在日志目录旁边，和日志同生共死：`--log` 指到哪就跟着到哪。停止服务
+    // 用的是 Stop-Process -Force，进程没有清理机会，靠这个文件把原值带过下一次
+    // 启动，否则一次强杀就让默认录音永远停在虚拟麦上。
+    let mic_state = cfg
+        .log_file
+        .as_ref()
+        .and_then(|p| p.parent())
+        .map(|dir| dir.join("mic-default.json"));
+    if let Some(target) = platform::virtual_mic::target() {
+        let mic_default =
+            platform::default_mic::apply(mic_policy, target, mic_state.as_deref());
+        if mic_default.action == "failed" {
+            log::warn!("microphone default device | {}", mic_default.summary());
+        } else {
+            log::info!("microphone default device | {}", mic_default.summary());
+        }
+        for line in &mic_default.previous {
+            log::info!("microphone default device | previous {line}");
+        }
+    }
+
     // #95: the software knob set. Same policy as `--video-codec`: a name this
     // build does not know keeps the default and says so, because the only
     // reason to pass this flag is to compare against old numbers — silently
@@ -296,13 +325,16 @@ async fn main() -> anyhow::Result<()> {
     // #36 starts the capture loop after Connected notices are sent; the WS
     // listener, media session and DC hook run from this point on.
     let serve = http::serve(cfg);
-    tokio::select! {
-        result = serve => {
-            result?;
-        }
+    let outcome = tokio::select! {
+        result = serve => result,
         _ = tokio::signal::ctrl_c() => {
-            log::info!("stream-server stopped.");
+            log::info!("stream-server stopping (ctrl-c).");
+            Ok(())
         }
-    }
-    Ok(())
+    };
+    // P1：无论走哪条路退出（正常返回 / Ctrl+C），都把默认录音设备还回去。
+    // `taskkill /F` 不会走到这里 —— 那时默认录音会停在虚拟麦上，表现是"本地
+    // 麦克风没声音"，见 `platform::default_mic` 的模块文档。
+    platform::default_mic::restore();
+    outcome
 }
