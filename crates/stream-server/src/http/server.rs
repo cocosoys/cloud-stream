@@ -66,6 +66,9 @@ fn surface_of(route: &Route) -> EventKind {
         Route::WebSockets => Endpoint::Signaling,
         // #106: 切传输是一次写操作（前端会据此重载页面），归到控制面。
         Route::Switch => Endpoint::Control,
+        // #28: 截图读的是屏幕内容，不是上传目录 —— 给它自己的面，将来
+        // "能看画面"和"能拉文件"才分得开。
+        Route::Screenshot => Endpoint::Screenshot,
         Route::NotFound => Endpoint::NotFound,
     })
 }
@@ -485,6 +488,59 @@ where
                         "Not Found",
                         "application/json; charset=utf-8",
                         br#"{"status":"error","message":"this dist has no .asset-manifest.json"}"#,
+                    )
+                    .await?;
+                }
+            }
+            return Ok(());
+        }
+
+        // #28: one PNG of the frame that is on screen *now*.
+        //
+        // Deliberately not "serve the last encoded frame": the pipeline keeps a
+        // cursor-free BGRA snapshot at target size every beat, so a screenshot
+        // can be taken between keyframes and without waiting for the desktop to
+        // change. `capture` sets a flag the beat loop reads, then waits for the
+        // encoder thread; the wait is bounded so a dead pipeline answers 503
+        // with a reason instead of hanging the connection.
+        crate::http::Route::Screenshot => {
+            match crate::pipeline::screenshot::capture(
+                crate::pipeline::screenshot::CAPTURE_TIMEOUT,
+            )
+            .await
+            {
+                Ok(shot) => {
+                    log::info!(
+                        "screenshot: {}x{} png={}B encode={}ms",
+                        shot.width,
+                        shot.height,
+                        shot.png.len(),
+                        shot.encode_ms
+                    );
+                    crate::http::write_http_with(
+                        &mut stream,
+                        200,
+                        "OK",
+                        "image/png",
+                        &shot.png,
+                        &[
+                            ("Cache-Control", "no-store"),
+                            ("Content-Disposition", "inline; filename=\"screenshot.png\""),
+                        ],
+                    )
+                    .await?;
+                }
+                Err(err) => {
+                    // 503, not 404: the endpoint exists and is authorized, the
+                    // thing it photographs does not exist right now.
+                    log::info!("screenshot: refused: {err}");
+                    let body = format!("503 Service Unavailable: {err}\n");
+                    crate::http::write_http(
+                        &mut stream,
+                        503,
+                        "Service Unavailable",
+                        "text/plain; charset=utf-8",
+                        body.as_bytes(),
                     )
                     .await?;
                 }

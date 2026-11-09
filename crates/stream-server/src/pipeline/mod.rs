@@ -63,10 +63,12 @@ pub mod codec;
 pub mod cursor;
 pub mod encoder;
 pub mod fanout;
+pub mod png;
 pub mod qos;
 pub mod raw;
 pub mod sample_map;
 pub mod scale;
+pub mod screenshot;
 pub mod settings;
 pub mod shared;
 pub mod stats;
@@ -865,7 +867,14 @@ fn run_inner_beat(
     // cursor handle), so a repaint happens only when the OS pointer really
     // moved, changed shape, or vanished. Without the pristine copy a repaint
     // would composite the pointer over the previous pointer and leave a trail.
+    //
+    // #28 reads the same buffer for screenshots — a screenshot is "the last
+    // frame", so it must not wait for the desktop to change (an idle desktop
+    // yields only 2–5 new frames/s). `pristine_w/h` travel with it because
+    // `Vec::len()` cannot be factored back into a width.
     let mut pristine_bgra: Vec<u8> = Vec::new();
+    let mut pristine_w: u32 = 0;
+    let mut pristine_h: u32 = 0;
     let mut cursor_buf: Vec<u8> = Vec::new();
     let mut last_paint: Option<(i32, i32, u64)> = None;
     // #70: last handover state, for a once-per-transition log line, and the
@@ -971,6 +980,21 @@ fn run_inner_beat(
         if handle.stopped.load(Ordering::SeqCst) {
             log::info!("pipeline loop stopped by session cleanup");
             return InnerOutcome::NormalStop;
+        }
+        // #28: on-demand screenshot, answered from the frame this beat already
+        // has. Checked at the top of the beat rather than in the new-frame
+        // branch: on an idle desktop a new frame only arrives 2–5 times a second,
+        // and waiting for one added up to half a second to a request that is
+        // supposed to feel immediate. Handing over the previous beat's snapshot
+        // costs one memcpy (target-size BGRA, ~8 MB at 1080p) and the frame is
+        // at most 16 ms old.
+        //
+        // `pristine_bgra` is the cursor-free copy (#70), which is what a
+        // screenshot should show: the desktop, not the synthetic pointer drawn
+        // for pointer lock. The flag stays raised until a beat has a buffer, so
+        // the very first request after a program starts is not lost.
+        if !pristine_bgra.is_empty() && pristine_w > 0 && screenshot::wanted() {
+            screenshot::submit(pristine_w, pristine_h, pristine_bgra.clone());
         }
         // #63: periodic self-report so a "fps is low" report has server-side
         // evidence (loop rate vs. capture rate vs. encode cost). Counters are
@@ -1663,6 +1687,8 @@ fn run_inner_beat(
             // figure of the pipeline log line. Do not "optimise" it back
             // behind `cursor_on`: that reintroduces the frozen pointer.
             keep_pristine(&mut pristine_bgra, &scaled_buf);
+            pristine_w = tw;
+            pristine_h = th;
             if cursor_on {
                 last_paint = paint_cursor_state(
                     &mut scaled_buf,
@@ -1679,6 +1705,8 @@ fn run_inner_beat(
             // Same as the scaled branch: snapshot first, then paint the copy we
             // actually encode (see #70 note above).
             keep_pristine(&mut pristine_bgra, &captured.data);
+            pristine_w = src_w;
+            pristine_h = src_h;
             if cursor_on {
                 last_paint = paint_cursor_state(
                     &mut captured.data,

@@ -18,7 +18,7 @@
 //! Thread boundary: all of this is called from the blocking capture worker
 //! (`run_inner_beat`); no `await` crosses it.
 
-use std::io::Write;
+// (the zlib/chunk writing moved to `pipeline::png` with the encoder itself)
 
 use windows_sys::Win32::Foundation::{FALSE, POINT};
 use windows_sys::Win32::Graphics::Gdi::{
@@ -340,55 +340,14 @@ fn cursor_rgba_rows(cur: &CursorData) -> Vec<u8> {
 }
 
 /// Encode `cur.colors` (top-down BGRA) as a base64 PNG for the frontend.
-/// Dependency-lean: `flate2` zlib + hand-rolled CRC32 + base64.
+///
+/// 编码器本体搬到了 [`super::png`]：截图（#28）要编整屏，用的必须是同一份
+/// CRC 和 chunk 写法 —— 两份实现迟早在 crc 表或 filter 字节上分叉，而那种错
+/// 只表现为"某张图打不开"。
 pub fn cursor_png_b64(cur: &CursorData) -> String {
     let raw = cursor_rgba_rows(cur);
-
-    let mut idat = Vec::new();
-    {
-        let mut enc =
-            flate2::write::ZlibEncoder::new(&mut idat, flate2::Compression::default());
-        let _ = enc.write_all(&raw);
-        let _ = enc.finish();
-    }
-
-    let mut png = Vec::with_capacity(64 + idat.len());
-    png.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
-    // IHDR
-    let mut ihdr = Vec::with_capacity(13);
-    ihdr.extend_from_slice(&(cur.width as u32).to_be_bytes());
-    ihdr.extend_from_slice(&(cur.height as u32).to_be_bytes());
-    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8-bit, RGBA, deflate, adaptive, no interlace
-    push_chunk(&mut png, b"IHDR", &ihdr);
-    // IDAT
-    push_chunk(&mut png, b"IDAT", &idat);
-    // IEND
-    push_chunk(&mut png, b"IEND", &[]);
-
+    let png = super::png::wrap(cur.width as u32, cur.height as u32, &raw);
     base64_encode(&png)
-}
-
-fn push_chunk(png: &mut Vec<u8>, tag: &[u8; 4], data: &[u8]) {
-    png.extend_from_slice(&(data.len() as u32).to_be_bytes());
-    png.extend_from_slice(tag);
-    png.extend_from_slice(data);
-    let mut crc_input = Vec::with_capacity(4 + data.len());
-    crc_input.extend_from_slice(tag);
-    crc_input.extend_from_slice(data);
-    png.extend_from_slice(&crc32(&crc_input).to_be_bytes());
-}
-
-/// CRC-32 (ISO 3309 / PNG), reflected table-less bitwise.
-fn crc32(data: &[u8]) -> u32 {
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &b in data {
-        crc ^= b as u32;
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
-    }
-    !crc
 }
 
 /// Standard base64 (no padding variants), tiny and good enough for <1 KB cursors.
@@ -534,8 +493,10 @@ mod tests {
 
     #[test]
     fn crc32_known_vector() {
-        // PNG spec example: CRC of "123456789" is 0xCBF43926.
-        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+        // PNG spec example: CRC of "123456789" is 0xCBF43926. The function now
+        // lives in `png` (shared with #28 screenshots); the check value follows
+        // it so the encoder cannot be swapped for one with a different CRC.
+        assert_eq!(super::super::png::crc32(b"123456789"), 0xCBF4_3926);
     }
 
     /// `colors` 是 BGRA，PNG 声明的是 RGBA —— 这里必须换序。

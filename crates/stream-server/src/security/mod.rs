@@ -92,6 +92,12 @@ pub enum Endpoint {
     /// 清单是"整个包里有什么、每份的哈希是多少"。后者一次性把整棵文件树摊开，
     /// 将来分级时可以让匿名访客拿页面却拿不到这份索引。
     Manifest,
+    /// #28: `GET /api/screenshot` —— 当前这一帧的 PNG。
+    ///
+    /// 只读，所以归在观测面；但它读的是**屏幕内容**，和 `files`（上传目录）不是
+    /// 一回事：一个租户的截图里可能有另一个窗口的信息。所以单开一类，而不是复用
+    /// [`Endpoint::Files`] —— 现在默认全放行看不出差别，将来分权时差别就在这。
+    Screenshot,
     /// `/api/` 下的未知路径。
     NotFound,
 }
@@ -159,6 +165,7 @@ impl EventKind {
                 Endpoint::Health => "http.health",
                 // #99: 追加而不是替换 —— 这些标签是策略与日志的契约。
                 Endpoint::Manifest => "http.manifest",
+                Endpoint::Screenshot => "http.screenshot",
                 Endpoint::Control => "http.control",
                 Endpoint::NotFound => "http.not-found",
             },
@@ -210,6 +217,9 @@ impl EventKind {
                 | EventKind::Http(Endpoint::Health)
                 // #99: 清单只读 —— 它报的是"包里有什么"，不改变任何状态。
                 | EventKind::Http(Endpoint::Manifest)
+                // #28: 截图只读，不改变主机的任何状态 —— 它拿走的是一份已经
+                // 存在于显存/内存里的画面。归在观测里，与 `Control` 分开。
+                | EventKind::Http(Endpoint::Screenshot)
                 | EventKind::Http(Endpoint::NotFound)
                 | EventKind::Media(MediaDir::VideoOut)
                 | EventKind::Media(MediaDir::AudioOut)
@@ -648,6 +658,8 @@ mod tests {
             EventKind::Http(Endpoint::Static),
             EventKind::Http(Endpoint::Signaling),
             EventKind::Http(Endpoint::Health),
+            EventKind::Http(Endpoint::Manifest),
+            EventKind::Http(Endpoint::Screenshot),
             EventKind::Http(Endpoint::Control),
             EventKind::Http(Endpoint::NotFound),
             EventKind::Signaling,

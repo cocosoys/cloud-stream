@@ -1,18 +1,23 @@
 //! HTTP routing: static bundle, signaling upgrade endpoint and health status
 //! (design 2.2, 5.1).
 //!
-//! Stage1 routes:
+//! Routes（下面这段 `Stage1` 是历史清单，入口早就不止这些）：
 //! * `GET /api/<app>/signaling/` — WS upgrade. `app` may be `webrtc` (client
 //!   hardcodes it) or any other segment accepted as a fallback; the app segment
-//!   is not validated against credentials (no auth gate in stage1).
+//!   is still not matched against a route table. It **is** authenticated
+//!   though: every route except `Static` and `Status` passes
+//!   `TokenGate::check_request` first (the `token_gate()` branch in `server.rs`,
+//!   #101/#110), so in a deployment with a password set, a handshake without a
+//!   token never reaches this handler.
 //! * `GET /api/status` — liveness probe used by the deploy wrapper before the
 //!   browser opens the signaling socket. JSON (`current_mode`,
 //!   `enable_dual_mode`): the dashboard parses it to choose a transport (#106).
 //! * Any other GET — served from the `--dist` root by `static`.
 //!
 //! The raw TCP accept loop, HTTP/Upgrade handshake, tungstenite upgrade and
-//! TLS acceptor are assembled with task #35; this module fixes path classification
-//! now so the loop can compile against a fixed route surface.
+//! TLS acceptor live in `server.rs` (task #35 landed long ago). This module
+//! keeps the path classification separate so the loop compiles against a fixed
+//! route surface.
 
 // `static` is a Rust keyword; the module is declared escaped and is still
 // referenced as `crate::http::static` downstream.
@@ -168,6 +173,13 @@ pub enum Route {
     /// signaling path that silently accepted a media client would look like a
     /// dead page rather than a wrong one.
     WebSockets,
+    /// #28: `GET /api/screenshot` — one PNG of the current frame.
+    ///
+    /// A separate route rather than a query on `/api/files`: this reads the
+    /// screen, not the upload tree, and the two must be separable when the
+    /// policy table finally grows past "allow everything". It also fails
+    /// differently (no session ⇒ 503) than any file can.
+    Screenshot,
     /// #106: `POST /api/switch` — the transport menu's entry point.
     ///
     /// The frontend posts `{"mode":"webrtc"|"websockets"}` here before it
@@ -213,6 +225,10 @@ pub fn classify(path: &str, _app_name: &str) -> Route {
         // with no prefix it is exactly this path — a trailing slash included
         // because a proxy may normalize one in.
         ["api", "websockets"] | ["api", "websockets", ""] => Route::WebSockets,
+        // #28: the screenshot. One arm is enough: the empty-segment filter above
+        // already folds `/api/screenshot/` into this shape (the websockets arm
+        // lists both only because it predates that filter).
+        ["api", "screenshot"] => Route::Screenshot,
         ["api", "switch"] => Route::Switch,
         ["api", ..] => Route::NotFound,
         _ => {
@@ -260,6 +276,10 @@ mod tests {
         ));
         // #106: the mode menu's POST.
         assert!(matches!(classify("/api/switch", "webrtc"), Route::Switch));
+        // #28: the screenshot, with and without the trailing slash the client
+        // might paste in.
+        assert!(matches!(classify("/api/screenshot", "webrtc"), Route::Screenshot));
+        assert!(matches!(classify("/api/screenshot/", "webrtc"), Route::Screenshot));
     }
 
     #[test]
