@@ -140,7 +140,7 @@ $RemoteLog = "$RemoteRoot\logs\stream-server.log"
 # 意义就是让人在被控机上用和看门狗完全一致的参数跑一次 —— 包里缺了它，
 # 那台机器就只能从仓库里翻，而拿到包的人手里没有仓库。
 # collect-launch-facts.cmd 是"起不来"时的第一个动作：新设备上三种常见故障
-# （空密码 / 缺 VC++ / zip 没解压）都不写日志、窗口一闪就关，它一次收全。
+# （任务没跑 / 缺 VC++ / zip 没解压）都不写日志、窗口一闪就关，它一次收全。
 # setup-inbound.cmd 是第二课：Windows 防火墙在新机器上把所有入站（含 ICMP）
 # 都丢掉，于是"ping 不通、8080 超时"，而服务其实跑得好好的。
 # open-inbound.cmd 与 probe-listen.cmd 是同一课的自动化部分，被 start-stream.cmd
@@ -151,6 +151,7 @@ $LauncherNames = @(
     'start-stream.60fps.cmd',
     'run-hidden.vbs',
     'setup-watchdog.bat',
+    'setup-task.ps1',
     'collect-launch-facts.cmd',
     'setup-inbound.cmd',
     'open-inbound.cmd',
@@ -430,12 +431,12 @@ cloud-stream 被控端整包
 
 怎么用
   1) 整包拷到目标机器（或解压同目录下的 cloud-stream.zip）。
-  2) 建看门狗计划任务（需要该账户密码，任务跑在交互式会话里）：
+  2) 建看门狗计划任务（不需要任何账户密码）：
          右键 setup-watchdog.bat -> "以管理员身份运行"
-     也可以直接给参数：setup-watchdog.bat Administrator <密码>
-     提权运行时它会顺手放行 8080 与 ping，并在建完任务后立刻启动一次、
-     等最多 60 秒，直接告诉你 [ok] 还是 [fail]。
-  3) 任务每分钟触发一次，进程挂了 60 秒内自己回来。
+     任务落在"当前登录的那个会话"里，用该会话已有的令牌运行，不存凭据、
+     不改账户。提权运行时它会顺手放行 8080 与 ping，并在建完任务后立刻启动
+     一次、等最多 60 秒，直接告诉你 [ok] 还是 [fail]。
+  3) 任务在登录时触发一次，之后每分钟一次，进程挂了 60 秒内自己回来。
      想手工起一次：start-stream.cmd
   4) 浏览器打开 https://<本机IP>:8080/
 
@@ -447,7 +448,8 @@ cloud-stream 被控端整包
   start-stream.cmd    命令行参数都在这里：分辨率 / 帧率 / 码率 / 证书
   start-stream.60fps.cmd 手工起一次用（同一个命令行，不进计划任务）
   run-hidden.vbs      计划任务的实际入口，无窗口，避免每分钟闪一次黑框
-  setup-watchdog.bat  创建 MCStreamSrv 任务并验证一次启动
+  setup-watchdog.bat  创建 MCStreamSrv 任务并验证一次启动（不碰账户密码）
+  setup-task.ps1      上面那条的实际执行者：按交互式令牌注册任务
   collect-launch-facts.cmd  起不来时双击它，生成一份事实清单（只读）
   setup-inbound.cmd   管理员身份运行：放行 8080 与 ping（否则外部一概连不上）
   open-inbound.cmd    上面那条规则的实际执行者，被启动脚本自动调用（幂等）

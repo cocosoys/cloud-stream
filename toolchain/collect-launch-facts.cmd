@@ -57,7 +57,7 @@ chcp 65001 >nul 2>&1
 >> "%OUT%" echo.
 
 >> "%OUT%" echo ==== 2. account policy ====
->> "%OUT%" echo -- LimitBlankPasswordUse (1 means a blank password cannot run a task) --
+>> "%OUT%" echo -- LimitBlankPasswordUse (only matters for a legacy /RP task now) --
 >> "%OUT%" "%PS%" -NoProfile -Command "try { $v = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name LimitBlankPasswordUse -ErrorAction Stop).LimitBlankPasswordUse; if ($v -eq 1) { 'LimitBlankPasswordUse = 1  (blank password blocked for batch logon)' } else { 'LimitBlankPasswordUse = ' + $v + '  (blank password allowed)' } } catch { 'LimitBlankPasswordUse not set (default 1: blank password blocked for batch logon)' }" 2>&1
 >> "%OUT%" echo.
 >> "%OUT%" echo -- net user for this account --
@@ -68,7 +68,7 @@ chcp 65001 >nul 2>&1
 >> "%OUT%" dir /a "%ROOT%" 2>&1
 >> "%OUT%" echo.
 >> "%OUT%" echo -- files that must exist --
-for %%F in (stream-server.exe ViGEmClient.dll start-stream.cmd start-stream.60fps.cmd run-hidden.vbs setup-watchdog.bat setup-inbound.cmd open-inbound.cmd probe-listen.cmd collect-launch-facts.cmd) do (
+for %%F in (stream-server.exe ViGEmClient.dll start-stream.cmd start-stream.60fps.cmd run-hidden.vbs setup-watchdog.bat setup-task.ps1 setup-inbound.cmd open-inbound.cmd probe-listen.cmd collect-launch-facts.cmd) do (
     if exist "%ROOT%\%%F" (
         >> "%OUT%" echo OK      %%F
     ) else (
@@ -121,6 +121,9 @@ netstat -ano 2>nul | "%SystemRoot%\System32\find.exe" ":8080" >> "%OUT%"
 >> "%OUT%" echo.
 >> "%OUT%" echo -- last run result (0x41301 = still running, 0xFFFFFFFF = never) --
 >> "%OUT%" "%PS%" -NoProfile -Command "try { $i = Get-ScheduledTaskInfo -TaskName MCStreamSrv -ErrorAction Stop; 'LastRunTime    ' + $i.LastRunTime; 'LastTaskResult 0x{0:X8}' -f $i.LastTaskResult } catch { 'no task MCStreamSrv: ' + $_.Exception.Message }" 2>&1
+>> "%OUT%" echo.
+>> "%OUT%" echo -- task principal (LogonType must be Interactive; anything else runs outside the desktop) --
+>> "%OUT%" "%PS%" -NoProfile -Command "try { $t = Get-ScheduledTask -TaskName MCStreamSrv -ErrorAction Stop; 'UserId    ' + $t.Principal.UserId; 'LogonType ' + $t.Principal.LogonType; 'RunLevel  ' + $t.Principal.RunLevel; 'State     ' + $t.State; foreach ($a in $t.Actions) { 'Action    ' + $a.Execute + ' ' + $a.Arguments } } catch { 'no task MCStreamSrv: ' + $_.Exception.Message }" 2>&1
 >> "%OUT%" echo.
 
 >> "%OUT%" echo ==== 6. logs (tail 40 each) ====

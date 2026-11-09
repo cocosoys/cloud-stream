@@ -3,23 +3,28 @@ rem ---------------------------------------------------------------------------
 rem Create the MCStreamSrv watchdog task for THIS directory.
 rem
 rem Portable: the task action is "wscript.exe <this dir>\run-hidden.vbs", built
-rem from %~dp0, so the bundle can be unpacked anywhere. The account and password
-rem are arguments (or prompts) instead of literals -- a password committed to the
-rem repo is both a leak and a lie, because every machine has a different one.
+rem from %~dp0, so the bundle can be unpacked anywhere.
 rem
 rem Usage, from the directory the bundle was unpacked into:
 rem
-rem   setup-watchdog.bat                     <- prompts for account and password
-rem   setup-watchdog.bat Administrator S3cr3t
+rem   setup-watchdog.bat                     <- uses the console user, no password
+rem   setup-watchdog.bat <account>           <- override the account, rarely needed
+rem
+rem Nothing on that command line is a credential. The task is registered as
+rem "run only when the user is logged on" (InteractiveToken), which reuses the
+rem session's existing token instead of performing a logon, so this works on an
+rem account with a blank password and leaves the account untouched. The real
+rem work is in setup-task.ps1 -- see the header there for why the old
+rem schtasks /RP line had to go.
 rem
 rem #81: turn the task from a one-shot launcher into a watchdog.
 rem
 rem Before: /SC ONCE, "repeat disabled" -- the server ran until it died and then
 rem stayed dead until somebody typed `schtasks /Run`.
 rem
-rem After: every minute. Task Scheduler's default policy is "do not start a new
-rem instance", so while the server is alive the trigger does nothing; when it
-rem dies the task completes and the next minute brings it back.
+rem After: at logon, and every minute after that. Task Scheduler's "do not start
+rem a new instance" policy means that while the server is alive the trigger does
+rem nothing; when it dies the task completes and the next minute brings it back.
 rem
 rem wscript + run-hidden.vbs instead of cmd.exe directly: the trigger fires 1440
 rem times a day, and a console flashing on the game's desktop would steal focus.
@@ -82,70 +87,65 @@ if errorlevel 1 (
 echo [inbound] 8080/TCP and ICMP echo allowed on all profiles.
 :inbound_done
 
+rem ---------------------------------------------------------------------------
+rem The task runs in the session that owns the desktop -- capture and SendInput
+rem are per-session, and a process in session 0 gets an empty desktop -- so the
+rem principal is the *console* user, not necessarily whoever runs this script.
+rem
+rem NO PASSWORD. None is asked for, none is stored, and nothing in the SAM
+rem database is touched. The task is registered with
+rem LogonType=Interactive ("run only when user is logged on"), which reuses the
+rem token that the console session already holds instead of logging anybody in.
+rem
+rem That is the same session behaviour the old `schtasks /RU ... /RP ... /IT`
+rem line had, minus the one thing that hurt: /RP made every trigger do a batch
+rem logon, so Windows stored the password and, by default
+rem (LimitBlankPasswordUse=1), refused the whole thing on an account without
+rem one -- which is why this script used to end in "give the account a
+rem password, then run me again".
+rem
+rem Optional override, rarely needed: setup-watchdog.bat <account>
+rem ---------------------------------------------------------------------------
 set "ACCOUNT=%~1"
-if not defined ACCOUNT (
-    rem The task must run in the session that has the desktop (/IT), so the
-    rem default is whoever is running this script, not a hardcoded Administrator.
-    set "ACCOUNT=%USERNAME%"
-)
-set "PASSWORD=%~2"
-if not defined PASSWORD set /p "PASSWORD=Password for %ACCOUNT%: "
-if not defined PASSWORD (
-    rem A blank password is not "no password needed" -- it is the single most
-    rem common reason this script looks dead on a fresh machine. Windows blocks
-    rem blank-password accounts from batch logon (LimitBlankPasswordUse=1), so
-    rem schtasks would fail with "the password is invalid" even if it got that
-    rem far, and the task it created (if any) would never start. Say so out
-    rem loud instead of exiting with six characters nobody can read.
-    echo NO_PASSWORD
-    echo.
-    echo A scheduled task cannot run for an account that has no password:
-    echo Windows bars blank-password accounts from batch logon.
-    echo Two ways forward:
-    echo   a^) give %ACCOUNT% a password, then run this script again:
-    echo         net user %ACCOUNT% *
-    echo   b^) keep the blank password and skip the task: put a shortcut to
-    echo      run-hidden.vbs into  shell:startup  instead ^(needs auto logon^).
-    echo.
-    echo docs\deploy-new-host.md section 3.0 covers both paths.
+
+set "PSS=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
+if not exist "%ROOT%\setup-task.ps1" (
+    echo MISSING %ROOT%\setup-task.ps1
+    echo Unpack the whole bundle, then run this script from its own directory.
     exit /b 1
 )
 
-rem \" is the documented escape for a quote passed *through* cmd to schtasks: the
-rem action string has to stay quoted inside /TR so an unpack path with spaces
-rem still works. Writing ""%VBS%"" instead hands schtasks a broken argument.
-schtasks /Create /TN %TASK% /TR "wscript.exe \"%VBS%\"" /SC MINUTE /MO 1 /RU "%ACCOUNT%" /RP "%PASSWORD%" /IT /F
+echo.
+echo -- creating task %TASK% (no password needed) --
+if defined ACCOUNT (
+    "%PSS%" -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\setup-task.ps1" -Root "%ROOT%" -TaskName "%TASK%" -Account "%ACCOUNT%" -Start
+) else (
+    "%PSS%" -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\setup-task.ps1" -Root "%ROOT%" -TaskName "%TASK%" -Start
+)
+rem Exit codes from setup-task.ps1: 1 missing bundle, 2 registration refused,
+rem 3 definition read back wrong, 5 created but not started.
+if errorlevel 5 (
+    echo START_FAILED
+    echo   The task was created but could not be started. Try by hand:
+    echo     schtasks /Run /TN %TASK%
+    goto :summary
+)
 if errorlevel 1 (
     echo CREATE_FAILED
     exit /b 1
 )
-rem Read the action back. If the quoting above ever regresses, the task still
-rem gets created -- pointing at a truncated path -- and the symptom is "the task
-rem says it ran, but nothing is listening". Catch it here instead of a week later.
-schtasks /Query /TN %TASK% /FO LIST /V | "%SystemRoot%\System32\find.exe" /I "run-hidden.vbs" >nul
-if errorlevel 1 (
-    echo WARNING task action does not mention run-hidden.vbs. Inspect with:
-    echo   schtasks /Query /TN %TASK% /FO LIST /V
-)
-
-schtasks /Query /TN %TASK% /FO LIST
 
 rem ---------------------------------------------------------------------------
-rem Start it now and report, instead of leaving "task created" as the last
-rem thing the operator sees. The previous version ended here, the window with
-rem it, and the next thing anybody noticed was a page that would not load --
-rem a minute later or a day later, with no way to tell which of the four usual
-rem causes it was. The probe is loopback only: it answers "is the server up",
-rem which is the part this script is responsible for.
+rem The task has already been started by setup-task.ps1 (-Start). All that is
+rem left is to answer the question the operator actually has: is it serving?
+rem The previous version ended at "task created", the window closed with it, and
+rem the next thing anybody noticed was a page that would not load -- a minute
+rem later or a day later, with no way to tell which of the four usual causes it
+rem was. The probe is loopback only: it answers "is the server up", which is the
+rem part this script is responsible for.
 rem ---------------------------------------------------------------------------
 echo.
-echo -- starting the task and waiting up to 60 s --
-schtasks /Run /TN %TASK% >nul 2>&1
-if errorlevel 1 (
-    echo   [fail] schtasks /Run was refused. Try by hand:
-    echo          schtasks /Run /TN %TASK%
-    goto :summary
-)
+echo -- waiting up to 60 s for 127.0.0.1:8080 --
 
 set /a TRY=0
 :wait_loop
@@ -176,7 +176,8 @@ goto :summary
 :summary
 echo.
 echo -- next steps --
-echo   * the task fires every minute; a crash heals within 60 s
+echo   * the task fires at logon and every minute; a crash heals within 60 s
+echo   * it runs as the console user, with no password stored anywhere
 echo   * resolution / fps / bitrate live in start-stream.cmd, not in the task
 echo   * firewall, port and session facts: collect-launch-facts.cmd
 echo   * re-open the port by hand:            setup-inbound.cmd
