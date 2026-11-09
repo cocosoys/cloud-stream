@@ -69,13 +69,13 @@
 | 1 | Windows 10/11 **x64** | `systeminfo` | 采不了：DXGI/WASAPI/`SendInput` 都是 Windows API，且只有 Windows 构建 |
 | 2 | 硬件基线 | 4 vCPU / 8 GB（现网基线，VP9 1080p60 约 2× CPU） | 掉帧、QoS 一路降档 |
 | 3 | **有真实显示输出** | VMware SVGA 3D 或物理显示器；分辨率设成要推的尺寸 | 采集黑屏或退化成 1024×768 |
-| 4 | **交互式已登录会话** | `quser` 看到 `administrator console 1 运行中` | 计划任务的 `/IT` 任务不启动；从服务/session 0 启动的进程抓到空桌面 |
+| 4 | **交互式已登录会话** | `quser` 看到 `administrator console 1 运行中` | 任务不会触发（它只在登录会话里跑）；从服务/session 0 启动的进程抓到空桌面 |
 | 5 | **开机自动登录**（可选但强烈建议） | `AutoAdminLogon=1` 或手工登录后再离开 | 重启后没人登录 → 1 分钟看门狗每次空跑，`/api/status` 不通 |
 | 6 | VC++ 运行库 | `Test-Path C:\Windows\System32\vcruntime140.dll` | exe 起不来（缺 `VCRUNTIME140.dll`） |
 | 7 | OpenSSH Server | 装 → `Set-Service sshd -StartupType Automatic` → `Start-Service sshd` → 放行 TCP 22 | 部署脚本第一步就超时（脚本会把这三行打出来） |
 | 8 | 目录 | `C:\dev\stream\logs`、`C:\dev\deploy`、`C:\dev\stream\selkies-web` | `-Bootstrap` 会建，但 exe/前端仍要落位 |
 | 9 | TLS 证书 | `C:\dev\stream\cert.pem` + `C:\dev\key.pem`，**SAN 里要有这台机器的新 IP** | 浏览器证书不匹配；剪贴板 API 直接不可用（非安全上下文） |
-| 10 | 计划任务 `MCStreamSrv` | 在运行根里**以管理员身份**跑一次 `setup-watchdog.bat`（账户密码用参数给，或按提示输入）：它会顺手放行入站、建任务、立刻启动并打印 `[ok]` / `[fail]` | `task MISSING`，切换阶段失败 |
+| 10 | 计划任务 `MCStreamSrv` | 在运行根里**以管理员身份**跑一次 `setup-watchdog.bat`（不需要账户密码）：它会顺手放行入站、建任务、立刻启动并打印 `[ok]` / `[fail]` | `task MISSING`，切换阶段失败 |
 | 11 | **入站放行** | 管理员跑一次 `setup-inbound.cmd`，或让第 10 项代劳；判据是从别的机器 `ping <IP>` 有回、`curl -k https://<IP>:8080` 不是 TIMEOUT | 服务跑得好好的，但外部一律连不上：ping 无响应、8080 TIMEOUT（连 RST 都不回）。`start-stream.cmd` 每次启动会尝试补，但提权失败时只能记一行日志 |
 
 额外两条只跟游戏有关，不属于推流链：
@@ -164,8 +164,8 @@ Host mc-admin-2
 |---|---|---|
 | Windows 10/11 **x64** | `systeminfo` | 无法运行：DXGI / WASAPI / `SendInput` 都是 Windows API，且只有 Windows 构建 |
 | VC++ 运行库 | `Test-Path C:\Windows\System32\vcruntime140.dll` | 双击后窗口一闪即退；`stream-server.exe` 导入表里有 `VCRUNTIME140.dll`，缺了加载器就拒绝启动（日志里一行都没有） |
-| **交互式已登录会话** | `quser` 看到 `console 1 运行中` | 计划任务的 `/IT` 任务不启动；从服务/session 0 起进程抓到空桌面 |
-| **账户有密码** | `net user %USERNAME%` 看 `Password required` | 看门狗建不出来或永远不启动：Windows 默认禁止空密码账户**批处理登录**（`LimitBlankPasswordUse=1`），`schtasks /RP ""` 直接失败。无密码机器见本节末尾的启动文件夹方案 |
+| **交互式已登录会话** | `quser` 看到 `console 1 运行中` | 任务建得出来但不会跑；从服务/session 0 起进程抓到空桌面 |
+| ~~账户有密码~~ | `net user %USERNAME%` 看 `Password required` | **不再是前提**（2026-11 改）：任务改用交互式令牌注册，不存凭据、不做批处理登录，空密码账户同样可用 |
 | 真实显示输出 | VMware SVGA 3D 或物理显示器，分辨率设成要推的尺寸 | 黑屏，或退化成 1024×768 |
 | **入站已放行** | 从别的机器 `ping <IP>`、`curl -k https://<IP>:8080` | 全部 TIMEOUT（连 RST 都不返回）就是整档被丢：服务跑得再好也连不上。管理员跑一次 `setup-inbound.cmd` |
 
@@ -194,9 +194,14 @@ Unblock-File .\cloud-stream.zip
 #    它一次做三件事，全都在这个窗口里给出结果：
 #      a) 放行 8080/TCP 与 ICMP echo（提权才做得到）
 #      b) 建 MCStreamSrv 任务：wscript.exe "D:\stream\run-hidden.vbs"
-#      c) 立刻 schtasks /Run 一次，最多等 60 秒，然后打印 [ok] 或 [fail]
-#    也可以给参数：setup-watchdog.bat Administrator <密码>
-#    密码是这台机器**该账户的登录密码**，不是这里新设的什么密码
+#      c) 立刻启动一次，最多等 60 秒，然后打印 [ok] 或 [fail]
+#
+#    **不需要任何账户密码**。任务注册成"仅当用户登录时运行"
+#    （InteractiveToken）：它复用当前登录会话已经持有的令牌，不做登录、
+#    不存凭据，也不读改 SAM 里的任何东西。空密码账户照样能建、能跑。
+#    任务落在**控制台上登录的那个账户**上，而不是"以管理员身份运行"时
+#    临时提权的那个身份 —— 因为桌面属于前者。
+#    只有极少数情况才需要指定账户：setup-watchdog.bat <account>
 
 # 4. 浏览器打开 https://<本机IP>:8080/
 #    窗口里已经告诉你 [ok] 了；若还要复核，见下面的三条命令
@@ -258,7 +263,7 @@ Get-NetConnectionProfile | Select-Object InterfaceAlias, NetworkCategory
 |---|---|---|
 | `start-stream.cmd` 跑起来（看门狗每分钟一次，但只在真的要起进程时执行） | 查 `cloud-stream 8080` / `ICMPv4` 两条规则，缺了就补（提权才有权限；没权限只记一行）；有 `auth-token.txt` 就把口令传给 exe | `logs\watchdog.log` 的 `PREFLIGHT` 行 |
 | exe 启动后 | 另起 `probe-listen.cmd`，每 5 秒探一次 loopback，最多 30 秒 | 同上：`PREFLIGHT listening on 8080 after N probe(s)` 或 `PREFLIGHT NOT listening ...` + 三条最可能原因 + 下一步 |
-| `setup-watchdog.bat` 跑完 | 建任务 → 立刻 `/Run` → 最多等 60 秒 → 打印 `[ok]` / `[fail]` | 屏幕上，窗口就是结果 |
+| `setup-watchdog.bat` 跑完 | 建任务（交互式令牌，无密码）→ 立刻启动 → 最多等 60 秒 → 打印 `[ok]` / `[fail]` | 屏幕上，窗口就是结果 |
 | `collect-launch-facts.cmd` | 第 9 节专门列入站：网络配置文件、本机 IPv4、两条规则的实际参数、最近 12 条 `PREFLIGHT` 行 | `cloud-stream-facts.txt` |
 
 所以"启动后发现没效果"必然留下痕迹：先看 `logs\watchdog.log` 里最后一条
@@ -270,19 +275,20 @@ Get-NetConnectionProfile | Select-Object InterfaceAlias, NetworkCategory
 preflight，所以窗口里看不到异常时，日志里也有判决。适合先验证画面，再回头
 建任务。
 
-**账户没有密码时**：计划任务这条路走不通（策略层限制，不是脚本问题）。
-要么先 `net user Admin *` 给账户设个密码再建任务；要么放弃看门狗，把
-`run-hidden.vbs` 的快捷方式丢进 `shell:startup`（需要开自动登录，否则重启后
-没人登录，什么都起不来）：
+**账户没有密码时**：照常建任务，不需要给账户设密码。任务用的是
+`InteractiveToken`（"仅当用户登录时运行"）—— 复用会话已有的令牌，不做批处理
+登录，所以 `LimitBlankPasswordUse=1` 根本不参与。这一条 2026-11 改过，
+老版本的 `schtasks /RP` 才要求密码，现在的 `setup-watchdog.bat` 不碰它。
 
-```powershell
-# 无密码机器的替代方案：登录后自动起（不是服务，挂了不会自愈）
-$lnk = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\cloud-stream.lnk"
-$s = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
-$s.TargetPath = 'D:\stream\run-hidden.vbs'
-$s.WorkingDirectory = 'D:\stream'
-$s.Save()
-```
+真正的前提只有一条：**那个会话是登录着的**。冷启动停在锁屏时，没有桌面可抓，
+任务也不会触发；要么人工登录一次，要么开自动登录（`Autologon` 用 LSA 加密存
+口令，比在注册表里写明文强）。
+
+**不想建任务的最小路径**：双击 `start-stream.cmd`。它开一个黑窗口跑
+`stream-server.exe`（关窗口 = 停服务），崩溃不会自愈。它同样会做上面那套
+preflight，所以窗口里看不到异常时，日志里也有判决。适合先验证画面，再回头
+建任务。把它放进 `shell:startup` 也能开机自起，但同样只在登录后发生、且没有
+自愈——这就是为什么要建任务。
 
 **起不来先双击 `collect-launch-facts.cmd`**：它生成 `cloud-stream-facts.txt`
 （桌面也放一份），把 OS/会话/账户策略/包完整性/VC 运行库/端口/任务状态/
@@ -351,8 +357,8 @@ ssh <别名> "powershell -c \"(Get-Process stream-server).SessionId\""     # 1�
 
 | 现象 | 原因 | 处置 |
 |---|---|---|
-| 页面能开、画面全黑 | 进程跑在 session 0（服务/schtasks 没加 `/IT`），抓的是空桌面 | 部署体检打印 `session=0` 就是这条；用 `setup-watchdog.bat` 建任务 |
-| 重启之后 8080 不通 | 没人登录 → `/IT` 任务不启动；或 `sshd` 是「手动」 | 开自动登录；`Set-Service sshd -StartupType Automatic` |
+| 页面能开、画面全黑 | 进程跑在 session 0（注册成服务、或任务没用交互式令牌），抓的是空桌面 | 部署体检打印 `session=0` 就是这条；用 `setup-watchdog.bat` 建任务 |
+| 重启之后 8080 不通 | 没人登录 → 交互式任务不触发；或 `sshd` 是「手动」 | 开自动登录；`Set-Service sshd -StartupType Automatic` |
 | 页面打不开但 ssh 正常 | 新机器防火墙是开的，8080 没放行 | 管理员跑 `setup-inbound.cmd`（22 也要放行） |
 | **服务在跑、日志也写了 `starting`，但外部完全连不上** | 入站被整档丢弃：Public 配置文件默认丢全部入站（含 ICMP），VMware NAT / host-only 网卡常被判成 Public。表现是 `ping` 无响应、8080 **TIMEOUT**（不是 REFUSED） | 先看 `logs\watchdog.log` 最后一条 `PREFLIGHT`：若是 `listening on 8080`，问题就在网络层 —— 管理员跑 `setup-inbound.cmd`；`Get-NetConnectionProfile` 确认不是被 `Private` 规则挡在 Public 上 |
 | 日志里只有 `starting`，没有后半句 | 包内缺 `probe-listen.cmd`（旧包），或 `start-stream.cmd` 是旧版 | 用当前整包覆盖运行根；新版每次启动都会写 `PREFLIGHT` 判决 |
@@ -368,7 +374,7 @@ ssh <别名> "powershell -c \"(Get-Process stream-server).SessionId\""     # 1�
 
 - 同一份整包（`target\output\cloud-stream.zip`）可以发到所有机器；`-SkipBuild`
   时也能直接复用上一轮的产物。
-- 每台机器各自的：证书（IP 不同）、计划任务（账户密码不同）、`start-stream.cmd`
+- 每台机器各自的：证书（IP 不同）、计划任务（控制台账户不同，但不需要密码）、`start-stream.cmd`
   里的分辨率 / 码率参数（`--upload-dir` 已按账户推导，通常不用改）。
 - 现在**没有**集中管理面：每台一套 `-Target`，靠 ssh 别名区分；`/api/v1/health`
   是单机自述，不做聚合。

@@ -104,7 +104,8 @@ target\output\cloud-stream\
   start-stream.cmd       命令行参数都在这里：分辨率 / 帧率 / 码率 / 证书
   start-stream.60fps.cmd 手工起一次用（同一个命令行，不进计划任务）
   run-hidden.vbs         计划任务入口，无窗口
-  setup-watchdog.bat     创建 MCStreamSrv 任务（账户密码用参数或用提示输入）
+  setup-watchdog.bat     创建 MCStreamSrv 任务（交互式令牌，不需要账户密码）
+  setup-task.ps1         上面那条的实际执行者：按交互式令牌注册任务
   collect-launch-facts.cmd  起不来时双击它，生成一份事实清单（只读，不启动 exe）
   setup-inbound.cmd     管理员身份运行：放行 8080 与 ping（新机器必须做一次）
   open-inbound.cmd      上面那条规则的执行者，被启动脚本自动调用（幂等、静默）
@@ -149,7 +150,7 @@ target\output\cloud-stream.zip   整包，拷到新机器用
 ```
 C:\dev\stream\   stream-server.exe  ViGEmClient.dll  cert.pem  key.pem
                  start-stream.cmd  start-stream.60fps.cmd
-                 run-hidden.vbs  setup-watchdog.bat
+                 run-hidden.vbs  setup-watchdog.bat  setup-task.ps1
                  selkies-web\   ← 2008 个文件，下面这几项
                  logs\          ← stream-server.log / watchdog.log
 C:\dev\deploy\   deploy-remote.ps1（只在部署窗口存在，zip 解压完即删）
@@ -175,7 +176,7 @@ manifest.json / favicon.ico / icon.png / icon-512.png
 |---|---|---|
 | sshd 服务 | `sshd`，启动类型 **Automatic** | 重启后还能连进来；改一次永久生效 |
 | 防火墙 | `OpenSSH SSH Server (sshd)`，TCP 22 入站 | 同上 |
-| 计划任务 | `MCStreamSrv`，每 1 分钟，动作 = `<运行根>\run-hidden.vbs` | 看门狗（#81），创建要账户密码 |
+| 计划任务 | `MCStreamSrv`，登录时 + 每 1 分钟，动作 = `<运行根>\run-hidden.vbs` | 看门狗（#81），交互式令牌创建，不需要密码 |
 | TLS 证书 | `C:\dev\stream\cert.pem` / `key.pem` | 自签，静态；脚本只检查存在 |
 | 目录 | `C:\dev\stream\logs`、`C:\dev\stream\selkies-web`、`C:\dev\deploy` | 建一次（幂等） |
 | 上传根 | `--upload-dir %USERPROFILE%\Desktop` | 在 `start-stream.cmd` 里，按运行账户推导 |
@@ -278,22 +279,34 @@ New-NetFirewallRule -DisplayName 'OpenSSH SSH Server (sshd)' -Direction Inbound 
 `ssh` 真连不上的时候，脚本会**把这三行原样打出来**并停下来，告诉你到被控机
 控制台（VMware 窗口 / IPMI）执行一次。它不会在那儿转圈重试。
 
-### 3.2 计划任务需要密码，脚本不碰
+### 3.2 计划任务不需要密码
 
-`MCStreamSrv` 要用能看见桌面的那个**交互式**账户跑（见 §7.8 的会话隔离），
-`schtasks` 建它必须带 `/RU` + `/RP`。密码不写进仓库（每台机器都不一样，写进去
-既是泄漏也是假的），所以这一步留给人，脚本只负责把它送上门：
+`MCStreamSrv` 要用能看见桌面的那个**交互式**账户跑（见 §7.8 的会话隔离）。
+老版本用 `schtasks /RU <账户> /RP <密码> /IT` 表达这件事，而 `/RP` 会让每个
+触发点做一次**批处理登录**：密码被 Windows 存进任务，且默认策略
+（`LimitBlankPasswordUse=1`）直接拒绝空密码账户 —— 于是"给账户设个密码"变成了
+部署前提。那是命令行的写法，不是系统的要求。
+
+现在改用 `LogonType=Interactive`（`toolchain\setup-task.ps1`）：复用登录会话
+已有的令牌，不登录、不存凭据、不读改 SAM。空密码账户同样能建能跑（已在
+`Password required: No` 的机器上实测 `LastTaskResult=0x0`）。被控机的账户和
+密码保持原样，部署不碰它们。
 
 ```bat
-:: 在被控机上，运行根目录里执行一次；账户默认是当前登录用户
+:: 在被控机上，运行根目录里执行一次（会先要管理员权限，用于放行入站）
 C:\dev\stream\setup-watchdog.bat
-:: 或者把账户密码一次给全
-C:\dev\stream\setup-watchdog.bat Administrator S3cr3t
+:: 极少数情况才需要指定账户（默认取控制台登录的那个）
+C:\dev\stream\setup-watchdog.bat <account>
 ```
 
 任务动作由 `%~dp0` 生成（`wscript.exe "<运行根>\run-hidden.vbs"`），所以整包
-换个目录解压也能用。建完会回读一次动作字符串，读不到 `run-hidden.vbs` 就打
-`WARNING` —— 引号写坏时任务照样"创建成功"，但永远不会真的拉起进程。
+换个目录解压也能用。建完会回读动作与登录类型：动作里读不到 `run-hidden.vbs`、
+或登录类型不是 `Interactive`，都会报警 —— 引号写坏时任务照样"创建成功"，但
+永远不会真的拉起进程。
+
+触发器现在是两条：**登录时**一次 + 之后每分钟一次。前者补掉了"登录后最多 60 秒
+没人监听"的空窗，后者仍是看门狗。执行时限同时设为"无限制"—— `schtasks` 给
+重复任务的默认值是 72 小时，运行满三天的服务会被静默收掉。
 
 部署脚本只负责核对任务存在、`Running`、且动作路径在运行根下（不在就提示搬过
 位置后要重建）。不存在就报 `task MISSING` 并随后在切换阶段失败（比静默跑起来好）。
@@ -702,7 +715,7 @@ node 的 `rmSync` 包了一层），超过阈值就拒绝执行，构建中断�
 
 | 类别 | 文件 |
 |---|---|
-| 部署契约（8） | `deploy.ps1` `deploy-remote.ps1` `start-stream.cmd` `start-stream.60fps.cmd` `run-hidden.vbs` `setup-watchdog.bat` `cert-san.cnf` `env-setup.ps1` |
+| 部署契约（9） | `deploy.ps1` `deploy-remote.ps1` `start-stream.cmd` `start-stream.60fps.cmd` `run-hidden.vbs` `setup-watchdog.bat` `setup-task.ps1` `cert-san.cnf` `env-setup.ps1` |
 | 构建（4） | `build-ws.cmd` `build-shell.cmd` `install-vcpkg-libs.cmd` `config.toml` |
 | 长期诊断（6） | `mouse-probe.ps1` `probe-top.py` `cleanup-dev-root.ps1` `logtriage.ps1` `distcheck.ps1` `ps-tree.py` |
 | MC / 密度（4） | `start-mc.ps1` `bench-local.ps1` + 两个 CPU 采样 CSV |
@@ -823,7 +836,7 @@ rem ... dies on "/I" — the guard ...
 `"%SystemRoot%\System32\find.exe"`。构建机上 PATH 里的 MSYS `find.exe` 不认
 `/I`，一报错就等价于"没在运行"，看门狗于是每分钟多起一个实例。
 
-### 7.24 新设备上"双击没反应"：空密码账户（已改成可读）
+### 7.24 新设备上"双击没反应"：空密码账户（已从根上改掉）
 
 **现象**：全新设备（账户 `Admin`，**无密码**）上双击 `setup-watchdog.bat`，窗口
 一闪就关，任务列表里没有 `MCStreamSrv`；双击 `start-stream.cmd` 同样一闪，
@@ -841,10 +854,10 @@ rem ... dies on "/I" — the guard ...
 3. **zip 没解压**：在资源管理器里双击 zip 内的 exe 是解压到临时目录运行，
    同级没有 `selkies-web\`，于是"起来了但 404"，且日志落在临时目录里。
 
-**改法**：
+**第一版的改法（只改提示，不动机制）**：
 
-- `setup-watchdog.bat` 在空密码时打印两条可行路径（给账户设密码 / 改用
-  `shell:startup` 快捷方式），不再是六个字符。
+- 空密码时打印两条可行路径（给账户设密码 / 改用 `shell:startup`），不再是六个
+  字符 —— 但仍然等于"这台机器要么改密码，要么没有看门狗"。
 - 包里新增 `collect-launch-facts.cmd`（同时装进运行根）：双击生成
   `cloud-stream-facts.txt`（桌面再放一份），一次收全 OS/架构、会话（`quser`）、
   `LimitBlankPasswordUse`、包内文件完整性与 exe 字节数、VC 运行库、8080 占用、
@@ -856,9 +869,15 @@ rem ... dies on "/I" — the guard ...
   5.1 的模块目录（否则 5.1 去加载 pwsh 的模块，弹"不受信任的发布者"交互提示，
   在无头机器上表现为"卡死"）。
 
-**结论**：无密码账户别走计划任务这条路 —— Windows 从策略层就不允许。要么给该
-账户设密码，要么放弃看门狗、把 `run-hidden.vbs` 的快捷方式放进 `shell:startup`
-（前提是开了自动登录，否则重启后没人登录，任务同样空转）。
+**真正的改法（2026-11，删掉了那个前提）**：问题不在提示，在 `/RP`。它让任务
+每个触发点做一次批处理登录，于是"必须有密码"从命令行的写法变成了部署前提。
+现在任务用 `LogonType=Interactive` 注册（`toolchain\setup-task.ps1`）：复用控制台
+会话已经持有的令牌，不登录、不存密码、不碰 SAM。**空密码账户照常建、照常跑**
+（实测 `Password required: No` → `LastTaskResult=0x0`）。
+
+**结论**：计划任务这条路现在对空密码账户同样可用，不需要改被控端的任何账户
+设置。唯一的前提是"那个会话是登录着的"——锁屏状态下没有桌面可抓，任务也不会
+触发，这一条是 Windows 桌面模型的边界，和凭据无关。
 
 ---
 

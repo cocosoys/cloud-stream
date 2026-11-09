@@ -23,7 +23,9 @@
 ## 三、启动方式（免启动器命令行直启）
 
 脚本：`C:\dev\mc\start-mc.ps1`（本机备份 `cloud-stream\toolchain\start-mc.ps1`）
-计划任务：`MCGame`（/IT 交互式 /RU Administrator /RP Admin@2026，/SC ONCE /ST 00:00，schtasks /Run 触发）
+计划任务：`MCGame`（交互式，`/SC ONCE /ST 00:00`，`schtasks /Run` 触发）。这台机器上的
+老任务是用 `/RU Administrator /RP <口令>` 建的 —— 口令存在任务里，也不再写进文档；
+重建时改用 `toolchain\setup-task.ps1` 的做法（`LogonType=Interactive`），任务里就不剩凭据了。
 
 启动命令等价（单字符串参数，避免 Start-Process 数组拆断含空格路径）：
 ```
