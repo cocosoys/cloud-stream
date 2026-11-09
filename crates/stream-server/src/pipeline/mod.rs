@@ -909,6 +909,12 @@ fn run_inner_beat(
     // nothing and motion is still riding (or falling back to) `control`.
     let mut prev_pointer_msgs: u64 = 0;
     let mut last_stats_log = Instant::now();
+    // #118: baseline for the audio summary line below. `audio::totals()` was
+    // written for #77/#80 and then never called by anything, so "how many audio
+    // frames per second does this loopback actually produce" had no answer —
+    // and that is the number that decides whether a stalled A/V clock means an
+    // idle desktop or a dead device. Same 5 s window as the video line.
+    let mut prev_audio = crate::pipeline::audio::totals();
     // #63: per-window cost split — capture block vs. BGRA->YUV+scale.
     let mut cap_wait_sum: f64 = 0.0;
     let mut cap_wait_n: u64 = 0;
@@ -1005,9 +1011,16 @@ fn run_inner_beat(
             let abs_events = crate::dispatch::win_input::mouse_abs_total();
             let pointer_msgs = crate::dispatch::win_input::pointer_channel_total();
             // #83: A/V offset as `signal`, the way the panel shows it. `-` means
-            // audio has not started (no baseline yet).
+            // audio has not started (no baseline yet). #118: `idle=` says the
+            // audio track has gone silent — without it a frozen clock reads as
+            // a healthy one, which is exactly how a 39-hour skew hid for days.
             let av = avsync::report()
-                .map(|(ms, fixes)| format!("{ms:+.0}ms/{fixes}fix"))
+                .map(|r| match r.idle_ms {
+                    Some(idle) => {
+                        format!("{:+.0}ms/{}fix idle={}ms", r.skew_ms, r.fixes, idle)
+                    }
+                    None => format!("{:+.0}ms/{}fix", r.skew_ms, r.fixes),
+                })
                 .unwrap_or_else(|| "-".to_owned());
             log::info!(
                 "pipeline {:.1}s: loop={:.1}Hz new={} repeat={} skip={} wb={} inv={} cap_err={} \
@@ -1046,6 +1059,37 @@ fn run_inner_beat(
             prev_rel_events = rel_events;
             prev_rel_pixels = rel_pixels;
             prev_pointer_msgs = pointer_msgs;
+            // #118: the audio twin of the line above. `cap=` is the only number
+            // that answers "is the loopback producing frames at all"; on an idle
+            // desktop (nothing playing) WASAPI delivers nothing, `cap` stays 0
+            // and the A/V clock is frozen rather than drifting. `sil=` counts
+            // packets the device flagged SILENT, which is *not* the same thing:
+            // a muted mix still delivers packets, an idle endpoint delivers none.
+            {
+                let now_audio = crate::pipeline::audio::totals();
+                let secs = since_log.as_secs_f64().max(0.001);
+                let cap = d(now_audio.0, prev_audio.0);
+                let enc = d(now_audio.1, prev_audio.1);
+                let bytes = d(now_audio.2, prev_audio.2);
+                let sil = d(now_audio.3, prev_audio.3);
+                let note = if cap == 0 {
+                    " (no frames: endpoint idle or device gone)"
+                } else {
+                    ""
+                };
+                log::info!(
+                    "audio {:.1}s: cap={} enc={} bytes={} sil={} => {:.1} fps, {:.1} kbps{}",
+                    since_log.as_secs_f64(),
+                    cap,
+                    enc,
+                    bytes,
+                    sil,
+                    cap as f64 / secs,
+                    bytes as f64 * 8.0 / secs / 1000.0,
+                    note
+                );
+                prev_audio = now_audio;
+            }
             beats = 0;
             cap_wait_sum = 0.0;
             cap_wait_n = 0;

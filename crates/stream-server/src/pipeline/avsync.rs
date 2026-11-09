@@ -35,6 +35,27 @@
 //! takes the first one over rather than running beside it), and that thread is
 //! spawned from `on_track`, whose closure has no access to the session context.
 //! Same shape as the audio counters in `pipeline::audio`.
+//!
+//! ## #118: the clock only runs while audio runs
+//!
+//! The first version of *this* module still measured "wall time since the first
+//! frame" against "media time written". On a desktop nobody is playing sound on,
+//! WASAPI loopback delivers nothing (`Loopback::drain` returns after its 500 ms
+//! timeout with an empty buffer), so no frame is ever written and the media
+//! clock stands still while the wall clock keeps running. The skew then doubles
+//! as fast as real time passes, and the corrector fires an `Advance` every
+//! [`FIX_MIN_INTERVAL`] forever — measured on the deployed host as
+//! `av=-140687920ms/70963fix`, i.e. it had been "correcting" a 39-hour offset
+//! for two days and 19 hours, one 20 ms silence frame at a time.
+//!
+//! That is not drift, it is silence on both ends of the link: the receiver is
+//! not playing anything either, so there is no lip-sync to preserve. The fix is
+//! to advance the wall clock **only across the gaps between consecutive audio
+//! frames**: a gap longer than [`MAX_FRAME_GAP`] is a stall (idle desktop, device
+//! restart, or a scheduling hiccup), and on resume both sides are re-aligned
+//! instead of pretending the missing seconds were media time. A real slow
+//! device never gaps — it keeps delivering 20 ms frames slightly late — so its
+//! drift is still measured, just without the idle noise.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -47,15 +68,24 @@ const SKEW_LIMIT: i64 = 80_000;
 const FIX_MIN_INTERVAL: Duration = Duration::from_secs(2);
 /// The first second is start-up: the loopback client delivers a burst of
 /// buffered samples while the device settles, and measuring against it would
-/// "correct" a startup artifact.
+/// "correct" a startup artifact. Measured in *audio* time, not wall time: a
+/// session that only starts producing sound after ten minutes has still had no
+/// chance to drift during those ten minutes.
 const WARMUP: Duration = Duration::from_secs(1);
+/// A gap between two written frames longer than this is a stall, not a slow
+/// device (#118). 250 ms is twelve frames — far beyond any jitter a working
+/// loopback produces, and far below the seconds an idle desktop can last.
+const MAX_FRAME_GAP: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Default)]
 struct State {
     /// Audio media time handed to the track, in microseconds.
     audio_us: i64,
-    /// Wall clock at the first written frame — the zero of the comparison.
-    started_at: Option<Instant>,
+    /// Wall time that passed **while audio was flowing**, in microseconds.
+    /// Not `now - started_at`: idle stretches are excluded (#118).
+    wall_us: i64,
+    /// When the last frame was written; `None` before the first one.
+    last_note_at: Option<Instant>,
     last_fix_at: Option<Instant>,
     fixes: u64,
 }
@@ -80,31 +110,58 @@ impl AvClock {
         Self {
             state: Mutex::new(State {
                 audio_us: 0,
-                started_at: None,
+                wall_us: 0,
+                last_note_at: None,
                 last_fix_at: None,
                 fixes: 0,
             }),
         }
     }
 
-    /// Record one written audio frame of `dur` of media time. The first call
-    /// starts the wall clock this is measured against.
+    /// Record one written audio frame of `dur` of media time.
+    ///
+    /// The wall clock advances by the gap since the previous frame — **unless**
+    /// that gap is longer than [`MAX_FRAME_GAP`], in which case the two clocks
+    /// are re-aligned instead. Re-aligning rather than accumulating is what
+    /// makes both stall shapes harmless: silence (audio did not advance, wall
+    /// did) and a catch-up burst (audio jumped ahead by however many frames the
+    /// device buffered) both end with `skew = 0` instead of a pile of
+    /// corrections that would take minutes to unwind.
     pub fn note_audio(&self, dur: Duration, now: Instant) {
         let mut st = self.lock();
-        st.audio_us += dur.as_micros() as i64;
-        if st.started_at.is_none() {
-            st.started_at = Some(now);
+        match st.last_note_at {
+            None => {
+                // First frame: no interval to measure yet. Media time starts at
+                // one frame, wall time at zero, so the very first reading is
+                // +20 ms — an order of magnitude below `SKEW_LIMIT`.
+            }
+            Some(prev) => {
+                let gap = now.saturating_duration_since(prev);
+                if gap > MAX_FRAME_GAP {
+                    st.wall_us = st.audio_us;
+                } else {
+                    st.wall_us += gap.as_micros() as i64;
+                }
+            }
         }
+        st.last_note_at = Some(now);
+        st.audio_us += dur.as_micros() as i64;
     }
 
     /// Decide whether this audio period should be stretched or squeezed.
     pub fn fix(&self, now: Instant) -> Fix {
         let mut st = self.lock();
-        let Some(start) = st.started_at else {
+        let Some(last) = st.last_note_at else {
             return Fix::None;
         };
-        let wall = now.duration_since(start);
-        if wall < WARMUP {
+        // Nothing has been written for a while: the receiver is not playing
+        // anything, so there is no drift to correct and no timeline to move.
+        if now.saturating_duration_since(last) > MAX_FRAME_GAP {
+            return Fix::None;
+        }
+        // Warm-up is measured in audio time: a session that has only produced
+        // half a second of sound has not had a chance to drift.
+        if st.audio_us < WARMUP.as_micros() as i64 {
             return Fix::None;
         }
         if let Some(at) = st.last_fix_at {
@@ -112,7 +169,7 @@ impl AvClock {
                 return Fix::None;
             }
         }
-        let skew = st.audio_us - wall.as_micros() as i64;
+        let skew = st.audio_us - st.wall_us;
         if skew < -SKEW_LIMIT {
             st.last_fix_at = Some(now);
             st.fixes += 1;
@@ -126,13 +183,23 @@ impl AvClock {
         }
     }
 
-    /// Audio media time minus real time in milliseconds; positive means audio
-    /// is running fast. `None` before the first frame.
-    pub fn skew_ms(&self, now: Instant) -> Option<f32> {
+    /// Audio media time minus the time audio actually ran, in milliseconds;
+    /// positive means audio is running fast. `None` before the first frame.
+    pub fn skew_ms(&self, _now: Instant) -> Option<f32> {
         let st = self.lock();
-        let start = st.started_at?;
-        let wall = now.duration_since(start).as_micros() as i64;
-        Some(((st.audio_us - wall) as f64 / 1000.0) as f32)
+        st.last_note_at?;
+        Some(((st.audio_us - st.wall_us) as f64 / 1000.0) as f32)
+    }
+
+    /// How long the audio track has been silent, if it has.
+    ///
+    /// Reported next to the skew so `av=+12ms` on an idle desktop is not
+    /// mistaken for a healthy reading: it is a frozen clock, not a synced one.
+    pub fn idle_for(&self, now: Instant) -> Option<Duration> {
+        let st = self.lock();
+        let last = st.last_note_at?;
+        let idle = now.saturating_duration_since(last);
+        (idle > MAX_FRAME_GAP).then_some(idle)
     }
 
     /// Steps applied since the session started, for the log line.
@@ -166,12 +233,28 @@ pub fn fix() -> Fix {
     CLOCK.fix(Instant::now())
 }
 
-/// `(skew_ms, fixes)` for the periodic log, `None` before audio starts.
-pub fn report() -> Option<(f32, u64)> {
+/// One reading for the periodic log.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Report {
+    /// Media time minus the time audio actually ran; positive = audio fast.
+    pub skew_ms: f32,
+    /// Correction steps applied since the session started.
+    pub fixes: u64,
+    /// How long the track has been silent; `None` while audio is flowing.
+    pub idle_ms: Option<u64>,
+}
+
+/// `(skew, fixes, idle)` for the periodic log, `None` before audio starts.
+pub fn report() -> Option<Report> {
     if !ACTIVE.load(Ordering::Relaxed) {
         return None;
     }
-    CLOCK.skew_ms(Instant::now()).map(|ms| (ms, CLOCK.fixes()))
+    let now = Instant::now();
+    CLOCK.skew_ms(now).map(|skew_ms| Report {
+        skew_ms,
+        fixes: CLOCK.fixes(),
+        idle_ms: CLOCK.idle_for(now).map(|d| d.as_millis() as u64),
+    })
 }
 
 /// Reset for a new session.
@@ -272,33 +355,50 @@ mod tests {
     }
 
     /// Nothing happens during warm-up, however the device behaves: the loopback
-    /// client's first second is a buffered burst, not a clock sample.
+    /// client's first second is a buffered burst, not a clock sample. Warm-up is
+    /// counted in *audio* time, so a burst of thirty frames inside 100 ms of wall
+    /// time is still exempt.
     #[test]
     fn warmup_is_exempt() {
         let c = AvClock::new();
         let t0 = Instant::now();
-        c.note_audio(Duration::from_millis(20), t0);
-        // One frame after 900 ms of wall time is 880 ms "behind" — warm-up.
-        assert_eq!(c.fix(t0 + Duration::from_millis(900)), Fix::None);
+        for i in 0..30 {
+            let at = t0 + Duration::from_millis(3 * i);
+            c.note_audio(Duration::from_millis(20), at);
+            // 600 ms of media inside 87 ms of wall is 513 ms "ahead".
+            assert_eq!(c.fix(at), Fix::None, "warm-up must stay exempt");
+        }
+        assert_eq!(c.fixes(), 0);
     }
 
     /// Correction cannot run faster than `FIX_MIN_INTERVAL`; without the gate a
     /// large offset would be "fixed" with a burst of silence.
+    ///
+    /// The drift here is produced by a device that runs at a fifth of real time
+    /// *without* ever gapping long enough to look like a stall — one 20 ms frame
+    /// every 100 ms. An idle gap would be re-aligned instead (#118).
     #[test]
     fn corrections_are_rate_limited() {
         let c = AvClock::new();
-        let t0 = Instant::now();
-        c.note_audio(Duration::from_millis(20), t0);
-        // 5 s of wall time with only 20 ms of media sent: audio is way behind.
-        assert_eq!(c.fix(t0 + Duration::from_secs(5)), Fix::Advance);
+        let mut at = Instant::now();
+        for _ in 0..60 {
+            c.note_audio(Duration::from_millis(20), at);
+            at += Duration::from_millis(100);
+        }
+        // 1.2 s of media over 5.9 s of wall: 4.7 s behind.
+        assert_eq!(c.fix(at), Fix::Advance);
         assert_eq!(
-            c.fix(t0 + Duration::from_secs(5) + Duration::from_millis(100)),
-            Fix::None
+            c.fix(at + Duration::from_millis(100)),
+            Fix::None,
+            "second step inside FIX_MIN_INTERVAL"
         );
-        assert_eq!(
-            c.fix(t0 + Duration::from_secs(5) + FIX_MIN_INTERVAL),
-            Fix::Advance
-        );
+        // Keep producing (so the idle guard stays out of the way) until the
+        // interval expires, then the same skew must buy another step.
+        for _ in 0..20 {
+            c.note_audio(Duration::from_millis(20), at + Duration::from_millis(100));
+            at += Duration::from_millis(100);
+        }
+        assert_eq!(c.fix(at), Fix::Advance);
     }
 
     /// The regression for the first deploy: comparing against the video media
@@ -322,12 +422,75 @@ mod tests {
     #[test]
     fn reset_forgets_the_previous_session() {
         let c = AvClock::new();
-        let t0 = Instant::now();
-        c.note_audio(Duration::from_millis(20), t0);
-        assert_eq!(c.fix(t0 + Duration::from_secs(5)), Fix::Advance);
+        let mut at = Instant::now();
+        for _ in 0..60 {
+            c.note_audio(Duration::from_millis(20), at);
+            at += Duration::from_millis(100);
+        }
+        assert_eq!(c.fix(at), Fix::Advance);
         c.reset();
         assert_eq!(c.fixes(), 0);
-        assert!(c.skew_ms(t0).is_none());
+        assert!(c.skew_ms(at).is_none());
+    }
+
+    /// #118, the regression for the deployed host: a desktop with nothing
+    /// playing produces no loopback frames at all, and that used to read as
+    /// drift — `av=-140687920ms/70963fix`, one silence frame injected every two
+    /// seconds for two days. Silence on both ends is not a lip-sync error.
+    #[test]
+    fn an_idle_gap_is_not_drift() {
+        let c = AvClock::new();
+        let mut at = Instant::now();
+        // Ten minutes of sound.
+        for _ in 0..50 * 60 * 10 {
+            c.note_audio(Duration::from_millis(20), at);
+            at += Duration::from_millis(20);
+        }
+        let before = c.fixes();
+        // Eight hours of nothing, then sound again.
+        at += Duration::from_secs(8 * 3600);
+        for _ in 0..300 {
+            c.note_audio(Duration::from_millis(20), at);
+            at += Duration::from_millis(20);
+        }
+        assert_eq!(c.fixes(), before, "silence must not be corrected");
+        assert_eq!(c.fix(at), Fix::None);
+        let skew = c.skew_ms(at).expect("audio has been written");
+        assert!(skew.abs() < 80.0, "skew after an idle gap: {skew}");
+    }
+
+    /// While the track is idle there is nothing to correct, and the log must say
+    /// so rather than print a frozen skew that looks healthy.
+    #[test]
+    fn idle_is_reported_instead_of_corrected() {
+        let c = AvClock::new();
+        let t0 = Instant::now();
+        c.note_audio(Duration::from_millis(20), t0);
+        assert!(c.idle_for(t0 + Duration::from_millis(100)).is_none());
+        let idle = c.idle_for(t0 + Duration::from_secs(30)).expect("idle");
+        assert_eq!(idle, Duration::from_secs(30));
+        assert_eq!(c.fix(t0 + Duration::from_secs(30)), Fix::None);
+        assert_eq!(c.fixes(), 0);
+    }
+
+    /// A stall that hands over the buffered backlog in one burst must stay
+    /// bounded by the endpoint buffer (`BUFFER_HNS` = 200 ms), not by the length
+    /// of the stall: without the re-align this read as "3 s behind".
+    #[test]
+    fn a_burst_after_a_stall_stays_bounded() {
+        let c = AvClock::new();
+        let mut at = Instant::now();
+        for _ in 0..100 {
+            c.note_audio(Duration::from_millis(20), at);
+            at += Duration::from_millis(20);
+        }
+        // 3 s of silence, then the device dumps its 200 ms buffer at once.
+        at += Duration::from_secs(3);
+        for _ in 0..10 {
+            c.note_audio(Duration::from_millis(20), at);
+        }
+        let skew = c.skew_ms(at).expect("audio has been written");
+        assert!(skew > 0.0 && skew <= 220.0, "burst skew: {skew}");
     }
 
     /// The process-wide clock behind `report()` only speaks once audio exists.
