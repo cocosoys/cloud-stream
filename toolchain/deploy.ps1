@@ -773,7 +773,10 @@ try {
         if ($install.Code -ne 0) { Write-Note '启动脚本安装有异常，见上面的输出' }
 
         if ($r.Code -ne 0) { Write-Note '目录核对有异常，见上面的输出' }
-    } else {
+    } elseif (-not $PackageOnly) {
+        # -PackageOnly 不碰被控机：这一步会 ssh 过去查 sshd 启动类型与防火墙规则，
+        # 属于"碰"。少了这道判断，一个纯本地的打包命令仍会去连目标机，目标机没开
+        # 机时还会卡在超时上。
         Enable-RemoteSsh
     }
 
@@ -902,8 +905,8 @@ try {
             (($allFiles | Measure-Object Length -Sum).Sum / 1MB), $allFiles.Count, $webFiles.Count)
         Write-Ok ("压缩包 {0:N1} MB  md5={1}" -f
             ((Get-Item $BundleZip).Length / 1MB), (Get-Md5 $BundleZip))
-        Write-Note "运行根 $BundleDir"
-        Write-Note "压缩包 $BundleZip"
+        Write-Info "运行根 $BundleDir"
+        Write-Info "压缩包 $BundleZip"
         Write-Note '拷到新机器解压即运行根；先读包里的 README.txt，再按 setup-watchdog.bat 装任务。'
         return
     }
