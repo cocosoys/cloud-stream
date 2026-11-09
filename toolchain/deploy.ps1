@@ -529,7 +529,10 @@ function New-DeployBundle {
     $webBytes = ($web | Measure-Object Length -Sum).Sum
     if (-not $webBytes) { $webBytes = 0 }
     $commit = $(try { (& git -C $RepoRoot rev-parse --short HEAD 2>$null) } catch { $null })
-    $dirty = $(try { [bool](& git -C $RepoRoot status --porcelain 2>$null) } catch { $true })
+    # 只统计**已跟踪**文件的改动。未跟踪的临时脚本（`toolchain/tmp-*.py` 这类）
+    # 不进包、也不改变产物的来源，但会让 `dirty` 永远为 true —— 一个永远是 true
+    # 的字段等于没有，而它本来要回答的是"这个包是不是从一个提交来的"。
+    $dirty = $(try { [bool](& git -C $RepoRoot status --porcelain --untracked-files=no 2>$null) } catch { $true })
 
     $manifest = [ordered]@{
         bundle   = 'cloud-stream'
@@ -605,7 +608,8 @@ function Save-DeployArchive {
     $zipMd5 = $(if (Test-Path $ArchiveZip) { Get-Md5 $ArchiveZip } else { $null })
     $commit = $(try { (& git -C $RepoRoot rev-parse --short HEAD 2>$null) } catch { $null })
     # 工作区脏的时候，归档里的 exe 不对应任何提交 —— 回滚到它的人需要知道这件事。
-    $dirty = $(try { [bool](& git -C $RepoRoot status --porcelain 2>$null) } catch { $true })
+    # 口径与 manifest 一致：只看已跟踪文件的改动。
+    $dirty = $(try { [bool](& git -C $RepoRoot status --porcelain --untracked-files=no 2>$null) } catch { $true })
     [ordered]@{
         saved_at = (Get-Date).ToString('o')
         parts    = $parts
