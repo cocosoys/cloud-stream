@@ -93,7 +93,13 @@ RTP track 的时刻。新帧算，重复帧也算（静止桌面本来就只发�
     "encoder": "libvpx", "codec": "vp8",
     "rate_control": "cbr",        // cbr | crf
     "crf": 25,                    // 仅 crf 模式有意义
+    // #120: 两个码率，不是一个。`target_kbps` 是**决策**（QoS 目标 / 客户端
+    // `vb,` 覆盖 / fps 缩放后的预算），`throttled` 就是拿它判的；
+    // `encoder_kbps` 是 libvpx 自报的值。两者不等 = 改档没落下去（被拒或量化），
+    // 这是唯一能把"以为改了"和"真改了"分开的地方。都读 encoder.bitrate() 时，
+    // 压到 1581 的流会报出 4527。
     "target_kbps": 2500,
+    "encoder_kbps": 2500,
     "warm": true,
     "last_sample_age_ms": 33,     // 判活的核心数字
     "timing": { "encode_ms": 4.2, "pipeline_ms": 9.1, "send_ms": 1.2 },

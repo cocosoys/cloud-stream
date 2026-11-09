@@ -1,29 +1,35 @@
 # L2 / L3 缺口清单与任务分解
 
-> **代码基线**：#81（后端 `9734d1f`，前端 `e43b56e`），`cargo test -p stream-server`
-> **41 通过 / 0 失败**（2026-10-29 复跑）。部署机 192.168.59.148：stream-server
-> PID 7612（看门狗拉起）、MC 客户端 java PID 3908，同在 Console 会话 1。
+> **代码基线**：#120（后端 `ad12ea8` + 本轮未提交改动，前端 `3dac1f2`），
+> `cargo test -p stream-server` **331 通过 / 0 失败 / 1 ignored**（2026-11-09 复跑）。
+> #120 不是缺口，是一处口径修正：`health.stream.target_kbps` 原来读
+> `encoder.bitrate()`，与 QoS 决策值是两个量，于是出现"`throttled: true` + target
+> 4527"而实际跑在 1581。现在拆成 `target_kbps`（决策）与 `encoder_kbps`（自报），
+> 见 `stage3-clipboard-qos-avsync.md` §2.4 末段。
+> 部署机 192.168.59.148：`/api/v1/health` 实测 `current_mode: websockets`、
+> `codec: vp9`、`viewer.credential: none`。
 >
 > **本文档的定位**：`roadmap-future.md` 末尾写「L2/L3 的缺口清单另见
 > `roadmap-l2-l3-gaps.md`」，此前一直没写。现在补上，两者严格不重叠——
 > 那边收「已分析清楚但暂缓」，这边收「范围内该做、还没做」。
 >
-> **全量 34 项：30 完成 / 3 部分 / 1 未做**（2026-10-29 第四批：#88 监听面鉴权
-> 骨架落地，22 个入口全部插桩、默认全放行，见 `listener-surface.md`；第三批
-> #34 一键部署见 `deploy-one-click.md`；第二批 #18 二进制剪贴板、#25 QoS 自适应、
-> #26 音画同步 见 `stage3-clipboard-qos-avsync.md`）。
-> 本轮订正两处此前误判：**#27 周期关键帧其实早已由编码器 `kf_max_dist=60` 覆盖**
-> （见 §1.3），**#32 服务自恢复已由 #81 完成并实测**。新增 §2.12「音频无观测」。
+> **全量 35 项：35 完成 / 0 部分 / 0 未做**（2026-11-09 再算一次）。最后一个
+> ❌（#28 截图/录屏）本轮做掉了截图那一半，录屏拆出去另记（§2.10）。
+> 此前的「30 完成 / 3 部分 / 1 未做」是 2026-10-29 的旧数，此后 #17 手柄、
+> #19 触控、#33 鉴权、#28 截图相继闭合，但顶部总数一直没跟着改 ——
+> 这次约定：**改小节标题必须同步本节，再同步顶部**，且用脚本按表格第三列复算。
 >
-> **2026-11-02 第五批**：#17 手柄注入落地（`dispatch/gamepad.rs` + vendored
-> `ViGEmClient.dll` + `toolchain/install-vigem.ps1`），#19 触屏虚拟摇杆随其一并可用，
-> §1.2 全部闭合。硬件回环在被控机通过；浏览器侧仍待人工验收。顶部总数未逐节重算，
-> **以各分节标题的计数为准**。
+> 本轮订正的关键一处：**#33 鉴权不是「仍无 token」**。`--auth-token` /
+> `--auth-grant tenant:role:token`、五载体提取、常量时间比较、`Grant{tenant,role}`
+> 与五处裁决点全都在（`config.rs:173/179`、`security/token.rs`、
+> `http/server.rs:254`），缺的只是**线上没开开关**（`C:\dev\stream\auth-token.txt`
+> 不存在）。这是「能力已闭环、默认关闭」，不是「没有能力」。
 >
 > **「完成」不等于「已验收」**：`#21 麦克风上行`、`#24 音量/静音/码率`、
 > `#23 统计浮层`、`#79 前端按钮` 四项代码已部署，但服务端日志里
 > `findstr "mic uplink|render open|uplink playing"` 命中数为 **0** —— 也就是
 > 还没有一次真实开麦记录。判定为 ✅ 依据是链路闭环 + 单测，**实机验收仍待用户操作**。
+> `#17 手柄`的浏览器侧同样待人工验收。**带 \* 的状态即"代码闭环、实机待验"。**
 
 ---
 
@@ -55,7 +61,7 @@
 | 7 | 静态托管 + TLS + 文件传输（列目录 / 下载 / 分片上传） | ✅ | `http/server.rs`、`http/file_transfer.rs` |
 | 8 | PC 状态机与断线恢复 | ✅ | `stage1-signaling-session.md` |
 
-### 1.2 L2 输入面 — 10 完成 / 0 部分 / 1 未做
+### 1.2 L2 输入面 — 11 完成 / 0 部分 / 0 未做
 
 | # | 能力 | 状态 | 证据与断点 |
 | --- | --- | --- | --- |
@@ -71,7 +77,7 @@
 | 18 | 二进制剪贴板（`cb/cbs/cbd/cbe`） | ✅ | #85，`dispatch/clipboard_image.rs`（PNG/BMP → DIB）+ `clipboard.rs` 上下行；顺带修正下行消息族（旧 `clipboardContentUpdate` 本页根本不收） |
 | 19 | 触控 | ✅ | 单指拖动走 `m`/`m2` 已通；**屏幕虚拟摇杆**走 `js,a`（`gamepad.js:125` 监听 `touchgamepadinput`），随 #17 一并可用 |
 
-### 1.3 L3 画质与体验 — 6 完成 / 3 未做
+### 1.3 L3 画质与体验 — 10 完成 / 0 部分 / 0 未做
 
 | # | 能力 | 状态 | 证据与断点 |
 | --- | --- | --- | --- |
@@ -83,7 +89,7 @@
 | 25 | QoS 自适应码率（丢包 / 积压反压） | ✅ | #84，`pipeline/qos.rs`（积压 + PLI 率 → 2s 一次决策，-25%/+10%，floor 20%）；`throttled` 现为真实状态 |
 | 26 | 音画同步 | ✅ | #83，`pipeline/avsync.rs`：音频媒体时钟钉在墙钟上，偏斜 >80 ms 时以 20 ms 为一格收发帧。首版比两路介质时钟，实测误判成 -16 s（见设计稿 §3.1） |
 | 27 | 周期关键帧 / 长参考链守护 | ✅ | **此前误判为未做**；`#86` 又把它从「帧数」改成「秒数」。现在 `--keyframe-secs`（默认 10 s）由采集循环按墙钟执行 `force_keyframe`，`kf_max_dist` 降级为 2 倍周期的兜底网（`encoder.rs:keyframe_backstop_frames`） |
-| 28 | 截图 / 录屏 | ❌ | `grep screenshot\|record` 在 Rust 侧零命中，无 HTTP 端点也无下行命令 |
+| 28 | 截图 | ✅ | #28：`GET /api/screenshot` → `image/png`，实测 1920×1080、1.32 MB、请求 **93 ms**（其中编码 42–51 ms），见 §2.10。数据源是管线每拍留的 `pristine_bgra`（不含合成指针），编码走 `pipeline::png`（与指针图共用同一份 CRC/chunk 写法）。**录屏仍不做**，理由见 §2.10 末尾 |
 | 92 | 视频设置五控件：码率 / 码控(CBR↔CRF) / CRF 真可改；编码器改事实行；覆盖层三项按无 paint-over 隐藏 | ✅ | `docs/video-knobs.md`；`VpxRateControl`（vendor/scrap）、`pipeline::settings::RateControl`、`_rc,`/`_crf,` 已不再是 B 组噪音 |
 
 > #27 的残余问题不是"没有周期关键帧"，而是**间隔不可配且偏短**：60 帧 ≈ 30 fps 下
@@ -98,7 +104,7 @@
 > 的兜底。实测日志：`periodic keyframe: 10.0s since the last IDR (period 10s)`，
 > 同一窗口 `kf=1`（`key_frames` 计数取自 VP8 包的 `key` 标志，证明 IDR 真发出去了）。
 
-### 1.4 L4 产品闭环 — 5 完成 / 0 部分 / 1 未做
+### 1.4 L4 产品闭环 — 6 完成 / 0 部分 / 0 未做
 
 | # | 能力 | 状态 | 证据与断点 |
 | --- | --- | --- | --- |
@@ -106,7 +112,7 @@
 | 30 | 默认灵敏度三层固化（游戏 0.5 / 关加速 / gain 1.0） | ✅ | `mouse-sensitivity-default.md`、`start-mc.ps1` |
 | 31 | 会话互斥（同页签重连驱逐旧 socket，跨页签共存） | ✅ | `websession.rs` `SessionRegistry::publish`：按 `client_tab_id` 比对，只踢同一页签的僵尸连接。多页面共享一条采集管线，首个为 `controller`，其余 `viewer` 只读。见 `pipeline/shared.rs` 与 `roadmap-multi-display-multi-input.md §5.1` |
 | 32 | 服务自恢复 | ✅ | #81 `0159076`：`MCStreamSrv` 改 `/SC MINUTE /MO 1` + `run-hidden.vbs` 隐藏宿主 + 单实例检查。实测 `taskkill` PID 1904 → 一分钟后 PID 7612 自起，当前跑的正是它 |
-| 33 | 鉴权 | 🟡 | **骨架已就位（#88）**：22 个监听面全部插桩，五处裁决点都在副作用之前（HTTP / 信令 / 控制通道 / 指针通道 / 麦克风），`--policy allow-all\|deny-all` 可切换，`deny-all` 实测三个入口全 403 且进程照常启动。**仍无 token**：`http/mod.rs:7` 明写 "no auth gate in stage1"，`config.rs` 无 `--token`，局域网内任何人打开 8080 即取得鼠标键盘。见 `listener-surface.md` |
+| 33 | 鉴权 | ✅* | **已闭环（#88 骨架 → #101 口令 → #110 身份）**：22 个监听面全部插桩、五处裁决点都在副作用之前（HTTP / 信令 / 控制通道 / 指针通道 / 麦克风）；`--auth-token <pw>`（等价 `default:host`）+ 可重复的 `--auth-grant tenant:role:token`（`host` / `operator` / `viewer`）；五种载体 Bearer / `?token=` / cookie / WS 子协议 / URL 片段，常量时间比较；`Static` 与 `Status` 豁免。裁决在 `http/server.rs:254`：**先口令（401 + `WWW-Authenticate`）、再策略（403）**，信令与媒体复用同一个 `grant`。**\*线上未开**：`C:\dev\stream\auth-token.txt` 不存在 → 启动日志 `cred=none`，局域网内任何人打开 8080 仍能直接操作。开只需在被控机跑一次 `set-password.cmd` 再重启任务。见 `listener-surface.md` |
 | 34 | 一键部署 | ✅ | #34 `toolchain/deploy.ps1` + `deploy-remote.ps1`：构建 → 上传 → 两端 MD5 → 停任务/禁用 → 备份 → 换文件 → 起任务 → 三重体检（HTTP 200 + 进程启动时间 + 日志 `listening on`）→ 失败自动回滚。实测两次全量部署各 48 s、一次 `-Rollback` 通过；`-Bootstrap` 顺带把 sshd 钉成自动启动。见 `deploy-one-click.md` |
 
 ---
@@ -222,33 +228,43 @@
 持续花屏；撤掉注入后 10 秒内回到目标码率；全程 `keyframe_requests` 不应暴涨
 （暴涨说明降档没起作用，只是 PLI 在打架）。
 
-### 2.5 鉴权（#33，P1，L4）
+### 2.5 鉴权（#33，P1，L4）— 已实现 #88 → #101 → #110，**线上未开开关**
 
-**现象**：局域网内任何设备浏览器打开 `https://192.168.59.148:8080/` 即可操作
-被控机鼠标键盘、读写 `upload_dir` 下的文件。
+**原现象**（2026-10 记录）：局域网内任何设备浏览器打开 `https://192.168.59.148:8080/`
+即可操作被控机鼠标键盘、读写 `upload_dir` 下的文件。
 
-**根因**：`http/mod.rs:7` 与 `server.rs:148` 明确不做校验。前端有
-`lib/auth-guard.js` / `lib/session-token.js`，但那是**客户端侧**的把戏，
-服务端完全信任 URL 里的 app 段。
+**这道缺口已经补完，现在的状态是「能力齐全、默认关闭」**：
 
-**2026-10-29 进展（#88）**：入口层面接完了，见 `listener-surface.md`。22 个监听面
-（`startup` / `http.*` / `signaling` / `control.*` / `input.*` / `clipboard.*` /
-`media.*` / `file.*`）全部映射到 `security::EventKind`，五处裁决点接在任何副作用
-**之前**：`http/server.rs:221`（所有 HTTP）、`:321`（信令建立）、`websession.rs:811`
-（指针通道）、`:846`（控制通道）、`webrtc/mod.rs:292`（麦克风）。默认 `allow-all`
-不改变行为，`deny-all` 是覆盖率探针。**缺的只有 token 本身**：`Principal` /
-`Credential` 结构已留好，WS 升级时把 cookie 解析成角色、随 `MediaSession` 带进
-DC 回调即可 —— 插桩点不用动。
+| 层 | 落地形态 | 位置 |
+| --- | --- | --- |
+| 口令表 | `--auth-token <pw>`（单条，等价 `default:host`，空串=关闭）+ 可重复的 `--auth-grant <tenant>:<role>:<token>`（令牌放最后，因为它可能含冒号） | `config.rs:173` / `:179` / `:453` / `:460` |
+| 身份 | `Grant{tenant, role}`，`Role` = `Host` / `Operator` / `Viewer`（默认 Viewer："没配凭据时谁都是观众"） | `security/token.rs:44`、`security/mod.rs:323` |
+| 提取 | 五载体，顺序即优先级：`Authorization: Bearer` → `?token=`（百分号解码）→ `selkies_token` cookie → WS 子协议 `selkies.token.<b64url>` | `security/token.rs:201` |
+| 比较 | 常量时间、走完整张表不提前 break（不泄漏"命中的是第几条"） | `security/token.rs:167` |
+| 裁决 | HTTP 全路由（`Static` / `Status` 豁免）→ 401 带 `Bearer realm="Selkies"`；随后策略 403。**口令判定在策略之前**，否则等于告诉未认证者"这里有东西" | `http/server.rs:254` |
+| 复用 | 信令与媒体拿到同一个 `grant`，`AUTH_SUCCESS` / `identified as tenant=… role=… cred=…` 落日志；观众令牌不能拿输入租约（`a_viewer_token_never_owns_input`） | `websession.rs:786`、`ws_media.rs:576` |
 
-**改动点**：
-- 最小可用：`--token <str>` 启动参数，校验 `?token=` 或 Cookie；
-  WS 升级与 `/api/files`、`/api/upload` 三条路径统一过一道
-  `check_auth(&req, &cfg)`，失败 401。
-- 正确做法：一次性登录换 session cookie（HttpOnly + Secure），WS 与 API 共用。
-- 前端 `session-token.js` 已能承载，不需要大改。
+`--policy allow-all|deny-all` 仍在，作为覆盖率探针：`deny-all` 实测三个入口全 403
+且进程照常启动。
 
-**验收**：无 token 打开得到 401 且 WS 握手被拒；带 token 正常；改 token 后旧
-链接失效。
+**残余（唯一一条）：线上没设口令。** 被控机 `C:\dev\stream\auth-token.txt` 不存在，
+`start-stream.cmd` 因此不传 `--auth-token`，启动日志为 `cred=none`。也就是说
+**能力已经在了，风险一点没减** —— 这是配置问题，不是代码问题。
+
+**开启方式**（无需改代码、无需重新部署）：
+```powershell
+# 在被控机（192.168.59.148）上
+C:\dev\stream\set-password.cmd            # 写入 auth-token.txt（ASCII）
+schtasks /End /TN MCStreamSrv; schtasks /Run /TN MCStreamSrv
+```
+
+**验收**：无 token 打开得到 401 且 WS 握手被拒；`?token=<pw>` 正常；
+改口令后旧链接失效。`docs/deploy-one-click.md` §7.26 有 `--auth-token test123`
+的实测记录（端口 18080），这条验收早已做过，只是没在这台生效。
+
+**为什么还不算问题**：这台机器目前在局域网内、只有一个用户、无端口映射到公网。
+一旦要给别人用，这一步必须前置 —— 而 `--auth-grant` 的 `tenant` 正是多用户
+方案里最先要用到的东西（见 `roadmap-future.md` §7）。
 
 ### 2.6 服务自恢复（#32，P1，L4）— 已实现 #81
 
@@ -283,6 +299,37 @@ DC 回调即可 —— 插桩点不用动。
 本管线视频是"变化才发"，静态桌面 1–2 帧/秒，视频介质时钟与墙钟无关。首版照原计划
 实现，部署后实测 `av=-16199ms/40fix`，一分钟内误校正 40 次。改为**把音频媒体时钟
 钉在墙钟上**，与视频无关。完整复盘见 `stage3-clipboard-qos-avsync.md` §3.1。
+
+**2026-11-09 追加（#118）：墙钟这个基准本身也被算错了 —— 空转了两天半。**
+
+线上每行日志都带 `av=`，实测是 `av=-140687920ms/70963fix`：音频媒体时钟被判成比
+墙钟慢 **39 小时**，每 2 秒补一个 20 ms 静音帧，两天半补了 70963 次。
+
+根因不在算法，在**取数**：`Loopback::drain()` 在没有声音播放时 500 ms 超时返回空
+（注释自己写着 "a machine with no playback at all legitimately never signals"），
+于是 `emit_frame` 不被调用、`note_audio` 不前进，而 `fix()` 拿的是
+`now - started_at` —— 墙钟照走、媒体钟不动，差值就是"服务运行了多久"。
+
+补观测后第一次实测量到的就是这个：连续几窗
+`audio 5.0s: cap=0 ... (no frames: endpoint idle)`；而在被控机上播一段声音，
+立刻变成 `cap=240 ... => 48.0 fps, 61.9 kbps` —— **空闲端点确实一个包都不产**。
+
+修法：墙钟**只在两次音频帧之间累加**。间隔超过 `MAX_FRAME_GAP`（250 ms）算停顿
+（空闲桌面、设备重启、调度抖动），恢复时把两条时钟**重新对齐**而不是把缺口算成
+漂移；`fix()` 在轨道空闲时直接返回 `None`；`av=` 后面多一个 `idle=`，表示"这一行
+的偏斜来自一个已经停住的时钟，不要当健康读数"。
+
+实测（在被控机的交互会话里播 15 s 声音，然后静音）：
+
+| 时刻 | 日志 | 含义 |
+| --- | --- | --- |
+| 播放中 | `av=+228ms/2fix` → `+188ms/5fix` | 首批缓冲让媒体钟超前约 200 ms，按 2 s 一步回压，**不再无限累积** |
+| 静音 4.4 s | `av=+188ms/5fix idle=4391ms` | `fixes` **停在 5** |
+| 静音 9.4 s | `av=+188ms/5fix idle=9398ms` | 仍是 5 |
+| 静音 14.4 s | `av=+188ms/5fix idle=14398ms` | 仍是 5 —— 旧版这里已经又多了 7 次 |
+
+新增 4 条单测，其中 `an_idle_gap_is_not_drift` 直接复现这次事故的形状：
+10 分钟有声 + 8 小时静音 + 再出声，要求 `fixes` 不变且 `|skew| < 80 ms`。
 
 ### 2.8 二进制剪贴板（#18，P2，L2）— 已实现 #85
 
@@ -325,15 +372,38 @@ IDR 约 100–200 KB，等于持续付出 0.4–0.8 Mbps。若要的是「长静
 计数 —— 请求了不等于发出去了，只有这个计数能证明。实测：日志每 10 s 一行
 `periodic keyframe: 10.0s since the last IDR (period 10s)`，对应窗口 `kf=1`。
 
-### 2.10 截图 / 录屏（#28，P3，L3）
+### 2.10 截图（#28，P3，L3）— 已实现；录屏明确不做
 
-**现象**：无。属产品功能缺失。
+**原来的判断**：「`pipeline` 里缓存的最后一帧 YUV/BGRA 直接编 PNG，加
+`GET /api/screenshot`」。
 
-**改动点**：截图最容易——`pipeline` 里缓存的最后一帧 YUV/BGRA 直接编 PNG，
-加 `GET /api/screenshot`（需鉴权）。录屏要落容器（IVF 已有 `build-ivf` 痕迹），
-成本高。
+**落地形态**（实现时改了两处原计划）：
 
-**建议**：先只做截图，录屏等有明确需求再说。
+| 项 | 做法 | 为什么 |
+| --- | --- | --- |
+| 取哪一帧 | 管线每拍留的 `pristine_bgra`（#70 的无指针快照，目标分辨率、紧排 BGRA） | 编码器交出来的是 **YUV**：转回 RGB 要重写色彩矩阵和色度上采样，4:2:0 会把字边糊掉 —— 而截图就是为了看清字 |
+| 何时取 | 节拍**开头**（用上一拍的快照），不是新帧分支里 | 桌面静止时新帧只有 2–5 张/秒，等新帧会给每个请求加最多半秒；代价是一次 memcpy（1080p 约 0.6 ms），帧龄 ≤16 ms |
+| 在哪编 | 独立线程 `screenshot-png`，同时只允许一张 | zlib 一帧 42–51 ms，放在 60 Hz 节拍里就是可见卡顿 |
+| 路由 | `GET /api/screenshot` → `image/png`，`Cache-Control: no-store` | 走的是 `Endpoint::Screenshot`（只读面），**自动受口令门保护**（非 `Static`/`Status`）；没有会话时 **503 + 原因**，而不是空图或旧图 |
+
+新增文件：`pipeline/screenshot.rs`（请求槽 + 编码线程 + `capture()`）、
+`pipeline/png.rs`（PNG 编码，指针图与整屏共用同一份 CRC/chunk 写法，
+`cursor.rs` 里那份重复实现已删）。
+
+**实测**（1920×1080 桌面，任务管理器开着）：
+
+| 版本 | 总耗时 | 其中编码 | 文件 |
+| --- | --- | --- | --- |
+| 默认 zlib + 等新帧（第一版） | **0.86–0.96 s** | 未单独计时 | 876 KB |
+| `Compression::fast` + 节拍开头用上一帧（最终） | **0.093 s** | 42–51 ms | 1.32 MB |
+
+日志：`screenshot: 1920x1080 png=1318790B encode=47ms`。图像人工核对过：
+壁纸紫蓝渐变正常（没有 BGRA/RGBA 通道错位）、任务栏与窗口文字清晰。
+
+**录屏不做**：要落容器（MP4/WebM 需要 muxer + 时间戳重排），而现有管线是
+"变化才发"、帧率不恒定，录出来的文件要么时长对不上要么播放器跳帧。真要做，
+正确形态是复用 `--dump-frame` 那套 IVF 路径（`build-ivf` 已有痕迹）产出
+`.ivf`，再离线转封装 —— 那是独立一件事，不在"补个端点"的量级。
 
 ### 2.11 一键部署（#34，P2，L4）— 已实现
 
@@ -363,26 +433,36 @@ IDR 约 100–200 KB，等于持续付出 0.4–0.8 Mbps。若要的是「长静
 **残余**：`sshd` 自启由脚本幂等保证，但**拿到一台新机器时第一次仍要人**到控制台
 执行三行（脚本连不上就只能打印它们）。这一条无法自动化，写进了文档 §3.1。
 
-### 2.12 音频没有观测（新增，P1，L3）
+### 2.12 音频观测（新增，P1，L3）— **日志已补，`StreamStats` 三字段仍缺**
 
-**现象**：静音到底生效了没有、音频在发多少码率、麦克风有没有真的在送数据 ——
+**原现象**：静音到底生效了没有、音频在发多少码率、麦克风有没有真的在送数据 ——
 服务端一行日志都不打，只能抓包或拿耳朵判断。
 
-**根因**：`pipeline/audio.rs` 里 `totals()`（captured / encoded / bytes / silence）
-与 `uplink_totals()`（packets / frames / concealed / silence / dropped）**都已经写好了，
-但全仓没有一处调用**；`stream_stats` 里也没有任何 `audio_*` 字段。这两组计数器
-是 #77/#79 留下的半成品，只差一个消费者。
+**2026-11-09 已做**（#118 顺带）：`pipeline` 的 5 s 摘要下面多了一行音频孪生：
 
-**改动点**：
-- `pipeline/audio.rs`：每 5 s 打一行摘要（与 `pipeline 5.0s:` 同格式），
-  静音切换时打状态变化而不是每帧打。
-- `dispatch/output.rs`：`StreamStats` 加 `audio_kbps` / `audio_on` / `mic_kbps`
-  三个字段，前端 `stream-stats-view.js` 与 HUD 各加一行。
-- 判据：关音频后 `audio_kbps` 掉到个位数（静音帧），开回来 100 ms 内有声；
-  开麦后 `mic_kbps` 从 0 变正数。
+```
+audio 5.0s: cap=240 enc=240 bytes=38721 sil=0 => 48.0 fps, 61.9 kbps
+audio 5.0s: cap=0 enc=0 bytes=0 sil=0 => 0.0 fps, 0.0 kbps (no frames: endpoint idle or device gone)
+```
 
-**为什么排 P1**：这是 #79/#80 的验收工具。没有它，那两项只能算「代码写完了」，
-出问题时也无从定位是编码、传输还是设备。
+- `cap` = 这一窗写进轨道的 20 ms 帧数，`=> N fps` 就是"每秒产生多少音频帧"；
+- `sil` 是设备标了 `AUDCLNT_BUFFERFLAGS_SILENT` 的包数，**与 `cap=0` 不是一回事**：
+  静音的混音仍然产包，空闲端点一个都不产；
+- `cap=0` 时行尾明写原因，否则一串 0 会被读成"音频坏了"。
+
+`/api/v1/health` 的 `stream.audio` 早就有 `uplink.live`（麦克风侧）全字段，
+本轮核对确认它已经在被消费（`http/health.rs:520` → `audio::uplink_stats()`），
+原文那句「全仓没有一处调用」已作废。
+
+**仍缺**：`dispatch/output.rs` 的 `StreamStats` 里没有任何 `audio_*` 字段
+（`output.rs:100` 有 cpu/encode/pipeline/send/video_mbps/rtt/keyframe，没有音频），
+所以前端 HUD 与面板统计里看不到音频 —— 要么把它们塞进 `stream_stats`，要么让
+面板直接轮询 `/api/v1/health`（后者零改动，但 HUD 是 1 Hz 的本地循环，
+多一条网络请求不如多三个字段）。`pipeline::audio::totals()` 现在有消费者了
+（就是上面那行日志），`uplink_stats()` 则继续供 health。
+
+**为什么仍是 P1**：health 只在被查询时是"现在"，日志才是"刚才"。#79/#80 的
+验收还需要一次开麦，而 `last_packet_age_ms` 这类字段必须连续采样才有意义。
 
 ---
 
@@ -401,14 +481,13 @@ IDR 约 100–200 KB，等于持续付出 0.4–0.8 Mbps。若要的是「长静
 | ~~P2~~ | ~~2.8 二进制剪贴板~~ | — | **已实现 #85**，PNG 解码器是自写的（flate2），没引新依赖 |
 | ~~P2~~ | ~~2.9 残余：关键帧秒级可配~~ | — | **已实现 #86**，`--keyframe-secs` 默认 10 s，墙钟为准、帧数是兜底 |
 | ~~P2~~ | ~~2.11 一键部署~~ | — | **已实现 #34**，`deploy.ps1` + `deploy-remote.ps1`，两次全量 + 一次回滚实测 |
-| **P1** | **2.12 音频观测** | — | 仍是 #79/#80 的验收工具；不做就只能靠耳朵 |
-| P1 | 2.5 鉴权 | — | **只剩 token 解析 + 一个 `impl Policy`**（#88 把入口全接好了） |
+| **P1** | **2.12 音频观测（收尾）** | — | 5 s 摘要日志已补（`audio 5.0s: cap=… => N fps`），health 的 `stream.audio.*` 已在用；**只剩** `StreamStats` 的 `audio_*` 三字段（HUD 才看得到） |
+| ~~P1~~ | ~~2.5 鉴权~~ | — | **已实现 #88→#101→#110**（口令表 / 五载体 / 租户+角色 / 五处裁决）。剩下的不是代码，是**在被控机跑一次 `set-password.cmd`** |
 | ~~P2~~ | ~~2.2 手柄~~ | — | **已实现 #17**，`dispatch/gamepad.rs` + vendored `ViGEmClient.dll`；硬件回环在被控机通过，浏览器侧待人工验收 |
-| P3 | 2.10 截图 | ← 2.5（鉴权） | 纯增量为先不碰 |
+| ~~P3~~ | ~~2.10 截图~~ | — | **已实现 #28**：`GET /api/screenshot`，1920×1080 请求 93 ms（编码 42–51 ms）。录屏拆出另议 |
 
-**剩下的 1 项未做 + 2 项部分**，按建议顺序：2.12 音频观测 → 2.5 鉴权 → 2.10 截图。
-2.12 是唯一"不做就没法验收已做完的东西"的一项；2.5 是唯一的安全债，而 #88
-已经把它的架子搭完了 —— 剩下的全是填写，不是接线。
+**剩 1 项收尾 + 1 条配置债**：2.12 的 `StreamStats` 三字段（HUD 才看得到音频），
+以及 2.5 的口令（`set-password.cmd` + 重启任务，两步，不需要构建）。
 2.11 落地之后，剩下的每一项验收都只要一条命令，摩擦不再是理由。
 
 ---

@@ -73,16 +73,17 @@ clipboard cmd received")`。所以**在这套前端上，连文本下行都是�
 | 信号 | 来源 | 含义 |
 | --- | --- | --- |
 | `send_ms - pipeline_ms` | #78 加的 `send_timing` / `pipeline_timing` | 帧在交接队列里等的时间。`pipeline_ms` 停在编码器出口，差值就是链路吸收不掉的部分 |
-| PLI/s | `pli_requests` 会话总数差分 | 解码器丢了参考链。**局域网上这几乎只意味着丢包**，不是编码慢 |
+| PLI/s | `pli_requests` 会话总数差分 | 解码器丢了参考链。**只是一半证据**——#119 证明它单独出现时说的是客户端，不是链路（见 2.4） |
 
 **客户端上报的丢包率没有用**，这是一个选择而非遗漏：下行丢包只有接收方
-`getStats()` 看得见，服务端要用就得再开一条上行命令；而上面两个信号已经能回答
+`getStats()` 看得见，服务端要用就得再开一条上行命令；而队列等待已经能回答
 「链路是不是跟不上」，多一个可能反了的样本只会白降码率。
 
 ### 2.3 状态机
 
 ```
-Normal --(backlog>=120ms 或 PLI>=2/s)--> Degraded   target *= 0.75
+Normal --(backlog>=120ms)-------------------------------> Degraded   target *= 0.75
+Normal --(backlog>=20ms 且 PLI>=2/s)--------------------> Degraded   ← #119
 Degraded --(持续压力)--> 继续 *= 0.75，到 floor 为止
 Degraded --(backlog<=40ms 且 PLI<0.5/s)--> Recovering
 Recovering --(连续 2 个平静窗口)--> target *= 1.10，回到 base 即 Normal
@@ -101,6 +102,78 @@ Recovering --(连续 2 个平静窗口)--> target *= 1.10，回到 base 即 Norm
 `throttled` 现在是真的：`PipelineHandle` 里一个 `AtomicBool`，由 capture loop 每
 2 秒写，`stream_stats` 每 1 秒读。HUD 加了一行 `QoS: full rate / throttled`——
 不然面板上只会看到 `Video` 跟着 `Target` 往下掉，看起来像编码器坏了。
+
+### 2.4 #119：PLI 单独不构成链路证据
+
+**症状**：`/api/v1/health` 报 `stream.throttled: true`，`target_kbps` 却停在
+4527 —— 两个数字互相矛盾，面板上看起来像编码器自己坏了。
+
+**日志原样**（2026-11-09，`.148`）：
+
+```text
+qos: degraded -> target 3750 of 5000 kbps (backlog 0 ms, 10 PLI in 2.0s)
+qos: degraded -> target 2109 of 5000 kbps (backlog 0 ms,  7 PLI in 2.0s)
+qos: degraded -> target 1581 of 5000 kbps (backlog 0 ms,  6 PLI in 2.0s)
+```
+
+三条独立证据指向同一个结论——**这不是拥塞**：
+
+| 证据 | 数值 | 说明 |
+| --- | --- | --- |
+| `backlog` | 每一条都是 **0 ms** | 交接队列一秒都没堆过 |
+| 降码率后的 PLI | 降到 1581 仍是 6 PLI/2s | **降码率对丢包毫无影响**，物理上排除"链路丢包" |
+| PLI 来源 | 500 行日志里 127 条 `stream_server::webrtc: received PLI` | 全来自 **WebRTC 的 RTCP** |
+
+第三条是根因：`pli_requests` 是**管线级**计数，而 `note_keyframe_request()` 只有
+`webrtc/mod.rs:372` 一处调用（WS 侧的 `REQUEST_KEYFRAME` 从不上报）。于是一路
+WebRTC 会话的解码器问题，被算到同一条管线上**所有**会话头上——包括那条
+`backlog` 恒为 0 的 WS 会话。`encoder.set_bitrate_kbps()` 同样是管线级的，所以
+降下去的码率也落在所有人身上。
+
+**修法**：两个信号从"或"改成"队列是必要条件"。
+
+```rust
+let backlog_pressure = sample.backlog_ms >= DEGRADE_BACKLOG_MS;
+let pli_pressure =
+    pli_rate >= DEGRADE_PLI_PER_SEC && sample.backlog_ms >= PLI_BACKLOG_FLOOR_MS;
+let pressure = backlog_pressure || pli_pressure;
+```
+
+`PLI_BACKLOG_FLOOR_MS = 20` 的依据：健康会话的 backlog 常年是 0，而真丢包时
+pacer 不会瞬间吐完，`send_ms` 会先涨到一个肉眼可分的量级。20 ms 是"确实在排队、
+但还没到 120 ms 那一步"的边界——给真丢包留了响应路径，同时把"客户端解码器在
+要关键帧"挡在门外。
+
+**验证**（部署 pid 9224，同样 2 个客户端、同样 1920×1080@60 VP9）：
+
+| | 修复前 | 修复后 |
+| --- | --- | --- |
+| `throttled` | `true` | `false` |
+| `target_kbps` | 被压到 1581（面板显示 4527） | 稳定 5000 |
+| `qos:` 降级日志 | 每 2 秒一条 | **一条都没有** |
+| `pli_requests` 增量 | 5–10 次/2s | 1 次/15s |
+| 关键帧 | 正常 | 仍是 `kf=0..3`/5s，周期 IDR 未受影响 |
+
+**刻意没改的部分**：`calm` 判据不动。降级一旦发生，PLI 高仍然阻止恢复——那时队列
+确实堆过，PLI 高说明丢包还在，不该急着松手。改的是"要不要因为 PLI **进入**降级"，
+不是"要不要因为 PLI **留在**降级"。
+
+**同轮修掉的口径 bug（#120）**：上表那句"被压到 1581（面板显示 4527）"里，矛盾
+不在控制器，也不在面板——`health.stream.target_kbps` 读的 `encoder.bitrate()` 和
+控制器内部的 `target_kbps` **本来就是两个量**：前者是 libvpx 按 `base × ratio` 算出
+的配置值（CBR 下 `set_bitrate_kbps` 走的是 `set_quality`），后者是"想让流跑多快"。
+用一个字段承载两个量，等于把"降档了"和"没降档"混成同一个数字。
+
+现在拆开：
+
+| 字段 | 来自 | 含义 |
+| --- | --- | --- |
+| `target_kbps` | `qos.target_kbps()` / `vb,` 覆盖 / fps 缩放预算 | **决策**，`throttled` 就是拿它判的 |
+| `encoder_kbps` | `encoder.bitrate()` | **自报**，改档有没有落下去 |
+
+相等 = 落地；不等 = 被拒或被量化。`stream_stats` 也带 `encoder_kbps`（新键，旧面板
+不认识就忽略，不会画错）。写入点只有三处：QoS 步进、`vb,` 覆盖、fps 重基准——都在
+做出决策的地方，而不是在"每帧读一次编码器"的地方。
 
 ---
 

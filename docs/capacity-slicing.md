@@ -168,9 +168,28 @@ n_max      = floor( k × M / (x + m) )     （k = 分配超卖比）
    （Parsec / AWS DCV 级别的工作量），否则抓到的是黑帧。
 2. **音频按会话隔离**需要每会话一块虚拟声卡；当前 `audio.rs` 走的是
    `GetDefaultAudioEndpoint(eRender, eConsole)` 单端点 loopback，必然串音。
+   **2026-11 复核：这一条比原文便宜。** WASAPI 的 *process loopback*
+   （`AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`，Win10 2004+，`.148` 的
+   build 26200 支持）可以按**进程树**抓音轨，不必每会话造虚拟声卡；
+   剩下要解决的只是"会话内默认播放端点"这一层（多会话时 RDS 每会话确有独立端点）。
 3. **授权**：客户端 SKU 只有一个 console 会话（实测这台：
    `EditionID=Professional`、`qwinsta` 仅 services(0) + console(1)），
    多会话要 Windows Server + RDS CAL，或 AVD/Windows 365 授权。
+
+### 5.2 反作弊：切出来的 VM 天然是 VM
+
+这条不是技术障碍，是**商品可用性**障碍，必须在定价之前想清楚。
+
+| 观察 | 依据 | 后果 |
+| --- | --- | --- |
+| 切分出来的 guest，SMBIOS 直接暴露虚拟化 | `.148` 实测 `Manufacturer=VMware, Inc.` / `Model=VMware7,1` / `BIOS=VMware, Inc.` | 带内核反作弊的游戏第一轮检查就过不去 |
+| 裸金属上启用 Hyper-V / VBS，BattlEye 也会报 "Virtual machine detected" | 反作弊看到的是"系统里有一个 hypervisor 层"，不看硬件归谁 | "用 Hyper-V 卖游戏机"在物理机上同样不成立 |
+| 官方云游戏（GFN/xCloud）能跑 | 反作弊厂商把它们登记为**受支持环境**（协议 + 硬件透明化） | 这个资格个人买不到，也不是靠隐藏技术 |
+| 隐藏 hypervisor 位 / 伪造 SMBIOS / 抹平时序 | 正是作弊工具的检测对抗手段 | 不做，且是持续军备竞赛 |
+
+结论：**切分商品只能承载"无内核反作弊"的负载**（自建 MC 服、私服、单机联机、
+办公/开发桌面）。带 EAC/BattlEye/Vanguard 的网游即使卖出去也进不去，
+退款率会直接吃掉这点边际收益。完整分析见 `roadmap-future.md §7.6`。
 
 ---
 

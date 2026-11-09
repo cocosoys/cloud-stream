@@ -34,7 +34,8 @@ Windows 上的**云游戏 / 远程桌面串流服务端**：DXGI 采集 → 视�
 | 周期关键帧 | ✅ | `--keyframe-secs`，按墙钟计时而非帧数 |
 | 监听面鉴权 | ✅ | `--auth-token`；五载体（Bearer / cookie / query / WS 子协议 / 片段），`Static` 与 `Status` 豁免 |
 | 手柄注入 | ✅ | #17：ViGEmBus 虚拟 Xbox 360 手柄 + vendored `ViGEmClient.dll`，含震动回程 |
-| 截图 / 录屏 | ❌ | 未实现 |
+| 截图 | ✅ | #28：`GET /api/screenshot` → `image/png`，取当前帧（不等关键帧），1080p 约 93 ms |
+| 录屏 | ❌ | 未实现（需要容器封装，见 roadmap §2.10） |
 
 逐项总账与缺口拆解在 [`docs/roadmap-l2-l3-gaps.md`](docs/roadmap-l2-l3-gaps.md)。
 
@@ -129,7 +130,8 @@ cd target\output\cloud-stream
 | `--policy` | `allow-all` | 监听面策略，`deny-all` 用于覆盖率探针 |
 | `--encoder` | `auto` | 编码后端策略：`auto` / `software` / `nvenc` / `amf` / `qsv`。`auto` 永不失败，只把探测结论写进日志；点名一个不存在的硬编会在启动时直接报错 |
 | `--display` | `0` | 默认采集哪块屏（索引 0 = 主屏，其余按枚举顺序）。页面的 `display_id`（`primary` / `display2`）会覆盖它；指定的屏不存在时采集如实失败，不会回落成主屏 |
-| `--mode` | `webrtc` | 新浏览器（本地还没有选择记录）默认用哪种传输：`webrtc` / `websockets`。页面从 `/api/status` 读它，面板切换的模式选择优先于它 |
+| `--mode` | `websockets` | 新浏览器（本地还没有选择记录）默认用哪种传输：`websockets` / `webrtc`。页面从 `/api/status` 读它，面板切换的模式选择优先于它 |
+| `--video-codec` | `vp9` | 视频编码：`vp9` / `vp8` / `h264`。`h264` 是硬编与 Safari/WebCodecs 兼容的通道，软编下也能跑 |
 | `--tune` | `tuned` | 软编实时参数组；`legacy` 复现 #95 之前的参数，仅用于同机 A/B |
 | `--log` | `logs\stream-server.log` | 日志落盘路径 |
 | `--no-hdr` | — | 关闭 HDR 采集路径 |

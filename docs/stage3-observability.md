@@ -70,8 +70,12 @@ L3「画质与体验」的每一次调参都要回答同一个问题：**慢在�
 - `peak_mbps` 是窗口内最宽的 250 ms（`PeakRate`）。1 s 均值会把
   「一个关键帧 + 两个满 P 帧」这种爆发抹平，而爆发才是解码器断链的原因。
   短于 50 ms 的桶直接丢弃：一个 60 KB 关键帧落在 8 ms 里会读成 60 Mbit。
-- `target_mbps` 直接读 `encoder.bitrate()`，所以 `vb,<N>` 覆盖和 fps 缩放后的
-  重定向都会同时反映在「Video rate x / y」上。
+- `target_mbps` 是**决策值**（QoS 目标 / `vb,<N>` 覆盖 / fps 缩放后的预算），
+  不是 `encoder.bitrate()` 的回读——两者在 CBR 下本来就不是同一个量
+  （见 #120 与 `stage3-clipboard-qos-avsync.md` §2.4 末段）。`vb,` 与 fps
+  重定向仍会立刻反映在「Video rate x / y」的 y 上。
+- `encoder_kbps` 才是 `encoder.bitrate()` 的回读。它跟 `target_mbps` 不并列显示，
+  存在的意义是"改档有没有落下去"：两者相等 = 落地，不等 = 被拒或被量化。
 
 ## 4. 字段对照表
 
@@ -87,11 +91,12 @@ L3「画质与体验」的每一次调参都要回答同一个问题：**慢在�
 | `pipeline_ms` | 采集 → 编码完成 | Capture to encoded |
 | `send_ms` / `send_min_ms` / `send_max_ms` | 采集 → 写进 track | Capture to sent（含区间） |
 | `video_mbps` | 实际入队负载速率 | Video rate（与 target 并列） |
-| `target_mbps` | 编码器当前目标 | 同上，右半边 |
+| `target_mbps` | 决策目标（QoS / `vb,` / fps 预算） | 同上，右半边 |
+| `encoder_kbps` | 编码器回读（诊断"改档是否落地"） | 暂不上面板 |
 | `peak_mbps` | 最宽 250 ms | Peak, 250 ms |
 | `keyframe_requests` | 会话累计 PLI/FIR | Keyframe requests |
 | `rtt_ms` | control 通道 EMA 往返 | 仅 WS 传输；WebRTC 走 `currentRoundTripTime`，此字段作兜底 |
-| `throttled` | 恒 false（无 QoS，见 P2） | 告警位 |
+| `throttled` | QoS 是否把目标压到基线下（#84） | 告警位 |
 
 **丢包不在服务端算。** 下行丢包只有接收方能看见（浏览器 `getStats()` 的
 `packetsLost`），服务端若自己报一个就是编的。前端已在客户端样本里填
