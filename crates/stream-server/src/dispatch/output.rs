@@ -122,7 +122,13 @@ pub struct StreamStats {
     /// #78: payload actually produced, its encoder target, and the widest
     /// 250 ms of the window — all Mbps.
     pub video_mbps: f32,
+    /// #120: the target the QoS controller asked for, in Mbps. This is the
+    /// decision, so "rate / target" now compares produced against intended.
     pub target_mbps: f32,
+    /// #120: the encoder's own read-back, in kbps. Kept beside `target_mbps`
+    /// rather than folded into it: they disagree exactly when a re-target did
+    /// not take, and that disagreement is the diagnostic.
+    pub encoder_kbps: u32,
     pub peak_mbps: f32,
     /// #78: smoothed control-channel RTT; `None` until the first pong.
     pub rtt_ms: Option<f32>,
@@ -158,6 +164,7 @@ impl StreamStats {
         self.send_max_ms = snap.send_max_ms;
         self.video_mbps = snap.video_mbps;
         self.target_mbps = snap.target_mbps;
+        self.encoder_kbps = snap.encoder_kbps;
         self.peak_mbps = snap.peak_mbps;
         self.keyframe_requests = snap.pli_requests;
         self
@@ -251,7 +258,12 @@ pub fn stream_stats(s: &StreamStats) -> String {
         // Produced rate against the encoder's target; the peak is the widest
         // 250 ms, which is what a burst actually hits on the wire.
         "video_mbps": r2(s.video_mbps),
+        // #120: intended vs. reported. The panel keeps drawing "rate / target";
+        // `encoder_kbps` rides along so a target that did not stick is visible
+        // instead of invisible (a new key is ignored by the current panel, so
+        // this cannot break a tile).
         "target_mbps": r2(s.target_mbps),
+        "encoder_kbps": s.encoder_kbps,
         "peak_mbps": r2(s.peak_mbps),
         "keyframe_requests": s.keyframe_requests,
         "throttled": s.throttled,
@@ -555,6 +567,7 @@ mod tests {
             send_max_ms: 41.0,
             video_mbps: 2.4567,
             target_mbps: 5.0,
+            encoder_kbps: 5000,
             peak_mbps: 9.874,
             pli_requests: 3,
             total_frames: 60,
@@ -630,6 +643,7 @@ mod tests {
             "send_max_ms",
             "video_mbps",
             "target_mbps",
+            "encoder_kbps",
             "peak_mbps",
             "keyframe_requests",
             "encoded_fps",

@@ -944,6 +944,15 @@ fn run_inner_beat(
 
     let start = Instant::now();
     let stats = handle.stats.clone();
+    // #120: seed both rate fields before the first frame, so a panel opened in
+    // the first second reads the configured budget instead of 0. They start
+    // equal — nothing has had a chance to disagree yet — and diverge only when
+    // a re-target is refused or quantised. `qos.base_kbps()` is the fps-scaled
+    // `--bitrate`, the same number the encoder was opened with.
+    bump(&stats, |s| {
+        s.target_kbps = qos.base_kbps();
+        s.encoder_kbps = encoder.bitrate();
+    });
     let yuvfmt = encoder.yuvfmt();
     // #65: native display size, published by the capture thread at open.
     let (src_w, src_h) = worker.dimensions();
@@ -1158,6 +1167,17 @@ fn run_inner_beat(
             handle.set_throttled(step.state.throttled());
             if step.changed {
                 encoder.set_bitrate_kbps(step.target_kbps);
+                // #120: read the encoder back immediately instead of waiting
+                // for the next frame — a static desktop can go seconds without
+                // one, and catching "the re-target did not take" is the only
+                // reason the pair exists. Two different numbers here (rather
+                // than one) is what tells a refused `set_quality` apart from a
+                // step that simply has not happened yet.
+                let applied_kbps = encoder.bitrate();
+                bump(&stats, |s| {
+                    s.target_kbps = step.target_kbps;
+                    s.encoder_kbps = applied_kbps;
+                });
             }
             if step.state != qos_state {
                 log::info!(
@@ -1256,6 +1276,15 @@ fn run_inner_beat(
             handle.set_throttled(false);
             qos_state = qos::QosState::Normal;
             last_qos = Instant::now();
+            // #120: the override *is* the decision from here on, so it replaces
+            // whatever the controller had settled on. The controller will not
+            // report a change next tick (its base moved with the target), which
+            // is exactly why this cannot be left to the QoS branch.
+            let applied_kbps = encoder.bitrate();
+            bump(&stats, |s| {
+                s.target_kbps = kbps;
+                s.encoder_kbps = applied_kbps;
+            });
         }
         // #50: re-read the live targets every beat (lock-free atomics).
         spf = settings.spf();
@@ -1284,6 +1313,13 @@ fn run_inner_beat(
                 handle.set_throttled(false);
                 qos_state = qos::QosState::Normal;
                 last_qos = Instant::now();
+                // #120: same re-seed as the `vb,` path — the fps-scaled budget
+                // is a new decision, not a step the controller will announce.
+                let applied_kbps = encoder.bitrate();
+                bump(&stats, |s| {
+                    s.target_kbps = base;
+                    s.encoder_kbps = applied_kbps;
+                });
             }
         }
         if (tw, th) != (enc_w, enc_h) {
@@ -1823,7 +1859,12 @@ fn run_inner_beat(
                 // #78: the live target, read from the encoder so a `vb,`
                 // override and an fps-scaled re-target both show up on the
                 // panel's "rate / target" without a second bookkeeping path.
-                s.target_kbps = encoder.bitrate();
+                // #120: that read-back is the *encoder's* number, so it goes in
+                // `encoder_kbps`; `target_kbps` is the decision and is written
+                // where the decision is made (QoS step, `vb,`, fps re-base).
+                // Assigning it here is what made a 1581 kbps stream report a
+                // 4527 kbps target whenever the encoder had been re-opened.
+                s.encoder_kbps = encoder.bitrate();
                 s.first_frame_seen = true;
                 s.warmed_up = true;
             });

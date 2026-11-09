@@ -431,22 +431,7 @@ fn build_at(
             let throttled = handle.is_throttled();
             // 锁只在这一个块里持有：后面组装 JSON 还要读别的，跨 await 更是
             // 不行 —— 捕获循环每拍都要抢这把锁。
-            let (
-                frames_new,
-                frames_repeat,
-                key_frames,
-                capture_err,
-                encode_err,
-                write_err,
-                encode_ms,
-                pipeline_ms,
-                send_ms,
-                target_kbps,
-                pli,
-                warmed,
-                first_frame,
-                last_age,
-            ) = {
+            let f = {
                 let stats = handle.stats();
                 let g = stats.lock().unwrap_or_else(|p| p.into_inner());
                 snapshot_fields(&g, now)
@@ -454,10 +439,10 @@ fn build_at(
 
             if !on {
                 verdict = Verdict::Paused;
-            } else if last_age.map(|d| d > STALL_AFTER).unwrap_or(false) {
+            } else if f.last_age.map(|d| d > STALL_AFTER).unwrap_or(false) {
                 verdict = Verdict::Stalled;
                 flags.push("no_frame_for_over_3s");
-            } else if first_frame {
+            } else if f.first_frame {
                 verdict = Verdict::Streaming;
             } else {
                 verdict = Verdict::Starting;
@@ -472,9 +457,9 @@ fn build_at(
             // 计数是累计值，不是"本窗口"。面板的统计开关关着时没有任何东西
             // 会去清零它们，所以"有没有新错"必须靠探针自己记基线做差。
             let errs = ErrorTotals {
-                capture: capture_err,
-                encode: encode_err,
-                write: write_err,
+                capture: f.capture_err,
+                encode: f.encode_err,
+                write: f.write_err,
             };
             let err_delta = probe.errors_since_last_check(errs);
             if err_delta.map(|(grew, _)| grew).unwrap_or(false) {
@@ -496,27 +481,34 @@ fn build_at(
                 "codec": settings.codec().wire(),
                 "rate_control": settings.rate_control().as_str(),
                 "crf": settings.crf(),
-                "target_kbps": target_kbps,
-                "warm": warmed,
-                "last_sample_age_ms": last_age.map(|d| d.as_millis() as u64),
+                // #120: two rate figures, not one. `target_kbps` is what the
+                // stream is trying to run at (the QoS decision, or the client's
+                // `vb,` override, or the fps-scaled budget); `encoder_kbps` is
+                // what libvpx reports back. They differ when a re-target did
+                // not take — previously both were `encoder.bitrate()`, so a
+                // stream throttled to 1581 advertised a 4527 target.
+                "target_kbps": f.target_kbps,
+                "encoder_kbps": f.encoder_kbps,
+                "warm": f.warmed,
+                "last_sample_age_ms": f.last_age.map(|d| d.as_millis() as u64),
                 "timing": {
-                    "encode_ms": round1(encode_ms),
-                    "pipeline_ms": round1(pipeline_ms),
-                    "send_ms": round1(send_ms),
+                    "encode_ms": round1(f.encode_ms),
+                    "pipeline_ms": round1(f.pipeline_ms),
+                    "send_ms": round1(f.send_ms),
                 },
                 // 累计值：自本次采集循环启动起。要速率就对自己的两次采样做差。
                 "frames_total": {
-                    "new": frames_new,
-                    "repeat": frames_repeat,
-                    "key": key_frames,
-                    "capture_err": capture_err,
-                    "encode_err": encode_err,
-                    "write_err": write_err,
+                    "new": f.frames_new,
+                    "repeat": f.frames_repeat,
+                    "key": f.key_frames,
+                    "capture_err": f.capture_err,
+                    "encode_err": f.encode_err,
+                    "write_err": f.write_err,
                 },
                 // `null` = 还没有上一次可比的基线（进程刚起、或首次查询）。
                 "errors_since_last_check": err_delta.map(|(grew, _)| grew),
                 "checked_ago_ms": err_delta.map(|(_, ms)| ms),
-                "pli_requests": pli,
+                "pli_requests": f.pli,
                 "audio": {
                     "enabled": settings.audio_enabled(),
                     "bitrate_bps": settings.audio_bitrate_bps(),
@@ -698,27 +690,53 @@ fn build_at(
     (verdict.healthy(), payload)
 }
 
-#[allow(clippy::type_complexity)]
-fn snapshot_fields(
-    g: &PipelineStats,
-    now: Instant,
-) -> (u64, u64, u64, u64, u64, u64, f32, f32, f32, u32, u64, bool, bool, Option<Duration>) {
-    (
-        g.counters.new_frames,
-        g.counters.repeat_ok,
-        g.counters.key_frames,
-        g.counters.capture_err,
-        g.counters.encode_err,
-        g.counters.write_sample_err,
-        g.encode_timing.avg_ms(),
-        g.pipeline_timing.avg_ms(),
-        g.send_timing.avg_ms(),
-        g.target_kbps,
-        g.pli_requests,
-        g.warmed_up,
-        g.first_frame_seen,
-        g.last_sample_at.map(|at| now.saturating_duration_since(at)),
-    )
+/// One lock-scoped read of the live pipeline counters, for `handle_health`.
+///
+/// This was a fourteen-element tuple until #120 needed a fifteenth figure. A
+/// struct is the only shape that stays readable from here: the next known
+/// addition is the audio trio in `roadmap-l2-l3-gaps.md` §2.12, and a field
+/// that has a name is a field the compiler can demand at the construction site
+/// instead of a positional slot that silently shifts.
+struct StreamFields {
+    frames_new: u64,
+    frames_repeat: u64,
+    key_frames: u64,
+    capture_err: u64,
+    encode_err: u64,
+    write_err: u64,
+    encode_ms: f32,
+    pipeline_ms: f32,
+    send_ms: f32,
+    /// #120: what the stream is trying to run at (QoS decision / `vb,` /
+    /// fps-scaled budget) — the value `throttled` is judged against.
+    target_kbps: u32,
+    /// #120: what the encoder reports back. Differs from `target_kbps` when a
+    /// re-target was refused or quantised.
+    encoder_kbps: u32,
+    pli: u64,
+    warmed: bool,
+    first_frame: bool,
+    last_age: Option<Duration>,
+}
+
+fn snapshot_fields(g: &PipelineStats, now: Instant) -> StreamFields {
+    StreamFields {
+        frames_new: g.counters.new_frames,
+        frames_repeat: g.counters.repeat_ok,
+        key_frames: g.counters.key_frames,
+        capture_err: g.counters.capture_err,
+        encode_err: g.counters.encode_err,
+        write_err: g.counters.write_sample_err,
+        encode_ms: g.encode_timing.avg_ms(),
+        pipeline_ms: g.pipeline_timing.avg_ms(),
+        send_ms: g.send_timing.avg_ms(),
+        target_kbps: g.target_kbps,
+        encoder_kbps: g.encoder_kbps,
+        pli: g.pli_requests,
+        warmed: g.warmed_up,
+        first_frame: g.first_frame_seen,
+        last_age: g.last_sample_at.map(|at| now.saturating_duration_since(at)),
+    }
 }
 
 fn hostname() -> String {

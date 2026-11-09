@@ -193,9 +193,26 @@ pub struct PipelineStats {
     pub bytes_sent: u64,
     /// #78: widest 250 ms of the window, for `peak_mbps`.
     pub peak: PeakRate,
-    /// #78: encoder target in kbps as last applied (client `vb,` override or
-    /// the fps-scaled `--bitrate`), so the panel can show "rate / target".
+    /// #120: what the stream is **trying** to run at, in kbps — the QoS
+    /// controller's live target, the client's `vb,` override, or the
+    /// fps-scaled `--bitrate` when neither has spoken since startup. This is
+    /// the decision; `throttled` is judged against it.
+    ///
+    /// Deliberately **not** `encoder.bitrate()`. Under CBR that call reads back
+    /// a `base x ratio` figure libvpx derived from `set_quality`, which is a
+    /// different quantity: measured 2026-11-09, the controller had stepped to
+    /// 1581 kbps while `encoder.bitrate()` still said 4527, so the panel showed
+    /// "throttled: true, target 4527" for a stream running at 1.5 Mbps. One
+    /// field for both values hid the very thing it was added to show.
     pub target_kbps: u32,
+    /// #120: what the encoder itself reports, in kbps.
+    ///
+    /// Kept beside `target_kbps` on purpose — the pair is the same "asked vs.
+    /// actually did" split as `default_device.current` / `previous`: equal
+    /// means the setting took, different means it did not (a rejected
+    /// `set_quality`, or libvpx quantising it). Neither number alone can tell
+    /// those two cases apart.
+    pub encoder_kbps: u32,
     /// #78: PLI + FIR received from the browser since the session started.
     /// Deliberately not windowed: the panel reads it as "how many times the
     /// decoder lost its anchor", which is a session fact, not a rate.
@@ -229,7 +246,12 @@ impl PipelineStats {
             send_min_ms: self.send_timing.min_ms(),
             send_max_ms: self.send_timing.max_ms(),
             video_mbps: (self.bytes_sent as f64 * 8.0 / wall / 1e6) as f32,
+            // #120: the decision, not the encoder's read-back (see the field
+            // docs). The panel's "rate / target" tile compares this against
+            // `video_mbps`; `encoder_kbps` travels beside it so "it did not
+            // take" stays visible instead of being averaged away.
             target_mbps: self.target_kbps as f32 / 1000.0,
+            encoder_kbps: self.encoder_kbps,
             peak_mbps: 0.0,
             pli_requests: self.pli_requests,
             total_frames,
@@ -261,11 +283,61 @@ pub struct PipelineSnapshot {
     /// #78: payload rate actually produced, and the encoder target it was
     /// produced against.
     pub video_mbps: f32,
+    /// #120: the target the controller asked for, in Mbps.
     pub target_mbps: f32,
+    /// #120: what the encoder reported back, in kbps. Same window as
+    /// `target_mbps`; a mismatch is the signal that a re-target did not stick.
+    pub encoder_kbps: u32,
     /// Filled by the caller from `PeakRate::take_peak_mbps`, which needs `&mut`.
     pub peak_mbps: f32,
     /// #78: session PLI/FIR total.
     pub pli_requests: u64,
     pub total_frames: u64,
     pub warm: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #120: the two rate fields answer different questions, so a snapshot has
+    /// to keep them apart. The pair below is the one that was measured on
+    /// `.148` while the field was shared: the controller had stepped down and
+    /// the encoder read-back had not moved.
+    #[test]
+    fn target_and_encoder_rates_stay_separate() {
+        let stats = PipelineStats {
+            target_kbps: 1581,
+            encoder_kbps: 4527,
+            ..Default::default()
+        };
+        let snap = stats.snapshot(Duration::from_secs(1));
+        assert!(
+            (snap.target_mbps - 1.581).abs() < 1e-4,
+            "target_mbps followed the encoder: {}",
+            snap.target_mbps
+        );
+        assert_eq!(snap.encoder_kbps, 4527);
+    }
+
+    /// A window reset zeroes traffic, not the rate pair: the 1 s stats tick
+    /// resets after every snapshot, and a target that blinked to 0 between
+    /// ticks would make the panel alternate between two answers.
+    #[test]
+    fn window_reset_keeps_the_rate_pair() {
+        let mut stats = PipelineStats {
+            target_kbps: 3000,
+            encoder_kbps: 2988,
+            ..Default::default()
+        };
+        stats.counters.new_frames = 60;
+        stats.bytes_sent = 123_456;
+
+        stats.reset_window();
+
+        assert_eq!(stats.counters.new_frames, 0, "counters survived the reset");
+        assert_eq!(stats.bytes_sent, 0, "bytes survived the reset");
+        assert_eq!(stats.target_kbps, 3000);
+        assert_eq!(stats.encoder_kbps, 2988);
+    }
 }
