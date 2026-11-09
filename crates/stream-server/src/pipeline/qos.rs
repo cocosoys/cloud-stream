@@ -13,11 +13,17 @@
 //! * **backpressure** — `send_ms - pipeline_ms`, the time a frame spends waiting
 //!   in the hand-off queue (added in #78). `pipeline_ms` stops at the encoder
 //!   exit, so the difference is exactly what the transport could not absorb.
-//! * **PLI rate** — the decoder lost its reference chain, which on a LAN means
-//!   the link dropped packets rather than the encoder being slow.
+//! * **PLI rate** — the decoder lost its reference chain. On a LAN that *can*
+//!   mean dropped packets, but #119 measured the counter being driven to
+//!   5/s over a link whose queue never left 0 ms — and backing the encoder all
+//!   the way down to 1581 kbps did not make a single PLI go away. The counter
+//!   is pipeline-wide and only WebRTC's RTCP feeds it, so one session's
+//!   decoder can tax every other session on the same pipeline. PLI is
+//!   therefore evidence **only beside a queue that is also filling**
+//!   (`PLI_BACKLOG_FLOOR_MS`).
 //!
 //! Packet loss *is* available from the browser (`stream_stats` on its side), but
-//! this server does not consume it yet: two server-side signals already answer
+//! this server does not consume it yet: backpressure alone already answers
 //! "is the link behind", and a wrong loss sample would degrade the picture for
 //! nothing. Recorded here so the next person knows it is a choice, not an
 //! oversight.
@@ -40,6 +46,26 @@ pub const QOS_INTERVAL: Duration = Duration::from_secs(2);
 const DEGRADE_BACKLOG_MS: f32 = 120.0;
 /// PLI/s above this is a link dropping packets, not a slow encoder.
 const DEGRADE_PLI_PER_SEC: f32 = 2.0;
+/// #119: PLI 只有在发送队列**也开始堆积**时才算链路证据。
+///
+/// 原来的判据是 `backlog >= 120ms || pli >= 2/s`，把两件互不相干的事并成了
+/// 一个"或"。实测（2026-11-09，`.148`）证明 PLI 单独出现时它说的不是链路：
+///
+/// ```text
+/// qos: degraded -> target 3750 of 5000 kbps (backlog 0 ms, 10 PLI in 2.0s)
+/// qos: degraded -> target 1581 of 5000 kbps (backlog 0 ms,  6 PLI in 2.0s)
+/// ```
+///
+/// 队列一秒都没堆过，而降码率到 1581 之后 PLI 仍是 6 次/2s —— 降码率对
+/// 丢包**毫无影响**，这在物理上就排除了"链路丢包"这个解释。真实来源是
+/// 另一路 WebRTC 会话的 RTCP PLI：`pli_requests` 是管线级计数（只有
+/// `webrtc/mod.rs` 的 RTCP 回调会加它，WS 的 `REQUEST_KEYFRAME` 不加），
+/// 于是那一路的解码器问题被算到了一条健康的 WS 会话头上。
+///
+/// 而真丢包一定伴随轻微排队：pacer 不会瞬间吐完，`send_ms` 会先涨起来。
+/// 20 ms 就是"确实在排队，但还没到 120 ms 那一步"的那条线 —— 健康会话
+/// 常年是 0，真丢包时不会这么久还是 0。
+const PLI_BACKLOG_FLOOR_MS: f32 = 20.0;
 /// Back to normal: queue drained and the decoder stopped asking for keyframes.
 const RECOVER_BACKLOG_MS: f32 = 40.0;
 const RECOVER_PLI_PER_SEC: f32 = 0.5;
@@ -155,7 +181,13 @@ impl QosController {
         self.pli_seen = sample.pli_total;
         let pli_rate = pli_delta as f32 / window_secs;
 
-        let pressure = sample.backlog_ms >= DEGRADE_BACKLOG_MS || pli_rate >= DEGRADE_PLI_PER_SEC;
+        // #119: 两个信号不再是"或"。队列堆积本身就是充分证据；PLI 只有在
+        // 队列也开始动的时候才是（见 `PLI_BACKLOG_FLOOR_MS`）。`backlog == 0
+        // && pli` 高说明要关键帧的是解码器，不是链路 —— 降码率改变不了它。
+        let backlog_pressure = sample.backlog_ms >= DEGRADE_BACKLOG_MS;
+        let pli_pressure =
+            pli_rate >= DEGRADE_PLI_PER_SEC && sample.backlog_ms >= PLI_BACKLOG_FLOOR_MS;
+        let pressure = backlog_pressure || pli_pressure;
         let calm = sample.backlog_ms <= RECOVER_BACKLOG_MS && pli_rate < RECOVER_PLI_PER_SEC;
 
         let before = self.target_kbps;
@@ -282,16 +314,47 @@ mod tests {
         assert!(!q.state().throttled());
     }
 
-    /// A PLI storm is a link symptom even with an empty queue: the queue only
-    /// fills when the transport *stalls*, while packet loss shows up as the
-    /// decoder re-requesting anchors.
+    /// #119：一条空队列 + 高的 PLI，是解码器在要关键帧，不是链路在丢包。
+    ///
+    /// 这条替换了原来的 `pli_storm_degrades_without_backpressure`。它的旧断言
+    /// （5 ms 队列 + 2 PLI/s → Degraded）在实测里造成了真实的画质损失：另一路
+    /// WebRTC 的 RTCP PLI 把一条 `backlog` 恒为 0 的 WS 会话一路压到 1581 kbps，
+    /// 而压到 1581 之后 PLI 一点没少。
     #[test]
-    fn pli_storm_degrades_without_backpressure() {
+    fn pli_storm_with_a_quiet_queue_is_not_a_link_symptom() {
         let mut q = QosController::new(4000);
-        // 4 PLI in one 2 s window = 2/s.
+        // 4 PLI in one 2 s window = 2/s, but nothing is queued.
         let step = q.evaluate(sample(5.0, 4));
+        assert_eq!(step.state, QosState::Normal);
+        assert!(!step.changed);
+        assert_eq!(step.target_kbps, 4000);
+    }
+
+    /// 真丢包会把 pacer 的队列顶起来，两个信号一起出现才是链路证据。
+    #[test]
+    fn pli_storm_beside_a_filling_queue_still_degrades() {
+        let mut q = QosController::new(4000);
+        let step = q.evaluate(sample(30.0, 4));
         assert_eq!(step.state, QosState::Degraded);
         assert_eq!(step.target_kbps, 3000);
+    }
+
+    /// 19 ms 的队列抖动（一次 GC、一次页面重排）不该把 PLI 变成降级信号；
+    /// 门槛是 `PLI_BACKLOG_FLOOR_MS`，不是 0。
+    #[test]
+    fn a_shallow_queue_does_not_unlock_the_pli_path() {
+        let mut q = QosController::new(4000);
+        let step = q.evaluate(sample(PLI_BACKLOG_FLOOR_MS - 1.0, 20));
+        assert_eq!(step.state, QosState::Normal);
+    }
+
+    /// 队列堆积单独仍然足够 —— 这条路一秒都不能松，它是 `send_ms` 真的
+    /// 盖过 `pipeline_ms` 时唯一能救画质的东西。
+    #[test]
+    fn queue_backlog_alone_still_degrades() {
+        let mut q = QosController::new(4000);
+        let step = q.evaluate(sample(200.0, 0));
+        assert_eq!(step.state, QosState::Degraded);
     }
 
     /// The controller differences the session-total PLI counter, so a session
@@ -300,13 +363,11 @@ mod tests {
     fn old_pli_does_not_degrade_a_quiet_link() {
         let mut q = QosController::new(4000);
         let first = q.evaluate(sample(5.0, 40));
-        assert_eq!(first.state, QosState::Degraded, "40 PLI in one window");
-        // Same total next window: no new loss.
-        let mut q = QosController::new(4000);
-        q.evaluate(sample(5.0, 40));
+        assert_eq!(first.state, QosState::Normal, "an empty queue keeps it Calm");
+        // Same total next window: no new loss, still nothing to do.
         let quiet = q.evaluate(sample(5.0, 40));
         assert!(!quiet.changed);
-        assert_eq!(quiet.state, QosState::Recovering);
+        assert_eq!(quiet.state, QosState::Normal);
     }
 
     /// A new base (fps change, `vb,N`) resets the ceiling; a stale reduced

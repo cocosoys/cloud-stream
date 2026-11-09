@@ -1127,10 +1127,15 @@ fn run_inner_beat(
         // #84: adaptive bitrate. Before this the rate had exactly one source —
         // the client's `vb,N` or the configured budget — so a congested link
         // changed nothing and the picture stayed mosaic until a human dragged
-        // the slider. The two inputs are already measured: `send_ms - pipeline_ms`
-        // is the hand-off queue (the part `pipeline_ms` does not cover), and
-        // `pli_requests` is the decoder losing its anchor, which on a LAN means
-        // loss rather than a slow encoder.
+        // the slider. The primary input is `send_ms - pipeline_ms`: the hand-off
+        // queue, the part `pipeline_ms` does not cover.
+        //
+        // #119: `pli_requests` is *not* a second opinion of that. It is
+        // pipeline-wide and only WebRTC's RTCP adds to it, so one session's
+        // decoder problems were dragging a healthy session down (measured:
+        // 6 PLI/2s at backlog 0 ms, encoder taken to 1581 kbps with no effect
+        // on the PLI). It now counts as evidence only beside a queue that is
+        // also filling — see `qos::PLI_BACKLOG_FLOOR_MS`.
         //
         // The window is read from the shared stats rather than kept locally:
         // the session's 1 s tick resets the timing groups, so the averages here
