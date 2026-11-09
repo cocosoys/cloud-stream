@@ -56,6 +56,13 @@
 .PARAMETER DryRun
     构建 + 上传 + 核对 MD5，但不切换、不重启。
 
+.PARAMETER PackageOnly
+    只构建 + 打包，**不碰被控机**：不查 ssh、不上传、不重启。
+    产物落在 target\output\cloud-stream（运行根，可直接拷走）与同目录的
+    cloud-stream.zip，这一步跑完就可以把整包交给别人去装。
+    用途是把"要一个能装到新机器上的包"和"部署到 .148"这两件事分开 ——
+    前者不需要目标机开机，也不该因为 ssh 连不上而整条命令失败。
+
 .PARAMETER Bootstrap
     一次性引导：建目录、开 sshd 自启、补防火墙规则、上传启动脚本、核对计划任务。
     可以单独跑，也可以和正常部署一起跑（幂等）。
@@ -74,6 +81,10 @@
 .EXAMPLE
     pwsh toolchain/deploy.ps1 -Rollback
     回滚：把 target\deploy-archive 里上一份成功的产物重新发上去。不编译、不重新打包。
+
+.EXAMPLE
+    pwsh toolchain/deploy.ps1 -PackageOnly
+    只出一个能装到新机器的整包（target\output\cloud-stream + zip），不连被控机。
 #>
 [CmdletBinding()]
 param(
@@ -87,6 +98,8 @@ param(
     [switch]$SkipFrontend,
     [switch]$SkipBuild,
     [switch]$DryRun,
+    # 只构建 + 打包，不连被控机。见 .PARAMETER PackageOnly。
+    [switch]$PackageOnly,
     [switch]$Bootstrap,
     # 回滚入口：把构建端归档的上一版重新发上去（不编译、不打包）。
     [switch]$Rollback,
@@ -670,14 +683,22 @@ $attempted = @()
 try {
     # ---- 1 预检
     Write-Step '预检'
-    foreach ($tool in @('ssh', 'scp', 'curl.exe')) {
-        if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) { throw "本机缺 $tool" }
-    }
-    Write-Ok 'ssh / scp / curl.exe 就位'
+    if ($PackageOnly) {
+        # 这一步的产物是"拷到别的机器上"的，不是"发到这台机器上"的，所以不查
+        # ssh/scp/curl，也不要求被控机在线 —— 否则"没开机时先把包做出来"就做不到。
+        foreach ($tool in @('cargo', 'npm')) {
+            if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) { throw "本机缺 $tool" }
+        }
+        Write-Ok 'cargo / npm 就位（-PackageOnly：不检查被控机）'
+    } else {
+        foreach ($tool in @('ssh', 'scp', 'curl.exe')) {
+            if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) { throw "本机缺 $tool" }
+        }
+        Write-Ok 'ssh / scp / curl.exe 就位'
 
-    $ssh = Invoke-Ssh 'hostname' -AllowFail
-    if ($ssh.Code -ne 0) {
-        throw @"
+        $ssh = Invoke-Ssh 'hostname' -AllowFail
+        if ($ssh.Code -ne 0) {
+            throw @"
 连不上 $Target。
 
 如果这台机器刚重启过、sshd 是「手动」启动类型，那么重启后它就没了。
@@ -689,10 +710,11 @@ try {
 
 然后回到本机重跑本脚本（可加 -Bootstrap 补齐其余一次性的东西）。
 "@
-    }
-    Write-Ok "ssh 可达：$($ssh.Output.Trim())（$Target）"
+        }
+        Write-Ok "ssh 可达：$($ssh.Output.Trim())（$Target）"
 
-    if (-not (Test-Path $RemoteScript)) { throw "缺少 $RemoteScript" }
+        if (-not (Test-Path $RemoteScript)) { throw "缺少 $RemoteScript" }
+    }
 
     # ---- 0 回滚（人工入口，不需要编译、不重新打包）
     <#
@@ -853,6 +875,38 @@ try {
     $srcDll = $(if ($packaged -and (Test-Path (Join-Path $BundleDir 'ViGEmClient.dll'))) {
             Join-Path $BundleDir 'ViGEmClient.dll'
         } else { $LocalVigem })
+
+    # ---- 出口：-PackageOnly 到汇总为止
+    <#
+        产物就是终点。这里把目录内容逐项报出来，是因为"打包成功"本身不说明包里
+        有没有 exe、有没有前端、有没有证书 —— 少一样，拿到包的人要到装的时候
+        才发现，而那时他人在另一台机器前。
+    #>
+    if ($PackageOnly) {
+        if (-not $packaged) {
+            throw '-PackageOnly 需要完整整包，但本机没有 dashboard dist（包会缺前端）。去掉 -SkipFrontend 重来'
+        }
+        Write-Step 'PackageOnly：到此为止（未碰被控机）'
+        foreach ($entry in (Get-ChildItem $BundleDir -Force | Sort-Object Name)) {
+            if ($entry.PSIsContainer) {
+                $n = (Get-ChildItem $entry.FullName -Recurse -File -ErrorAction SilentlyContinue |
+                    Measure-Object).Count
+                Write-Info ("{0,-22} <dir>  {1} 个文件" -f $entry.Name, $n)
+            } else {
+                Write-Info ("{0,-22} {1,10:N0} B" -f $entry.Name, $entry.Length)
+            }
+        }
+        $allFiles = Get-ChildItem $BundleDir -Recurse -File
+        $webFiles = Get-ChildItem (Join-Path $BundleDir 'selkies-web') -Recurse -File
+        Write-Ok ("运行根 {0:N1} MB / {1} 文件（前端 {2}）" -f
+            (($allFiles | Measure-Object Length -Sum).Sum / 1MB), $allFiles.Count, $webFiles.Count)
+        Write-Ok ("压缩包 {0:N1} MB  md5={1}" -f
+            ((Get-Item $BundleZip).Length / 1MB), (Get-Md5 $BundleZip))
+        Write-Note "运行根 $BundleDir"
+        Write-Note "压缩包 $BundleZip"
+        Write-Note '拷到新机器解压即运行根；先读包里的 README.txt，再按 setup-watchdog.bat 装任务。'
+        return
+    }
 
     # ---- 6 上传
     Write-Step '上传'
