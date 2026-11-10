@@ -72,14 +72,17 @@ docs/                     设计稿与现状盘点
 toolchain\install-vcpkg-libs.cmd libyuv
 toolchain\install-vcpkg-libs.cmd "libvpx[realtime]"
 
-# 2. 编译
-cargo build --release -p stream-server
-# 首次全量编译内存峰值较高，2 vCPU / 8 GB 机器上加 -j 2
+# 2. 编译 —— 用脚本，不要直接敲 cargo
+toolchain\build.ps1 -Task build -CargoArgs --release
+# 首次全量编译内存峰值较高，2 vCPU / 8 GB 机器上再加 -CargoArgs '-j','2'
 ```
 
-> `toolchain\build-ws.cmd` 与 `install-vcpkg-libs.cmd` 里写死了本机的
-> `C:\dev\vcpkg`、`C:\dev\llvm`、VS 安装路径。换机器请先改这几行 `PATH`，
-> 或者直接在已 `vcvars64.bat` 过的终端里跑 `cargo`。
+> **为什么要这层壳**：`rustc` 链接时去 PATH 找 `link.exe`，Git Bash 里会命中
+> PortableGit 的 GNU coreutils `link`，报 `missing operand after '\377\376'`；
+> 裸 PowerShell / cmd 里则根本没有 MSVC，报 `linker not found`。而 `cargo check`
+> 不链接，所以它会全绿 —— 最容易让人误判成代码有 bug。脚本自己定位 VS/SDK 与
+> 三个原生依赖（`VCPKG_ROOT`、`LIBCLANG_PATH`、`LIBOPUS_LIB_DIR`），拼好环境再
+> 转手给 cargo。细节与手工方式见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。
 
 ## 运行
 
@@ -92,9 +95,16 @@ target\output\cloud-stream\start-stream.cmd
 ```
 
 整包（含前端、证书、启动脚本）还有一个同名 zip，拷到新设备解压即可跑，见
-`docs/deploy-one-click.md` §1.1。在**新设备**上第一次用，是右键
-`setup-watchdog.bat` → “以管理员身份运行”：它一次做完放行入站、建看门狗任务、
-立刻启动并验证（打印 `[ok]` / `[fail]`），细节见 `docs/deploy-new-host.md` §3.0。
+`docs/deploy-one-click.md` §1.1。在**新设备**上第一次用就是双击 `install.cmd`：
+它自己提权，然后一次做完检查包、放行入站、建看门狗任务、立刻启动并验证（打印
+`[ok]` 和本机访问地址），细节见 `docs/deploy-new-host.md` §3.0。`install.cmd` /
+`uninstall.cmd` 内部调的是同一批助手（`setup-task.ps1`、`open-inbound.cmd`、
+exe 的 `--restore-mic`），所以想分步做时 `setup-watchdog.bat` 依然可用；要撤掉
+一台机器就双击 `uninstall.cmd`（`/keep` 只卸服务留文件，`/whatif` 只列清单）。
+
+目标机连 ssh 都还没有时（`deploy.ps1` 正是靠 ssh 才够得着它），先拷
+`toolchain\enable-ssh.ps1` 与 `enable-ssh.cmd` 过去双击一次：装 sshd、只对构建机
+放行 22、写入公钥并**先自测再关密码登录**，见 `docs/deploy-ssh-access.md`。
 
 启动脚本自己也会做两件事，不需要人守着：真启动前补入站规则（提权时），启动后
 另起 `probe-listen.cmd` 探 loopback，把结果写成 `logs\watchdog.log` 里的一行
@@ -132,9 +142,11 @@ cd target\output\cloud-stream
 | `--display` | `0` | 默认采集哪块屏（索引 0 = 主屏，其余按枚举顺序）。页面的 `display_id`（`primary` / `display2`）会覆盖它；指定的屏不存在时采集如实失败，不会回落成主屏 |
 | `--mode` | `websockets` | 新浏览器（本地还没有选择记录）默认用哪种传输：`websockets` / `webrtc`。页面从 `/api/status` 读它，面板切换的模式选择优先于它 |
 | `--video-codec` | `vp9` | 视频编码：`vp9` / `vp8` / `h264`。`h264` 是硬编与 Safari/WebCodecs 兼容的通道，软编下也能跑 |
+| `--webrtc-udp-port-min` / `--webrtc-udp-port-max` | `40000` / `40049` | ICE 只会绑这一段 UDP（含两端），让防火墙规则写得出来。改了要同步 `open-inbound.cmd` 的 `cloud-stream webrtc UDP`；程序规则 `cloud-stream app` 仍覆盖任意端口 |
 | `--tune` | `tuned` | 软编实时参数组；`legacy` 复现 #95 之前的参数，仅用于同机 A/B |
 | `--log` | `logs\stream-server.log` | 日志落盘路径 |
 | `--no-hdr` | — | 关闭 HDR 采集路径 |
+| `--restore-mic` | — | 只把上次遗留的默认录音设备还原，然后立刻退出（不绑端口、不开日志）。给 `uninstall.cmd` 用；没有遗留记录时打印 `MICRESTORE nothing-to-do` |
 
 启动成功的标志是一行 `listening on https://0.0.0.0:8080 (TLS rustls 1.2/1.3)`。
 然后浏览器打开 `https://<host>:8080/`（自签证书需要先信任，或用 `-k` 类工具探测）。
@@ -148,6 +160,8 @@ cd target\output\cloud-stream
 
 | 文档 | 内容 |
 |---|---|
+| [`docs/architecture.md`](docs/architecture.md) | **架构：模块边界、依赖规则、四个扩展点、模块化欠账** |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | **参与开发：环境、构建、测试、提交规范、硬规矩** |
 | [`docs/roadmap-l2-l3-gaps.md`](docs/roadmap-l2-l3-gaps.md) | 全量盘点：已完成 / 部分 / 未做，逐项拆解 |
 | [`docs/stage1-signaling-session.md`](docs/stage1-signaling-session.md) | 信令契约与会话状态机 |
 | [`docs/stage1-pipeline-loop.md`](docs/stage1-pipeline-loop.md) | 采集→编码→推流的循环与背压 |
