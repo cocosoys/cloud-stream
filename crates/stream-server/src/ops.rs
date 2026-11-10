@@ -874,9 +874,26 @@ pub fn execute(request: &Request) -> i32 {
                 .iter()
                 .find(|s| s.label != PRE_ROLLBACK_LABEL)
                 .map(summarize);
-            // `--config` 优先，其次 exe 旁默认位置。两条都可能不存在 ——
-            // 那本身就是"这台机器没有配置文件"这个事实的一部分。
-            let config = request.config.clone().or_else(crate::configfile::default_path);
+            // `--config` 优先，其次默认位置。默认位置还要再分两种：`Config::parse`
+            // 自动发现的是 exe 旁的 `config.toml`，但整包分发的那份叫
+            // `stream-config.toml` 且由 `start-stream.cmd --config` 显式指定。
+            // 只报 `config.toml (absent)` 会让人以为自己没配置，而实际上文件
+            // 就在旁边、服务也在用它 —— 所以这里退一步再找一个，纯只读。
+            //
+            // 刻意**不改** `configfile::default_path`：那是启动时的自动发现逻辑，
+            // 动它等于改变已有部署的加载行为，不属于"报告得更准"。
+            let config = request.config.clone().or_else(|| {
+                let primary = crate::configfile::default_path()?;
+                if primary.exists() {
+                    return Some(primary);
+                }
+                let sibling = primary.with_file_name("stream-config.toml");
+                if sibling.exists() {
+                    Some(sibling)
+                } else {
+                    Some(primary)
+                }
+            });
             let mut doc = serde_json::json!({
                 "root": root.display().to_string(),
                 "backups": backups.display().to_string(),

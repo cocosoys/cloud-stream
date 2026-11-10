@@ -1,0 +1,24 @@
+[package]
+name = "cloud-setup"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "可视化控制台：把安装/卸载/更新/修改四个动作做成按钮，本身不链接 stream-server。"
+
+# 刻意**不**依赖 stream-server：这个壳只做三件事 —— 起子进程、读它的输出、
+# 把结果画在窗口上。于是它不会把 30 MB 的推流依赖（webrtc / scrap / opus）
+# 拖进一个按钮窗口，也不会因为服务端某次重构编译不过。
+#
+# 它和 `install.cmd` / `uninstall.cmd` 处在同一层：三个消费者，一个后端
+# （`stream-server.exe --ops ...`）。没有第二套实现。
+[dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+] }
+
+[profile.dev]
+codegen-units = 2

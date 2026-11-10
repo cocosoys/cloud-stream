@@ -5,6 +5,7 @@ members = [
   "vendor/scrap",
   "crates/bench-capture",
   "crates/stream-server",
+  "crates/setup",
 ]
 # 0d smoke crate 是独立工程，不并入本 workspace
 exclude = ["crates/shell"]
