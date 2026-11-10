@@ -29,7 +29,12 @@
 //!
 //! `install.cmd` / `uninstall.cmd` 需要管理员。用 `runas` 拉起时输出在新开的
 //! 控制台里，本窗口抓不到 —— 与其假装抓到了再显示一半，不如明说"已在新窗口
-//! 运行"。等这两个脚本哪天能往 `%TEMP%` 写一份结果文件，再把输出接回来。
+//! 运行"。
+//!
+//! 安装这一条已经接回来了：`install.cmd` 会把自己的结论写进
+//! `%ProgramData%\cloud-stream\last-install.txt`（固定路径，提权换账户也读得
+//! 到），本窗口在拉起之后盯着那个文件，出现 `=== RESULT:` 就把整段贴进日志。
+//! 卸载还没有这一步 —— 它跑完就把目录删了，需要另找落点。
 
 use std::sync::Mutex;
 
@@ -186,6 +191,75 @@ fn run_elevated(hwnd: HWND, script: &str, extra: &str) {
     }
 }
 
+/// `%ProgramData%\cloud-stream\last-install.txt`。
+///
+/// 和 `install.cmd` 里 `RESULT` 的默认值是同一个路径，**两边必须一致**。
+/// 刻意不是 `%TEMP%`：提权可能切换账户，那时提权进程的 `%TEMP%` 是本窗口
+/// 读不到的地方；`ProgramData` 对两侧是同一个字符串，也不用在
+/// cmd → PowerShell → CreateProcess 这条链上给路径加引号（引号就是在这条
+/// 链上死的）。
+fn install_result_path() -> Option<std::path::PathBuf> {
+    let program_data = std::env::var_os("ProgramData")?;
+    Some(
+        std::path::PathBuf::from(program_data)
+            .join("cloud-stream")
+            .join("last-install.txt"),
+    )
+}
+
+/// 盯着结论文件，出现终局标记就把整段读回日志面板。
+///
+/// 为什么是"盯文件"而不是抓子进程输出：`runas` 拉起来的是另一个进程（往往
+/// 还是另一个账户），它的控制台本窗口看不到。文件是两边都能看见的唯一通道。
+///
+/// 三条防错：只认 `started` 之后写出来的那份（上一次的 OK 不能冒充这一次）、
+/// 只认带 `=== RESULT:` 的（半截文件读下去只会看到一半）、等不到就说清楚
+/// 去哪儿找 —— 沉默的等待比报错更让人不知所措。
+fn watch_install_result(hwnd: HWND, path: std::path::PathBuf, started: std::time::SystemTime) {
+    let target = hwnd as isize;
+    std::thread::spawn(move || {
+        let hwnd = target as HWND;
+        let grace = started
+            .checked_sub(std::time::Duration::from_secs(3))
+            .unwrap_or(started);
+        // 240 秒：install.cmd 自己最多等 60 秒探活，加上提权、防火墙、任务注册，
+        // 留足余量。超时就明说，而不是永远转下去。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
+        loop {
+            if std::time::Instant::now() > deadline {
+                log(
+                    &format!(
+                        "[warn] 240 秒内没等到结论文件 {}",
+                        path.display()
+                    ),
+                    hwnd,
+                );
+                log("     提权那个窗口里有关键的 [ok]/[fail] 结论，请以它为准", hwnd);
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(700));
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            let fresh = meta.modified().map(|m| m >= grace).unwrap_or(true);
+            if !fresh {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if !text.contains("=== RESULT:") {
+                continue;
+            }
+            log("-- 提权窗口的结论（读自 last-install.txt）--", hwnd);
+            for line in text.lines() {
+                log(line, hwnd);
+            }
+            return;
+        }
+    });
+}
+
 /// 确认框。返回 true = 继续。
 fn confirm(hwnd: HWND, text: &str, caption: &str) -> bool {
     unsafe {
@@ -310,7 +384,20 @@ fn on_command(hwnd: HWND, id: i32) {
                 lines
             });
         }
-        BTN_INSTALL => run_elevated(hwnd, "install.cmd", "/y"),
+        BTN_INSTALL => {
+            // 先记下时间点再拉起提权窗口：上一次安装留下的 OK 不能冒充这一次。
+            let started = std::time::SystemTime::now();
+            let path = install_result_path();
+            if let Some(p) = &path {
+                // 能删就删（提权写的文件普通用户删不掉，所以上面那个时间戳是
+                // 真正的保险，这一行只是让文件干净一点）。
+                let _ = std::fs::remove_file(p);
+            }
+            run_elevated(hwnd, "install.cmd", "/y");
+            if let Some(p) = path {
+                watch_install_result(hwnd, p, started);
+            }
+        }
         BTN_UNINSTALL => {
             if confirm(
                 hwnd,

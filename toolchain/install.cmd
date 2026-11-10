@@ -52,6 +52,18 @@ set "CURL=%SystemRoot%\System32\curl.exe"
 set "FIND=%SystemRoot%\System32\find.exe"
 set "FINDSTR=%SystemRoot%\System32\findstr.exe"
 set "TMPF=%TEMP%\cloud-stream-install.tmp"
+rem Where this run leaves its verdict.
+rem
+rem A FIXED machine-wide path, not %TEMP%: this script re-launches itself
+rem elevated, and elevation can switch accounts -- the elevated run's %TEMP%
+rem is then a different folder that the caller cannot read. ProgramData is the
+rem same string for both sides, needs no quoting on the command line (that
+rem round trip through cmd -> PowerShell -> CreateProcess is where arguments
+rem go to die), and doubles as a "what did the last install say" file that
+rem survives the window being closed.
+rem
+rem /result <path> overrides it for a one-off; nothing else in here needs it.
+set "RESULT=%ProgramData%\cloud-stream\last-install.txt"
 rem Self path, exported for the elevation call: Start-Process then needs no
 rem quoting at all. A "\"" inside -Command has to survive cmd's parser and then
 rem PowerShell's, and every escape character in that chain is a way to open the
@@ -67,6 +79,7 @@ set "RESTORE=0"
 if "%~1"=="" goto :args_done
 if /i "%~1"=="/check" set "MODE=check"
 if /i "%~1"=="/restore" set "RESTORE=1"
+if /i "%~1"=="/result" set "RESULT=%~2" & shift
 if /i "%~1"=="/y" set "NOPAUSE=1"
 if /i "%~1"=="/yes" set "NOPAUSE=1"
 if /i "%~1"=="/?" goto :usage
@@ -82,6 +95,10 @@ echo   install.cmd /check     read-only preflight, changes nothing
 echo   install.cmd /restore   put back the config/cert/recorder that the last
 echo                          uninstall.cmd saved, then install
 echo   install.cmd /y         no pause at the end
+echo   install.cmd /result ^<file^>  also write the outcome to ^<file^> so the
+echo                          console (cloud-setup.exe) can read it back: the
+echo                          elevated window is a different process and its
+echo                          output cannot be captured any other way
 exit /b 0
 
 :args_done
@@ -100,6 +117,7 @@ if exist "%BK%" echo   note   : a previous uninstall saved this machine's identi
 if exist "%BK%" echo            %BK%
 if exist "%BK%" echo            install.cmd /restore  puts it back before installing
 echo.
+call :result_begin
 
 rem ---------------------------------------------------------------------------
 rem A UNC path cannot be elevated: the UAC prompt runs the script through
@@ -117,6 +135,7 @@ if "%ROOT:~0,2%"=="\\" (
 
 rem ---- step 0: is this really a complete bundle? ----------------------------
 echo -- [0/4] bundle check --
+call :note [0/4] bundle check
 set "BAD=0"
 
 call :need "%EXE%"                        stream-server.exe
@@ -184,6 +203,7 @@ rem ---------------------------------------------------------------------------
 if "%RESTORE%"=="0" goto :restore_done
 echo.
 echo -- [restore] previous machine identity --
+call :note [restore] previous machine identity
 if not exist "%BK%" goto :restore_none
 call :ops_capable
 if "%OPSOK%"=="1" goto :restore_go
@@ -233,6 +253,7 @@ exit /b 0
 rem ---- step 1: firewall -----------------------------------------------------
 echo.
 echo -- [1/4] inbound firewall rules --
+call :note [1/4] inbound firewall rules
 call "%ROOT%\open-inbound.cmd" >nul 2>&1
 if errorlevel 2 goto :fw_refused
 if errorlevel 1 goto :fw_denied
@@ -256,6 +277,7 @@ rem ---- step 2: the watchdog task -------------------------------------------
 :task_step
 echo.
 echo -- [2/4] watchdog task %TASK% --
+call :note [2/4] watchdog task %TASK%
 rem Stop the old instance first. Re-running install.cmd on top of a live install
 rem is the documented repair path, and re-registering a task whose instance is
 rem still running is refused on some Windows builds ("the task is currently
@@ -270,6 +292,7 @@ if "%RC%"=="5" (
     goto :probe
 )
 echo   [fail] task registration failed (exit %RC%). Nothing below will work.
+call :note [fail] task registration failed, exit %RC%
 goto :die
 
 :task_ok
@@ -279,6 +302,7 @@ rem ---- step 3: does it actually serve? -------------------------------------
 :probe
 echo.
 echo -- [3/4] waiting up to 60 s for 127.0.0.1:8080 --
+call :note [3/4] waiting for 127.0.0.1:8080
 
 set /a TRY=0
 :wait
@@ -294,6 +318,7 @@ echo   [ok] stream-server answered after %TRY% probe^(s^).
 
 echo.
 echo -- [4/4] done --
+call :note [4/4] done: server answered
 echo.
 echo   Open from another machine ^(any of these^):
 del /f /q "%TMPF%" >nul 2>&1
@@ -316,7 +341,9 @@ echo   Removing it later:  uninstall.cmd
 goto :finish
 
 :down
+set "VERDICT=FAIL"
 echo   [fail] nothing listening on 127.0.0.1:8080 after 12 probes ^(~60 s^).
+call :note [fail] nothing listening on 127.0.0.1:8080 after ~60 s
 echo.
 echo   In this order:
 if "%VCMISS%"=="1" echo     0^) vcruntime140.dll is missing -- install the VC++ 2015-2022
@@ -333,6 +360,7 @@ goto :finish
 :check_summary
 echo.
 echo -- /check: nothing was changed --
+call :note [check] bundle looks complete, nothing was changed
 echo   Bundle looks complete. To install, run this file again without /check.
 if "%VCMISS%"=="1" echo   [warn] VC++ runtime missing -- fix that first.
 goto :finish
@@ -340,6 +368,8 @@ goto :finish
 :incomplete
 echo.
 echo   [fail] this directory is not a complete bundle.
+set "VERDICT=FAIL"
+call :note [fail] this directory is not a complete bundle
 echo          Unpack cloud-stream.zip in full, then run install.cmd from the
 echo          folder that contains stream-server.exe.
 set "RC=1"
@@ -347,6 +377,8 @@ goto :finish
 
 :finish
 echo.
+if "%VERDICT%"=="" set "VERDICT=OK"
+call :result_end
 del /f /q "%TMPF%" >nul 2>&1
 if not "%RC%"=="0" if not "%RC%"=="" goto :die
 if "%NOPAUSE%"=="1" exit /b 0
@@ -356,6 +388,8 @@ exit /b 0
 
 :die
 echo.
+if "%VERDICT%"=="" set "VERDICT=FAIL"
+call :result_end
 if "%NOPAUSE%"=="1" exit /b 1
 echo Press any key to close this window.
 pause >nul
@@ -444,3 +478,50 @@ if not errorlevel 1 (
 )
 set "CODE=000"
 exit /b 0
+
+rem ---------------------------------------------------------------------------
+rem :result_begin / :note / :result_end -- the outcome file (install.cmd /result)
+rem
+rem Why this exists: this script re-launches itself elevated, and Windows gives
+rem the elevated process its own console. Whoever clicked the button cannot read
+rem that console -- it is a different process, often a different window, and
+rem sometimes a different user (elevation can switch accounts). A file is the
+rem only channel both sides can see.
+rem
+rem It is also why the path is passed in instead of derived here: with account
+rem switching, %TEMP% inside the elevated run is NOT the same folder as the
+rem caller's %TEMP%, so a path we compute ourselves would be readable by nobody.
+rem
+rem The file is written as we go, not once at the end: if the script is killed
+rem half way, the last line still says which step it was in. A summary written
+rem only on success would leave exactly the interesting case blank.
+rem ---------------------------------------------------------------------------
+:result_begin
+if "%RESULT%"=="" exit /b 0
+for %%D in ("%RESULT%") do set "RDIR=%%~dpD"
+if not exist "%RDIR%" mkdir "%RDIR%" >nul 2>&1
+rem Truncate with "copy /y nul" rather than "> file echo": a failed redirect
+rem prints "Access is denied" into the window, and the operator reads that as
+rem the install failing. The honest answer is "this account may not write
+rem there, carry on" -- a plain /check run is expected to hit it.
+copy /y nul "%RESULT%" >nul 2>&1
+if errorlevel 1 exit /b 0
+>>"%RESULT%" echo cloud-stream install
+>>"%RESULT%" echo mode    : %MODE%
+>>"%RESULT%" echo bundle  : %ROOT%
+>>"%RESULT%" echo started : %DATE% %TIME%
+exit /b 0
+
+:note
+if "%RESULT%"=="" exit /b 0
+>>"%RESULT%" echo %*
+exit /b 0
+
+:result_end
+if "%RESULT%"=="" exit /b 0
+>>"%RESULT%" echo.
+if "%VERDICT%"=="" set "VERDICT=UNKNOWN"
+>>"%RESULT%" echo === RESULT: %VERDICT% ===
+>>"%RESULT%" echo finished: %DATE% %TIME%
+exit /b 0
+
