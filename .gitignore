@@ -45,6 +45,12 @@ target/
 # 已跟踪的 dump-triage/mcbak/launch-remote.ps1 不受影响，仍会正常显示改动。
 /dump-triage/
 
+# ---- 会话临时目录 ----
+# .workbuddy/tmp/ 是智能体跑临时脚本、抓一次现场用的沙盒，内容和 dump-triage/
+# 一样属于"重跑一次就有"，但天天在 git status 里出现会把真正的改动淹掉。
+# memory/ 与 settings 不在此列：它们是项目记忆，要入库。
+/.workbuddy/tmp/
+
 # ---- 编辑器 / 系统 ----
 Thumbs.db
 .DS_Store
