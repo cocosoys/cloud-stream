@@ -37,6 +37,7 @@ stream-server.exe --ops <verb> [选项]
 --ops-dir <目录>       备份目录，默认 <运行根>\state\backups
 --ops-to <id>         指定快照（支持前缀），默认最近一次主动快照
 --ops-keep <n>        gc 保留份数
+--ops-paths <列表>    只备份这些相对路径（分号或逗号分隔，目录会递归）；空 = 全量
 --config <路径>       仅用于 state 报告"实际读的是哪份配置"，不做解析
 ```
 
@@ -85,12 +86,20 @@ stream-server.exe              ->  stream-server.exe.rollback-old
 
 | 动作 | 调用点 | 做法 |
 |---|---|---|
-| 安装 | `install.cmd` 动手之前 | `--ops snapshot --ops-label preinstall`；失败时 `--ops rollback` |
-| 卸载 | `uninstall.cmd` 删目录之前 | `--ops snapshot --ops-dir <目录外> --ops-label preuninstall` —— 备份必须落在将被删掉的目录之外 |
+| 安装 | `install.cmd /restore` | 重装时先把上次卸载存的身份放回来（不默认执行，见下） |
+| 卸载 | `uninstall.cmd` 第 5 步之前 | `--ops snapshot --ops-dir %ProgramData%\cloud-stream\uninstall-backup --ops-paths "stream-config.toml;config.toml;cert.pem;cert.key;logs\mic-default.json"` |
 | 更新 | 更新器（后续） | 覆盖 exe/DLL/前端之前 `snapshot`，验证 `/api/v1/version` 不对就 `rollback` |
 | 修改 | 配置界面（后续） | 写 `stream-config.toml` 之前 `snapshot`；"撤销上次修改"就是 `rollback` |
 
-卸载这一行有个细节值得写下来：备份放目录里等于没备，因为下一步就是 `rmdir /s`。所以 `--ops-dir` 必须支持指到目录之外，恢复时用同一份 `--ops-dir` 从外面读回来。
+三处细节值得写下来。
+
+**卸载的备份必须落在目录之外。** 放目录里等于没备，因为下一步就是 `rmdir /s`。
+
+**卸载只备"身份"，不备整包。** 所以有了 `--ops-paths`：`stream-config.toml`（端口、帧率、令牌）、证书、`logs\mic-default.json`（录音设备原值）一共几 KB；把 30 多 MB 的前端 bundle 和 DLL 也搬进 `ProgramData` 是纯浪费 —— 那些东西重装时会原样再来一遍。同一台机器上实测：全量 12 个文件 33.3 MiB，`--ops-paths` 之后 1 个文件 4.5 KiB。
+
+**显式点名时默认排除表要让路。** 全量快照排除 `logs/` 是为了省事，但卸载恰恰只要 `logs\mic-default.json`。第一次写这个过滤时就是这么错的：测试跑出来备份里一个文件都没有。现在规则是：全量用 `["logs","state"]`，显式点名用 `["state"]`（`state/` 永远不能进 —— 那里装的就是快照自己）。
+
+**旧 exe 的能力探测。** 0.3.0 之前的 exe 不认识 `--ops`，`Config::parse` 会忽略未知开关，于是它**会把整个服务拉起来**：不返回、占住 8080、还锁着 exe，而脚本正在删这个目录。这和当初 `--restore-mic` 踩的坑是同一个。两个脚本因此都在调用前做一次 `findstr` 探测，针是 `ops snapshot failed`（ops.rs 里的 `eprintln!` 文本），**不是** `--ops` —— rustc 会把短开关字面量折成立即数比较，开关名根本不在二进制里（实测：`ops snapshot failed` 有，`--ops` 没有）。探不到就跳过备份并说明，绝不盲跑。
 
 ## 7. 验证记录（本机，2026-11-10）
 
@@ -130,6 +139,6 @@ $ stream-server.exe --ops verify
 2. **配置文件写坏（`port = `）时 `--ops state` 与 `--ops rollback` 照常工作**，暴露的正是分层顺序的价值；
 3. **动词拼错退出码 2**，且不会悄悄回落成"起了个服务"。
 
-单元测试 16 条（`cargo test -p stream-server --lib`，共 369 passed / 0 failed），覆盖：跳过 `logs`/`state`、标签里的路径分隔符被清洗、回滚恢复改动与被删文件、多余文件让路、回滚可再回滚、二次回滚是空操作、`verify` 三分类、`gc` 的两条保留策略、前缀匹配与歧义拒绝、外置备份目录。
+单元测试 18 条（`cargo test -p stream-server --lib`，共 371 passed / 0 failed），覆盖：跳过 `logs`/`state`、标签里的路径分隔符被清洗、回滚恢复改动与被删文件、多余文件让路、回滚可再回滚、二次回滚是空操作、`verify` 三分类、`gc` 的两条保留策略、前缀匹配与歧义拒绝、外置备份目录、`--ops-paths` 的精确匹配与目录递归。
 
-**未验证**：实机（`.150` 自 11-10 15:40 起离线）。上面的记录全部来自本机调试版 exe；release 产物与目标机行为要等机器回来后补。
+**未验证**：实机（`.150` 自 11-10 15:40 起离线）。上面的记录全部来自本机调试版 exe；release 产物与目标机行为要等机器回来后补。`install.cmd` / `uninstall.cmd` 的改动只做了静态校验（跳转目标全部可解析、纯 ASCII、CRLF 未破）和命令行级别的验证（把脚本实际会执行的 `--ops snapshot --ops-paths ...` 原样跑了一遍），**没有在真机上完整跑过安装/卸载**。

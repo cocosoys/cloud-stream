@@ -41,6 +41,11 @@ set "ROOT=%~dp0"
 if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 set "EXE=%ROOT%\stream-server.exe"
 set "TASK=MCStreamSrv"
+rem Where uninstall.cmd leaves the machine's identity (config / cert / recorder
+rem original). `install.cmd /restore` reads it back; nothing is restored without
+rem that switch, because silently overwriting a shipped stream-config.toml with
+rem an old one is exactly the kind of "helpful" that is impossible to debug.
+set "BK=%ProgramData%\cloud-stream\uninstall-backup"
 set "PSS=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
 set "TIMEOUT=%SystemRoot%\System32\timeout.exe"
 set "CURL=%SystemRoot%\System32\curl.exe"
@@ -56,10 +61,12 @@ set "CS_SELF=%~f0"
 rem ---- arguments ------------------------------------------------------------
 set "MODE=install"
 set "NOPAUSE=0"
+set "RESTORE=0"
 
 :args
 if "%~1"=="" goto :args_done
 if /i "%~1"=="/check" set "MODE=check"
+if /i "%~1"=="/restore" set "RESTORE=1"
 if /i "%~1"=="/y" set "NOPAUSE=1"
 if /i "%~1"=="/yes" set "NOPAUSE=1"
 if /i "%~1"=="/?" goto :usage
@@ -72,6 +79,8 @@ goto :args
 echo Usage:
 echo   install.cmd            install / repair, self-elevates
 echo   install.cmd /check     read-only preflight, changes nothing
+echo   install.cmd /restore   put back the config/cert/recorder that the last
+echo                          uninstall.cmd saved, then install
 echo   install.cmd /y         no pause at the end
 exit /b 0
 
@@ -84,6 +93,12 @@ echo   bundle : %ROOT%
 echo   task   : %TASK%
 echo   port   : 8080
 echo ======================================================================
+rem Discoverability: after an uninstall the operator usually re-runs this file
+rem and expects the machine to come back the way it was. Say how, once, and do
+rem not do it silently.
+if exist "%BK%" echo   note   : a previous uninstall saved this machine's identity to
+if exist "%BK%" echo            %BK%
+if exist "%BK%" echo            install.cmd /restore  puts it back before installing
 echo.
 
 rem ---------------------------------------------------------------------------
@@ -159,6 +174,35 @@ echo            netstat -ano ^| findstr :8080
 :check_done
 
 if "%MODE%"=="check" goto :check_summary
+
+rem ---------------------------------------------------------------------------
+rem Optional: put the previous machine identity back. Only with /restore --
+rem the backup is from a *different* install and may carry an old port, token
+rem or certificate; applying it unasked turns "reinstall" into "surprise".
+rem No admin needed (it writes into this folder), so it happens before UAC.
+rem ---------------------------------------------------------------------------
+if "%RESTORE%"=="0" goto :restore_done
+echo.
+echo -- [restore] previous machine identity --
+if not exist "%BK%" goto :restore_none
+call :ops_capable
+if "%OPSOK%"=="1" goto :restore_go
+echo   [skip] this exe predates --ops, nothing to restore it with.
+goto :restore_done
+:restore_none
+echo   [skip] no backup at %BK%
+echo          ^(uninstall.cmd writes one there before it deletes a folder^)
+goto :restore_done
+:restore_go
+pushd "%ROOT%"
+"%EXE%" --ops rollback --ops-dir "%BK%" > "%TMPF%" 2>&1
+set "RSRC=%errorlevel%"
+popd
+if exist "%TMPF%" for /f "usebackq delims=" %%L in ("%TMPF%") do echo   [i] %%L
+del /f /q "%TMPF%" >nul 2>&1
+if not "%RSRC%"=="0" echo   [warn] restore did not complete (exit %RSRC%); continuing with the shipped config.
+if "%RSRC%"=="0" echo   [ok] config / certificate / recorder original are back.
+:restore_done
 
 rem ---------------------------------------------------------------------------
 rem Elevation. Rules and task registration both need it. Rather than teaching
@@ -316,6 +360,23 @@ if "%NOPAUSE%"=="1" exit /b 1
 echo Press any key to close this window.
 pause >nul
 exit /b 1
+
+rem ---------------------------------------------------------------------------
+rem :ops_capable -- does this stream-server.exe know --ops?  OPSOK=1 / 0.
+rem
+rem Same reason as uninstall.cmd: an exe built before the ops layer ignores the
+rem switch and starts a FULL server instead, which never returns. The needle is
+rem "ops snapshot failed" (the eprintln! text from ops.rs), not "--ops" -- rustc
+rem folds short switch literals into immediate comparisons, so the switch name
+rem is not in the binary at all.
+rem ---------------------------------------------------------------------------
+:ops_capable
+set "OPSOK=0"
+if not exist "%EXE%" exit /b 0
+findstr /M /C:"ops snapshot failed" "%EXE%" >nul 2>&1
+if errorlevel 1 exit /b 0
+set "OPSOK=1"
+exit /b 0
 
 rem ---------------------------------------------------------------------------
 rem :need <absolute path> <name shown>

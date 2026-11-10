@@ -48,6 +48,10 @@ set "ROOT=%~dp0"
 if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 set "EXE=%ROOT%\stream-server.exe"
 set "TASK=MCStreamSrv"
+rem Where the machine's identity is kept after the folder is gone. Outside the
+rem bundle on purpose: step 5 deletes this whole directory, so a backup inside
+rem it would be deleted by the very action it is meant to survive.
+set "BK=%ProgramData%\cloud-stream\uninstall-backup"
 set "PSS=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
 set "TMPF=%TEMP%\cloud-stream-uninstall.tmp"
 rem Exported for the PowerShell snippets below: they filter processes by the
@@ -152,6 +156,9 @@ echo   [ ] inbound rules          none of the four present
 
 if exist "%ROOT%\auth-token.txt" echo   [x] auth-token.txt         a password is configured
 if exist "%ROOT%\logs\mic-default.json" echo   [x] logs\mic-default.json   the default recorder was taken over
+call :ops_capable
+if "%OPSOK%"=="1" echo   [x] machine identity       config/cert/recorder -^> %BK%
+if "%OPSOK%"=="0" echo   [ ] machine identity       not-available ^(this exe predates --ops^)
 if "%MODE%"=="keep" goto :inv_files_kept
 echo   [x] files                  %ROOT%
 goto :inv_done
@@ -376,6 +383,11 @@ if "%MODE%"=="keep" goto :keep_done
 echo.
 echo -- [5/5] removing the folder --
 echo   %ROOT%
+rem Before the folder goes: keep the machine's identity somewhere that survives
+rem it. Without this, "uninstall then reinstall" silently loses the port, the
+rem token, the certificate and the recorder original -- the folder was the only
+rem copy of all four.
+call :save_identity
 if "%NOPAUSE%"=="0" (
     echo   It disappears a few seconds after this window closes.
     echo Press any key to close this window.
@@ -430,6 +442,64 @@ if "%NOPAUSE%"=="1" exit /b 1
 echo Press any key to close this window.
 pause >nul
 exit /b 1
+
+rem ---------------------------------------------------------------------------
+rem :ops_capable -- does this stream-server.exe know --ops?  OPSOK=1 / 0.
+rem
+rem Same trap as --restore-mic (see step 3): an exe built before the ops layer
+rem ignores the switch and starts a FULL server instead -- which never returns,
+rem takes port 8080 and holds the exe open while the folder is being deleted.
+rem So it is never run without this probe.
+rem
+rem The needle is "ops snapshot failed", the eprintln! text from ops.rs, not
+rem "--ops": rustc folds short switch literals into immediate comparisons, so
+rem the switch name is not in the binary at all. Verified on the 0.3.0 build:
+rem "ops snapshot failed" is present, "--ops" alone is not.
+rem ---------------------------------------------------------------------------
+:ops_capable
+set "OPSOK=0"
+if not exist "%EXE%" exit /b 0
+findstr /M /C:"ops snapshot failed" "%EXE%" >nul 2>&1
+if errorlevel 1 exit /b 0
+set "OPSOK=1"
+exit /b 0
+
+rem ---------------------------------------------------------------------------
+rem :save_identity -- keep config / cert / recorder original outside the folder.
+rem
+rem --ops-paths, not a full snapshot: what has to survive an uninstall is "who
+rem this machine was" (port, token, certificate, recorder), not the 30-odd MB
+rem of frontend bundle that a fresh install puts back anyway.
+rem
+rem A failure here is a [warn], never a [fail]: refusing to uninstall because a
+rem backup could not be written would leave the operator stuck with a machine
+rem they asked to clean, which is worse than losing the config.
+rem ---------------------------------------------------------------------------
+:save_identity
+if "%OPSOK%"=="1" goto :ident_go
+echo   [skip] identity not saved -- this exe predates --ops
+echo          what would have been kept: stream-config.toml, config.toml,
+echo          cert.pem, cert.key, logs\mic-default.json
+exit /b 0
+:ident_go
+del /f /q "%TMPF%" >nul 2>&1
+pushd "%ROOT%"
+"%EXE%" --ops snapshot --ops-dir "%BK%" --ops-label preuninstall --ops-paths "stream-config.toml;config.toml;cert.pem;cert.key;logs\mic-default.json" > "%TMPF%" 2>&1
+set "BKRC=%errorlevel%"
+popd
+if not exist "%TMPF%" goto :ident_failed
+for /f "usebackq delims=" %%L in ("%TMPF%") do echo   [i] %%L
+del /f /q "%TMPF%" >nul 2>&1
+if not "%BKRC%"=="0" goto :ident_failed
+echo   [ok] identity saved outside the folder: %BK%
+echo        after reinstalling, put it back with:
+echo          stream-server.exe --ops rollback --ops-dir "%BK%"
+exit /b 0
+:ident_failed
+echo   [warn] the identity backup did not complete (exit %BKRC%).
+echo          Continue -- but the next install starts from its own defaults:
+echo          port, token, certificate and recorder original are not carried over.
+exit /b 0
 
 rem ---------------------------------------------------------------------------
 rem :remove_task -- stop then unregister %TASK%.

@@ -70,6 +70,13 @@ pub fn default_backup_dir(root: &Path) -> PathBuf {
 /// `state`：快照自己就住在这里，递归进去等于自己拷自己。
 const SKIP_DIRS: &[&str] = &["logs", "state"];
 
+/// 调用方显式点名要哪些路径时，只保留这一条排除。
+///
+/// `state/` 永远不能进快照（里面装的就是快照自己），但 `logs/` 必须放开：
+/// 默认排除它是为全量快照省事，而卸载恰恰只要 `logs\mic-default.json` ——
+/// 默认录音设备原值就在那儿，不备这一份，"卸载后再装回来"就丢了机器状态。
+const EXPLICIT_SKIP: &[&str] = &["state"];
+
 /// 恢复时让路用的后缀。
 pub const STASH_SUFFIX: &str = ".rollback-old";
 
@@ -250,8 +257,22 @@ fn hash_file(path: &Path) -> Result<(u64, String), String> {
 }
 
 /// 收集运行根下需要纳入快照的文件（相对路径，已排序）。
+///
+/// `skip` 是顶层要跳过的目录名。默认全量快照传 [`SKIP_DIRS`]；调用方显式
+/// 点名要哪些路径时传 `["state"]` —— 那一条永远不能放开，否则快照会把备份
+/// 目录自己拷进备份目录。
 fn collect(root: &Path) -> Result<Vec<PathBuf>, String> {
-    fn walk(dir: &Path, rel: &Path, out: &mut Vec<PathBuf>, depth: usize) -> Result<(), String> {
+    collect_skipping(root, SKIP_DIRS)
+}
+
+fn collect_skipping(root: &Path, skip: &[&str]) -> Result<Vec<PathBuf>, String> {
+    fn walk(
+        dir: &Path,
+        rel: &Path,
+        out: &mut Vec<PathBuf>,
+        depth: usize,
+        skip: &[&str],
+    ) -> Result<(), String> {
         // 深度上限不是防御性编程洁癖：目录里可能出现符号链接环，
         // 而 `read_dir` 会跟着它一直走下去。
         if depth > 16 {
@@ -273,10 +294,10 @@ fn collect(root: &Path) -> Result<Vec<PathBuf>, String> {
                 Err(_) => continue,
             };
             if meta.is_dir() {
-                if depth == 0 && SKIP_DIRS.iter().any(|d| name_str.eq_ignore_ascii_case(d)) {
+                if depth == 0 && skip.iter().any(|d| name_str.eq_ignore_ascii_case(d)) {
                     continue;
                 }
-                walk(&path, &child_rel, out, depth + 1)?;
+                walk(&path, &child_rel, out, depth + 1, skip)?;
             } else if meta.is_file() {
                 // 上一轮回滚让路留下的残骸不该进入新的快照，否则每回滚一次，
                 // 备份就胖一圈，而且永远删不掉。
@@ -290,7 +311,7 @@ fn collect(root: &Path) -> Result<Vec<PathBuf>, String> {
     }
 
     let mut files = Vec::new();
-    walk(root, Path::new(""), &mut files, 0)?;
+    walk(root, Path::new(""), &mut files, 0, skip)?;
     files.sort();
     Ok(files)
 }
@@ -322,7 +343,45 @@ fn load_manifest(dir: &Path) -> Result<Snapshot, String> {
 /// `backups` 是备份目录（默认 `root/state/backups`，也可以指到目录之外 ——
 /// 卸载就要求这样，因为整个目录马上要被删掉）。
 pub fn snapshot(root: &Path, backups: &Path, label: &str) -> Result<Snapshot, String> {
-    let files = collect(root)?;
+    snapshot_paths(root, backups, label, None)
+}
+
+/// 只备份指定路径（相对运行根，目录会被递归）。
+///
+/// 卸载要的那一份和更新要的那一份不是一回事：卸载只需要留下"这台机器的身份"
+/// —— 配置、证书、录音设备原值 —— 把几十兆的前端 bundle 和 DLL 也搬进
+/// `ProgramData` 只是在浪费磁盘；更新才需要完整一份用于回退。`None` = 全量。
+pub fn snapshot_paths(
+    root: &Path,
+    backups: &Path,
+    label: &str,
+    include: Option<&[String]>,
+) -> Result<Snapshot, String> {
+    // 全量快照沿用默认排除（logs 与 state 都不进）；显式点名时只保 state
+    // 这一条 —— 见 [`EXPLICIT_SKIP`]。
+    let explicit = include.map(|list| !list.is_empty()).unwrap_or(false);
+    let mut files = if explicit {
+        collect_skipping(root, EXPLICIT_SKIP)?
+    } else {
+        collect(root)?
+    };
+    if let Some(only) = include {
+        if explicit {
+            let wanted: Vec<String> = only
+                .iter()
+                // 命令行上写反斜杠更自然（这是 Windows 工具），但清单里统一是
+                // 正斜杠，所以两边都归一化再比。
+                .map(|s| s.trim().trim_start_matches("./").replace('\\', "/"))
+                .filter(|s| !s.is_empty())
+                .collect();
+            files.retain(|rel| {
+                let rel = rel_to_string(rel);
+                wanted
+                    .iter()
+                    .any(|want| rel == *want || rel.starts_with(&format!("{want}/")))
+            });
+        }
+    }
     let now = unix_now();
     let id = format!("{}-{}", compact_utc(now), sanitize_label(label));
     let dir = backups.join(&id);
@@ -663,6 +722,8 @@ pub struct Request {
     pub dir: Option<PathBuf>,
     pub to: Option<String>,
     pub keep: Option<usize>,
+    /// 只备份这些相对路径（`--ops-paths`，分号或逗号分隔）。空 = 全量。
+    pub paths: Option<Vec<String>>,
     /// 顺带记下 `--config`：`state` 要报"这台机器实际读的是哪份配置"。
     /// 不解析配置内容，只记路径 —— 恢复入口不能依赖它要恢复的东西。
     pub config: Option<PathBuf>,
@@ -717,6 +778,16 @@ impl Request {
                                 return Some(Err(format!("--ops-keep 需要一个数字，收到 {v:?}")))
                             }
                         }
+                    }
+                }
+                "--ops-paths" => {
+                    if let Some(v) = iter.next() {
+                        let list: Vec<String> = v
+                            .split(|c| c == ';' || c == ',')
+                            .map(|s| s.trim().to_owned())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        req.paths = Some(list);
                     }
                 }
                 "--config" => {
@@ -871,7 +942,12 @@ pub fn execute(request: &Request) -> i32 {
             EXIT_OK
         }
 
-        Verb::Snapshot => match snapshot(&root, &backups, &request.label) {
+        Verb::Snapshot => match snapshot_paths(
+            &root,
+            &backups,
+            &request.label,
+            request.paths.as_deref(),
+        ) {
             Ok(s) => {
                 if json {
                     println!(
@@ -1330,6 +1406,36 @@ mod tests {
         // 否则连点两次回滚等于来回翻。
         let target = resolve(&dir.backups(), None).expect("应当有默认目标");
         assert_eq!(target.label, "before");
+    }
+
+    #[test]
+    fn snapshot_paths_keeps_only_the_machine_identity() {
+        // 卸载场景：只留配置与录音设备原值，不搬 bundle。
+        let dir = TempDir::new("paths");
+        dir.write("stream-config.toml", "fps = 15");
+        dir.write("logs/mic-default.json", "{}");
+        dir.write("dist/index.html", "<html>");
+        dir.write("stream-server.exe", "bin");
+
+        let only = vec!["stream-config.toml".to_owned(), "logs\\mic-default.json".to_owned()];
+        let snap = snapshot_paths(&dir.0, &dir.backups(), "preuninstall", Some(&only))
+            .expect("快照应当成功");
+        let mut paths: Vec<&str> = snap.files.iter().map(|f| f.path.as_str()).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["logs/mic-default.json", "stream-config.toml"]);
+    }
+
+    #[test]
+    fn snapshot_paths_accepts_a_directory_and_recurses() {
+        let dir = TempDir::new("paths-dir");
+        dir.write("logs/a.log", "a");
+        dir.write("logs/b.json", "b");
+        dir.write("other.txt", "x");
+        let only = vec!["logs".to_owned()];
+        let snap = snapshot_paths(&dir.0, &dir.backups(), "t", Some(&only)).expect("快照应当成功");
+        let paths: Vec<&str> = snap.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths.len(), 2, "{paths:?}");
+        assert!(paths.iter().all(|p| p.starts_with("logs/")), "{paths:?}");
     }
 
     #[test]

@@ -107,8 +107,9 @@ target\output\cloud-stream\
   setup-watchdog.bat     创建 MCStreamSrv 任务（交互式令牌，不需要账户密码）
   setup-task.ps1         上面那条的实际执行者：按交互式令牌注册任务
   install.cmd            一键安装：检查包 → 放行入站 → 建任务 → 启动 → 等 60 秒给结论
-                         （`/check` 只读预检，不改任何东西，也不需要管理员）
-  uninstall.cmd          一键卸载：停任务 → 杀进程 → 还默认录音设备 → 删规则 → 删目录
+                         （`/check` 只读预检，不改任何东西，也不需要管理员；
+                           `/restore` 先把上次卸载留下的配置/证书/录音设备原值放回来）
+  uninstall.cmd          一键卸载：停任务 → 杀进程 → 还默认录音设备 → 删规则 → 存身份 → 删目录
                          （`/keep` 只卸服务留文件，`/whatif` 只列清单）
   collect-launch-facts.cmd  起不来时双击它，生成一份事实清单（只读，不启动 exe）
   setup-inbound.cmd     管理员身份运行：放行 8080、ping 与 WebRTC 的 UDP 段（新机器必须做一次）
@@ -128,6 +129,13 @@ UAC，然后检查包、放行入站、建任务、立刻起一次并打印 `[ok
 `uninstall.cmd` 内部调用的还是 `setup-task.ps1`、`open-inbound.cmd` 和 exe 的
 `--restore-mic`，没有第二套实现，所以手工路径与一键路径不会各自漂移 ——
 `setup-watchdog.bat` 仍然可用，它是这条链上"只建任务"的那一半。
+
+**卸载不再"删了即没了"。** 删目录之前，`uninstall.cmd` 会调 exe 的
+`--ops snapshot` 把"这台机器的身份"——`stream-config.toml`（端口、帧率、令牌）、
+证书、`logs\mic-default.json`（默认录音设备原值）——存到
+`%ProgramData%\cloud-stream\uninstall-backup\`，并打印恢复命令。之后重装时
+`install.cmd /restore` 会把它放回去，于是"卸载 → 重装"不再静默丢掉端口和口令。
+细节见 `docs/operations-rollback.md`。
 
 生产机器上的对应位置是 `<RemoteBase>\stream`（默认 `C:\dev\stream`）。
 `-RemoteBase` 是整台机器换位置时唯一要改的参数 —— 其余路径都是相对推导的。
