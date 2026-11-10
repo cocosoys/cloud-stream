@@ -80,6 +80,22 @@ const EXPLICIT_SKIP: &[&str] = &["state"];
 /// 恢复时让路用的后缀。
 pub const STASH_SUFFIX: &str = ".rollback-old";
 
+/// 改配置前留底的标签。与 `pre-rollback` 同一个思路：让它出现在
+/// `--ops list` 里，人一眼能看出"这一份是某次改配置之前的"。
+pub const PRE_EDIT_LABEL: &str = "preedit";
+
+/// 运行目录之外的那份配置，留底写在旁边用这个后缀。
+pub const PRE_EDIT_SUFFIX: &str = ".pre-edit";
+
+/// 配置还不存在时，新文件的开头。
+///
+/// 只两行：完整的注释模板在工具包的 `stream-config.toml` 里，复制一份到这里
+/// 只会多一处需要同步维护的文本。指向它比抄它更不容易分叉。
+const NEW_CONFIG_HEAD: &str = "\
+# cloud-stream 配置（由配置表单创建；带注释的完整模板见工具包里的 stream-config.toml）
+# 删掉一行 = 这一项回到默认值。
+";
+
 /// 回滚前自动留底用的标签。
 ///
 /// 它有两个作用，第二个是**默认目标要排除它**：回滚一次之后，最新那份快照
@@ -126,6 +142,17 @@ pub struct Snapshot {
     pub commit: String,
     /// 拍快照时运行根的绝对路径，仅用于展示与核对。
     pub root: String,
+    /// 这份快照只备份了点名的那几项，**不是**整个运行目录。
+    ///
+    /// 这一位决定回滚时要不要"把快照里没有的文件改名让路"。完整快照要，因为
+    /// 那正是"更新引入的新文件"；只备了两三个文件的快照（`preedit`、
+    /// `preuninstall`）绝对不能 —— 否则回滚一次配置，整个目录的 exe 和 dist
+    /// 全被改名成 `.rollback-old`，服务当场起不来。
+    ///
+    /// 老清单里没有这一位，`serde(default)` 读成 `false`（= 完整），与旧行为
+    /// 一致。
+    #[serde(default)]
+    pub partial: bool,
     pub files: Vec<FileEntry>,
 }
 
@@ -452,6 +479,7 @@ pub fn snapshot_paths(
         version: crate::version::VERSION.to_owned(),
         commit: crate::version::COMMIT.to_owned(),
         root: root.display().to_string(),
+        partial: explicit,
         files: entries,
     };
     write_manifest(&dir, &snapshot)?;
@@ -572,16 +600,22 @@ pub fn rollback(root: &Path, backups: &Path, to: Option<&str>) -> Result<Rollbac
     }
 
     // 盘上有、目标快照里没有的文件：更新引入的新文件。让路而不是删除。
-    if let Ok(current) = collect(root) {
-        for rel in current {
-            let key = rel_to_string(&rel);
-            if wanted.contains_key(key.as_str()) {
-                continue;
-            }
-            let path = root.join(&rel);
-            match stash(&path) {
-                Ok(_) => report.stashed.push(key),
-                Err(e) => report.failed.push((key, e)),
+    //
+    // **只对完整快照做这一步**：只备份了几项的（`preedit`、`preuninstall`）
+    // 里"快照没有的文件"是正常存在的其余东西，把它们全改名成 `.rollback-old`
+    // 等于回滚一次配置就让整个目录不可用。
+    if !target.partial {
+        if let Ok(current) = collect(root) {
+            for rel in current {
+                let key = rel_to_string(&rel);
+                if wanted.contains_key(key.as_str()) {
+                    continue;
+                }
+                let path = root.join(&rel);
+                match stash(&path) {
+                    Ok(_) => report.stashed.push(key),
+                    Err(e) => report.failed.push((key, e)),
+                }
             }
         }
     }
@@ -656,11 +690,15 @@ pub fn verify(root: &Path, backups: &Path, against: Option<&str>) -> Result<Veri
             Err(_) => report.missing.push(entry.path.clone()),
         }
     }
-    if let Ok(current) = collect(root) {
-        for rel in current {
-            let key = rel_to_string(&rel);
-            if !wanted.contains_key(key.as_str()) {
-                report.extra.push(key);
+    // 只备份了几项的快照，比不出"多出来什么"：其余的本来就是正常文件，
+    // 报成 extra 只会让人以为盘上被塞了东西。
+    if !target.partial {
+        if let Ok(current) = collect(root) {
+            for rel in current {
+                let key = rel_to_string(&rel);
+                if !wanted.contains_key(key.as_str()) {
+                    report.extra.push(key);
+                }
             }
         }
     }
@@ -727,6 +765,10 @@ pub enum Verb {
     List,
     /// 清理旧快照。
     Gc,
+    /// 读配置文件里现在写着什么（只读，给配置表单用）。
+    ConfigGet,
+    /// 改配置：先留底，按键改写，校验通过才落盘。
+    ConfigSet,
 }
 
 impl Verb {
@@ -738,6 +780,8 @@ impl Verb {
             "verify" => Some(Self::Verify),
             "list" => Some(Self::List),
             "gc" => Some(Self::Gc),
+            "config-get" | "config_get" | "configget" => Some(Self::ConfigGet),
+            "config-set" | "config_set" | "configset" => Some(Self::ConfigSet),
             _ => None,
         }
     }
@@ -754,6 +798,13 @@ pub struct Request {
     pub keep: Option<usize>,
     /// 只备份这些相对路径（`--ops-paths`，分号或逗号分隔）。空 = 全量。
     pub paths: Option<Vec<String>>,
+    /// `--ops-set key=value`，可重复。`config-set` 用它。
+    ///
+    /// 值原样收下，格式化与范围检查交给 `configedit`：那里有类型表，也不过
+    /// 是第二个解析器 —— 同一个判断只该有一处。
+    pub sets: Vec<(String, String)>,
+    /// `--ops-unset key`，可重复：删掉整行（= 用默认值）。
+    pub unsets: Vec<String>,
     /// 顺带记下 `--config`：`state` 要报"这台机器实际读的是哪份配置"。
     /// 不解析配置内容，只记路径 —— 恢复入口不能依赖它要恢复的东西。
     pub config: Option<PathBuf>,
@@ -808,6 +859,23 @@ impl Request {
                                 return Some(Err(format!("--ops-keep 需要一个数字，收到 {v:?}")))
                             }
                         }
+                    }
+                }
+                "--ops-set" => {
+                    if let Some(v) = iter.next() {
+                        match v.split_once('=') {
+                            Some((k, val)) => req.sets.push((k.trim().to_owned(), val.to_owned())),
+                            None => {
+                                return Some(Err(format!(
+                                    "--ops-set 要 key=value 形态，收到 {v:?}"
+                                )))
+                            }
+                        }
+                    }
+                }
+                "--ops-unset" => {
+                    if let Some(v) = iter.next() {
+                        req.unsets.push(v.trim().to_owned());
                     }
                 }
                 "--ops-paths" => {
@@ -875,7 +943,147 @@ fn summarize(snapshot: &Snapshot) -> serde_json::Value {
         "files": snapshot.files.len(),
         "bytes": snapshot.total_bytes(),
         "root": snapshot.root,
+        // 只备份了几项 = 回滚只会碰那几项。界面上要能说出这句话，所以报出来。
+        "partial": snapshot.partial,
     })
+}
+
+/// 这台机器实际读的是哪份配置。
+///
+/// `--config` 优先，其次默认位置。默认位置还要再分两种：`Config::parse` 自动
+/// 发现的是 exe 旁的 `config.toml`，但整包分发的那份叫 `stream-config.toml`
+/// 且由 `start-stream.cmd --config` 显式指定。只报 `config.toml (absent)`
+/// 会让人以为自己没配置，而实际上文件就在旁边、服务也在用它 —— 所以这里退
+/// 一步再找一个，纯只读。
+///
+/// 刻意**不改** `configfile::default_path`：那是启动时的自动发现逻辑，动它等于
+/// 改变已有部署的加载行为，不属于"报告得更准"。
+///
+/// 两份都不存在时这个函数还要**决定新建哪一份**：整包分发的布局里服务是用
+/// `--config stream-config.toml` 起的，那就得建那一份（见下面的证据）。
+///
+/// `state` 与 `config-get` / `config-set` 共用这一处：三处各写一遍，迟早有一
+/// 处先漂走，然后屏幕说 A、写入落在 B。
+fn resolve_config(explicit: Option<&Path>) -> Option<PathBuf> {
+    if let Some(path) = explicit {
+        return Some(path.to_path_buf());
+    }
+    let primary = crate::configfile::default_path()?;
+    if primary.exists() {
+        return Some(primary);
+    }
+    let sibling = primary.with_file_name("stream-config.toml");
+    if sibling.exists() {
+        return Some(sibling);
+    }
+    // 两份都不存在时，看这份安装是不是整包分发的：`start-stream.cmd` 里写死了
+    // `--config %ROOT%\stream-config.toml`，于是服务只认那一份。此时若把表单
+    // 的改动存进 `config.toml`，就是"改了没反应"—— 一个纯粹由猜错文件名造成
+    // 的故障，而旁边那个脚本本身就是证据。
+    if primary.with_file_name("start-stream.cmd").exists() {
+        Some(sibling)
+    } else {
+        Some(primary)
+    }
+}
+
+/// 补空格到指定的**显示**宽度。
+///
+/// `{:<18}` 数的是字符个数，而中日韩字符占两列 —— 表格里混着中文时，
+/// 按字符补齐的结果是右边那列高高低低。这个项目里所有面向人的列表都有中文，
+/// 所以按显示宽度补。
+fn pad(text: &str, width: usize) -> String {
+    let shown: usize = text
+        .chars()
+        .map(|c| if c as u32 >= 0x2E80 { 2 } else { 1 })
+        .sum();
+    let mut out = text.to_owned();
+    for _ in shown..width {
+        out.push(' ');
+    }
+    out
+}
+
+/// 读这份配置：整份读成字符串，文件不存在则当空文件。
+///
+/// 不存在不等于出错 —— 首次配置就是"从零写一份"，那不是异常路径。
+fn read_config_text(path: &Path) -> Result<String, String> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(format!("{}: 读不了: {e}", path.display())),
+    }
+}
+
+/// 改配置之前的留底。
+///
+/// 配置在运行目录里时走快照：和安装/更新/卸载用同一套，`--ops rollback` 能
+/// 直接还原。配置在运行目录之外时（`--config` 指到别处）快照够不着 —— 它是
+/// 按相对路径遍历 root 的 —— 于是退一步在旁边写一份 `<文件名>.pre-edit`。
+/// 两种都是"留一份旧的、不删任何东西"，区别只是能不能一条命令退回去。
+struct ConfigBackup {
+    snapshot: Option<String>,
+    copy: Option<PathBuf>,
+}
+
+fn backup_config(
+    root: &Path,
+    backups: &Path,
+    path: &Path,
+    label: &str,
+) -> Result<ConfigBackup, String> {
+    if !path.exists() {
+        // 还没有文件：没有旧内容可留。
+        return Ok(ConfigBackup {
+            snapshot: None,
+            copy: None,
+        });
+    }
+    // 只认真正的下级：`strip_prefix` 顺带把 `..` 与不同盘符都挡掉了。
+    if let Ok(rel) = path.strip_prefix(root) {
+        if !rel.as_os_str().is_empty() {
+            let only = vec![rel_to_string(rel)];
+            let snapshot = snapshot_paths(root, backups, label, Some(&only))?;
+            return Ok(ConfigBackup {
+                snapshot: Some(snapshot.id),
+                copy: None,
+            });
+        }
+    }
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(PRE_EDIT_SUFFIX);
+    let copy = path.with_file_name(name);
+    fs::copy(path, &copy).map_err(|e| format!("{}: 留底失败: {e}", copy.display()))?;
+    Ok(ConfigBackup {
+        snapshot: None,
+        copy: Some(copy),
+    })
+}
+
+/// 把 `Kind` 说给界面听：表单靠它决定画输入框、下拉框还是勾选框。
+fn key_json(key: &crate::configedit::Key, text: &str) -> serde_json::Value {
+    use crate::configedit::Kind;
+    let mut doc = match key.kind {
+        Kind::Num(min, max) => serde_json::json!({ "kind": "num", "min": min, "max": max }),
+        Kind::Bool => serde_json::json!({ "kind": "bool" }),
+        Kind::Enum(options) => serde_json::json!({ "kind": "enum", "options": options }),
+        Kind::Text => serde_json::json!({ "kind": "text" }),
+    };
+    let raw = crate::configedit::raw_value(text, key.name);
+    let object = doc.as_object_mut().expect("上面构造的一定是对象");
+    object.insert("name".into(), key.name.into());
+    object.insert("label".into(), key.label.into());
+    // `written` 与 `raw` 一起给：表单要区分"这一项没写（用默认值）"与
+    // "写了但是空字符串" —— 后者在 TLS 那几项里是有意义的状态。
+    object.insert("written".into(), raw.is_some().into());
+    object.insert(
+        "raw".into(),
+        match raw {
+            Some(v) => serde_json::Value::String(v),
+            None => serde_json::Value::Null,
+        },
+    );
+    doc
 }
 
 /// 执行一次 `--ops` 调用并打印结果，返回值即进程退出码。
@@ -904,26 +1112,9 @@ pub fn execute(request: &Request) -> i32 {
                 .iter()
                 .find(|s| s.label != PRE_ROLLBACK_LABEL)
                 .map(summarize);
-            // `--config` 优先，其次默认位置。默认位置还要再分两种：`Config::parse`
-            // 自动发现的是 exe 旁的 `config.toml`，但整包分发的那份叫
-            // `stream-config.toml` 且由 `start-stream.cmd --config` 显式指定。
-            // 只报 `config.toml (absent)` 会让人以为自己没配置，而实际上文件
-            // 就在旁边、服务也在用它 —— 所以这里退一步再找一个，纯只读。
-            //
-            // 刻意**不改** `configfile::default_path`：那是启动时的自动发现逻辑，
-            // 动它等于改变已有部署的加载行为，不属于"报告得更准"。
-            let config = request.config.clone().or_else(|| {
-                let primary = crate::configfile::default_path()?;
-                if primary.exists() {
-                    return Some(primary);
-                }
-                let sibling = primary.with_file_name("stream-config.toml");
-                if sibling.exists() {
-                    Some(sibling)
-                } else {
-                    Some(primary)
-                }
-            });
+            // 哪份配置：见 [`resolve_config`]（`state` 与读写配置共用同一处判断，
+            // 免得屏幕说一份、实际改的是另一份）。
+            let config = resolve_config(request.config.as_deref());
             let mut doc = serde_json::json!({
                 "root": root.display().to_string(),
                 "backups": backups.display().to_string(),
@@ -1028,7 +1219,7 @@ pub fn execute(request: &Request) -> i32 {
             } else {
                 for s in &snapshots {
                     println!(
-                        "{:<40} {:>4} files {:>10}  {}{}",
+                        "{:<40} {:>4} files {:>10}  {}{}{}",
                         s.id,
                         s.files.len(),
                         human_bytes(s.total_bytes()),
@@ -1037,7 +1228,9 @@ pub fn execute(request: &Request) -> i32 {
                             String::new()
                         } else {
                             format!("  [{}]", s.label)
-                        }
+                        },
+                        // 只备份了几项要写明白：这决定了回滚会碰多少东西。
+                        if s.partial { "  (只备份这几项)" } else { "" }
                     );
                 }
             }
@@ -1141,6 +1334,221 @@ pub fn execute(request: &Request) -> i32 {
                     EXIT_FAILED
                 }
             }
+        }
+
+        // ---------------------------------------------------------------
+        // 配置：读
+        // ---------------------------------------------------------------
+        //
+        // 输出的是**文件里写着什么**，不是生效值：表单要显示"这一行现在是什么样"
+        // 好让人在原文上改，而不是看到一堆被默认值填满的格子、分不清哪些是自己
+        // 设过的。生效值另有 `--print-config` 与 `state` 负责。
+        Verb::ConfigGet => {
+            let Some(path) = resolve_config(request.config.as_deref()) else {
+                eprintln!("ops config-get: 拿不到 exe 所在目录，没法定位配置");
+                return EXIT_MISSING;
+            };
+            let text = match read_config_text(&path) {
+                Ok(text) => text,
+                Err(err) => {
+                    eprintln!("ops config-get failed: {err}");
+                    return EXIT_FAILED;
+                }
+            };
+            // 解析不过也照样把原文报出去：那正是最该打开表单改一改的时刻，
+            // 报一句"读失败"等于把人赶回记事本。
+            let problem = crate::configedit::validate(&text).err();
+            let exists = path.exists();
+            if json {
+                let keys: Vec<serde_json::Value> = crate::configedit::KEYS
+                    .iter()
+                    .map(|key| key_json(key, &text))
+                    .collect();
+                let doc = serde_json::json!({
+                    "path": path.display().to_string(),
+                    "exists": exists,
+                    "problem": problem,
+                    "keys": keys,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".to_owned())
+                );
+            } else {
+                println!(
+                    "config:   {} ({})",
+                    path.display(),
+                    if exists { "present" } else { "absent" }
+                );
+                if let Some(problem) = &problem {
+                    eprintln!("  这份配置解析不过：{problem}");
+                }
+                for key in crate::configedit::KEYS {
+                    let written = crate::configedit::raw_value(&text, key.name);
+                    let value = written.clone().unwrap_or_else(|| "(默认)".to_owned());
+                    // 没写着的用空格代替 "="，一眼能看出哪些是自己设过的。
+                    let marker = if written.is_some() { '=' } else { ' ' };
+                    println!(
+                        "  {} {} {} # {}",
+                        pad(key.name, 18),
+                        marker,
+                        pad(&value, 10),
+                        key.label
+                    );
+                }
+            }
+            EXIT_OK
+        }
+
+        // ---------------------------------------------------------------
+        // 配置：写
+        // ---------------------------------------------------------------
+        //
+        // 顺序是刻意的：**先全部校验，再动文件**。有一项不合法就整批不改 ——
+        // 改一半的配置比不改更难收拾，而且"到底哪几项进了文件"无从回答。
+        Verb::ConfigSet => {
+            if request.sets.is_empty() && request.unsets.is_empty() {
+                eprintln!(
+                    "ops config-set: 没有要改的项（用 --ops-set key=value，删行用 --ops-unset key）"
+                );
+                return EXIT_USAGE;
+            }
+            let Some(path) = resolve_config(request.config.as_deref()) else {
+                eprintln!("ops config-set: 拿不到 exe 所在目录，没法定位配置");
+                return EXIT_MISSING;
+            };
+
+            // 1. 类型校验 + 格式化。键名先过 `find`：拼错的键不能靠"写进去再
+            //    让解析器报错"来发现，因为那已经把错的东西写进文件了。
+            let mut sets: Vec<(&'static crate::configedit::Key, String)> = Vec::new();
+            for (name, value) in &request.sets {
+                let Some(key) = crate::configedit::find(name) else {
+                    eprintln!(
+                        "ops config-set: 不认识的键 {name:?}（能改哪些键，看 --ops config-get）"
+                    );
+                    return EXIT_USAGE;
+                };
+                match crate::configedit::format_value(key, value) {
+                    Ok(formatted) => sets.push((key, formatted)),
+                    Err(err) => {
+                        eprintln!("ops config-set: {err}");
+                        return EXIT_USAGE;
+                    }
+                }
+            }
+            // `unset` 刻意**不**查键名：删掉一行不会引入任何新东西，而"把那个
+            // 拼错的键删掉"恰恰是最需要它的时刻 —— 在这儿严格校验，等于在最
+            // 该帮忙的地方把人挡回去改记事本。
+            let unsets: Vec<String> = request
+                .unsets
+                .iter()
+                .map(|name| name.trim().to_owned())
+                .filter(|name| !name.is_empty())
+                .collect();
+
+            // 2. 读旧文、留底。留底失败就**不写**：宁可不改，也不能改了退不回去。
+            let existed = path.exists();
+            let mut after = match read_config_text(&path) {
+                Ok(text) => {
+                    if text.is_empty() {
+                        NEW_CONFIG_HEAD.to_owned()
+                    } else {
+                        text
+                    }
+                }
+                Err(err) => {
+                    eprintln!("ops config-set failed: {err}");
+                    return EXIT_FAILED;
+                }
+            };
+            let backup = match backup_config(&root, &backups, &path, PRE_EDIT_LABEL) {
+                Ok(backup) => backup,
+                Err(err) => {
+                    eprintln!("ops config-set: 留底失败，没有写入：{err}");
+                    return EXIT_FAILED;
+                }
+            };
+
+            // 3. 逐项改写。按行替换，注释与分组原样留着。
+            let mut changes: Vec<(String, Option<String>, Option<String>)> = Vec::new();
+            for (key, value) in &sets {
+                let was = crate::configedit::raw_value(&after, key.name);
+                after = crate::configedit::set(&after, key.name, value);
+                let now = crate::configedit::raw_value(&after, key.name);
+                changes.push((key.name.to_owned(), was, now));
+            }
+            let mut removed: Vec<String> = Vec::new();
+            // 文件里本来就没有这一行：要如实说，不然界面上点了"清空"没反应，
+            // 人会以为是没生效。
+            let mut not_found: Vec<String> = Vec::new();
+            for key in &unsets {
+                if crate::configedit::raw_value(&after, key).is_some() {
+                    removed.push(key.clone());
+                } else {
+                    not_found.push(key.clone());
+                }
+                after = crate::configedit::remove(&after, key);
+            }
+
+            // 4. 用启动时同一套解析器再验一遍：保存能过 = 下次启动不会因为这份
+            //    文件起不来。校验不过就不落盘，旧文件一个字节没动。
+            if let Err(err) = crate::configedit::validate(&after) {
+                eprintln!("ops config-set: 改完这份配置过不了校验，没有写入：{err}");
+                return EXIT_FAILED;
+            }
+            if let Err(err) = crate::configedit::write_atomic(&path, &after) {
+                eprintln!("ops config-set: 写入失败: {err}");
+                return EXIT_FAILED;
+            }
+
+            if json {
+                let changes: Vec<serde_json::Value> = changes
+                    .iter()
+                    .map(|(key, was, now)| serde_json::json!({ "key": key, "was": was, "now": now }))
+                    .collect();
+                let doc = serde_json::json!({
+                    "path": path.display().to_string(),
+                    "created": !existed,
+                    "snapshot": backup.snapshot,
+                    "copy": backup.copy.as_ref().map(|p| p.display().to_string()),
+                    "changes": changes,
+                    "removed": removed,
+                    "not_found": not_found,
+                    // 服务是启动时读一次配置的，改完必须重启才生效 —— 写在结果里
+                    // 比写在文档里更可能被看见。
+                    "restart_required": true,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".to_owned())
+                );
+            } else {
+                println!("config:   {}", path.display());
+                if !existed {
+                    println!("  new:      原来没有这份文件，已新建");
+                }
+                if let Some(id) = &backup.snapshot {
+                    println!("  preedit:  {id}（--ops rollback 能退回）");
+                }
+                if let Some(copy) = &backup.copy {
+                    println!("  preedit:  {}（副本）", copy.display());
+                }
+                for (key, was, now) in &changes {
+                    println!(
+                        "  ~ {key}: {} -> {}",
+                        was.as_deref().unwrap_or("(默认)"),
+                        now.as_deref().unwrap_or("?")
+                    );
+                }
+                for key in &removed {
+                    println!("  - {key}: 已删掉这一行（回到默认值）");
+                }
+                for key in &not_found {
+                    println!("  ? {key}: 文件里本来就没有这一行，没动");
+                }
+                println!("  改完要重启服务才生效。");
+            }
+            EXIT_OK
         }
     }
 }
@@ -1501,6 +1909,181 @@ mod tests {
             .expect("有 --ops")
             .expect_err("动词不认识应当报错");
         assert!(bad.contains("unknown --ops verb"), "{bad}");
+    }
+
+    /// `--ops-set` 的值里可以再有等号：路径参数比键值对本身更容易出现 `=`，
+    /// 按第一个等号切才不会把 `C:\a=b\x.log` 截成 `C:\a`。
+    #[test]
+    fn request_parsing_collects_config_edits() {
+        let args = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let parsed = Request::parse(&args(&[
+            "--ops",
+            "config-set",
+            "--ops-set",
+            "fps=30",
+            "--ops-set",
+            "log=C:\\a=b\\x.log",
+            "--ops-unset",
+            "no_hdr",
+            "--ops-json",
+        ]))
+        .expect("有 --ops")
+        .expect("应当解析成功");
+        assert_eq!(parsed.verb, Some(Verb::ConfigSet));
+        assert_eq!(
+            parsed.sets,
+            vec![
+                ("fps".to_owned(), "30".to_owned()),
+                ("log".to_owned(), r"C:\a=b\x.log".to_owned()),
+            ]
+        );
+        assert_eq!(parsed.unsets, vec!["no_hdr".to_owned()]);
+        assert!(parsed.json);
+
+        let bad = Request::parse(&args(&["--ops", "config-set", "--ops-set", "fps"]))
+            .expect("有 --ops")
+            .expect_err("没有等号应当报错");
+        assert!(bad.contains("key=value"), "{bad}");
+    }
+
+    /// 配置在运行目录里：走快照，`--ops rollback` 能顺手退回去。
+    #[test]
+    fn editing_a_config_inside_the_root_leaves_a_snapshot() {
+        let dir = TempDir::new("cedit-in");
+        dir.write("stream-config.toml", "fps = 60\n");
+        let path = dir.0.join("stream-config.toml");
+        let backup = backup_config(&dir.0, &dir.backups(), &path, PRE_EDIT_LABEL)
+            .expect("留底应当成功");
+        let id = backup.snapshot.expect("目录里的配置走快照");
+        assert!(backup.copy.is_none(), "不该再另写一份副本");
+        assert!(id.ends_with(PRE_EDIT_LABEL), "{id}");
+        let snapshot = list(&dir.backups())
+            .into_iter()
+            .find(|s| s.id == id)
+            .expect("快照要能在列表里找到");
+        let saved = snapshot.files_dir(&dir.backups()).join("stream-config.toml");
+        assert_eq!(fs::read_to_string(saved).unwrap(), "fps = 60\n");
+    }
+
+    /// 配置在运行目录之外（`--config` 指到别处）：快照遍历不到它，就地留副本。
+    /// 关键是不能静默地"没留底就改了"。
+    #[test]
+    fn editing_a_config_outside_the_root_leaves_a_copy_next_to_it() {
+        let dir = TempDir::new("cedit-in2");
+        let elsewhere = TempDir::new("cedit-out");
+        let path = elsewhere.0.join("stream-config.toml");
+        fs::write(&path, "fps = 60\n").expect("写配置");
+        let backup =
+            backup_config(&dir.0, &dir.backups(), &path, PRE_EDIT_LABEL).expect("留底应当成功");
+        assert!(backup.snapshot.is_none());
+        let copy = backup.copy.expect("目录外的配置要留副本");
+        assert_eq!(copy.file_name().unwrap().to_string_lossy(), format!("stream-config.toml{PRE_EDIT_SUFFIX}"));
+        assert_eq!(fs::read_to_string(copy).unwrap(), "fps = 60\n");
+        // 副本必须留在原文件旁边，而不是运行目录或备份目录里 —— 找的时候人
+        // 只会看配置自己那一格。
+        assert!(path.with_file_name(format!("stream-config.toml{PRE_EDIT_SUFFIX}")).exists());
+    }
+
+    /// 文件还不存在时没有旧内容可留，也不该凭空造出快照。
+    #[test]
+    fn a_missing_config_needs_no_backup() {
+        let dir = TempDir::new("cedit-none");
+        let path = dir.0.join("stream-config.toml");
+        let backup = backup_config(&dir.0, &dir.backups(), &path, PRE_EDIT_LABEL)
+            .expect("留底应当成功");
+        assert!(backup.snapshot.is_none() && backup.copy.is_none());
+        assert!(list(&dir.backups()).is_empty(), "不该凭空多一份快照");
+    }
+
+    /// 中文占两列，按字符数补齐会让表格右列歪掉。
+    #[test]
+    fn pad_counts_wide_characters() {
+        assert_eq!(pad("fps", 6), "fps   ");
+        assert_eq!(pad("默认值啊", 10), "默认值啊  ");
+        // 已经比目标宽就原样返回，不截断。
+        assert_eq!(pad("超出宽度", 2), "超出宽度");
+    }
+
+    /// 这一条是实测撞出来的：回滚一份只含 `stream-config.toml` 的快照，
+    /// 目录里的 exe 被改名成了 `.rollback-old` —— 回滚配置把安装弄坏了。
+    #[test]
+    fn rolling_back_a_partial_snapshot_leaves_other_files_alone() {
+        let dir = TempDir::new("rb-partial");
+        dir.write("stream-server.exe", "bin");
+        dir.write("stream-config.toml", "fps = 60\n");
+        let only = vec!["stream-config.toml".to_owned()];
+        snapshot_paths(&dir.0, &dir.backups(), PRE_EDIT_LABEL, Some(&only))
+            .expect("快照应当成功");
+        dir.write("stream-config.toml", "fps = 15\n");
+
+        let report = rollback(&dir.0, &dir.backups(), None).expect("回滚应当成功");
+        assert_eq!(dir.read("stream-config.toml"), "fps = 60\n", "配置要退回去");
+        assert!(
+            report.stashed.is_empty(),
+            "只备份了几项的快照不该动别的文件：{:?}",
+            report.stashed
+        );
+        assert!(dir.0.join("stream-server.exe").exists(), "exe 必须原样还在");
+    }
+
+    /// 完整快照仍然要"多出来的文件让路"—— 那是更新的回退路径，不能一起放掉。
+    #[test]
+    fn rolling_back_a_full_snapshot_still_stashes_new_files() {
+        let dir = TempDir::new("rb-full");
+        dir.write("app.exe", "v1");
+        snapshot(&dir.0, &dir.backups(), "before").expect("快照应当成功");
+        dir.write("app.exe", "v2");
+        dir.write("new-in-v2.dll", "new");
+        let report = rollback(&dir.0, &dir.backups(), None).expect("回滚应当成功");
+        assert_eq!(dir.read("app.exe"), "v1");
+        assert!(
+            report.stashed.contains(&"new-in-v2.dll".to_owned()),
+            "更新带进来的新文件要让路：{:?}",
+            report.stashed
+        );
+    }
+
+    /// 只备份了几项时，别的文件不算"多出来的"。
+    #[test]
+    fn verifying_against_a_partial_snapshot_ignores_other_files() {
+        let dir = TempDir::new("verify-partial");
+        dir.write("stream-config.toml", "fps = 60\n");
+        let only = vec!["stream-config.toml".to_owned()];
+        snapshot_paths(&dir.0, &dir.backups(), PRE_EDIT_LABEL, Some(&only))
+            .expect("快照应当成功");
+        dir.write("stream-server.exe", "bin");
+        let report = verify(&dir.0, &dir.backups(), None).expect("校验应当成功");
+        assert!(
+            report.extra.is_empty(),
+            "别的文件不该被算成 extra：{:?}",
+            report.extra
+        );
+        assert!(report.is_clean());
+    }
+
+    /// 老版本写的清单里没有 `partial` 这一位：必须读成"完整快照"。读错方向
+    /// 的后果是升级之后第一次回滚就成了空转（该退回的新文件退不掉）。
+    #[test]
+    fn an_old_manifest_without_the_partial_field_reads_as_full() {
+        let dir = TempDir::new("old-manifest");
+        let snap = dir.backups().join("20260101T000000Z-before");
+        fs::create_dir_all(&snap).expect("建快照目录");
+        fs::write(
+            snap.join("manifest.json"),
+            r#"{
+                "id": "20260101T000000Z-before",
+                "created_unix": 1767225600,
+                "created_at": "2026-01-01T00:00:00Z",
+                "label": "before",
+                "version": "0.1.0",
+                "commit": "abc",
+                "root": "C:\\x",
+                "files": []
+            }"#,
+        )
+        .expect("写清单");
+        let loaded = load_manifest(&snap).expect("老清单要能读");
+        assert!(!loaded.partial, "没有这一位就是完整快照");
     }
 
     #[test]
