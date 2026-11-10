@@ -28,6 +28,7 @@
 //! dispatch   输入与设备：键鼠注入、手柄、光标、显示控制
 //! platform   平台适配：硬件编码探测、虚拟麦克风、默认录音设备
 //! security   横切：鉴权策略、主体、事件
+//! ops        横切：快照/回滚/校验，四个动作的共同底座（先于 config 执行）
 //! config     横切：命令行解析，无下游依赖
 //! ```
 //!
@@ -39,6 +40,7 @@ pub mod config;
 pub mod configfile;
 pub mod dispatch;
 pub mod http;
+pub mod ops;
 pub mod pipeline;
 pub mod platform;
 pub mod security;

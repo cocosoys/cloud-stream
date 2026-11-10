@@ -82,7 +82,10 @@ pub fn as_json() -> Value {
 }
 
 /// Unix 秒 → (年, 月, 日, 时, 分, 秒)，UTC（Howard Hinnant `civil_from_days`）。
-fn civil_from_unix(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
+///
+/// 对 crate 内公开：`ops` 要用它给快照目录起名（`20261110T075512Z-preinstall`），
+/// 而定宽的时间戳是"字典序即时间序"这个排序承诺的唯一来源。
+pub(crate) fn civil_from_unix(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
     let days = (secs / 86_400) as i64;
     let rem = (secs % 86_400) as u32;
 

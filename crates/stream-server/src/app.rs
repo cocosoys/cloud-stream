@@ -60,6 +60,22 @@ fn init_logger(
 /// 启动）；运行期的失败都在 `http::serve` 内部消化并记日志，不往上抛 —— 一个
 /// 已经在为用户服务的进程不该因为某个会话出错就退出。
 pub async fn run() -> anyhow::Result<()> {
+    // `--ops` 必须**早于**配置解析，而且早于下面那句 timeBeginPeriod：
+    //
+    // 1. 早于配置解析：最需要回滚的时刻，常常是配置文件刚被改坏的那一刻。让
+    //    "用来救命的那条命令"和"把机器搞坏的那份配置"死在同一个 `exit(2)` 上，
+    //    等于把唯一的恢复入口也一起锁掉。
+    // 2. 早于任何启动动作：它是一次性动作，不该调高定时器精度、不该绑端口。
+    //
+    // 参数直接从原始命令行读：`Config` 里没有 `--ops`，也不该有 —— 一次性动作
+    // 不进配置文件，这条规则在 `configfile` 的模块文档里已经写死了。
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(code) = crate::ops::try_run(&argv) {
+        // 用 exit 而不是 return：这条路径上不该再有任何退出清理被"顺手"引进来
+        // （默认录音设备还原之类），它没碰过那些状态。
+        std::process::exit(code);
+    }
+
     // #65: Windows 默认定时器粒度（~15.6 ms）会让 beat 的 `sleep` 超调，即使
     // beat 是 5.8 ms，循环也会被压到 ~57 Hz。一毫秒的粒度让 settle sleep 落在
     // 目标上。从 Windows 10 起这个请求的作用域限于本进程。
@@ -71,7 +87,7 @@ pub async fn run() -> anyhow::Result<()> {
     // 区分开：前者的唯一办法是人改文件，看门狗把机器重启一万次也不会好；后者
     // 值得重试。此刻日志还没初始化，所以只能用 eprintln —— 而这句就是用户能
     // 看到的全部，它必须自己说清是哪一份文件、哪一行。
-    let cfg = match config::Config::parse(std::env::args().skip(1).collect()) {
+    let cfg = match config::Config::parse(argv) {
         Ok(cfg) => Arc::new(cfg),
         Err(err) => {
             eprintln!("config error: {err}");

@@ -33,6 +33,7 @@
 | `config` | 命令行解析、默认值、配置文件优先级 | 0.9k | `Config::parse` |
 | `configfile` | TOML 配置：解析、覆盖、`--print-config` 回环 | 0.6k | `configfile::load`、`render` |
 | `version` | 版本与构建指纹，`/api/v1/version` 的数据源 | 0.2k | `version::as_json` |
+| `ops` | 快照/回滚/校验：四个动作（装/卸/更新/改）的失败兜底 | 1.0k | `ops::try_run`、`snapshot`、`rollback` |
 
 ## 3. 一次推流经过哪些模块
 
@@ -66,6 +67,7 @@ scrap（vendor）                               DXGI Desktop Duplication / GDI �
 2. **`http` 不做业务判断。** 路由、鉴权、序列化可以；帧格式、编码参数、采集状态不行 —— 那些属于 `pipeline`。
 3. **`app` 之外不许有启动副作用。** 装鉴权策略、切默认录音设备、探测编码器，只有 `app::run` 能做，且顺序即契约（策略必须在 bind 之前装好，否则前几个请求会按默认放行）。
 4. **跨层通信走既有类型，不要拉私有字段。** 需要新数据时先加一个 `pub` 方法或结构体，而不是把 `pub(crate)` 改成 `pub` 了事。
+5. **`ops` 必须先于 `config` 执行，且不依赖它。** `--ops` 在 `app::run` 的一开头、`Config::parse` 之前被拦下。理由不是分层洁癖：最需要回滚的时刻往往是配置文件刚被改坏的那一刻，而那时 `Config::parse` 会以退出码 2 结束进程 —— 恢复入口不能依赖它要恢复的东西。任何"顺手"把 `ops` 挪到 `config` 之后的改动都是在拆这条保险。
 
 **已知违反（欠账，见第 7 节）：**
 

@@ -1,6 +1,6 @@
 [package]
 name = "stream-server"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2018"
 rust-version = "1.75"
 description = "Stage1: RustDesk-style WebRTC streamer bridged to the selkies-webclient signaling contract."
