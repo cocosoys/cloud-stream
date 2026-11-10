@@ -95,6 +95,19 @@ pub struct Config {
     /// `DuplicateOutput1` failure before falling back to the legacy call; the
     /// flag silences that warning and opens the duplication path directly.
     pub no_hdr: bool,
+    /// 一键卸载：把上次遗留的默认录音设备还原，然后立刻退出，不启动任何服务。
+    ///
+    /// `uninstall.cmd` 在删目录之前跑一次。为什么必须有这个入口：默认录音
+    /// 设备是启动时被 `--mic-default-device auto` 接管的，而进程从来不是
+    /// 优雅退出的（看门狗、卸载、关机都是 `Stop-Process -Force`），拿不到
+    /// 任何清理机会；原值只在 `logs/mic-default.json` 这一个文件里，卸载
+    /// 又会把文件连同目录一起删掉 —— 不先还回去，这台机器的默认录音就
+    /// 永久停在虚拟线缆上，表现是"本地麦克风没声音"，得让人自己去声音
+    /// 设置里改，而那时已经没有任何线索指向我们。
+    ///
+    /// 与 `--mic-default-device off` 的区别只在于"还原完就退"：后者会把整个
+    /// 服务拉起来（绑端口、开始采集），在一个正在被卸载的目录里跑它是荒谬的。
+    pub restore_mic: bool,
     /// #60: diagnostic frame dump directory. When set, the pipeline writes the
     /// pre-scale BGRA frame and the post-scale BGRA frame every N-th beat to
     /// this directory as BMP files, so a smear/glitch can be attributed to the
@@ -138,6 +151,23 @@ pub struct Config {
     /// carried it, or the reload it triggers would revert it). This flag exists
     /// so a fresh process can start on VP8 without anyone touching the UI.
     pub video_codec: String,
+    /// #122: WebRTC 的 ICE 只用这一段 UDP 端口（含两端），默认 40000–40049。
+    ///
+    /// 为什么必须固定：ICE 的 host 候选默认绑 `:0`，也就是每个会话由系统随机
+    /// 挑端口 —— 防火墙按端口写的规则永远追不上它。全新 Windows 上只放行了
+    /// TCP 8080，浏览器发往那个随机端口的 STUN 检查被静默丢弃，ICE 凑不出
+    /// 可用候选对，页面只看到"媒体路径失败"，而信令和 WS 画面一切正常。
+    /// .148 之所以从没暴露这件事，是因为那台机器的防火墙**三档全关**。
+    ///
+    /// 一段区间而不是单端口：`ice` 的 `gather_candidates_local` 对**每个本机
+    /// 地址**各绑一个 socket（IPv4 多网卡、非 link-local 的 IPv6 都算），一个
+    /// 会话通常占 2–4 个。50 个端口对 `max_sessions=8` 留了足够余量。
+    ///
+    /// 改了这里就要同步 `toolchain/open-inbound.cmd` 里的
+    /// `cloud-stream webrtc UDP` 规则（程序规则 `cloud-stream app` 仍然覆盖任意
+    /// 端口，但它绑绝对路径，换个目录解压就失效）。
+    pub webrtc_udp_port_min: u16,
+    pub webrtc_udp_port_max: u16,
     /// #96: how long the client's game-mode ghost pointer stays on screen
     /// without an effective move, in seconds (default 5).
     ///
@@ -273,6 +303,7 @@ impl Default for Config {
             // to the working directory; rotation is deferred to stage4 serviceization.
             log_file: Some(PathBuf::from(r"logs\stream-server.log")),
             no_hdr: false,
+            restore_mic: false,
             dump_frame: None,
             repeat_every: 2,
             keyframe_secs: 10,
@@ -287,6 +318,11 @@ impl Default for Config {
             // more CPU per frame on the software encoder, which matters on a
             // small host asked for 1080p60.
             video_codec: "vp9".to_owned(),
+            // #122: pinned so `open-inbound.cmd` can describe the range. The
+            // library default is ":0" (a different random port per session),
+            // which no firewall rule can follow -- see the field docs.
+            webrtc_udp_port_min: 40000,
+            webrtc_udp_port_max: 40049,
             ghost_cursor_idle_secs: crate::dispatch::ghost::DEFAULT_IDLE_SECS,
             policy: "auto".to_owned(),
             auth_token: None,
@@ -303,6 +339,17 @@ impl Default for Config {
 }
 
 impl Config {
+    /// #122: 生效的 ICE UDP 端口区间（含两端）；`None` 表示交给库的默认
+    /// （每个会话随机一个端口，任何防火墙规则都跟不上）。
+    ///
+    /// 判定只做两件事：低于 1024 的端口要特权，部署包是普通用户会话里起的，
+    /// 绑不上；`max < min` 是一个必然让每个候选都失败的区间 —— 那种情况下
+    /// 退回随机端口比"HOST 候选一个都出不来"更容易查。
+    pub fn webrtc_udp_ports(&self) -> Option<(u16, u16)> {
+        let (min, max) = (self.webrtc_udp_port_min, self.webrtc_udp_port_max);
+        (min >= 1024 && max >= min).then_some((min, max))
+    }
+
     /// #110: 这次部署的门。
     ///
     /// `--auth-token` 与若干条 `--auth-grant` 合并成一张令牌表：前者是后者的
@@ -427,11 +474,33 @@ impl Config {
                     }
                 }
                 "--no-hdr" => cfg.no_hdr = true,
+                // 一键卸载专用：还原默认录音设备后立即退出（见字段注释）。
+                // 单独一个开关而不是复用 `--mic-default-device off`，是因为
+                // 后者只决定"启动时要不要接管"，仍然会把整个服务拉起来。
+                "--restore-mic" => cfg.restore_mic = true,
                 "--video-codec" => {
                     if let Some(v) = iter.next() {
                         // 未知值保留默认：本项目的默认是 VP8，拼错不该变成
                         // "启动失败"，但也别静默接受 —— main 里会记一条 warn。
                         cfg.video_codec = v;
+                    }
+                }
+                // #122: ICE 的 UDP 端口区间。两个都写才生效，且必须
+                // `min >= 1024`、`max >= min`；不成立时 `webrtc_udp_ports()`
+                // 返回 `None`，main 会记一条 warn（见该方法的注释：宁可退回
+                // 随机端口，也不要给 ICE 一个绑不上的区间）。
+                "--webrtc-udp-port-min" => {
+                    if let Some(v) = iter.next() {
+                        if let Ok(n) = v.parse::<u16>() {
+                            cfg.webrtc_udp_port_min = n;
+                        }
+                    }
+                }
+                "--webrtc-udp-port-max" => {
+                    if let Some(v) = iter.next() {
+                        if let Ok(n) = v.parse::<u16>() {
+                            cfg.webrtc_udp_port_max = n;
+                        }
                     }
                 }
                 // #96: optional, like the two above — the default (5 s) is what
@@ -654,6 +723,18 @@ mod tests {
         assert_eq!(parse(&["--keyframe-secs", "soon"]).keyframe_secs, 10);
     }
 
+    /// 一键卸载的开关：默认关（正常启动不该走还原分支），带上才提前退出。
+    ///
+    /// 这条测试守的是"默认值"那一侧 —— 如果它变成 true，每个被控机启动时
+    /// 都会先还一次默认录音设备再正常起，等于把 P1 的接管关掉了。
+    #[test]
+    fn restore_mic_is_off_unless_asked_for() {
+        assert!(!parse(&[]).restore_mic);
+        assert!(parse(&["--restore-mic"]).restore_mic);
+        // 与真正的启动参数并存时仍然是它说了算（卸载脚本会带上 --log）。
+        assert!(parse(&["--log", r"D:\s\logs\stream-server.log", "--restore-mic"]).restore_mic);
+    }
+
     /// #96: the ghost pointer's fade time is optional on purpose — the default
     /// is what almost every host wants, so a launch script need not carry it.
     #[test]
@@ -676,6 +757,40 @@ mod tests {
         let flipped = parse(&["--mode", "webrtc", "--video-codec", "vp8"]);
         assert_eq!(flipped.default_mode, "webrtc");
         assert_eq!(flipped.video_codec, "vp8");
+    }
+
+    /// #122: 默认区间就是 `open-inbound.cmd` 里那条 UDP 规则写的区间。
+    ///
+    /// 这两处必须一致 —— 它们描述的是同一件事，只是分别给 Windows 防火墙和
+    /// webrtc 看。不一致的症状很隐蔽：ICE 的候选绑在 40500，规则放行的是
+    /// 40000–40049，浏览器照样"媒体路径失败"，而脚本会打印"规则已在"。
+    #[test]
+    fn webrtc_udp_ports_default_to_the_range_the_firewall_rule_opens() {
+        assert_eq!(parse(&[]).webrtc_udp_ports(), Some((40000, 40049)));
+    }
+
+    /// 区间反向 / 低于特权端口时退回随机端口，而不是把一个必然失败的区间
+    /// 交给 ICE —— 那种失败是"所有 HOST 候选都绑不上"，比随机端口更难查。
+    #[test]
+    fn webrtc_udp_ports_read_the_flags_and_reject_a_broken_range() {
+        let cfg = parse(&[
+            "--webrtc-udp-port-min",
+            "41000",
+            "--webrtc-udp-port-max",
+            "41009",
+        ]);
+        assert_eq!(cfg.webrtc_udp_ports(), Some((41000, 41009)));
+
+        let inverted = parse(&[
+            "--webrtc-udp-port-min",
+            "41009",
+            "--webrtc-udp-port-max",
+            "41000",
+        ]);
+        assert_eq!(inverted.webrtc_udp_ports(), None);
+
+        let privileged = parse(&["--webrtc-udp-port-min", "80"]);
+        assert_eq!(privileged.webrtc_udp_ports(), None);
     }
 
     /// A value outside the range is clamped rather than announced: 0 would read

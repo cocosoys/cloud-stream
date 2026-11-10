@@ -124,8 +124,31 @@ impl MediaSession {
     /// join does not exist yet at `SESSION` time, so the source of truth is the
     /// session's own settings — which is also what the SDP-answer path consults
     /// when a browser refuses the pick, so offer and refusal cannot disagree.
-    pub async fn new(codec: crate::pipeline::codec::VideoCodec) -> Result<Self> {
+    ///
+    /// #122: `udp_ports` is the `(min, max)` range the ICE agent may bind, from
+    /// `Config::webrtc_udp_ports()`. `None` keeps the library default (":0",
+    /// one random port per session).
+    pub async fn new(
+        codec: crate::pipeline::codec::VideoCodec,
+        udp_ports: Option<(u16, u16)>,
+    ) -> Result<Self> {
         let mut setting_engine = SettingEngine::default();
+        // #122: pin the ICE sockets to a known range so a firewall rule can
+        // describe them. The library default binds ":0" -- a fresh random port
+        // per session, which no inbound rule can follow; on a stock Windows
+        // that silently drops the browser's connectivity checks and the page
+        // reports "media path failed" while WebSockets works fine.
+        if let Some((min, max)) = udp_ports {
+            match webrtc::ice::udp_network::EphemeralUDP::new(min, max) {
+                Ok(pinned) => {
+                    setting_engine
+                        .set_udp_network(webrtc::ice::udp_network::UDPNetwork::Ephemeral(pinned));
+                }
+                Err(err) => {
+                    log::warn!("ignoring ICE udp port range {min}-{max}: {err}; falling back to ephemeral ports");
+                }
+            }
+        }
         // No detach_data_channels(): attached channels keep the internal read
         // loop that dispatches on_message; see the module-level note.
         setting_engine.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);

@@ -1179,7 +1179,9 @@ where
 /// Build the PC, two channels and the VP8 track once the client asks for a
 /// session; subscribe to its state, start the stats timer and the ICE forwarder.
 async fn start_media_session(ctx: &mut SessionCtx) -> Result<()> {
-    let media = Arc::new(Mutex::new(MediaSession::new(ctx.settings.codec()).await?));
+    let media = Arc::new(Mutex::new(
+        MediaSession::new(ctx.settings.codec(), ctx.cfg.webrtc_udp_ports()).await?,
+    ));
     ctx.media = Some(media.clone());
 
     // #62: worker-termination sink. A panicking or erroring capture worker used

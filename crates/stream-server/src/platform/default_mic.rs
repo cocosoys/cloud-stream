@@ -144,6 +144,12 @@ pub struct Status {
     pub note: String,
     /// [`restore`] 是否已经跑过。
     pub restored: bool,
+    /// `restore_pending` 成功还回去的角色个数 / 总数。
+    ///
+    /// 单独给字段而不是让调用方去解析 `note`：`--restore-mic` 的消费者是一个
+    /// `.cmd`，它要在 GBK 控制台里读结论，中文无论怎么排都会变成乱码。
+    pub restored_roles: usize,
+    pub total_roles: usize,
 }
 
 impl Status {
@@ -223,14 +229,24 @@ pub fn apply(policy: Policy, target: &Target, state_path: Option<&Path>) -> Stat
     if policy == Policy::Off {
         match leftover {
             Some(previous) => {
-                let restored = restore_entries(&previous);
+                let outcome = restore_entries(&previous);
                 if let Some(path) = state_path {
                     remove_state(path);
                 }
                 st.status.action = "restored";
+                st.status.restored_roles = outcome.ok;
+                st.status.total_roles = previous.len();
                 st.status.note = format!(
-                    "--mic-default-device off：已把上次遗留的默认录音设备还原（{restored} 个角色）"
+                    "--mic-default-device off：已把上次遗留的默认录音设备还原（{}/{} 个角色）",
+                    outcome.ok,
+                    previous.len()
                 );
+                if !outcome.failed.is_empty() {
+                    if let Some(reason) = &outcome.reason {
+                        st.status.note = format!("{}（{}）", st.status.note, reason);
+                    }
+                    st.status.previous = outcome.failed;
+                }
             }
             None => {
                 st.status.action = "disabled";
@@ -302,14 +318,59 @@ pub fn apply(policy: Policy, target: &Target, state_path: Option<&Path>) -> Stat
     st.status.clone()
 }
 
+/// 一键卸载用：只做"把上次遗留的默认录音设备还回去"这一件事，不做任何决议。
+///
+/// 与 [`apply`] 的 `Off` 分支是同一段逻辑，区别在调用方：卸载工具是一个
+/// `.cmd`，手里只有 exe 和一个目录，构造不出 [`Target`]，也不该为了"还回一个
+/// 设备"去探测虚拟线缆还在不在 —— 线缆可能正是上一个被卸载的东西。
+///
+/// 返回 `None` 表示没有遗留记录（没切过、已经还原过、文件坏了），调用方据此
+/// 打印"无需还原"而不是假装做了什么。文件在还原之后一并删掉：它是"欠系统一次
+/// 还原"的账本，还完就该消失。
+pub fn restore_pending(state_path: Option<&Path>) -> Option<Status> {
+    let path = state_path?;
+    let previous = read_state(path)?;
+    let outcome = restore_entries(&previous);
+    remove_state(path);
+    let mut status = Status {
+        policy: Policy::Off.as_str(),
+        action: "restored",
+        note: format!(
+            "卸载前还原默认录音设备：{}/{} 个角色",
+            outcome.ok,
+            previous.len()
+        ),
+        restored_roles: outcome.ok,
+        total_roles: previous.len(),
+        ..Status::default()
+    };
+    if !outcome.failed.is_empty() {
+        // 没还回去的角色连同原因一起带出去：调用方下一步就要删掉整个目录，
+        // 账本一没，用户连"该改回哪个设备"都无处可查。
+        if let Some(reason) = &outcome.reason {
+            status.note = format!("{}（{}）", status.note, reason);
+        }
+        status.previous = outcome.failed;
+    }
+    Some(status)
+}
+
 /// 还原到切换前的设备。幂等：没切过、已经还原过、进程没起来过都安全。
 pub fn restore() {
     let mut st = state().lock().unwrap_or_else(|e| e.into_inner());
     if st.saved.is_empty() || st.status.restored {
         return;
     }
-    let count = restore_entries(&st.saved);
+    let outcome = restore_entries(&st.saved);
+    let count = outcome.ok;
     log::info!("microphone restore | 默认录音设备已还原（{count} 个角色）");
+    if let Some(reason) = outcome.reason {
+        log::warn!(
+            "microphone restore | {} 个角色没有还原（{reason}），原值：{}",
+            outcome.failed.len(),
+            outcome.failed.join(", ")
+        );
+    }
     if let Some(path) = st.path.clone() {
         remove_state(&path);
     }
@@ -318,16 +379,36 @@ pub fn restore() {
     st.status.note = format!("默认录音设备已还原（{count} 个角色）");
 }
 
-/// 把一组 `(role, device_id)` 写回系统，返回成功的个数。
-fn restore_entries(entries: &[(i32, String)]) -> usize {
-    let mut ok = 0;
+/// 还原一组原值的结果。
+struct Restore {
+    /// 成功写回的角色个数。
+    ok: usize,
+    /// 没写回去的角色，`console={0.0.0...}` 这种，交给调用方原样转述。
+    failed: Vec<String>,
+    /// 第一条失败原因。同一个入口下三个角色通常一起失败，只报一条足够。
+    reason: Option<String>,
+}
+
+/// 把一组 `(role, device_id)` 写回系统。
+fn restore_entries(entries: &[(i32, String)]) -> Restore {
+    let mut outcome = Restore {
+        ok: 0,
+        failed: Vec::new(),
+        reason: None,
+    };
     for (role, id) in entries {
         match win::set_default_capture(id, *role) {
-            Ok(()) => ok += 1,
-            Err(err) => log::warn!("microphone restore | {}={id} 失败：{err}", role_name(*role)),
+            Ok(()) => outcome.ok += 1,
+            Err(err) => {
+                log::warn!("microphone restore | {}={id} 失败：{err}", role_name(*role));
+                outcome.failed.push(format!("{}={id}", role_name(*role)));
+                if outcome.reason.is_none() {
+                    outcome.reason = Some(err);
+                }
+            }
         }
     }
-    ok
+    outcome
 }
 
 // ---------------------------------------------------------------------------
@@ -492,8 +573,18 @@ mod win {
         }
     }
 
+    /// `IPolicyConfig` 是进程内组件，但 `CoCreateInstance` 要求**当前线程**
+    /// 已经初始化过 COM：没初始化的线程上它直接返回 `CO_E_NOTINITIALIZED`
+    /// （0x800401F0）。`with_com` 里那次 `CoInitializeEx` 覆盖不到这里 ——
+    /// 三个调用点（切换、还原、卸载还原）都是先要 policy config 再读设备，
+    /// 于是换成 `--restore-mic` 这种从不碰 WASAPI 的入口时，还原一次都没成功过，
+    /// 只有 `0/N` 这个数字透露了实情。
+    ///
+    /// `RPC_E_CHANGED_MODE` 不是失败：它说明线程已经在别的 apartment 里，
+    /// COM 本身就是可用的，照样能创建对象。
     fn policy_config() -> Result<IPolicyConfig, String> {
         unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             CoCreateInstance(&CLSID_POLICY_CONFIG, None, CLSCTX_ALL)
                 .map_err(|err| format!("CoCreateInstance(IPolicyConfig): {err}"))
         }
@@ -791,5 +882,45 @@ mod tests {
         std::fs::write(&path, r#"{"previous":[{"role":0}]}"#).unwrap();
         assert!(read_state(&path).is_none(), "缺 id 的条目不能瞎猜");
         remove_state(&path);
+    }
+
+    #[test]
+    fn uninstall_restores_the_pending_record_then_clears_it() {
+        // 卸载时最要紧的一步：原值文件马上就要连着目录被删掉，不先还回去，
+        // 这台机器的默认录音就永久停在虚拟线缆上。
+        let path = temp_path("restore-pending");
+        let entries = vec![
+            (ROLE_CONSOLE, "{0.0.0.00000000}.{ccc}".to_owned()),
+            (ROLE_COMMUNICATIONS, "{0.0.0.00000000}.{ddd}".to_owned()),
+        ];
+        write_state(&path, "CABLE Output (VB-Audio Virtual Cable)", &entries);
+
+        let status = restore_pending(Some(&path)).expect("有记录就必须还一次");
+        assert_eq!(status.action, "restored");
+        // 计数可能是 0：测试机上那个设备 id 不存在，set 必然失败。这里只要求
+        // 报出分母，让卸载窗口能说"涉及 2 个角色"，不把失败伪装成没发生。
+        assert!(status.note.contains("/2"), "note 要报出角色总数：{}", status.note);
+        assert_eq!(status.total_roles, 2, "分母要单独给，调用方不解析中文 note");
+        assert!(status.restored_roles <= 2);
+        // 两个假 id：Windows 对不存在的端点有时照样回 S_OK，所以不能钉死
+        // "必然失败"。这里钉的是不允许出现的状态 —— 少了角色却什么都没说。
+        if status.restored_roles < 2 {
+            assert_eq!(status.previous.len(), 2, "没还原的条目必须带出去");
+        }
+        assert!(read_state(&path).is_none(), "还完账本必须消失");
+
+        assert!(
+            restore_pending(Some(&path)).is_none(),
+            "第二次卸载什么都不做（幂等）"
+        );
+    }
+
+    #[test]
+    fn uninstall_without_a_record_is_a_no_op() {
+        // 没配过 --log、从没切过、文件坏了 —— 都不该让卸载卡住。
+        assert!(restore_pending(None).is_none(), "没有日志目录就没有账本");
+        let path = temp_path("restore-none");
+        let _ = std::fs::remove_file(&path);
+        assert!(restore_pending(Some(&path)).is_none(), "文件不存在就无事可做");
     }
 }
