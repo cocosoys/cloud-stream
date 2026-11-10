@@ -62,3 +62,6 @@ Thumbs.db
 # Python bytecode (toolchain/*.py 是本机诊断脚本)
 __pycache__/
 *.pyc
+
+# 提交信息的临时落点（bash 里 heredoc 会被拦，只能先写文件再 `git commit -F`）
+.git-commit-msg.tmp
