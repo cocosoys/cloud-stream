@@ -59,6 +59,11 @@ fn surface_of(route: &Route) -> EventKind {
         // #99: 清单把全站的文件名和哈希一次性摊开，属于侦察面，单独一类而不是
         // 并进 `Static` —— 将来"能拉页面"和"能点出整棵文件树"可以分权。
         Route::Manifest => Endpoint::Manifest,
+        // 版本与健康同属**只读观测**面：都不改任何状态，都只回答"这台机器
+        // 是什么"。不新开一个 `Endpoint` 变体，是因为每加一个就得在策略表里
+        // 多一处"忘了配"，而这里分权的收益是零 —— 想知道版本的人本来就能从
+        // 健康报告里读到同一件事。
+        Route::Version => Endpoint::Health,
         Route::Static(_) => Endpoint::Static,
         // #106: 媒体 socket 与信令同一个端点面 —— 两者都是"给我一路画面"的升级
         // 路径，区别只在线上格式。给它单开一类，就得到策略表里再加一处"忘了配"
@@ -456,6 +461,24 @@ where
                 &principal,
             )
             .await;
+            return Ok(());
+        }
+
+        // 版本与构建指纹。刻意**不带 ETag、明确 no-store**：更新器问"现在跑的
+        // 是哪一版"时，答案必须是此刻这一份。缓存住它，等于让它对着一个已经
+        // 被替换掉的版本判断要不要升级 —— 而这类错误只会表现为"更新器一直说
+        // 已是最新"，没人会去怀疑缓存头。
+        crate::http::Route::Version => {
+            let body = crate::version::as_json().to_string();
+            crate::http::write_http_with(
+                &mut stream,
+                200,
+                "OK",
+                "application/json; charset=utf-8",
+                body.as_bytes(),
+                &[("Cache-Control", "no-store")],
+            )
+            .await?;
             return Ok(());
         }
 

@@ -1,0 +1,96 @@
+# ============================================================================
+# cloud-stream 被控端配置
+#
+# 这份文件是「这台机器的常态」。`start-stream.cmd` 只负责三件与部署位置绑定的
+# 事：前端目录在哪、证书在不在、令牌文件有没有 —— 那些跟着目录走，写在这里
+# 每次都要跟着改。参数跟着机器走，写在这里。
+#
+# 优先级：默认值 < 本文件 < 命令行。所以 cmd 里那句 `--tls-cert` 永远能盖过
+# 这里；改这里的值不需要动脚本，改完重启计划任务 MCStreamSrv 生效。
+#
+# 想知道"现在到底生效了什么"，跑：
+#     stream-server.exe --config stream-config.toml --print-config
+# 它打出来的是**当前生效值**，不是默认值，可以直接存回来当模板。
+# 加 `json` 得到同样的内容，给程序读。
+#
+# 键名与命令行一一对应：`--some-flag` 写成 `some_flag`。
+# 空串 "" 表示「这一项是关的」；删掉整行表示「用默认值」。
+# 拼错一个键名会让服务**启动失败并指出是哪个键**，而不是静默忽略 —— 后者会
+# 表现成"我改了没生效"，那种问题查起来比启动失败贵得多。
+# ============================================================================
+
+# ---------- 网络 ----------
+# 0.0.0.0 = 所有网卡。只给本机用写 127.0.0.1。
+host = '0.0.0.0'
+port = 8080
+
+# ---------- 页面 ----------
+# app: 信令路径里的 app 段（/api/<app>/signaling/），前端写死了 webrtc。
+app = 'webrtc'
+# mode: 新页面默认走哪条传输。websockets 只用一个 TCP 端口、不需要 UDP 放行，
+# 全新环境第一次打开就能出画面；webrtc 的 NACK/PLI/FEC 更好，但要求
+# 40000–40049 的 UDP 入站已在防火墙里放行。面板上随时能切。
+mode = 'websockets'
+
+# ---------- 画面 ----------
+width = 1920
+height = 1080
+# fps: 编码是 CPU 干的。核显/虚拟机宿主上 15–30 更稳，实体机 60。
+fps = 60
+# bitrate: 单位 kbps。1080p60 用 2500–4000。
+bitrate = 2500
+# repeat_every: 静止画面每 N 拍重发一帧。1 = 保持完整节奏。
+repeat_every = 1
+# keyframe_secs: 周期关键帧间隔。调小会让码率被关键帧吃掉（一个 IDR 100–200 KB）。
+keyframe_secs = 10
+# video_codec: vp9 画质好但 CPU 高；vp8 省 CPU，弱机上更稳。
+video_codec = 'vp9'
+# display: 采集哪块屏（DXGI 序号，0 = 主屏）。
+display = 0
+
+# ---------- 编码 ----------
+# auto 永不失败：找不到硬件编码就落回软件编码并说明原因。
+# nvenc / amf / qsv 是硬要求，硬件不在时**启动即失败** —— 那是明确的意图。
+encoder = 'auto'
+# tuned（默认）或 legacy（#95 之前的参数集），用于同机对比新旧画质。
+tune = 'tuned'
+
+# ---------- 输入 ----------
+# exclusive：只有持锁的那个会话能操作（默认）。
+# shared：任何连上的会话都能操作 —— 电视墙 / 多人围观时用这个。
+input_policy = 'exclusive'
+# 并发信令会话上限，超出返回 503 + Retry-After。
+max_sessions = 8
+# 游戏模式下客户端幽灵指针静止多少秒后淡出。
+ghost_cursor_idle = 5
+
+# ---------- 音频 ----------
+# auto = 挑一台虚拟线缆（Steam Streaming Microphone / VB-CABLE / VoiceMeeter）。
+# 没有线缆时报"不可用"并给出安装提示，**不会**退回扬声器（那会导致自听）。
+mic_device = 'auto'
+# auto = 启动时把系统默认**录音**设备切到那根线缆（游戏启动时读一次并缓存，
+# 会话开始才切就晚了）；off = 完全不碰系统设置。
+mic_default_device = 'auto'
+
+# ---------- 上传 ----------
+# 每个租户的配额（MiB），0 = 不限。512 够传存档截图，不够写死系统盘。
+upload_quota_mb = 512
+
+# ---------- ICE ----------
+# WebRTC 的 UDP 端口区间。改了这里就要同步防火墙规则
+# （toolchain/open-inbound.cmd 里的 `cloud-stream webrtc UDP`）。
+# 走 websockets 时这段用不上，但留着不影响。
+webrtc_udp_port_min = 40000
+webrtc_udp_port_max = 40049
+
+# ---------- 安全 ----------
+# auto = 有没有令牌决定 allow-all / role-based。口令本身在 auth-token.txt，
+# 由 start-stream.cmd 用 --auth-token 传入，不写在这里（这份文件可能进版本库）。
+policy = 'auto'
+# 多租户才需要，格式 "租户:角色:令牌"，整体替换而不是追加。
+auth_grants = []
+
+# ---------- 诊断 ----------
+# VMware SVGA 3D 这类没有 HDR 桌面的宿主上设 true：省掉每次启动必然失败的那
+# 一次 HDR 采集尝试。真实 HDR 显示器上设 false。
+no_hdr = true

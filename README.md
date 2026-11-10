@@ -87,12 +87,27 @@ toolchain\build.ps1 -Task build -CargoArgs --release
 ## 运行
 
 日常不用手敲参数：部署脚本会把“被控端需要的全部东西”汇总成
-`target\output\cloud-stream`（运行根），里面的 `start-stream.cmd` 按自身位置
-推导所有路径，命令行参数也在那里：
+`target\output\cloud-stream`（运行根）。里面的 `start-stream.cmd` 按自身位置
+推导所有路径，只传三类与环境相关的东西（前端目录在哪、证书在不在、令牌文件
+有没有），**其余参数在 `stream-config.toml`**：
 
 ```powershell
 target\output\cloud-stream\start-stream.cmd
 ```
+
+改分辨率、帧率、码率、编码器、输入策略，都是编辑那份 TOML，改完重启计划任务
+生效。想知道“现在到底生效了什么”，跑：
+
+```powershell
+stream-server.exe --config stream-config.toml --print-config
+```
+
+它打出来的是**当前生效值**（不是默认值），带注释，可以直接存回去当模板；
+加 `json` 得到同样的内容给程序读。优先级是「默认值 < 配置文件 < 命令行」，
+所以脚本里那几条 `--flag` 永远压过文件。键表、空串语义、改错时的行为见
+[`docs/configuration.md`](docs/configuration.md)。版本与构建指纹走
+`/api/v1/version`（`version` / `commit` / `dirty` / `built_at`），供更新器判断
+“要不要升级”。
 
 整包（含前端、证书、启动脚本）还有一个同名 zip，拷到新设备解压即可跑，见
 `docs/deploy-one-click.md` §1.1。在**新设备**上第一次用就是双击 `install.cmd`：
@@ -160,7 +175,8 @@ cd target\output\cloud-stream
 
 | 文档 | 内容 |
 |---|---|
-| [`docs/architecture.md`](docs/architecture.md) | **架构：模块边界、依赖规则、四个扩展点、模块化欠账** |
+| [`docs/architecture.md`](docs/architecture.md) | **架构：模块边界、依赖规则、五个扩展点、模块化欠账** |
+| [`docs/configuration.md`](docs/configuration.md) | **配置：三层优先级、完整键表、`--print-config` 回环、改错时的行为** |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | **参与开发：环境、构建、测试、提交规范、硬规矩** |
 | [`docs/roadmap-l2-l3-gaps.md`](docs/roadmap-l2-l3-gaps.md) | 全量盘点：已完成 / 部分 / 未做，逐项拆解 |
 | [`docs/stage1-signaling-session.md`](docs/stage1-signaling-session.md) | 信令契约与会话状态机 |

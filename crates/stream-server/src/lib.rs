@@ -36,10 +36,12 @@
 
 pub mod app;
 pub mod config;
+pub mod configfile;
 pub mod dispatch;
 pub mod http;
 pub mod pipeline;
 pub mod platform;
 pub mod security;
 pub mod signaling;
+pub mod version;
 pub mod webrtc;

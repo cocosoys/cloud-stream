@@ -56,6 +56,22 @@ impl Default for InputPolicy {
     }
 }
 
+/// 配置文件不能用：读不出来、格式不对、键名拼错、类型不对。
+///
+/// 单独一个类型而不是裸 `String`，是为了让 `app::run` 能用退出码 2 把"配置错"
+/// 和"端口被占"这类运行期失败分开：前者要人改文件，重试多少次都不会好；后者
+/// 值得重试。看门狗把这台机器重启一万次也不会救回一个拼错的键名。
+#[derive(Debug)]
+pub struct ConfigError(pub String);
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Listen interface.
@@ -108,6 +124,25 @@ pub struct Config {
     /// 与 `--mic-default-device off` 的区别只在于"还原完就退"：后者会把整个
     /// 服务拉起来（绑端口、开始采集），在一个正在被卸载的目录里跑它是荒谬的。
     pub restore_mic: bool,
+    /// 一次性动作：打印生效配置后退出，不绑端口、不开日志、不碰采集。
+    ///
+    /// 值是输出格式（`toml` 默认，或 `json`）。两个理由：人要看"这台机器现在
+    /// 到底按什么在跑"——三十二个参数的默认值没人记得住；可视化配置界面要读
+    /// 一份**结构化、键名稳定**的当前值去回填表单，让它自己去解析 cmd 里的引号
+    /// 拼接是荒唐的。
+    ///
+    /// 输出必须能回环：把 `--print-config` 的 toml 存成 config.toml 再启动，
+    /// 得到的必须是同一个配置。`configfile` 里有一个测试守着这一条。
+    pub print_config: Option<String>,
+    /// 实际读到的配置文件（`--config` 指定，或 exe 旁边自动发现的）。
+    ///
+    /// 不是配置项，是"这份配置从哪来"的元信息。两个用处：启动日志要解释
+    /// "为什么是 1280 而不是 1920"，诊断时要能一眼看出读的是不是那份以为的文件。
+    /// `None` = 没有配置文件，全部来自默认值 + 命令行。
+    ///
+    /// **刻意不进 `--print-config` 的输出**：那是配置本体，掺进元信息后
+    /// "打印出来存回去再打印"就不再逐字节相同，回环承诺会破。
+    pub config_source: Option<PathBuf>,
     /// #60: diagnostic frame dump directory. When set, the pipeline writes the
     /// pre-scale BGRA frame and the post-scale BGRA frame every N-th beat to
     /// this directory as BMP files, so a smear/glitch can be attributed to the
@@ -304,6 +339,8 @@ impl Default for Config {
             log_file: Some(PathBuf::from(r"logs\stream-server.log")),
             no_hdr: false,
             restore_mic: false,
+            print_config: None,
+            config_source: None,
             dump_frame: None,
             repeat_every: 2,
             keyframe_secs: 10,
@@ -370,9 +407,47 @@ impl Config {
     /// Parse `argv` after the program name. Unknown flags keep the default and
     /// are logged once; a non-numeric value for a numeric flag keeps the
     /// default rather than aborting startup.
-    pub fn parse(argv: Vec<String>) -> Self {
+    ///
+    /// 配置文件先应用、命令行后应用，于是**命令行永远赢**。文件本身有问题时
+    /// 返回 [`ConfigError`] 而不是继续：那是运维写的输入错了，带着半份配置起
+    /// 服务只会让人以为"我改的生效了"。
+    ///
+    /// 缺省位置（exe 旁边的 `config.toml`）是**可选**的 —— 老部署里没有这个
+    /// 文件，行为必须一个字节都不变，这是整个模块能被安全引入的前提。
+    pub fn parse(argv: Vec<String>) -> Result<Self, ConfigError> {
         let mut cfg = Self::default();
-        let mut iter = argv.into_iter();
+
+        // 第一遍只找 `--config`。文件是优先级最低的一层，必须先于任何命令行
+        // 参数应用；边扫边用会让 `--config` 写在末尾时，前面的参数悄悄输给文件。
+        let mut explicit: Option<PathBuf> = None;
+        {
+            let mut probe = argv.iter();
+            while let Some(arg) = probe.next() {
+                if arg == "--config" {
+                    explicit = probe.next().map(PathBuf::from);
+                }
+            }
+        }
+
+        let from_default_location = explicit.is_none();
+        if let Some(path) = explicit.or_else(crate::configfile::default_path) {
+            // 显式 `--config` 是"我说了有这么一份"，找不到就是错；默认位置只是
+            // 顺手看一眼，不存在属于常态。
+            if !from_default_location || path.exists() {
+                let file = crate::configfile::load(&path).map_err(ConfigError)?;
+                let mut warnings = Vec::new();
+                file.apply(&mut cfg, &mut warnings);
+                // 用 eprintln 而不是 log：此刻 logger 还没初始化（它在 app::run
+                // 里、`parse` 之后才建），`log::warn!` 会直接消失 —— 而这条恰恰
+                // 是"我改了配置却没生效"的唯一线索。
+                for warning in warnings {
+                    eprintln!("[config] {warning}");
+                }
+                cfg.config_source = Some(path);
+            }
+        }
+
+        let mut iter = argv.into_iter().peekable();
         while let Some(arg) = iter.next() {
             match arg.as_str() {
                 "--host" => {
@@ -640,12 +715,34 @@ impl Config {
                         }
                     }
                 }
+                // 值已经在第一遍里读过并应用了，这里只是把它吞掉 —— 否则下面
+                // 的 `other` 分支会把 `--config` 报成未知参数，而它明明生效了。
+                "--config" => {
+                    let _ = iter.next();
+                }
+                // 可选值：`--print-config` 或 `--print-config json`。用 peek
+                // 而不是无条件吞下一个 token，否则 `--print-config --port 9000`
+                // 会把 `--port` 吃掉，而那个参数本该生效。
+                "--print-config" => {
+                    let format = match iter.peek().map(|s| s.as_str()) {
+                        Some("json") => {
+                            let _ = iter.next();
+                            "json"
+                        }
+                        Some("toml") => {
+                            let _ = iter.next();
+                            "toml"
+                        }
+                        _ => "toml",
+                    };
+                    cfg.print_config = Some(format.to_owned());
+                }
                 other => {
                     log::warn!("unknown CLI argument ignored: {other}");
                 }
             }
         }
-        cfg
+        Ok(cfg)
     }
 
     /// Spacing between pipeline beats, per the stage1 decision: duration is
@@ -675,6 +772,7 @@ mod tests {
 
     fn parse(args: &[&str]) -> Config {
         Config::parse(args.iter().map(|s| (*s).to_owned()).collect())
+            .expect("测试用的命令行应当总能解析")
     }
 
     /// The default dist must stay portable. A drive-qualified default would only

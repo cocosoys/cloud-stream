@@ -1,6 +1,6 @@
 [package]
 name = "stream-server"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2018"
 rust-version = "1.75"
 description = "Stage1: RustDesk-style WebRTC streamer bridged to the selkies-webclient signaling contract."
@@ -26,6 +26,12 @@ bytes = { version = "1.10", features = ["serde"] }
 anyhow = "1.0"
 log = "0.4"
 httparse = "1.10"
+
+# 配置文件（`--config`）。选 0.7 而不是最新版：它已经在 workspace 的 lock 里
+# （别的 crate 间接依赖），本机 registry 缓存里也有，所以这个依赖不新增任何
+# 下载、不引入新的传递依赖树。TOML 而不是 JSON/INI，是因为配置文件主要给人看
+# 和给人改，注释和分组在 TOML 里是原生的。
+toml = "0.7"
 
 # #106: JPEG stripes (`0x03`) for a browser without WebCodecs. Pure Rust, no
 # build script, no C dependency — the alternative (libjpeg-turbo) would add a

@@ -30,7 +30,9 @@
 | `dispatch` | 上行命令路由、下行白名单、键鼠注入、手柄、光标、剪贴板 | 6.1k | `commands`、`win_input` |
 | `platform` | 平台适配：硬件编码探测、虚拟麦克风、默认录音设备、主机指标 | 2.3k | `hwenc::probe`、`virtual_mic::probe` |
 | `security` | 监听面鉴权骨架：事件名、主体、策略 | 1.5k | `install`、`EventKind`、`Policy` |
-| `config` | 命令行解析与默认值 | 0.8k | `Config::parse` |
+| `config` | 命令行解析、默认值、配置文件优先级 | 0.9k | `Config::parse` |
+| `configfile` | TOML 配置：解析、覆盖、`--print-config` 回环 | 0.6k | `configfile::load`、`render` |
+| `version` | 版本与构建指纹，`/api/v1/version` 的数据源 | 0.2k | `version::as_json` |
 
 ## 3. 一次推流经过哪些模块
 
@@ -69,7 +71,7 @@ scrap（vendor）                               DXGI Desktop Duplication / GDI �
 
 - `config` 反向依赖了 `security`（`GrantSpec`/`TokenGate`）、`dispatch`（`ghost::DEFAULT_IDLE_SECS`、`ghost::clamped`）、`platform`（`default_mic::Policy`）。配置层本不该知道业务类型，这是历史积累。
 
-## 5. 四个常见扩展点
+## 5. 五个常见扩展点
 
 ### 加一个编码器
 
@@ -84,6 +86,19 @@ scrap（vendor）                               DXGI Desktop Duplication / GDI �
 3. 如果要保留运行时切换，接到现有的 `set_gdi()` 开关上（`capture.rs:161`），它已经在 `stream_info` 里上报了。
 
 ⚠️ `scrap` 的 DXGI 路径是单适配器（`EnumAdapters1(0, ...)`）。任何"跨适配器"的需求（虚拟显示器、多显卡）都得先改这一处。
+
+### 加一个配置项
+
+这是最常见的改动，一共六处，漏了任何一处都有对应测试或症状把它顶出来：
+
+1. `config.rs`：`Config` 加字段 + `Default` 加默认值 + `parse` 的 `match` 加一个 `--flag` 分支；
+2. `configfile.rs`：`FileConfig` 加同名字段（`Option<T>`，需要改键名就加 `#[serde(rename)]`）；
+3. `configfile.rs` `apply()`：把文件值盖到 `Config` 上；
+4. `configfile.rs` `from_config()`：反向，供 `--print-config` 用；
+5. `configfile.rs` `render_toml()`：加一行 `kv_xxx(...)` 和一句注释；
+6. 跑 `cargo test -p stream-server --lib`。**第 5 步漏了会被 `tomf_round_trip_is_identity` 直接抓住** —— 那个测试把手写的 `render_toml` 再解析回来逐字段比对，它就是为"手写格式化和结构体悄悄分叉"准备的。
+
+不要在两个地方实现值域校验：枚举型参数（`input_policy`、`mic_default_device`）在 `apply()` 里调用同一个 `parse()`，识别不了就收进 `warnings` 而不是报错 —— 与命令行"拼错保留默认并告警"保持一致。
 
 ### 加一个 HTTP 接口
 

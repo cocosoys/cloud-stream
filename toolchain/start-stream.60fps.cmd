@@ -11,9 +11,16 @@ set "ROOT=%~dp0"
 if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 if not exist "%ROOT%\logs" mkdir "%ROOT%\logs" >nul 2>&1
 
-set "ARGS=--host 0.0.0.0 --port 8080 --width 1920 --height 1080 --fps 60 --bitrate 2500"
-set "ARGS=%ARGS% --app webrtc --dist "%ROOT%\selkies-web" --log "%ROOT%\logs\stream-server.log""
-set "ARGS=%ARGS% --no-hdr --repeat-every 1"
+rem Same split as start-stream.cmd: tunables live in stream-config.toml, and only
+rem what follows the deployment location is passed here. Keep the two in sync --
+rem a hand-run test that passes different flags than the watchdog is not a test
+rem of the watchdog.
+if not exist "%ROOT%\stream-config.toml" (
+    echo [error] MISSING %ROOT%\stream-config.toml -- refusing to run on silent defaults
+    exit /b 1
+)
+set "ARGS=--config "%ROOT%\stream-config.toml""
+set "ARGS=%ARGS% --dist "%ROOT%\selkies-web" --log "%ROOT%\logs\stream-server.log""
 if not exist "%ROOT%\cert.pem" goto :no_tls
 if not exist "%ROOT%\key.pem" goto :no_tls
 set "ARGS=%ARGS% --tls-cert "%ROOT%\cert.pem" --tls-key "%ROOT%\key.pem""
@@ -36,7 +43,7 @@ goto :pf_done
 echo  [preflight] netsh refused the inbound rules -- a third-party firewall or a policy owns the profile
 goto :pf_done
 :pf_blocked
-echo  [preflight] inbound 8080/ICMP still blocked -- run setup-inbound.cmd as administrator once
+echo  [preflight] inbound 8080/ICMP/WebRTC still blocked -- run setup-inbound.cmd as administrator once
 :pf_done
 
 rem #101: same file, same rule as start-stream.cmd -- the long explanation is

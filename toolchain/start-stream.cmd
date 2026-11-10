@@ -56,6 +56,15 @@ if not exist "%EXE%" (
     exit /b 1
 )
 
+rem Everything except paths lives in the config file now. Without it the server
+rem would still start -- on 1080p30 defaults -- and look perfectly up while
+rem ignoring every tuned value. That is precisely the failure this split is
+rem meant to make impossible to hide, so refuse to start and say so.
+if not exist "%ROOT%\stream-config.toml" (
+    echo [%date% %time%] MISSING %ROOT%\stream-config.toml -- refusing to start on silent defaults>> "%WLOG%"
+    exit /b 1
+)
+
 rem ---------------------------------------------------------------------------
 rem Preflight, every real start: inbound firewall, then a listening probe.
 rem
@@ -73,22 +82,35 @@ if errorlevel 2 (
     echo [%date% %time%] PREFLIGHT netsh refused the inbound rules -- a third-party firewall or a policy owns the profile; allow stream-server.exe there too>> "%WLOG%"
     goto :inbound_done
 )
-if errorlevel 1 echo [%date% %time%] PREFLIGHT inbound 8080/ICMP still blocked -- run setup-inbound.cmd as administrator once; a browser on another machine will time out until then>> "%WLOG%"
+if errorlevel 1 echo [%date% %time%] PREFLIGHT inbound 8080/ICMP/WebRTC still blocked -- run setup-inbound.cmd as administrator once; a browser on another machine will time out, and WebRTC will report a failed media path, until then>> "%WLOG%"
 :inbound_done
 
 echo [%date% %time%] starting stream-server.exe from %ROOT%>> "%WLOG%"
 
-rem #65/#66: 60fps target; capture runs on its own thread; a client resolution
-rem larger than the native display is clamped (no upscale); --repeat-every 1
-rem holds the full cadence on a static screen. --dump-frame stays off (BMP every
-rem 150 frames was pure diagnostic I/O and gets scanned by Defender).
+rem ---------------------------------------------------------------------------
+rem Parameters are split in two layers, and that split is the point of this file.
 rem
+rem   follows the **deployment location** -> stays here (absolute paths, existence)
+rem     web root, log path, whether cert.pem is there, whose desktop is the upload
+rem     root, whether auth-token.txt exists
+rem   follows the **machine** -> stream-config.toml (size, fps, bitrate, port,
+rem     codec, input policy, HDR)
+rem
+rem Why: paths change when the folder moves, tuning changes when the box changes.
+rem Keeping both here meant a resolution tweak required editing a script that also
+rem contains conditionals and nested quoting -- one wrong quote and the server
+rem starts on defaults without saying so. Editing one flat TOML file cannot do that.
+rem
+rem Precedence is default < stream-config.toml < this file, so every `--flag`
+rem below **overrides** the file. That is also why TLS has to be decided here: a
+rem config file cannot express "pass this only if the file exists".
+rem ---------------------------------------------------------------------------
+set "ARGS=--config "%ROOT%\stream-config.toml""
+set "ARGS=%ARGS% --dist "%ROOT%\selkies-web" --log "%ROOT%\logs\stream-server.log""
+
 rem TLS is conditional: a bundle built without certificates still has to run
 rem (plain HTTP). Clipboard sync needs a secure context, so the absence is
 rem recorded in the log instead of silently degrading.
-set "ARGS=--host 0.0.0.0 --port 8080 --width 1920 --height 1080 --fps 60 --bitrate 2500"
-set "ARGS=%ARGS% --app webrtc --dist "%ROOT%\selkies-web" --log "%ROOT%\logs\stream-server.log""
-set "ARGS=%ARGS% --no-hdr --repeat-every 1"
 
 rem Microphone destination is left at the default: "auto". The server then picks
 rem the first virtual cable it can find (Steam Streaming Microphone, VB-CABLE,

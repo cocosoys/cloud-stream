@@ -160,6 +160,12 @@ pub enum Route {
     /// actually serving without downloading it: which files exist, their
     /// SHA-256, and which ones are safe to cache forever.
     Manifest,
+    /// `GET /api/v1/version` —— 版本与构建指纹，给更新器读。
+    ///
+    /// 单开一个端点而不是塞进 `/api/v1/health`：健康报告是为**人**和仪表盘
+    /// 准备的（几个 KB，含进程表），而更新器每次轮询只需要四个字段。让它去
+    /// 解析一份随时会加字段的大报告，等于给未来的字段改名判了自己的死刑。
+    Version,
     /// #93: `POST /api/v1/control/<action>` — the small write surface. The
     /// action is kept as a raw string here and matched against a whitelist in
     /// the handler, so a typo yields 404 instead of a silent no-op.
@@ -211,6 +217,7 @@ pub fn classify(path: &str, _app_name: &str) -> Route {
         // "did the port open".
         ["api", "v1", "health"] => Route::Health,
         ["api", "v1", "manifest"] => Route::Manifest,
+        ["api", "v1", "version"] => Route::Version,
         ["api", "v1", "control", rest @ ..] => Route::Control {
             action: rest.join("/"),
         },

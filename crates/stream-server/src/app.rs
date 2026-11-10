@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use crate::{config, dispatch, http, pipeline, platform, security};
+use crate::{config, configfile, dispatch, http, pipeline, platform, security};
 
 /// Stage1 日志过滤器。压低嘈杂的传输内部，同时保留 webrtc ICE 的收集错误可见
 /// （hbb_common init_log:455 的写法）。
@@ -67,7 +67,41 @@ pub async fn run() -> anyhow::Result<()> {
     unsafe {
         windows_sys::Win32::Media::timeBeginPeriod(1);
     }
-    let cfg = Arc::new(config::Config::parse(std::env::args().skip(1).collect()));
+    // 配置错误停在这里，并用**退出码 2** 与运行期失败（端口被占、日志不可写）
+    // 区分开：前者的唯一办法是人改文件，看门狗把机器重启一万次也不会好；后者
+    // 值得重试。此刻日志还没初始化，所以只能用 eprintln —— 而这句就是用户能
+    // 看到的全部，它必须自己说清是哪一份文件、哪一行。
+    let cfg = match config::Config::parse(std::env::args().skip(1).collect()) {
+        Ok(cfg) => Arc::new(cfg),
+        Err(err) => {
+            eprintln!("config error: {err}");
+            std::process::exit(2);
+        }
+    };
+
+    // 一次性动作：把生效配置打出来就退出。放在日志初始化之前是有意的 ——
+    // 这段输出会被可视化配置界面或 shell 直接读走，混进一行 `[INFO]` 就解析不了。
+    if let Some(format) = cfg.print_config.as_deref() {
+        // 来源走 stderr：stdout 必须是**纯配置**，否则"打印出来存成
+        // config.toml 再读回来"就不是逐字节相同，回环承诺会破。
+        match cfg.config_source.as_deref() {
+            Some(path) => eprintln!("# source: {}", path.display()),
+            None => eprintln!("# source: none (defaults + command line)"),
+        }
+        match configfile::render(&cfg, format) {
+            Ok(text) => {
+                print!("{text}");
+                if !text.ends_with('\n') {
+                    println!();
+                }
+            }
+            Err(err) => {
+                eprintln!("config error: {err}");
+                std::process::exit(2);
+            }
+        }
+        return Ok(());
+    }
 
     // 一键卸载：把上次遗留的默认录音设备还回去，然后立刻退出。
     //
@@ -116,13 +150,22 @@ pub async fn run() -> anyhow::Result<()> {
         }
         return Ok(());
     }
-    // #60: VMware SVGA 3D has no HDR desktop; `--no-hdr` skips the guaranteed
-    // DuplicateOutput1 probe and its per-start warning.
     if cfg.no_hdr {
         scrap::dxgi::hdr::UNAVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
-        log::info!("HDR duplication disabled by --no-hdr (VMware SVGA fallback)");
     }
     let _logger = init_logger(&cfg)?;
+
+    // 启动事实只能记在 logger 起来之后。`--no-hdr` 那句原本写在上面，
+    // 而那时 logger 还不存在，于是它从来没写进过任何文件 —— 顺手修掉。
+    if cfg.no_hdr {
+        log::info!("HDR duplication disabled by --no-hdr (VMware SVGA fallback)");
+    }
+    // "配置从哪来"必须留下一条：之后每一次"我改了为什么没生效"，
+    // 答案不是这一行（就是那份文件），就是这一行不存在（根本没有文件）。
+    match cfg.config_source.as_deref() {
+        Some(path) => log::info!("config: loaded {}", path.display()),
+        None => log::info!("config: no config.toml found, using defaults + command line"),
+    }
 
     // #122: ICE 的 UDP 区间必须让外部知道 —— 它是唯一一个"防火墙写错时
     // 服务端一切正常、只有浏览器说媒体路径失败"的参数。日志里有一行，至少
