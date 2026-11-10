@@ -178,7 +178,8 @@ cd target\output\cloud-stream
 | [`docs/architecture.md`](docs/architecture.md) | **架构：模块边界、依赖规则、五个扩展点、模块化欠账** |
 | [`docs/configuration.md`](docs/configuration.md) | **配置：三层优先级、完整键表、`--print-config` 回环、改错时的行为** |
 | [`docs/operations-rollback.md`](docs/operations-rollback.md) | **快照与回滚：`--ops snapshot/rollback/verify`，四个动作的失败兜底** |
-| [`docs/console.md`](docs/console.md) | **可视化控制台 `cloud-setup.exe`：四个动作的按钮版，六个按钮各落到哪条命令** |
+| [`docs/operations-update.md`](docs/operations-update.md) | **更新：`--update check/apply`，三种验版本口径、自动回滚、更新包放哪** |
+| [`docs/console.md`](docs/console.md) | **可视化控制台 `cloud-setup.exe`：四个动作的按钮版，七个按钮各落到哪条命令** |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | **参与开发：环境、构建、测试、提交规范、硬规矩** |
 | [`docs/roadmap-l2-l3-gaps.md`](docs/roadmap-l2-l3-gaps.md) | 全量盘点：已完成 / 部分 / 未做，逐项拆解 |
 | [`docs/stage1-signaling-session.md`](docs/stage1-signaling-session.md) | 信令契约与会话状态机 |

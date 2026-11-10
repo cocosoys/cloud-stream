@@ -9,6 +9,7 @@
 //!
 //! ```text
 //! 刷新状态 / 拍快照 / 回滚   ->  stream-server.exe --ops state|snapshot|rollback
+//! 更新                      ->  stream-server.exe --update check|apply
 //! 安装 / 卸载               ->  install.cmd / uninstall.cmd（提权窗口）
 //! 改配置                    ->  用记事本打开 stream-config.toml
 //! ```
@@ -54,6 +55,7 @@ const BTN_ROLLBACK: i32 = 1003;
 const BTN_INSTALL: i32 = 1004;
 const BTN_UNINSTALL: i32 = 1005;
 const BTN_CONFIG: i32 = 1006;
+const BTN_UPDATE: i32 = 1007;
 
 /// 后台线程干完活之后通知 UI 线程来取结果。
 const WM_APP_DONE: u32 = WM_APP + 1;
@@ -245,6 +247,69 @@ fn on_command(hwnd: HWND, id: i32) {
                 vec![format!("[exit {code}] 回滚"), text.trim_end().to_owned()]
             });
         }
+        BTN_UPDATE => {
+            if !exe.exists() {
+                log("[fail] 找不到 stream-server.exe", hwnd);
+                return;
+            }
+            // 整个"检查 → 问一句 → 覆盖"放在一个后台任务里，因为中间那一步
+            // 要等人点确认；分两段写会让窗口在等待期间被当成卡死。确认框由
+            // 后台线程弹：MessageBox 会在自己那条线程上跑一个模态循环，
+            // 主线程照常泵消息，所以窗口不会假死。
+            let target = hwnd as isize;
+            spawn_job(hwnd, move || {
+                let hwnd = target as HWND;
+                let mut lines = Vec::new();
+
+                let (code, text) = run_capture(&exe, &["--update", "check"]);
+                lines.push(format!("[exit {code}] 检查更新"));
+                lines.push(text.trim_end().to_owned());
+                match code {
+                    0 => {}
+                    5 => {
+                        lines.push(
+                            "已经是最新版本（更新包里的版本不比当前新）".to_owned(),
+                        );
+                        return lines;
+                    }
+                    4 => {
+                        lines.push(
+                            "没找到更新包目录。把新的一包解到 \
+                             %ProgramData%\\cloud-stream\\update 再试。"
+                                .to_owned(),
+                        );
+                        return lines;
+                    }
+                    _ => {
+                        lines.push("检查失败，详情见上".to_owned());
+                        return lines;
+                    }
+                }
+
+                let ok = confirm(
+                    hwnd,
+                    "用更新包里的文件覆盖当前程序？\n\n\
+                     覆盖之前会自动留一份完整快照；新版本起不来或版本对不上，\
+                     会自动退回原样。\n\n\
+                     服务需要重启才会用上新版本。",
+                    "更新",
+                );
+                if !ok {
+                    lines.push("-- 已取消更新".to_owned());
+                    return lines;
+                }
+
+                let (code, text) = run_capture(&exe, &["--update", "apply"]);
+                lines.push(format!("[exit {code}] 更新"));
+                lines.push(text.trim_end().to_owned());
+                lines.push(if code == 0 {
+                    "更新完成：重启服务（安装 / 修复）后生效".to_owned()
+                } else {
+                    "更新没有完成；失败时会自动回滚，情况见上面的记录".to_owned()
+                });
+                lines
+            });
+        }
         BTN_INSTALL => run_elevated(hwnd, "install.cmd", "/y"),
         BTN_UNINSTALL => {
             if confirm(
@@ -345,24 +410,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 READONLY_EDIT,
                 16,
                 34,
-                728,
+                748,
                 130,
                 ID_STATE,
             );
 
-            let buttons: [(&str, i32); 6] = [
+            // 七个按钮等宽排一行：中文字宽差不多的前提下，等宽比"按字数
+            // 伸缩"更好看，也不会因为某个标签多了两个字就挤歪整排。
+            // 顺序即操作顺序：看状态 → 留底 → 退回 → 更新 → 装 / 卸 / 改。
+            let buttons: [(&str, i32); 7] = [
                 ("刷新状态", BTN_REFRESH),
                 ("拍快照", BTN_SNAPSHOT),
                 ("回滚", BTN_ROLLBACK),
+                ("更新", BTN_UPDATE),
                 ("安装 / 修复", BTN_INSTALL),
                 ("卸载", BTN_UNINSTALL),
                 ("改配置", BTN_CONFIG),
             ];
             let mut x = 16;
             for (label, id) in buttons {
-                let w = 104 + if label.len() > 6 { 16 } else { 0 };
-                make("BUTTON", label, BUTTON, x, 176, w, 30, id);
-                x += w + 8;
+                make("BUTTON", label, BUTTON, x, 176, 100, 30, id);
+                x += 108;
             }
 
             make("STATIC", "操作记录", 0, 16, 220, 200, 20, 0);
@@ -372,7 +440,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 READONLY_EDIT,
                 16,
                 242,
-                728,
+                748,
                 210,
                 ID_LOG,
             );
@@ -426,7 +494,7 @@ fn main() {
             WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            776,
+            796,
             484,
             0,
             0,

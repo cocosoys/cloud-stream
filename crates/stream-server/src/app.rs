@@ -70,9 +70,24 @@ pub async fn run() -> anyhow::Result<()> {
     // 参数直接从原始命令行读：`Config` 里没有 `--ops`，也不该有 —— 一次性动作
     // 不进配置文件，这条规则在 `configfile` 的模块文档里已经写死了。
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    // 三个一次性动作，全部早于配置解析，顺序按"最不可能互相干扰"排：
+    //
+    //   --version  只回答"我是谁"，不读不写任何东西。
+    //   --ops      快照/回滚/校验 —— 配置坏了也要能用。
+    //   --update   检查/覆盖/验版本 —— 它要问包里那份 exe 的版本，靠的正是
+    //              `--version`，所以那个分支必须在，而且不能依赖配置。
+    //
+    // 共同点：它们都不会走到下面任何一行启动动作（调高定时器精度、绑端口、
+    // 切默认录音设备）。"一次性动作"这四个字在这里是字面意思。
+    if let Some(code) = crate::version::try_run(&argv) {
+        std::process::exit(code);
+    }
     if let Some(code) = crate::ops::try_run(&argv) {
         // 用 exit 而不是 return：这条路径上不该再有任何退出清理被"顺手"引进来
         // （默认录音设备还原之类），它没碰过那些状态。
+        std::process::exit(code);
+    }
+    if let Some(code) = crate::update::try_run(&argv) {
         std::process::exit(code);
     }
 

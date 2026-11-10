@@ -29,6 +29,7 @@
 //! platform   平台适配：硬件编码探测、虚拟麦克风、默认录音设备
 //! security   横切：鉴权策略、主体、事件
 //! ops        横切：快照/回滚/校验，四个动作的共同底座（先于 config 执行）
+//! update     横切：检查/覆盖/验版本，更新动作的实现（先于 config 执行）
 //! config     横切：命令行解析，无下游依赖
 //! ```
 //!
@@ -45,5 +46,6 @@ pub mod pipeline;
 pub mod platform;
 pub mod security;
 pub mod signaling;
+pub mod update;
 pub mod version;
 pub mod webrtc;

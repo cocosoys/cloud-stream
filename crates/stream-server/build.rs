@@ -29,6 +29,9 @@ fn main() {
     // 切分支或新提交后必须重新生成常量。监听 HEAD 的内容而不是整个 .git：
     // 索引文件随时在变，监听它等于每次构建都重跑这一段。
     println!("cargo:rerun-if-changed=../../.git/HEAD");
+    // 监听 Cargo.toml，这样"只改了 version"也会真的重建。见下面
+    // `CS_VERSION` 那一段 —— 这条指令是那个机制的一半。
+    println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-env-changed=CS_GIT_COMMIT");
     println!("cargo:rerun-if-env-changed=CS_GIT_DIRTY");
     println!("cargo:rerun-if-env-changed=CS_BUILT_AT");
@@ -60,6 +63,18 @@ fn main() {
     println!("cargo:rustc-env=CS_GIT_COMMIT={commit}");
     println!("cargo:rustc-env=CS_GIT_DIRTY={dirty}");
     println!("cargo:rustc-env=CS_BUILT_AT={built_at}");
+    // 版本号也走 build.rs，而不是源码里的 `env!("CARGO_PKG_VERSION")`。
+    //
+    // 理由是一次实测出来的坑：**只把 Cargo.toml 的 version 从 0.3.0 改成
+    // 0.4.0，`cargo build` 会说 "Finished" 但根本不重编**，于是产出的 exe
+    // 仍然报 0.3.0 —— 一个"版本号写着改过、二进制里还是旧的"的假象，而这个
+    // 项目做版本层就是为了根治这种假象。
+    //
+    // 经 build.rs 中转之后，version 变成了构建脚本的输出：Cargo.toml 一变，
+    // 构建脚本重跑，`rustc-env` 的值变了，cargo 因此认定这个 crate 脏了，
+    // 必须重编。上面那条 `rerun-if-changed=Cargo.toml` 是这个链条的另一半，
+    // 少任何一半都不生效。
+    println!("cargo:rustc-env=CS_VERSION={version}");
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         emit_version_resource(&version, &commit, &built_at);

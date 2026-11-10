@@ -23,7 +23,12 @@ use hbb_common::serde_json::{json, Value};
 ///
 /// 升级规则（简单到不需要查文档）：新增接口或行为变化 → 次版本 +1；只有修复 →
 /// 补丁 +1。`0.x` 阶段主版本留给"配置文件格式不兼容"这种级别。
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+///
+/// 读的是 build.rs 转发的 `CS_VERSION` 而不是 `CARGO_PKG_VERSION`：后者在
+/// "只改版本号"时不会让 crate 重编，产出的二进制会继续报旧版本。经过构建
+/// 脚本转发之后，版本号变成构建脚本的输出，cargo 才会真的重编 —— 细节见
+/// `build.rs` 里那段注释。
+pub const VERSION: &str = env!("CS_VERSION");
 
 /// 构建时的 git 提交（短哈希）。探测不到时是 `"unknown"`。
 pub const COMMIT: &str = env!("CS_GIT_COMMIT");
@@ -81,6 +86,67 @@ pub fn as_json() -> Value {
     })
 }
 
+/// 本进程的可执行文件名（`stream-server.exe`）。
+///
+/// 更新器要在更新包里找"和我同名的那个文件"，硬写 `stream-server.exe` 会在
+/// 有人把 exe 改名之后悄悄失配（然后报"包里没有 exe"）。问自己叫什么，比
+/// 记住别人给的名字可靠。
+pub fn exe_name() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "stream-server.exe".to_owned())
+}
+
+/// `--version [text|json]`：一次性动作，回答"这个 exe 是哪一版"。
+///
+/// 早于配置解析执行，和 `--ops` 同一个理由：一个刚被覆盖上去、配置文件还没
+/// 跟上的 exe，也必须能报出自己的版本 —— 更新器验完新版正是这么问的。让
+/// "你是谁"这个问题的答案依赖"你的配置对不对"，等于在需要它的时候最不可用。
+///
+/// 返回 `None` = 命令行里没有 `--version`，调用方继续走正常启动。
+pub fn try_run(args: &[String]) -> Option<i32> {
+    let index = args.iter().position(|a| a == "--version")?;
+    // 格式是紧跟在后面的第一个非开关参数，与 `--print-config [toml|json]`
+    // 的写法一致 —— 同一个程序里不该有两种给参数的办法。
+    let mut format = "text";
+    if let Some(next) = args.get(index + 1) {
+        if !next.starts_with('-') {
+            match next.as_str() {
+                "text" | "toml" => {}
+                "json" => format = "json",
+                other => {
+                    eprintln!("version: 不认识的格式 {other:?}（text|json）");
+                    return Some(crate::ops::EXIT_USAGE);
+                }
+            }
+        }
+    }
+
+    if format == "json" {
+        // 与 `/api/v1/version` 同一个函数、同一个键名：更新器读的两个来源
+        // 因此可以是同一段代码。
+        match serde_json::to_string(&as_json()) {
+            Ok(text) => println!("{text}"),
+            Err(err) => {
+                eprintln!("version: 序列化失败: {err}");
+                return Some(crate::ops::EXIT_FAILED);
+            }
+        }
+        return Some(crate::ops::EXIT_OK);
+    }
+
+    // 人读的一行。`+` 而不是括号：这一行经常被 `findstr` / `Select-String`
+    // 捞出来贴进工单，括号在 cmd 里是要转义的字符。
+    let dirty = match DIRTY {
+        "true" => "+dirty",
+        "unknown" => "+unknown",
+        _ => "",
+    };
+    println!("{VERSION} ({COMMIT}){dirty}");
+    Some(crate::ops::EXIT_OK)
+}
+
 /// Unix 秒 → (年, 月, 日, 时, 分, 秒)，UTC（Howard Hinnant `civil_from_days`）。
 ///
 /// 对 crate 内公开：`ops` 要用它给快照目录起名（`20261110T075512Z-preinstall`），
@@ -113,6 +179,19 @@ pub(crate) fn civil_from_unix(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 版本号的唯一来源是 Cargo.toml。build.rs 只是把它转一手。
+    ///
+    /// 这条测试挡的是"两边读的不是同一个地方"：build.rs 里少一行 `rustc-env`、
+    /// 或者哪天有人把 `env!("CS_VERSION")` 换成手写的常量，这里会先红。
+    #[test]
+    fn version_comes_from_the_manifest() {
+        assert_eq!(
+            VERSION,
+            env!("CARGO_PKG_VERSION"),
+            "build.rs 转发的版本必须与 Cargo.toml 的 version 一致"
+        );
+    }
 
     #[test]
     fn version_is_semver() {

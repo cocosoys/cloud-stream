@@ -221,20 +221,20 @@ fn sanitize_label(label: &str) -> String {
 }
 
 /// 相对路径转成清单里的形态：`/` 分隔。
-fn rel_to_string(rel: &Path) -> String {
+pub(crate) fn rel_to_string(rel: &Path) -> String {
     rel.components()
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
         .collect::<Vec<_>>()
         .join("/")
 }
 
-fn string_to_rel(s: &str) -> PathBuf {
+pub(crate) fn string_to_rel(s: &str) -> PathBuf {
     s.split('/').fold(PathBuf::new(), |acc, part| acc.join(part))
 }
 
 /// FNV-1a 64。选它而不是 sha2 的理由：没有依赖、源码十二行、对"文件变了没变"
 /// 这个用途足够；哈希值只在本项目内部比较，不进任何协议。
-fn hash_file(path: &Path) -> Result<(u64, String), String> {
+pub(crate) fn hash_file(path: &Path) -> Result<(u64, String), String> {
     let mut file =
         fs::File::open(path).map_err(|e| format!("{}: 打不开: {e}", path.display()))?;
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -265,7 +265,7 @@ fn collect(root: &Path) -> Result<Vec<PathBuf>, String> {
     collect_skipping(root, SKIP_DIRS)
 }
 
-fn collect_skipping(root: &Path, skip: &[&str]) -> Result<Vec<PathBuf>, String> {
+pub(crate) fn collect_skipping(root: &Path, skip: &[&str]) -> Result<Vec<PathBuf>, String> {
     fn walk(
         dir: &Path,
         rel: &Path,
@@ -299,9 +299,13 @@ fn collect_skipping(root: &Path, skip: &[&str]) -> Result<Vec<PathBuf>, String> 
                 }
                 walk(&path, &child_rel, out, depth + 1, skip)?;
             } else if meta.is_file() {
-                // 上一轮回滚让路留下的残骸不该进入新的快照，否则每回滚一次，
+                // 上一轮让路留下的残骸不该进入新的快照，否则每让路一次，
                 // 备份就胖一圈，而且永远删不掉。
-                if name_str.ends_with(STASH_SUFFIX) {
+                //
+                // 判断是"名字里含"而不是"以它结尾"：让路时目标被占会改用
+                // `x.rollback-old.1` 这种带编号的名字（见 [`stash`]），只认
+                // 后缀会漏掉它们，于是这些残骸反而成了"快照里该有的文件"。
+                if name_str.contains(STASH_SUFFIX) {
                     continue;
                 }
                 out.push(child_rel);
@@ -576,7 +580,7 @@ pub fn rollback(root: &Path, backups: &Path, to: Option<&str>) -> Result<Rollbac
             }
             let path = root.join(&rel);
             match stash(&path) {
-                Ok(()) => report.stashed.push(key),
+                Ok(_) => report.stashed.push(key),
                 Err(e) => report.failed.push((key, e)),
             }
         }
@@ -585,22 +589,48 @@ pub fn rollback(root: &Path, backups: &Path, to: Option<&str>) -> Result<Rollbac
     Ok(report)
 }
 
-/// 把文件改名让路。已存在的残骸先删掉，否则 Windows 上 `rename` 会因为目标
-/// 存在而失败（POSIX 会静默覆盖，两边语义不同，这里统一成"先删再改名"）。
-fn stash(path: &Path) -> Result<(), String> {
-    let mut stash_name = path.as_os_str().to_owned();
-    stash_name.push(STASH_SUFFIX);
-    let stash_path = PathBuf::from(stash_name);
-    if stash_path.exists() {
-        fs::remove_file(&stash_path)
-            .map_err(|e| format!("{}: 旧残骸删不掉: {e}", stash_path.display()))?;
+/// 让路用的第 `n` 个名字：`x.exe` → `x.exe.rollback-old`（n=0）、
+/// `x.exe.rollback-old.1`（n=1）……
+pub(crate) fn stash_name(path: &Path, n: usize) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(STASH_SUFFIX);
+    if n > 0 {
+        name.push(format!(".{n}"));
     }
-    fs::rename(path, &stash_path).map_err(|e| {
-        format!(
-            "{}: 改名失败: {e}（文件正被占用时先停服务）",
-            path.display()
-        )
-    })
+    PathBuf::from(name)
+}
+
+/// 把文件改名让路，返回最终用的名字。
+///
+/// 标准名字是 `<路径>.rollback-old`。这个名字被占时，先试着删掉上一轮的残骸
+/// （Windows 的 `rename` 不覆盖已存在的目标，POSIX 会静默覆盖，这里统一成
+/// "先删再改名"）；**删不掉就换一个编号**。
+///
+/// 换编号这一条不是洁癖，是实测撞出来的：更新器覆盖的往往正是"正在运行的
+/// 自己"，于是那份留底就是当前进程的镜像 —— 而 Windows 允许重命名运行中的
+/// exe、不允许删除它。旧代码在这里直接报错，结果是"更新失败 → 自动回滚 →
+/// 回滚也失败"，把人留在最坏的组合里。宁可多留一份文件，也要把"退回去"做成。
+pub(crate) fn stash(path: &Path) -> Result<PathBuf, String> {
+    // 32 是个够用的上限：真堆了三十多份同名留底，该做的是让人来清理。
+    for n in 0..32 {
+        let candidate = stash_name(path, n);
+        if candidate.exists() && fs::remove_file(&candidate).is_err() {
+            // 删不掉 = 正被使用（多半是运行中的自己），换下一个编号。
+            continue;
+        }
+        return match fs::rename(path, &candidate) {
+            Ok(_) => Ok(candidate),
+            Err(e) => Err(format!(
+                "{}: 改名失败: {e}（文件正被占用时先停服务）",
+                path.display()
+            )),
+        };
+    }
+    Err(format!(
+        "{}: 改名失败：连 {} 都被占用（目录里有 32 份同名留底，需要人工清理）",
+        path.display(),
+        stash_name(path, 31).display()
+    ))
 }
 
 /// 拿当前状态和某份快照对比。不写任何文件。
@@ -819,7 +849,7 @@ pub fn run_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn human_bytes(bytes: u64) -> String {
+pub(crate) fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
     let mut value = bytes as f64;
     let mut unit = 0;
@@ -1479,5 +1509,53 @@ mod tests {
         let late = compact_utc(1_800_000_000);
         assert!(early < late, "{early} 应当排在 {late} 之前");
         assert_eq!(early.len(), 16);
+    }
+
+    /// 标准名字空着时就用标准名字，并把上一轮的残骸丢掉。
+    #[test]
+    fn stash_reuses_the_standard_name() {
+        let dir = TempDir::new("stashstd");
+        dir.write("a.txt", "new");
+        dir.write("a.txt.rollback-old", "old-remains");
+        let used = stash(&dir.0.join("a.txt")).expect("应当让路");
+        assert_eq!(
+            used.file_name().unwrap().to_string_lossy(),
+            "a.txt.rollback-old"
+        );
+        assert_eq!(fs::read_to_string(&used).expect("读留底"), "new");
+        assert!(!dir.0.join("a.txt").exists());
+    }
+
+    /// 名字被占**而且删不掉**时必须换编号，而不是报错。
+    ///
+    /// 这不是边界情况，是常规情况：更新器覆盖的往往正是"正在运行的自己"，
+    /// 那份留底就是当前进程的镜像 —— Windows 允许重命名运行中的 exe，不允许
+    /// 删除它。旧实现在这里直接失败，于是"更新失败 → 自动回滚 → 回滚也失败"。
+    ///
+    /// 用同名**目录**模拟"删不掉"：`remove_file` 遇到目录在 Windows 上必然
+    /// 失败，和"文件被运行中的进程占着"在这一步的行为一致。
+    #[test]
+    fn stash_falls_back_to_a_numbered_name_when_the_slot_is_held() {
+        let dir = TempDir::new("stashhold");
+        dir.write("a.txt", "v1");
+        fs::create_dir_all(stash_name(&dir.0.join("a.txt"), 0)).expect("建占位目录");
+        let used = stash(&dir.0.join("a.txt")).expect("应当换编号让路");
+        assert_eq!(
+            used.file_name().unwrap().to_string_lossy(),
+            "a.txt.rollback-old.1"
+        );
+        assert_eq!(fs::read_to_string(&used).expect("读留底"), "v1");
+        assert!(!dir.0.join("a.txt").exists());
+    }
+
+    /// 带编号的残骸不能进快照，否则每让路一次备份就胖一圈。
+    #[test]
+    fn numbered_stash_files_are_not_snapshotted() {
+        let dir = TempDir::new("stashskip");
+        dir.write("a.txt", "v1");
+        dir.write("a.txt.rollback-old.1", "旧残骸");
+        let snap = snapshot(&dir.0, &dir.backups(), "t").expect("快照应当成功");
+        let paths: Vec<&str> = snap.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["a.txt"], "{paths:?}");
     }
 }
