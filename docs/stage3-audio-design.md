@@ -412,6 +412,10 @@ logs/mic-default.json
   是上次自己切过去的），于是接管还原责任。即使每次都强杀，只要之后有一次
   `--mic-default-device off`，设备就能回到原位。
 - `--mic-default-device off` 兼作撤销：有遗留文件就先还原再什么都不做。
+- `--restore-mic` 是"只做还原、做完就退"的那一个：不绑端口、不开日志、不碰采集。
+  `uninstall.cmd` 在删目录之前跑它一次 —— 原值文件马上就要随目录消失，而
+  `--mic-default-device off` 会顺便把整个服务拉起来，在一个正在被卸载的目录里
+  跑它没有意义。没有遗留记录时它打印 `MICRESTORE nothing-to-do` 并退出 0。
 
 **验证记录（192.168.59.148）**
 

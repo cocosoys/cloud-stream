@@ -11,7 +11,7 @@
       2. 构建后端 release
       3. 构建前端（core → dashboard 两级，顺序不能反）
       4. 汇总产物到 target\output\cloud-stream（+ 同名 zip），上传从这里取
-      5. scp 上传（exe / DLL / zip / 九个上机脚本 / 证书，内容一样就跳过）
+      5. scp 上传（exe / DLL / zip / 十二个上机脚本 / 证书，内容一样就跳过）
       6. MD5 双向核对
 
     被控机做的事（由 deploy-remote.ps1 执行，脚本随包上传）：
@@ -146,12 +146,23 @@ $RemoteLog = "$RemoteRoot\logs\stream-server.log"
 # open-inbound.cmd 与 probe-listen.cmd 是同一课的自动化部分，被 start-stream.cmd
 # 和 setup-watchdog.bat 调用：前者幂等地补规则，后者在启动后 30 秒内把
 # "到底有没有监听"写成一行 PREFLIGHT 日志。少了它们，启动失败仍然没有痕迹。
+# install.cmd / uninstall.cmd 是"一次点击"那一层：把上面的准备工作串成一条线，
+# 并且各自带一个只读模式（/check、/whatif）。它们不重新实现任何东西 —— install
+# 调 setup-task.ps1 + open-inbound.cmd，uninstall 调 netsh 与 --restore-mic，
+# 所以两条路径不会各自漂移。
 $LauncherNames = @(
     'start-stream.cmd',
     'start-stream.60fps.cmd',
+    # 参数本体。start-stream.cmd 只传路径与环境相关的那几条，分辨率/帧率/
+    # 码率/编码器/输入策略都在这个文件里。它跟着部署走（和过去命令行写在
+    # start-stream.cmd 里完全同构），所以"每次部署把参数覆盖回去"这个既有
+    # 行为没有变；"每台机器的差异要留住"是安装器那一层的事，不在这里解决。
+    'stream-config.toml',
     'run-hidden.vbs',
     'setup-watchdog.bat',
     'setup-task.ps1',
+    'install.cmd',
+    'uninstall.cmd',
     'collect-launch-facts.cmd',
     'setup-inbound.cmd',
     'open-inbound.cmd',
@@ -194,7 +205,7 @@ $RemoteScript = Join-Path $PSScriptRoot 'deploy-remote.ps1'
 
 # 统一产物目录。target\output\cloud-stream **就是**被控机的运行根：把这个目录
 # 原样拷到任何一台机器（或解压同名 zip），里面的 exe / DLL / 前端 / 证书 /
-# 九个上机脚本就是全部所需，不需要再手工拼路径。上传也从这里取，所以「本地能
+# 十二个上机脚本就是全部所需，不需要再手工拼路径。上传也从这里取，所以「本地能
 # 跑」与「线上在跑」是同一批字节。
 $OutputDir = Join-Path $RepoRoot 'target\output'
 $BundleDir = Join-Path $OutputDir 'cloud-stream'
@@ -397,7 +408,7 @@ function Test-Health([int]$TimeoutSec) {
     target\release、DLL 在 vendor\vigem、前端在另一个仓库的 dist、启动脚本在
     toolchain\、证书只在被控机本地。于是"把一台新机器变成被控机"变成一串手工
     scp，漏一个就得到"能连上但没画面 / 有画面但没手柄 / 有手柄但剪贴板废掉"。
-    汇总之后，这个目录**就是**运行根：拷过去、跑一次 setup-watchdog.bat，完事。
+    汇总之后，这个目录**就是**运行根：拷过去、双击 install.cmd，完事。
 
     约定：运行根 <base>\stream 与本目录一一对应（相对路径全部自定位），所以
     "本地这份能跑"与"线上在跑"是同一批字节，不是两次拼装的结果。
@@ -431,27 +442,38 @@ cloud-stream 被控端整包
 
 怎么用
   1) 整包拷到目标机器（或解压同目录下的 cloud-stream.zip）。
-  2) 建看门狗计划任务（不需要任何账户密码）：
-         右键 setup-watchdog.bat -> "以管理员身份运行"
-     任务落在"当前登录的那个会话"里，用该会话已有的令牌运行，不存凭据、
-     不改账户。提权运行时它会顺手放行 8080 与 ping，并在建完任务后立刻启动
-     一次、等最多 60 秒，直接告诉你 [ok] 还是 [fail]。
+  2) 双击 install.cmd —— 就这么一步。
+     它自己弹 UAC 提权，然后依次：检查包是否完整 -> 放行 8080/ping/WebRTC 的 UDP
+     段 -> 建看门狗计划任务（不需要任何账户密码）-> 启动一次 -> 最多等 60 秒 ->
+     打印 [ok] 和这台机器的访问地址。失败时它会按最可能的原因给下一步，而不是
+     只说一句 fail。
+     只想看看它会做什么、不改动任何东西：install.cmd /check
   3) 任务在登录时触发一次，之后每分钟一次，进程挂了 60 秒内自己回来。
      想手工起一次：start-stream.cmd
   4) 浏览器打开 https://<本机IP>:8080/
+  5) 以后不要了：双击 uninstall.cmd —— 停任务、杀进程、删规则、把默认录音设备
+     还回去，最后删掉整个目录（/keep 只卸服务、留文件；/whatif 只列清单）。
+
+     install.cmd 干的事与下面这条完全一样，只是不用记顺序：
+       右键 setup-watchdog.bat -> "以管理员身份运行"
+     它同样不存凭据、不改账户；提权运行时它会顺手放行防火墙，并在建完任务后
+     立刻启动一次、等最多 60 秒，直接告诉你 [ok] 还是 [fail]。
 
 目录说明
   stream-server.exe   采集 / 编码 / 信令 / HTTP / 文件传输，全在这一个进程
   ViGEmClient.dll     虚拟手柄客户端；缺了只降级成"没手柄"，其余照常
   selkies-web\        前端静态根（--dist 指向这里）
   logs\               stream-server.log 与 watchdog.log（进程起不来先看后者）
+  install.cmd         一键安装：检查 + 放行 + 建任务 + 启动 + 验证（/check 只读）
+  uninstall.cmd       一键卸载：任务 + 进程 + 规则 + 默认录音设备 + 整个目录
+                      （/keep 保留文件，/whatif 只列清单）
   start-stream.cmd    命令行参数都在这里：分辨率 / 帧率 / 码率 / 证书
   start-stream.60fps.cmd 手工起一次用（同一个命令行，不进计划任务）
   run-hidden.vbs      计划任务的实际入口，无窗口，避免每分钟闪一次黑框
   setup-watchdog.bat  创建 MCStreamSrv 任务并验证一次启动（不碰账户密码）
   setup-task.ps1      上面那条的实际执行者：按交互式令牌注册任务
   collect-launch-facts.cmd  起不来时双击它，生成一份事实清单（只读）
-  setup-inbound.cmd   管理员身份运行：放行 8080 与 ping（否则外部一概连不上）
+  setup-inbound.cmd   管理员身份运行：放行 8080、ping 与 UDP 40000-40049（否则 WebRTC 切不过去）
   open-inbound.cmd    上面那条规则的实际执行者，被启动脚本自动调用（幂等）
   probe-listen.cmd    启动后 30 秒内把"有没有监听"写进 watchdog.log
   set-password.cmd    设/改/清除访问口令（写 auth-token.txt，重启任务生效）
@@ -467,7 +489,7 @@ cloud-stream 被控端整包
   口令存在 auth-token.txt；删掉它（或 set-password.cmd 里留空）就恢复开放。
 
 每次启动会自动做的事（不需要人守在那里）
-  * 查 8080 / ICMP 入站规则，缺了就补（当前进程提权时）；补不上会把原因写进
+  * 查 8080 / ICMP / WebRTC UDP / app 四条入站规则，缺了就补（当前进程提权时）；补不上会把原因写进
     logs\watchdog.log 的 PREFLIGHT 行，而不是安静地少一条规则
   * 起 exe 之后另起一个探针，最多 30 秒，把结果写成
         PREFLIGHT listening on 8080 after N probe(s): local status 200
@@ -913,7 +935,7 @@ try {
             ((Get-Item $BundleZip).Length / 1MB), (Get-Md5 $BundleZip))
         Write-Info "运行根 $BundleDir"
         Write-Info "压缩包 $BundleZip"
-        Write-Note '拷到新机器解压即运行根；先读包里的 README.txt，再按 setup-watchdog.bat 装任务。'
+        Write-Note '拷到新机器解压即运行根；先读包里的 README.txt，再双击 install.cmd（相当于 setup-watchdog.bat + 防火墙 + 验证一次做完）。'
         return
     }
 

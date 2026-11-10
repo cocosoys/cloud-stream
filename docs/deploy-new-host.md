@@ -102,13 +102,24 @@ IP，拿构建端的覆盖等于把 HTTPS 换成浏览器报警）。
 
 | 端口 | 用途 | 现状 |
 |---|---|---|
-| TCP 22 | 部署（ssh/scp） | 被控机防火墙**三档全关**，所以没有显式规则也能连 |
-| TCP 8080 | HTTPS 页面 + WS 信令 | 同上 |
-| UDP（临时） | WebRTC 媒体，ICE **host** 候选，端口随机 | 服务端出站发起连通性检查即可回包，同网段不需要入站规则 |
+| TCP 8080 | HTTPS 页面 + WS 信令 + 文件传输 | `open-inbound.cmd` 建 `cloud-stream 8080`（profile=any） |
+| UDP 40000-40049 | WebRTC 媒体，ICE **host** 候选 | `cloud-stream webrtc UDP`；区间由 `--webrtc-udp-port-min/max` 定（#122） |
+| 任意 TCP/UDP | `stream-server.exe` 本体 | `cloud-stream app` 程序规则，按路径匹配，覆盖改区间/换端口 |
+| TCP 22 | 部署（ssh/scp） | **不随包放行**；要远程部署才手动开 |
+
+**为什么 WebRTC 必须单独放行**：ICE 的 host 候选每个本机地址绑一个 UDP socket，
+库的默认值是 `:0` —— 每个会话一个随机端口，任何按端口的规则都追不上它。#122 把
+区间钉死（默认 40000-40049），规则才写得出来。**这是最容易漏的一条**：WS 模式只
+用 TCP 8080，所以一台机器可以画面完全正常、一切切到 WebRTC 就报"媒体路径失败"。
+
+早期文档写过"服务端出站发起检查即可回包，同网段不需要入站规则"，**这句是错的**：
+浏览器自己也会发检查，那些包是**无状态入站**，不在任何出站流的回程里；而只有
+浏览器自己的检查成功，它才会把 `connectionState` 报成 `connected`。.148 上没暴露，
+是因为那台机器的防火墙**三档全关**（上表第一列已改），全新设备默认是开着的。
 
 **跨 NAT 不行**：`webrtc/mod.rs` 里 `ice_servers = []`（照 hbb_common 的写法），
 只有 host candidate。要跨公网必须另配 STUN/TURN —— 前端仓库里有 `coturn` 目录，
-但本仓库没有接。
+但本仓库没有接。固定端口区间是那一步的前提：随机端口连端口映射都配不出来。
 
 **没有鉴权**：监听面 22 个入口默认 `--policy allow-all`（令牌解析待做，见
 `roadmap-l2-l3-gaps.md`）。所以「部署到其他设备」的边界是**内网/可信网段**。
@@ -172,7 +183,7 @@ Host mc-admin-2
 **五步**（0–1 是包与解压，2–4 在新机器上做）：
 
 ```powershell
-# 0. 取包：target\output\cloud-stream\（目录）或 cloud-stream.zip（8.17 MB）
+# 0. 取包：target\output\cloud-stream\（目录）或 cloud-stream.zip（约 8.6 MB）
 #    从网上 / IM 拿到的 zip 先解锁，否则 SmartScreen 会拦 exe 与 .cmd：
 Unblock-File .\cloud-stream.zip
 
@@ -190,18 +201,24 @@ Unblock-File .\cloud-stream.zip
 #    注意：删掉 cert.pem/key.pem 不是捷径 —— 那会退回明文 HTTP，剪贴板**照样**
 #    不可用（Clipboard API 要安全上下文），只是少了一个告警。
 
-# 3. 初始化：右键 setup-watchdog.bat -> "以管理员身份运行"
-#    它一次做三件事，全都在这个窗口里给出结果：
-#      a) 放行 8080/TCP 与 ICMP echo（提权才做得到）
-#      b) 建 MCStreamSrv 任务：wscript.exe "D:\stream\run-hidden.vbs"
-#      c) 立刻启动一次，最多等 60 秒，然后打印 [ok] 或 [fail]
+# 3. 安装：双击 install.cmd —— 就这一步
+#    它自己弹 UAC 提权，然后一次做完：
+#      a) 检查包是否完整（缺 selkies-web 或缺 run-hidden.vbs 会当场停下）
+#      b) 放行 8080/TCP、ICMP echo、UDP 40000-40049 与程序规则
+#      c) 建 MCStreamSrv 任务：wscript.exe "D:\stream\run-hidden.vbs"
+#      d) 立刻启动一次，最多等 60 秒，然后打印 [ok] 和这台机器的访问地址
+#    只想知道它会做什么、不改动任何东西：install.cmd /check（不需要管理员）
 #
 #    **不需要任何账户密码**。任务注册成"仅当用户登录时运行"
 #    （InteractiveToken）：它复用当前登录会话已经持有的令牌，不做登录、
 #    不存凭据，也不读改 SAM 里的任何东西。空密码账户照样能建、能跑。
 #    任务落在**控制台上登录的那个账户**上，而不是"以管理员身份运行"时
 #    临时提权的那个身份 —— 因为桌面属于前者。
-#    只有极少数情况才需要指定账户：setup-watchdog.bat <account>
+#
+#    等价的手工路径（想分步做时用，install.cmd 内部调的就是它们）：
+#      右键 setup-watchdog.bat -> "以管理员身份运行"
+#      它做 a) b) c) d) 里除"包完整性检查"以外的全部，输出更细。
+#      只有极少数情况才需要指定账户：setup-watchdog.bat <account>
 
 # 4. 浏览器打开 https://<本机IP>:8080/
 #    窗口里已经告诉你 [ok] 了；若还要复核，见下面的三条命令
@@ -313,7 +330,30 @@ Get-Content D:\stream\logs\stream-server.log | Select-String 'listening on' # ht
 1920×1080 / 60 fps / 2500 kbps），然后重启任务。改完别动计划任务本身。
 
 这一路不需要构建机、不需要 ssh、不需要工具链。包里的 `README.txt` 就是三步版
-（解压 → `setup-watchdog.bat` → 浏览器）。
+（解压 → `install.cmd` → 浏览器）。
+
+### 3.0.2 把一台机器退回去：`uninstall.cmd`
+
+同一个目录里的 `uninstall.cmd`，双击即可（同样自己提权）。顺序是排过的，不是
+想起哪个做哪个：
+
+| 步骤 | 动作 | 为什么是这个顺序 |
+|---|---|---|
+| 1 | 停任务 + 注销 `MCStreamSrv` | 看门狗每分钟一次；先杀进程的话它会在这中间把服务拉回来，然后 exe 被占用、目录删不掉 |
+| 2 | 杀掉**本目录**下的 `stream-server.exe` | 按 `ExecutablePath` 前缀过滤，另一份安装在别处的不会被误杀 |
+| 3 | 还原默认录音设备 | 服务启动时会把它切到虚拟麦，而进程从来是被强杀的；原值只在 `logs\mic-default.json`，这个文件下一步就随目录消失 |
+| 4 | 删四条入站规则（含程序规则） | 规则名是全局的，所以也会清掉"另一份副本"用的那几条 |
+| 5 | 删整个目录 | 脚本删不掉自己所在的目录，所以交给一个等 3 秒的 PowerShell 进程 |
+
+任务是"按目录认领"的：如果 `MCStreamSrv` 的动作指向别的目录，它会**跳过**并
+告诉你那个目录在哪（要强删加 `/force`）。另外两个模式：
+
+```cmd
+uninstall.cmd /whatif    :: 只列清单，什么都不改（不需要管理员）
+uninstall.cmd /keep      :: 卸服务、留文件（换新版本重装时用）
+```
+
+不碰的东西：`--upload-dir` 指向的桌面目录里的文件、虚拟声卡驱动、VC++ 运行库。
 
 ### 3.1 有构建机时：一条命令
 

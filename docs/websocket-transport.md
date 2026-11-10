@@ -153,7 +153,10 @@ server → 二进制帧 …
 `resp.json()` 抛异常被 catch 吞掉，所以那个探测从来没生效过。`current_mode` 的
 来源是 `--mode webrtc|websockets`，**#117 起默认 `websockets`**：新设备首屏只占用
 页面已经在用的那个 TCP 端口，不必先放通 UDP 段。要让新设备直接走 WebRTC
-（需要 NACK/PLI/FEC 的那类链路），启动参数写 `--mode webrtc`。
+（需要 NACK/PLI/FEC 的那类链路），启动参数写 `--mode webrtc`，**并且先在那台机器
+上放行 UDP**：ICE 区间由 `--webrtc-udp-port-min/max` 固定（默认 40000-40049，#122），
+`open-inbound.cmd` 会建好对应规则。少了这一条，页面的症状是"WebRTC 无法连接 /
+媒体路径失败"，而 WS 模式一切正常 —— 因为信令走 TCP 8080，媒体走 UDP。
 
 ## 4. `/api/switch`
 

@@ -163,6 +163,12 @@ if exist "%ROOT%\logs\stream-server.log" (
 >> "%OUT%" echo -- rule "cloud-stream ICMPv4" --
 >> "%OUT%" "%PS%" -NoProfile -Command "try { $r = Get-NetFirewallRule -DisplayName 'cloud-stream ICMPv4' -ErrorAction Stop; $r | ForEach-Object { 'enabled=' + $_.Enabled + '  direction=' + $_.Direction + '  action=' + $_.Action + '  profile=' + $_.Profile } } catch { 'NOT FOUND -- ping will time out even when the server is fine' }" 2>&1
 >> "%OUT%" echo.
+>> "%OUT%" echo -- rule "cloud-stream webrtc UDP" (40000-40049 by default) --
+>> "%OUT%" "%PS%" -NoProfile -Command "try { $r = Get-NetFirewallRule -DisplayName 'cloud-stream webrtc UDP' -ErrorAction Stop; $r | ForEach-Object { 'enabled=' + $_.Enabled + '  direction=' + $_.Direction + '  action=' + $_.Action + '  profile=' + $_.Profile }; $r | Get-NetFirewallPortFilter | ForEach-Object { 'protocol=' + $_.Protocol + '  localport=' + $_.LocalPort } } catch { 'NOT FOUND -- WebRTC will report a failed media path while WebSockets keeps working' }" 2>&1
+>> "%OUT%" echo.
+>> "%OUT%" echo -- rule "cloud-stream app" (program rule; covers any port) --
+>> "%OUT%" "%PS%" -NoProfile -Command "try { $r = Get-NetFirewallRule -DisplayName 'cloud-stream app' -ErrorAction Stop; $r | ForEach-Object { 'enabled=' + $_.Enabled + '  direction=' + $_.Direction + '  action=' + $_.Action + '  profile=' + $_.Profile }; $r | Get-NetFirewallApplicationFilter | ForEach-Object { 'program=' + $_.Program } } catch { 'NOT FOUND -- run setup-inbound.cmd as administrator' }" 2>&1
+>> "%OUT%" echo.
 >> "%OUT%" echo -- startup verdicts from start-stream.cmd (PREFLIGHT lines) --
 >> "%OUT%" "%PS%" -NoProfile -Command "if (Test-Path -LiteralPath '%ROOT%\logs\watchdog.log') { $l = Select-String -LiteralPath '%ROOT%\logs\watchdog.log' -Pattern 'PREFLIGHT' | Select-Object -Last 12; if ($l) { $l | ForEach-Object { $_.Line } } else { 'no PREFLIGHT lines -- this bundle predates the startup check' } } else { 'no watchdog.log -- start-stream.cmd never ran from this folder' }" 2>&1
 >> "%OUT%" echo.

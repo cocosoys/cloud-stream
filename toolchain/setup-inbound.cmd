@@ -1,6 +1,6 @@
 @echo off
 rem ---------------------------------------------------------------------------
-rem Open the two inbound paths a controlled machine needs, from its own console.
+rem Open the inbound paths a controlled machine needs, from its own console.
 rem
 rem Run it as administrator (right-click -> Run as administrator). The work is
 rem done by open-inbound.cmd, the same helper start-stream.cmd and
@@ -14,8 +14,14 @@ rem from the build machine -- ping fails, 8080 times out, every port TIMEOUT --
 rem while the server is running perfectly. The Windows popup shown on first
 rem start only helps if somebody sits at that machine and clicks "allow".
 rem
-rem   8080 TCP   HTTPS page, WS signalling, file transfer
-rem   ICMP echo  so "ping <ip>" answers, which is what everyone tries first
+rem   8080 TCP        HTTPS page, WS signalling, file transfer
+rem   40000-40049 UDP WebRTC media (ICE host candidates; #122 pins the range)
+rem   ICMP echo       so "ping <ip>" answers, which is what everyone tries first
+rem   stream-server   program rule, any port/protocol (covers a changed range)
+rem
+rem The UDP rule is the one people forget. WebSockets needs only TCP 8080, so a
+rem machine can serve a perfect picture over WS and still report "WebRTC cannot
+rem connect -- the media path fails" until this range is open.
 rem ---------------------------------------------------------------------------
 setlocal EnableExtensions
 
@@ -54,6 +60,8 @@ echo.
 echo -- rules now in place --
 netsh advfirewall firewall show rule name="cloud-stream 8080"
 netsh advfirewall firewall show rule name="cloud-stream ICMPv4"
+netsh advfirewall firewall show rule name="cloud-stream webrtc UDP"
+netsh advfirewall firewall show rule name="cloud-stream app"
 
 echo.
 echo -- local self check ^(the firewall does not affect loopback^) --

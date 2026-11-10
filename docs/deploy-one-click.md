@@ -106,8 +106,12 @@ target\output\cloud-stream\
   run-hidden.vbs         计划任务入口，无窗口
   setup-watchdog.bat     创建 MCStreamSrv 任务（交互式令牌，不需要账户密码）
   setup-task.ps1         上面那条的实际执行者：按交互式令牌注册任务
+  install.cmd            一键安装：检查包 → 放行入站 → 建任务 → 启动 → 等 60 秒给结论
+                         （`/check` 只读预检，不改任何东西，也不需要管理员）
+  uninstall.cmd          一键卸载：停任务 → 杀进程 → 还默认录音设备 → 删规则 → 删目录
+                         （`/keep` 只卸服务留文件，`/whatif` 只列清单）
   collect-launch-facts.cmd  起不来时双击它，生成一份事实清单（只读，不启动 exe）
-  setup-inbound.cmd     管理员身份运行：放行 8080 与 ping（新机器必须做一次）
+  setup-inbound.cmd     管理员身份运行：放行 8080、ping 与 WebRTC 的 UDP 段（新机器必须做一次）
   open-inbound.cmd      上面那条规则的执行者，被启动脚本自动调用（幂等、静默）
   probe-listen.cmd      启动后 30 秒内把"到底有没有监听"写进 watchdog.log
   set-password.cmd      设 / 改 / 清访问口令，写 auth-token.txt（重启任务生效）
@@ -116,9 +120,14 @@ target\output\cloud-stream\
 target\output\cloud-stream.zip   整包，拷到新机器用
 ```
 
-于是「把一台新设备变成被控设备」是三步：解压 → 右键 `setup-watchdog.bat`
-以管理员身份运行（它会放行入站、建任务、立刻起一次并打印 `[ok]` / `[fail]`）
-→ 打开浏览器。不再逐个 `scp`，也不会漏掉 DLL / 脚本 / 证书。
+于是「把一台新设备变成被控设备」是三步：解压 → 双击 `install.cmd`（它自己弹
+UAC，然后检查包、放行入站、建任务、立刻起一次并打印 `[ok]` / `[fail]`）→ 打开
+浏览器。不再逐个 `scp`，也不会漏掉 DLL / 脚本 / 证书。
+
+要撤掉一台就是一步：双击 `uninstall.cmd`（默认连目录一起删）。`install.cmd` /
+`uninstall.cmd` 内部调用的还是 `setup-task.ps1`、`open-inbound.cmd` 和 exe 的
+`--restore-mic`，没有第二套实现，所以手工路径与一键路径不会各自漂移 ——
+`setup-watchdog.bat` 仍然可用，它是这条链上"只建任务"的那一半。
 
 生产机器上的对应位置是 `<RemoteBase>\stream`（默认 `C:\dev\stream`）。
 `-RemoteBase` 是整台机器换位置时唯一要改的参数 —— 其余路径都是相对推导的。
@@ -135,7 +144,7 @@ target\output\cloud-stream.zip   整包，拷到新机器用
 | `…\run-hidden.vbs` | `C:\dev\stream\run-hidden.vbs` | 无窗口启动，避免每分钟闪一次黑框 | 下次启动生效 |
 | `…\setup-watchdog.bat` | `C:\dev\stream\setup-watchdog.bat` | 建/重建看门狗任务，任务动作按自身位置生成 | 不要 |
 | `…\collect-launch-facts.cmd` | `C:\dev\stream\collect-launch-facts.cmd` | 起不来时的第一个动作：双击生成事实清单（只读） | 不要 |
-| `…\setup-inbound.cmd` | `C:\dev\stream\setup-inbound.cmd` | 管理员运行一次：放行 TCP 8080 + ICMP，否则外部一概连不上 | 不要 |
+| `…\setup-inbound.cmd` | `C:\dev\stream\setup-inbound.cmd` | 管理员运行一次：放行 TCP 8080、ICMP、UDP 40000-40049 与 `stream-server.exe` 程序规则，否则外部一概连不上、WebRTC 切不过去 | 不要 |
 | `…\open-inbound.cmd` | `C:\dev\stream\open-inbound.cmd` | 上面那条规则的幂等实现，`start-stream.cmd` 每次真启动时调用；无输出，只回退出码 | 下次启动生效 |
 | `…\probe-listen.cmd` | `C:\dev\stream\probe-listen.cmd` | 启动后另起一个进程探 loopback，把判决写进 `watchdog.log` 的 `PREFLIGHT` 行 | 下次启动生效 |
 | `…\set-password.cmd` | `C:\dev\stream\set-password.cmd` | 设 / 改 / 清访问口令，结果写入 `auth-token.txt` | 下次启动生效 |
@@ -294,10 +303,18 @@ New-NetFirewallRule -DisplayName 'OpenSSH SSH Server (sshd)' -Direction Inbound 
 
 ```bat
 :: 在被控机上，运行根目录里执行一次（会先要管理员权限，用于放行入站）
+C:\dev\stream\install.cmd
+:: 只建任务、不要向导式的那一套（分步排查时用）
 C:\dev\stream\setup-watchdog.bat
 :: 极少数情况才需要指定账户（默认取控制台登录的那个）
 C:\dev\stream\setup-watchdog.bat <account>
 ```
+
+`install.cmd` 是同一条链的入口：包完整性检查 → `open-inbound.cmd` →
+`setup-task.ps1` → 启动并等 60 秒 → 打印地址。它和 `setup-watchdog.bat` 共用
+同一批实现，所以两条路径不会各自漂移；多出来的只有"检查包"和"读回结论"两件
+纯展示的事。`install.cmd /check` 是只读预检（不改任何东西、不需要管理员），
+用来在动手之前判断"这台机器缺什么"。
 
 任务动作由 `%~dp0` 生成（`wscript.exe "<运行根>\run-hidden.vbs"`），所以整包
 换个目录解压也能用。建完会回读动作与登录类型：动作里读不到 `run-hidden.vbs`、
@@ -905,10 +922,10 @@ rem ... dies on "/I" — the guard ...
 
 | 层 | 改动 | 失败时留下什么 |
 |---|---|---|
-| 启动前 | `start-stream.cmd` 每次**真启动**前 `call open-inbound.cmd`（幂等：查询两条规则，缺了才加）。提权才加得动；UAC 过滤令牌下加不上就记一行 | `PREFLIGHT inbound 8080/ICMP still blocked -- run setup-inbound.cmd as administrator once` |
+| 启动前 | `start-stream.cmd` 每次**真启动**前 `call open-inbound.cmd`（幂等：查询四条规则，缺了才加）。提权才加得动；UAC 过滤令牌下加不上就记一行 | `PREFLIGHT inbound 8080/ICMP/WebRTC still blocked -- run setup-inbound.cmd as administrator once` |
 | 启动后 | `start "" /b probe-listen.cmd`：每 5 秒探一次 loopback（先 https 再 http），最多 6 轮 | `PREFLIGHT listening on 8080 after N probe(s): local status 200` 或 `PREFLIGHT NOT listening on 8080 ...` + 8080 被占用 / panic / 加载器失败三选一 + 下一步 |
 | 建任务时 | `setup-watchdog.bat` 结尾改成：`schtasks /Run` → 最多等 60 秒 → 打印 `[ok]` / `[fail]`，失败时直接给出要看哪两个日志；最后 `pause`，窗口停在结论上 | 屏幕上的 `[fail]`，不会随窗口消失 |
-| 收证据时 | `collect-launch-facts.cmd` 新增第 9 节：网络配置文件、本机 IPv4、两条规则的实际参数、最近 12 条 `PREFLIGHT` 行 | `cloud-stream-facts.txt` 直接可回传 |
+| 收证据时 | `collect-launch-facts.cmd` 第 9 节：网络配置文件、本机 IPv4、四条规则（含 UDP 区间与程序路径）的实际参数、最近 12 条 `PREFLIGHT` 行 | `cloud-stream-facts.txt` 直接可回传 |
 
 **探针自己的四个坑**（都实测踩过）：
 
@@ -1089,3 +1106,142 @@ curl.exe -sk -o NUL -w '%{http_code}' https://192.168.59.148:8080/api/status
 
 前两项挂了都会让**后续所有部署都做不了**，所以它们的修复方法（§3.1 的三行）
 应该和这台机器的 IP 一起记在能看到的地方。
+
+---
+
+## 11 一键安装 / 一键卸载
+
+被控端的运行根里多了两个入口文件，它们只做"把已有步骤串起来"这一件事：
+
+```bat
+install.cmd            :: 检查包 → 放行入站 → 建任务 → 启动 → 最多等 60 s → 打印地址
+install.cmd /check     :: 只读预检，不改任何东西，不需要管理员
+uninstall.cmd          :: 停任务 → 杀进程 → 还默认录音设备 → 删规则 → 删整个目录
+uninstall.cmd /keep    :: 只卸服务，留文件（换版本重装时用）
+uninstall.cmd /whatif  :: 只列清单，什么都不改（不需要管理员）
+```
+
+两者都支持 `/y`（不暂停，给脚本和远程 shell 用），退出码 0 = 成功、1 = 失败。
+
+**它们不重新实现任何东西。** `install.cmd` 调 `open-inbound.cmd` +
+`setup-task.ps1`；`uninstall.cmd` 调 `netsh` 和 exe 的 `--restore-mic`。所以
+`setup-watchdog.bat` 这条手工路径和一键路径不会各自漂移 —— 多出来的只有"包里
+缺了什么"和"读回结论"两件纯展示的事。
+
+### 11.1 为什么多出两个文件而不是改现有脚本
+
+`setup-watchdog.bat` 是"建任务"的正确工具，但它假定操作者已经知道：要给管理员
+权限、防火墙得单独放行、`[fail]` 之后该看哪两个日志。新机器的实际情况是"没人
+知道这些"，于是同一个故障在每台新机器上重演一遍。把知识写进一个入口，比写进
+文档更可靠 —— 文档不会被双击。
+
+`uninstall.cmd` 只能新开一个文件：`setup-watchdog.bat` 的职责是"加上去"，把
+删除逻辑塞进同一个文件会让两边都要读一半。
+
+### 11.2 自提权：UAC 只弹一次
+
+两个脚本开头都先 `net session` 探一下；不是管理员就用 `Start-Process -Verb
+RunAs` 重开自己，**原窗口直接退出**。所以屏幕上永远只有一个窗口是"要做事的
+那个"，结论也只出现在那一个窗口里。
+
+自身路径通过环境变量 `CS_SELF` 传进去，而不是在 `-Command` 里拼嵌套引号：那
+种写法要连续穿过 cmd 的解析器和 PowerShell 的解析器，两层的转义规则不一样，
+路径里带空格或特殊字符时就会打开错的文件。
+
+提权后的副本必须继承模式（`/keep`、`/y`、`/force`），否则"卸服务留文件"在新
+窗口里会变成"连文件一起删"。卸载脚本因此多一个内部参数 `/resumed`：它表示
+"确认已经做过了"，避免在提权后的窗口里再问一遍同样的问题。
+
+### 11.3 卸载的顺序是排过的
+
+| 顺序 | 动作 | 换一下会怎样 |
+|---|---|---|
+| 1 | 停任务 + 注销 `MCStreamSrv` | 看门狗每分钟一次；先杀进程的话它会在中间把服务拉回来，exe 被占用，第 5 步删不掉 |
+| 2 | 杀**本目录**的 `stream-server.exe` | 按 `ExecutablePath` 前缀过滤 —— 只按镜像名杀会连带干掉另一份安装在别处的副本 |
+| 3 | 还原默认录音设备 | 原值只在 `logs\mic-default.json`，第 5 步会把它一起删掉；晚了就永久停在虚拟麦上 |
+| 4 | 删四条入站规则 + 程序规则 | 规则名是全局的，删掉的是"机器上这几条名字"，不是"这个目录的这几条" |
+| 5 | 删目录（交给等 3 秒的 PowerShell） | 脚本删不掉自己所在的目录：cmd 的 CWD 和正在执行的批处理都在里面 |
+
+第 3 步需要 exe 配合，所以加了 `--restore-mic`：只做还原、不绑端口、不开日志、
+立刻退出。这个开关存在的唯一理由是**卸载** —— 服务启动时接管默认录音设备，
+而进程从来是被 `Stop-Process -Force` 收掉的，没有清理机会；拿
+`--mic-default-device off` 顶替不行，那会把整个服务拉起来。
+
+### 11.4 任务按目录认领
+
+`MCStreamSrv` 是**机器级**名字，一台机器只该有一个。卸载时先读回它的动作：
+
+* 动作指向本目录 → 停 + 删；
+* 指向别的目录 → **跳过**，并打印那个目录（"回那个目录里去卸载"），加 `/force`
+  才硬删。
+
+这条规则是为了防止"在新版本目录里点卸载，把旧版本目录的任务删掉"。同时
+`install.cmd` 会在建任务前把旧动作打印出来：整包搬过位置之后，那句
+`it points somewhere else -- this run replaces it` 就是唯一能解释"为什么我改了
+新目录还是老画面"的线索。
+
+### 11.5 两个只读模式
+
+`install.cmd /check` 与 `uninstall.cmd /whatif` 存在的理由不是"优雅"，是
+**可回传**：让用户在动手之前先跑一次，把输出贴过来，比来回猜"你那台机器缺什么"
+快得多。两者都不需要管理员、都不改任何状态，因此在任何权限下都能跑。
+
+`/check` 会检查：exe / `start-stream.cmd` / `run-hidden.vbs` / `setup-task.ps1` /
+`open-inbound.cmd` / `selkies-web\index.html` 是否齐全，`vcruntime140.dll` 是否
+存在（缺了 exe 连 `main()` 都到不了，日志里一个字都不会有），已存在的任务指向
+哪里，8080 是否已被别的程序占用。
+
+### 11.6 明确不做的事
+
+* **不碰账户**：不设密码、不改密码、不动 SAM（见 §3.2）。
+* **不装驱动**：虚拟声卡 / 虚拟手柄驱动是机器级安装，不属于"解压一个目录"。
+* **不删用户数据**：`--upload-dir` 指向的桌面目录里的文件、运行根之外的东西都
+  不在卸载范围内 —— 只有运行根这一个目录会被删。
+* **不做静默安装**：`/y` 只是去掉暂停，不是无人值守；UAC 那一步永远要人点。
+
+### 11.7 第一次实机卸载踩到的三件事
+
+第一次在真机上跑 `uninstall.cmd`（旧版本地目录 + 新的卸载脚本），窗口停在
+`-- [3/5] restoring the default recording device --` 再也不动。三个独立的坑叠在
+一起，每个都单独能让人以为"脚本挂了"。
+
+**一、`Unregister-ScheduledTask` 在实例收尾期间会被拒。** `Stop-ScheduledTask`
+只是**请求**停止，返回时任务状态还是 `Running`；紧接着注销就会拿到
+`0x8004131F`（"该任务的实例已在运行"）。旧代码把错误吞进 `SilentlyContinue`，
+所以屏幕上只有一句 `[warn] task is still registered`。现在：
+
+* 停 → 轮询 `State` 直到不是 `Running`（最多 6 秒）→ 注销；
+* 再补一次 `schtasks /End` + `schtasks /Delete /F`（老 API，能删正在跑的任务）；
+* 仍然删不掉**并且任务还是启用状态** → **就地停下，不删文件**。看门狗每分钟
+  拉一次服务，这时候删目录只会得到半个安装；提示去 `taskschd.msc` 手工删完再
+  跑一遍。
+
+**二、`SetDefaultEndpoint` 可能长时间不返回。** 它走的是未文档化的
+`IPolicyConfig`，在音频服务换状态、设备被独占、第三方驱动栈上会卡住。卸载脚本
+正等着它返回才继续，卡死在这里等于整个卸载卡死。所以 `--restore-mic` 现在把
+还原放进独立线程，主线程最多等 **5 秒**，超时就打 `MICRESTORE timeout` 并以
+退出码 3 结束 —— **卸载继续**，账本先备份到 `%TEMP%\cloud-stream-mic-default.json`，
+提示用户去"设置 → 系统 → 声音"手工改回。
+
+**三、旧 exe 不认识 `--restore-mic`，会当成普通启动。** `Config::parse` 忽略
+未知开关，于是老二进制被当成"正常启动服务"：不返回、占住 8080、还再接管一次
+麦克风。这比卡住更糟。所以执行前先做一次**能力探测**：
+
+```bat
+findstr /M /C:"MICRESTORE" "%EXE%" >nul 2>&1
+```
+
+探测的是一个不会说谎的指纹 —— `MICRESTORE` 只出现在有还原路径的构建里。
+**不能探测 `--restore-mic` 本身**：rustc 会把短开关字面量折叠成立即数比较，
+二进制里一处都不留（`--no-hdr` 能找到，只是因为它同时出现在日志文案里）。
+探测不中就不执行，直接提示手工改回 —— 失败方向是安全的。
+
+顺带修掉一个真 bug：`policy_config()` 在 `CoCreateInstance` 前从不初始化 COM，
+而 `CoCreateInstance` 要求当前线程已初始化。外部进程（`--restore-mic`）里这条
+路径必然返回 `CO_E_NOTINITIALIZED`，也就是**"还原"从来没成功过**，只有
+`0/N 个角色` 这个数字透露了实情。现在 policy config 自己也 `CoInitializeEx`
+（`RPC_E_CHANGED_MODE` 视为正常：那说明 COM 已经可用）。
+
+这三条的共同教训：**卸载器不能无条件相信被卸载的东西**。它面对的可能是一个
+更老的 exe、一个卡住的系统调用、一个删不掉的任务 —— 每一种都必须有上限，
+并且失败时要留下能手工收尾的凭据。
