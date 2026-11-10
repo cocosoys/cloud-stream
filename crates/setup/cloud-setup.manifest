@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity type="win32" name="cloud-stream.setup" version="1.0.0.0" processorArchitecture="*"/>
+
+  <!-- 提权交给用户点"安装"时自己决定（ShellExecute 的 runas），本进程不要管理员。 -->
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+
+  <!--
+    Per-Monitor V2。这一条只能在清单里声明：进程一启动系统就按这个决定
+    "要不要替它做位图缩放"，事后调 SetProcessDpiAwareness 也改不回来
+    （同一个进程只认第一次设置）。没有它，150% 屏上整个窗口是放大过的
+    位图 —— 糊，而且控件位置和字体一起被拉伸。
+    两行都要：dpiAware 给 Win7/8.1，dpiAwareness 给 Win10+，只写前者会被
+    后者覆盖成 System aware。
+  -->
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+    </windowsSettings>
+  </application>
+
+  <!-- 声明支持 Win10/11：不写的话 GetVersionEx 之类会看到 6.2，某些系统行为
+       会退回 Win8 兼容路径。 -->
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+</assembly>

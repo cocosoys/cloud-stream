@@ -47,23 +47,26 @@
 
 use std::sync::Mutex;
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::CreateFontW;
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::{CreateFontW, DeleteObject};
+use windows_sys::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetDlgItem, GetMessageW, GetWindowTextW,
-    LoadCursorW, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW, SendMessageW,
-    SetForegroundWindow, SetWindowTextW, ShowWindow, TranslateMessage, BS_PUSHBUTTON, CW_USEDEFAULT,
-    ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, MB_ICONINFORMATION, MB_ICONWARNING,
-    MB_OK, MB_YESNO, MSG, SW_SHOWNORMAL, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY,
-    WM_SETFONT, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_MINIMIZEBOX, WS_SYSMENU, WS_VISIBLE,
-    WS_VSCROLL,
+    LoadCursorW, MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassW,
+    SendMessageW, SetForegroundWindow, SetWindowTextW, SetWindowPos, ShowWindow, TranslateMessage,
+    BS_PUSHBUTTON, CW_USEDEFAULT, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY,
+    MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO, MSG, SWP_NOACTIVATE, SWP_NOZORDER,
+    SW_SHOWNORMAL, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_SETFONT,
+    WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_MINIMIZEBOX, WS_SYSMENU, WS_VISIBLE, WS_VSCROLL,
 };
 
 // 控件 id。数字直接写死：这个窗口的生命周期里只会有这一套控件。
 const ID_STATE: i32 = 1100;
 const ID_LOG: i32 = 1101;
+const ID_LABEL_STATE: i32 = 1102;
+const ID_LABEL_LOG: i32 = 1103;
 const BTN_REFRESH: i32 = 1001;
 const BTN_SNAPSHOT: i32 = 1002;
 const BTN_ROLLBACK: i32 = 1003;
@@ -99,6 +102,121 @@ static STATE_TEXT: Mutex<String> = Mutex::new(String::new());
 
 unsafe fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+// ---------------------------------------------------------------------------
+// 缩放：Per-Monitor DPI
+// ---------------------------------------------------------------------------
+//
+// 150% 的屏上看到的不该是"被拉大的位图"。三步，缺一不可：
+//
+// 1. 清单里声明 PerMonitorV2（`cloud-setup.manifest` + `build.rs`）—— 不声明
+//    的话系统在进程启动那一刻就把窗口当位图放大，代码里做什么都晚了。
+// 2. 所有尺寸从 96 DPI 的基准值按窗口当前 DPI 换算，字体也按 DPI 重建。
+// 3. 窗口被拖到另一块不同缩放的屏上时系统会发 `WM_DPICHANGED`：按它给的矩形
+//    摆好窗口，再按新 DPI 重排一遍控件。只改窗口不重排，控件挤在左上角；
+//    只重排不改窗口，控件溢出到框外。
+
+/// 96 DPI 下的主窗口布局：`(控件 id, x, y, 宽, 高)`。
+///
+/// 写成表而不是散在 `WM_CREATE` 里，是因为 `WM_DPICHANGED` 要按新 DPI 再排
+/// 一遍；散着写就得写两份，而两份坐标一定会分叉。
+const MAIN_LAYOUT: &[(i32, i32, i32, i32, i32)] = &[
+    (ID_LABEL_STATE, 16, 12, 200, 20),
+    (ID_STATE, 16, 34, 748, 130),
+    // 七个按钮等宽排一行：中文字宽差不多的前提下，等宽比"按字数伸缩"更好看，
+    // 也不会因为某个标签多了两个字就挤歪整排。顺序即操作顺序：看状态 →
+    // 留底 → 退回 → 更新 → 装 / 卸 / 改。
+    (BTN_REFRESH, 16, 176, 100, 30),
+    (BTN_SNAPSHOT, 124, 176, 100, 30),
+    (BTN_ROLLBACK, 232, 176, 100, 30),
+    (BTN_UPDATE, 340, 176, 100, 30),
+    (BTN_INSTALL, 448, 176, 100, 30),
+    (BTN_UNINSTALL, 556, 176, 100, 30),
+    (BTN_CONFIG, 664, 176, 100, 30),
+    (ID_LABEL_LOG, 16, 220, 200, 20),
+    (ID_LOG, 16, 242, 748, 210),
+];
+
+/// 主窗口的基准尺寸（96 DPI，含边框）。窗口按当前 DPI 等比放大。
+const MAIN_WINDOW: (i32, i32) = (796, 484);
+
+/// 一个 96 DPI 下的长度换成像素。
+///
+/// 整数算、四舍五入：1.25 倍时 100 该是 125 而不是 124（截断会一路攒成可见
+/// 的错位）。`+ 48` 就是 `+ half of 96`。
+fn scaled(value: i32, dpi: u32) -> i32 {
+    (value * dpi as i32 + 48) / 96
+}
+
+/// 窗口现在所在那块屏的 DPI。取不到就按 96（100%）—— 老系统上会略小，
+/// 但不会画错。
+fn window_dpi(hwnd: HWND) -> u32 {
+    let dpi = unsafe { GetDpiForWindow(hwnd) };
+    if dpi == 0 {
+        96
+    } else {
+        dpi
+    }
+}
+
+/// 当前 DPI 对应的界面字体。
+///
+/// 缓存一份：DPI 变了才重建，旧的 `DeleteObject` 掉 —— GDI 对象不删就漏，
+/// 而人把窗口在两块屏之间拖来拖去会反复重排。
+static UI_FONT: Mutex<(u32, isize)> = Mutex::new((0, 0));
+
+fn ui_font(dpi: u32) -> isize {
+    let mut slot = UI_FONT.lock().unwrap_or_else(|e| e.into_inner());
+    if slot.0 == dpi && slot.1 != 0 {
+        return slot.1;
+    }
+    unsafe {
+        if slot.1 != 0 {
+            DeleteObject(slot.1);
+        }
+        let font = CreateFontW(
+            -scaled(16, dpi),
+            0,
+            0,
+            0,
+            400,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            wide("Segoe UI").as_ptr(),
+        );
+        *slot = (dpi, font);
+        font
+    }
+}
+
+/// 按当前 DPI 把主窗口的控件摆一遍（`WM_CREATE` 与 `WM_DPICHANGED` 共用）。
+fn apply_main_layout(hwnd: HWND) {
+    let dpi = window_dpi(hwnd);
+    let font = ui_font(dpi);
+    for &(id, x, y, w, h) in MAIN_LAYOUT {
+        let child = unsafe { GetDlgItem(hwnd, id) };
+        if child == 0 {
+            continue;
+        }
+        unsafe {
+            MoveWindow(
+                child,
+                scaled(x, dpi),
+                scaled(y, dpi),
+                scaled(w, dpi),
+                scaled(h, dpi),
+                1,
+            );
+            SendMessageW(child, WM_SETFONT, font as usize, 1);
+        }
+    }
 }
 
 /// 运行根：本 exe 所在目录。和 `ops::run_root` 同一口径 —— 不取当前工作目录，
@@ -324,7 +442,10 @@ struct Field {
     original: Option<String>,
     /// 下拉框的选项。空 = 用文本框。
     options: Vec<String>,
+    /// 输入控件（文本框或下拉框）。
     hwnd: HWND,
+    /// 上面那行名字。也要跟着 DPI 重排，所以句柄得留着。
+    label: HWND,
 }
 
 /// 每格的节拍与宽度：标签 16 + 间隔 2 + 控件 24 + 行距 4。
@@ -332,6 +453,13 @@ const FIELD_PITCH: i32 = 46;
 const FIELD_W: i32 = 320;
 /// 两列的左边界。
 const COL_X: [i32; 2] = [16, 360];
+
+/// 表单底部三个按钮：`(文字, 控件 id, 96 DPI 下的 x, 宽)`。
+const CFG_BUTTONS: &[(&str, i32, i32, i32)] = &[
+    ("保存", BTN_CFG_SAVE, 16, 100),
+    ("重新读", BTN_CFG_RELOAD, 124, 100),
+    ("打开原文", BTN_CFG_RAW, 232, 100),
+];
 
 static FIELDS: Mutex<Vec<Field>> = Mutex::new(Vec::new());
 
@@ -415,6 +543,7 @@ fn read_config_fields(exe: &std::path::Path) -> Result<Vec<Field>, String> {
             original: key["raw"].as_str().map(|v| v.to_owned()),
             options,
             hwnd: 0,
+            label: 0,
         });
     }
     Ok(fields)
@@ -442,47 +571,26 @@ unsafe fn fill_combo(combo: HWND, options: &[String], selected: Option<&str>) {
 /// `HMODULE`/`HFONT` 的具体类型签名抄到这个函数上。
 unsafe fn build_config_controls(parent: HWND) -> i32 {
     let instance = GetModuleHandleW(std::ptr::null());
-    let font = CreateFontW(
-        -16,
-        0,
-        0,
-        0,
-        400,
-        0,
-        0,
-        0,
-        1,
-        0,
-        0,
-        0,
-        0,
-        wide("Segoe UI").as_ptr(),
-    );
     let mut fields = FIELDS.lock().unwrap_or_else(|e| e.into_inner());
-    let rows = ((fields.len() + 1) / 2) as i32;
     for (i, field) in fields.iter_mut().enumerate() {
-        let column = (i as i32) / rows;
-        let row = (i as i32) % rows;
-        let x = COL_X[column as usize];
-        let y = 12 + row * FIELD_PITCH;
-        // 标签
-        let label = wide(&field.brief);
+        // 先建成 0 尺寸：位置与字体统一由 `apply_config_layout` 按当前 DPI 定，
+        // 免得"创建时用一套坐标、重排时用另一套"。
+        let text = wide(&field.brief);
         let c = wide("STATIC");
-        let child = CreateWindowExW(
+        let label = CreateWindowExW(
             0,
             c.as_ptr(),
-            label.as_ptr(),
+            text.as_ptr(),
             0 | WS_CHILD | WS_VISIBLE,
-            x,
-            y,
-            FIELD_W,
-            16,
+            0,
+            0,
+            0,
+            0,
             parent,
             0,
             instance,
             std::ptr::null(),
         );
-        SendMessageW(child, WM_SETFONT, font as usize, 1);
         // 控件：枚举/布尔是下拉框，其余是文本框
         let (class, style) = if field.options.is_empty() {
             // ES_* 在 windows-sys 里是 i32，style 是 u32（WINDOW_STYLE）。
@@ -498,26 +606,68 @@ unsafe fn build_config_controls(parent: HWND) -> i32 {
             c.as_ptr(),
             blank.as_ptr(),
             style | WS_CHILD | WS_VISIBLE,
-            x,
-            y + 18,
-            FIELD_W,
-            if field.options.is_empty() { 24 } else { 200 },
+            0,
+            0,
+            0,
+            0,
             parent,
             (FIELD_BASE + i as i32) as isize,
             instance,
             std::ptr::null(),
         );
-        SendMessageW(input, WM_SETFONT, font as usize, 1);
         let selected = field.original.as_deref().map(plain);
         if field.options.is_empty() {
             let w = wide(selected.unwrap_or(""));
             SetWindowTextW(input, w.as_ptr());
         } else {
+            // 下拉框的"高度"是展开列表的高度，得给足；重排时会换成按 DPI 算的。
             fill_combo(input, &field.options, selected);
         }
         field.hwnd = input;
+        field.label = label;
     }
-    rows
+    ((fields.len() + 1) / 2) as i32
+}
+
+/// 按当前 DPI 排一遍表单（`WM_CREATE` 与 `WM_DPICHANGED` 共用）。
+fn apply_config_layout(hwnd: HWND) {
+    let dpi = window_dpi(hwnd);
+    let font = ui_font(dpi);
+    let rows = {
+        let mut fields = FIELDS.lock().unwrap_or_else(|e| e.into_inner());
+        let rows = ((fields.len() + 1) / 2) as i32;
+        for (i, field) in fields.iter_mut().enumerate() {
+            let column = (i as i32) / rows;
+            let row = (i as i32) % rows;
+            let x = scaled(COL_X[column as usize], dpi);
+            let y = scaled(12 + row * FIELD_PITCH, dpi);
+            let width = scaled(FIELD_W, dpi);
+            // 下拉框给足展开高度（列表项数 × 行高 + 边），否则只有两三行可看。
+            let height = if field.options.is_empty() {
+                scaled(24, dpi)
+            } else {
+                scaled(200, dpi)
+            };
+            unsafe {
+                MoveWindow(field.label, x, y, width, scaled(16, dpi), 1);
+                MoveWindow(field.hwnd, x, y + scaled(18, dpi), width, height, 1);
+                SendMessageW(field.label, WM_SETFONT, font as usize, 1);
+                SendMessageW(field.hwnd, WM_SETFONT, font as usize, 1);
+            }
+        }
+        rows
+    };
+    let y = scaled(12 + rows * FIELD_PITCH + 8, dpi);
+    for &(_, id, x, w) in CFG_BUTTONS {
+        let child = unsafe { GetDlgItem(hwnd, id) };
+        if child == 0 {
+            continue;
+        }
+        unsafe {
+            MoveWindow(child, scaled(x, dpi), y, scaled(w, dpi), scaled(30, dpi), 1);
+            SendMessageW(child, WM_SETFONT, font as usize, 1);
+        }
+    }
 }
 
 /// 把 `FIELDS` 里的原值重新摆到控件上（打开窗口时、保存之后各一次）。
@@ -617,10 +767,12 @@ fn reload_config_form(main: HWND) -> bool {
                 let mut slot = FIELDS.lock().unwrap_or_else(|e| e.into_inner());
                 // 保留已经建好的控件句柄：重建窗口才能拿到新句柄，而窗口不该
                 // 为了值变化而重建。
-                let handles: Vec<HWND> = slot.iter().map(|f| f.hwnd).collect();
+                let handles: Vec<(HWND, HWND)> =
+                    slot.iter().map(|f| (f.hwnd, f.label)).collect();
                 *slot = fields;
-                for (field, hwnd) in slot.iter_mut().zip(handles) {
+                for (field, (hwnd, label)) in slot.iter_mut().zip(handles) {
                     field.hwnd = hwnd;
+                    field.label = label;
                 }
             }
             fill_fields();
@@ -670,6 +822,14 @@ fn open_config_window(main: HWND) {
     }
     // 窗口高度按行数算：加一个键不该把按钮挤出可视区。
     let client_h = 12 + rows * FIELD_PITCH + 8 + 32 + 12;
+    let dpi = {
+        let d = unsafe { GetDpiForSystem() };
+        if d == 0 {
+            96
+        } else {
+            d
+        }
+    };
     unsafe {
         let class = wide("CloudStreamConfig");
         let title = wide("配置（改完要重启服务才生效）");
@@ -680,8 +840,8 @@ fn open_config_window(main: HWND) {
             WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            COL_X[1] + FIELD_W + 32,
-            client_h + 39,
+            scaled(COL_X[1] + FIELD_W + 32, dpi),
+            scaled(client_h + 39, dpi),
             main,
             0,
             GetModuleHandleW(std::ptr::null()),
@@ -705,51 +865,28 @@ unsafe extern "system" fn config_wndproc(
 ) -> LRESULT {
     match msg {
         WM_CREATE => {
-            let rows = build_config_controls(hwnd);
-            let y = 12 + rows * FIELD_PITCH + 8;
+            build_config_controls(hwnd);
             let instance = GetModuleHandleW(std::ptr::null());
-            let font = CreateFontW(
-                -16,
-                0,
-                0,
-                0,
-                400,
-                0,
-                0,
-                0,
-                1,
-                0,
-                0,
-                0,
-                0,
-                wide("Segoe UI").as_ptr(),
-            );
-            let buttons: [(&str, i32, i32); 3] = [
-                ("保存", BTN_CFG_SAVE, 100),
-                ("重新读", BTN_CFG_RELOAD, 100),
-                ("打开原文", BTN_CFG_RAW, 100),
-            ];
-            let mut x = COL_X[0];
-            for (label, id, w) in buttons {
+            for &(text, id, _, _) in CFG_BUTTONS {
                 let c = wide("BUTTON");
-                let t = wide(label);
-                let child = CreateWindowExW(
+                let t = wide(text);
+                CreateWindowExW(
                     0,
                     c.as_ptr(),
                     t.as_ptr(),
                     (BS_PUSHBUTTON as u32) | WS_CHILD | WS_VISIBLE,
-                    x,
-                    y,
-                    w,
-                    30,
+                    0,
+                    0,
+                    0,
+                    0,
                     hwnd,
                     id as isize,
                     instance,
                     std::ptr::null(),
                 );
-                SendMessageW(child, WM_SETFONT, font as usize, 1);
-                x += w + 8;
             }
+            // 位置与字体统一在这里定，按窗口所在屏的 DPI。
+            apply_config_layout(hwnd);
             0
         }
         WM_COMMAND => {
@@ -807,6 +944,26 @@ unsafe extern "system" fn config_wndproc(
                 }
                 _ => {}
             }
+            0
+        }
+        WM_DPICHANGED => {
+            // lparam 是系统建议的新矩形（已按新 DPI 算好）：照它摆，再重排。
+            let rect = lparam as *const RECT;
+            if !rect.is_null() {
+                let r = *rect;
+                unsafe {
+                    SetWindowPos(
+                        hwnd,
+                        0,
+                        r.left,
+                        r.top,
+                        r.right - r.left,
+                        r.bottom - r.top,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                }
+            }
+            apply_config_layout(hwnd);
             0
         }
         // X 只隐藏：窗口留着，人下次打开时改了一半的内容还在。
@@ -966,10 +1123,6 @@ fn on_command(hwnd: HWND, id: i32) {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_CREATE => {
-            let font = CreateFontW(
-                -16, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 0, 0,
-                wide("Segoe UI").as_ptr(),
-            );
             let parent = hwnd;
             let instance = GetModuleHandleW(std::ptr::null());
             // ES_* / BS_* 在 windows-sys 里是 i32，而 CreateWindowExW 的 style 是
@@ -977,51 +1130,30 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             const READONLY_EDIT: u32 =
                 (ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL) as u32 | WS_BORDER | WS_VSCROLL;
             const BUTTON: u32 = BS_PUSHBUTTON as u32;
-            let make = |class: &str, text: &str, style: u32, x: i32, y: i32, w: i32, h: i32, id: i32| -> HWND {
+            // 位置与字体不在这里定：`apply_main_layout` 按窗口所在屏的 DPI 统一
+            // 摆一遍，`WM_DPICHANGED` 也用它。散着写迟早分叉成两套坐标。
+            let make = |class: &str, text: &str, style: u32, id: i32| -> HWND {
                 let c = wide(class);
                 let t = wide(text);
-                let child = CreateWindowExW(
+                CreateWindowExW(
                     0,
                     c.as_ptr(),
                     t.as_ptr(),
                     style | WS_CHILD | WS_VISIBLE,
-                    x,
-                    y,
-                    w,
-                    h,
+                    0,
+                    0,
+                    0,
+                    0,
                     parent,
                     id as isize,
                     instance,
                     std::ptr::null(),
-                );
-                SendMessageW(child, WM_SETFONT, font as usize, 1);
-                child
+                )
             };
 
-            make(
-                "STATIC",
-                "程序文件",
-                0,
-                16,
-                12,
-                200,
-                20,
-                0,
-            );
-            make(
-                "EDIT",
-                "",
-                READONLY_EDIT,
-                16,
-                34,
-                748,
-                130,
-                ID_STATE,
-            );
+            make("STATIC", "程序文件", 0, ID_LABEL_STATE);
+            make("EDIT", "", READONLY_EDIT, ID_STATE);
 
-            // 七个按钮等宽排一行：中文字宽差不多的前提下，等宽比"按字数
-            // 伸缩"更好看，也不会因为某个标签多了两个字就挤歪整排。
-            // 顺序即操作顺序：看状态 → 留底 → 退回 → 更新 → 装 / 卸 / 改。
             let buttons: [(&str, i32); 7] = [
                 ("刷新状态", BTN_REFRESH),
                 ("拍快照", BTN_SNAPSHOT),
@@ -1031,26 +1163,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 ("卸载", BTN_UNINSTALL),
                 ("改配置", BTN_CONFIG),
             ];
-            let mut x = 16;
             for (label, id) in buttons {
-                make("BUTTON", label, BUTTON, x, 176, 100, 30, id);
-                x += 108;
+                make("BUTTON", label, BUTTON, id);
             }
 
-            make("STATIC", "操作记录", 0, 16, 220, 200, 20, 0);
-            make(
-                "EDIT",
-                "",
-                READONLY_EDIT,
-                16,
-                242,
-                748,
-                210,
-                ID_LOG,
-            );
+            make("STATIC", "操作记录", 0, ID_LABEL_LOG);
+            make("EDIT", "", READONLY_EDIT, ID_LOG);
 
+            apply_main_layout(hwnd);
             SetWindowTextW(hwnd, wide("cloud-stream 控制台").as_ptr());
-            let _ = font;
             0
         }
         WM_COMMAND => {
@@ -1061,6 +1182,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_APP_DONE => {
             // 动作结束后顺手刷一次状态：装完/回滚完，人第一眼看的就是版本。
             on_command(hwnd, BTN_REFRESH);
+            0
+        }
+        WM_DPICHANGED => {
+            // 窗口被拖到另一块不同缩放的屏上了。系统给的矩形是"按新 DPI 重新
+            // 算过的窗口大小"，照着摆；再按新 DPI 重排控件与字体。
+            let rect = lparam as *const RECT;
+            if !rect.is_null() {
+                let r = *rect;
+                unsafe {
+                    SetWindowPos(
+                        hwnd,
+                        0,
+                        r.left,
+                        r.top,
+                        r.right - r.left,
+                        r.bottom - r.top,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                }
+            }
+            apply_main_layout(hwnd);
             0
         }
         WM_DESTROY => {
@@ -1108,6 +1250,16 @@ fn main() {
         };
         RegisterClassW(&config_wc);
 
+        // 初始尺寸就按系统 DPI 算：窗口一出现就该是合适的大小，而不是先按
+        // 96 DPI 建出来再等 `WM_DPICHANGED` 补救 —— 创建窗口时不会有那个消息。
+        let dpi = {
+            let d = GetDpiForSystem();
+            if d == 0 {
+                96
+            } else {
+                d
+            }
+        };
         let title = wide("cloud-stream 控制台");
         let hwnd = CreateWindowExW(
             0,
@@ -1116,8 +1268,8 @@ fn main() {
             WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            796,
-            484,
+            scaled(MAIN_WINDOW.0, dpi),
+            scaled(MAIN_WINDOW.1, dpi),
             0,
             0,
             instance,
@@ -1143,5 +1295,73 @@ fn main() {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 缩放要四舍五入，不能截断。
+    ///
+    /// 125% 下 100 该是 125；截断得 124，两个控件各差 1px 看不出来，但一列
+    /// 排下来就是可见的错位，而且是"只有高分屏才复现"的那类问题。
+    #[test]
+    fn scaling_rounds_instead_of_truncating() {
+        assert_eq!(scaled(16, 96), 16);
+        assert_eq!(scaled(100, 120), 125); // 1.25
+        assert_eq!(scaled(100, 144), 150); // 1.5
+        assert_eq!(scaled(100, 168), 175); // 1.75
+        assert_eq!(scaled(100, 192), 200); // 2.0
+        assert_eq!(scaled(83, 120), 104); // 103.75 → 104
+    }
+
+    /// 出框的控件在窗口上根本看不见，而这种错只有肉眼能发现 —— 除非这里守着。
+    #[test]
+    fn every_control_fits_in_the_window() {
+        for &(id, x, y, w, h) in MAIN_LAYOUT {
+            assert!(x >= 0 && y >= 0, "控件 {id} 的坐标是负的");
+            assert!(
+                x + w <= MAIN_WINDOW.0,
+                "控件 {id} 右边出框：{} > {}",
+                x + w,
+                MAIN_WINDOW.0
+            );
+            assert!(
+                y + h <= MAIN_WINDOW.1,
+                "控件 {id} 下边出框：{} > {}",
+                y + h,
+                MAIN_WINDOW.1
+            );
+        }
+    }
+
+    /// 表单是两列，第二列必须从第一列右边之外开始，否则两列叠在一起。
+    #[test]
+    fn config_columns_do_not_overlap() {
+        assert!(
+            COL_X[1] >= COL_X[0] + FIELD_W,
+            "两列挤在一起了：{} + {} > {}",
+            COL_X[0],
+            FIELD_W,
+            COL_X[1]
+        );
+    }
+
+    /// 窗口高度是按行数算出来的，算错了最后一个按钮就没了。
+    #[test]
+    fn config_buttons_fit_under_the_fields() {
+        // 与 `build_config_controls` 同一套算法：18 个键 → 9 行
+        let rows = (18 + 1) / 2;
+        let buttons_y = 12 + rows * FIELD_PITCH + 8;
+        let window_h = 12 + rows * FIELD_PITCH + 8 + 32 + 12;
+        assert!(
+            buttons_y + 30 <= window_h,
+            "按钮被挤出窗口：{} > {window_h}",
+            buttons_y + 30
+        );
+        // 按钮总宽不能超过内容宽度
+        let last_x = CFG_BUTTONS.iter().map(|b| b.2 + b.3).max().unwrap();
+        assert!(last_x <= COL_X[1] + FIELD_W, "按钮比内容还宽：{last_x}");
     }
 }
