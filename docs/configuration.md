@@ -135,7 +135,36 @@ stream-server.exe --print-config json
 问题（配置与程序分离、升级时保留配置），不在这一步。在那之前，机器差异要么
 接受被覆盖，要么写进 `start-stream.cmd`（它同样会被覆盖），要么部署后手工改。
 
-## 9. 与版本的关系
+## 9. 怎么改（不用记事本）
+
+三条路，同一条后端：
+
+```bat
+:: 看现在写着什么（原文 + 类型表；不用打开文件）
+stream-server.exe --ops config-get
+
+:: 改一项；--ops-set 可重复，--ops-unset 删掉整行（= 回默认）
+stream-server.exe --ops config-set --ops-set fps=30 --ops-set video_codec=vp9
+stream-server.exe --ops config-set --ops-unset bitrate
+
+:: 图形界面：控制台窗口的「改配置」，或 cloud-setup.exe --config
+```
+
+`config-set` 保证的四件事：
+
+1. **只改那一行。** 注释、分组、行尾备注原样留着，CRLF 也不会变成 LF ——
+   "读成结构体再整个写回"会把这份文件的价值（注释）抹掉。
+2. **先校验再动文件。** 键名拼错、超范围、类型不对都在"保存"这一刻失败，
+   而不是停在下次启动；一批里有一项不合法就整批不改。
+3. **留底。** 配置在运行目录里时拍一份 `preedit` 快照（`--ops rollback`
+   能退回）；在运行目录之外时在旁边写一份 `.pre-edit` 副本。留底失败就不写。
+4. **原子写。** 先写 `.toml.tmp` 再改名。半截配置的下场是服务起不来，那正是
+   这里最不该制造的状态。
+
+空串与删行仍然是两件事：`--ops-set tls_cert=` 会因为"不能为空"被拒绝，
+要去掉这一项用 `--ops-unset tls_cert`。
+
+## 10. 与版本的关系
 
 `/api/v1/version` 报 `version` / `commit` / `dirty` / `built_at`。它和配置文件
 没有直接关系，但两者解决的是一类问题：**让"这台机器现在是什么状态"可被程序

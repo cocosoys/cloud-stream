@@ -40,8 +40,11 @@ pub struct Key {
     /// TOML 里的键名，与命令行一一对应（`--some-flag` → `some_flag`）。
     pub name: &'static str,
     pub kind: Kind,
-    /// 界面上那一行的大白话，以及这个值是什么单位。
+    /// 界面上那一行的大白话，以及这个值是什么单位。命令行列表用它。
     pub label: &'static str,
+    /// 表单里那一格的名字。`label` 是给人读的句子（"编码是 CPU 干的，
+    /// 虚拟机 15–30 更稳"），塞不进一个 320px 宽的标签；表单要的是名词。
+    pub brief: &'static str,
 }
 
 pub const CODECS: &[&str] = &["vp8", "vp9"];
@@ -56,71 +59,85 @@ pub const KEYS: &[Key] = &[
         name: "port",
         kind: Kind::Num(1, 65535),
         label: "端口",
+        brief: "端口",
     },
     Key {
         name: "width",
         kind: Kind::Num(16, 7680),
         label: "画面宽",
+        brief: "画面宽",
     },
     Key {
         name: "height",
         kind: Kind::Num(16, 4320),
         label: "画面高",
+        brief: "画面高",
     },
     Key {
         name: "fps",
         kind: Kind::Num(1, 240),
         label: "帧率（编码是 CPU 干的，虚拟机 15–30 更稳）",
+        brief: "帧率",
     },
     Key {
         name: "bitrate",
         kind: Kind::Num(50, 200_000),
         label: "码率 kbps（1080p60 用 2500–4000）",
+        brief: "码率 kbps",
     },
     Key {
         name: "keyframe_secs",
         kind: Kind::Num(1, 300),
         label: "关键帧间隔（秒）",
+        brief: "关键帧间隔（秒）",
     },
     Key {
         name: "repeat_every",
         kind: Kind::Num(1, 600),
         label: "静止画面每 N 拍重发一帧",
+        brief: "静止画面重发间隔",
     },
     Key {
         name: "video_codec",
         kind: Kind::Enum(CODECS),
         label: "视频编码（vp9 画质好，vp8 省 CPU）",
+        brief: "视频编码",
     },
     Key {
         name: "encoder",
         kind: Kind::Enum(ENCODERS),
         label: "编码器（auto 找不到硬件会落回软件）",
+        brief: "编码器",
     },
     Key {
         name: "mode",
         kind: Kind::Enum(MODES),
         label: "传输模式（websockets 只需一个 TCP 端口）",
+        brief: "传输模式",
     },
     Key {
         name: "input_policy",
         kind: Kind::Enum(INPUT_POLICIES),
         label: "输入策略（shared = 多人同时操作）",
+        brief: "输入策略",
     },
     Key {
         name: "mic_default_device",
         kind: Kind::Enum(MIC_DEFAULTS),
         label: "接管默认录音设备（off = 完全不碰系统设置）",
+        brief: "默认录音设备",
     },
     Key {
         name: "display",
         kind: Kind::Num(0, 15),
         label: "采集哪块屏（DXGI 序号，0 = 主屏）",
+        brief: "采集哪块屏",
     },
     Key {
         name: "no_hdr",
         kind: Kind::Bool,
         label: "跳过 HDR 采集（虚拟机上设 true）",
+        brief: "跳过 HDR 采集",
     },
     // 下面几个是路径/设备名，属于"改一次就不再动"的那类。放进表单是因为它们
     // 恰恰是最容易被手工改坏的一项 —— 路径里的反斜杠在双引号字符串里要写成
@@ -129,21 +146,25 @@ pub const KEYS: &[Key] = &[
         name: "dist",
         kind: Kind::Text,
         label: "页面目录（不改就留空）",
+        brief: "页面目录",
     },
     Key {
         name: "upload_dir",
         kind: Kind::Text,
         label: "上传落盘目录",
+        brief: "上传目录",
     },
     Key {
         name: "log",
         kind: Kind::Text,
         label: "日志文件路径",
+        brief: "日志文件",
     },
     Key {
         name: "mic_device",
         kind: Kind::Text,
         label: "指定录音设备名（空 = 系统默认）",
+        brief: "录音设备名",
     },
 ];
 
@@ -503,6 +524,7 @@ no_hdr = true
             name: "log",
             kind: Kind::Text,
             label: "日志路径",
+            brief: "日志",
         };
         let value = format_value(&key, r"D:\logs\stream-server.log").unwrap();
         assert_eq!(value, r"'D:\logs\stream-server.log'");
@@ -521,6 +543,7 @@ no_hdr = true
             name: "app",
             kind: Kind::Text,
             label: "app",
+            brief: "app",
         };
         let value = format_value(&key, "we#brtc").unwrap();
         let out = set(TEMPLATE, "app", &value);

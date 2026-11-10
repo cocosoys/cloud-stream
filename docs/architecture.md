@@ -35,6 +35,7 @@
 | `version` | 版本与构建指纹，`/api/v1/version` 的数据源 | 0.2k | `version::as_json` |
 | `ops` | 快照/回滚/校验：四个动作（装/卸/更新/改）的失败兜底 | 1.0k | `ops::try_run`、`snapshot`、`rollback` |
 | `update` | 检查/覆盖/验版本：更新动作的实现，失败自动回滚 | 0.9k | `update::try_run`、`check`、`apply` |
+| `configedit` | 按键读改配置：类型表、校验、原子写，`--ops config-get/config-set` 的实现 | 0.5k | `configedit::KEYS`、`set`、`validate` |
 
 ## 3. 一次推流经过哪些模块
 

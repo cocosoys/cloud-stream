@@ -19,6 +19,10 @@ windows-sys = { version = "0.52", features = [
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",
 ] }
+# 只用来读 `--ops config-get --ops-json`：配置表单要知道每个键现在是什么、
+# 接受什么范围，而这两件事只有服务端那份类型表说了算。仍然没有第二套实现 ——
+# 校验和写入统统在 `--ops config-set` 里。
+serde_json = "1.0"
 
 [profile.dev]
 codegen-units = 2

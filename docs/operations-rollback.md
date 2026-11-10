@@ -74,6 +74,8 @@ stream-server.exe              ->  stream-server.exe.rollback-old
 
 **多出来的文件也改名，不删除。** 更新引入的新 DLL、用户自己放进来的东西，回滚时一律让路成 `.rollback-old`。判错一次不该让人丢文件；清理是人的决定。
 
+**但只对完整快照这么做。** 只备份了几项的快照（`preedit`、`preuninstall`）里，"快照没有的文件"是正常存在的其余东西 —— 对它们也让路，等于回滚一次配置就把目录里的 exe 和 dist 全改名成 `.rollback-old`，服务当场起不来。这是实测撞到的：验证配置表单时回滚一份只含 `stream-config.toml` 的快照，`stream-server.exe` 变成了 `stream-server.exe.rollback-old`。清单里因此多了一位 `partial`（老清单没有这一位，`serde(default)` 读成 `false` = 完整，与旧行为一致），`rollback` 与 `verify` 都只对完整快照做"多出来的文件"这一步。
+
 **回滚之前自动留底。** 每次 `rollback` 先拍一份 `pre-rollback` 快照，然后才动文件。回滚本身也会出错（目标选错、拷到一半断电），那时唯一能救命的正是刚被覆盖掉的那一份。用 `--ops-to <那个 id>` 就能退回去。
 
 ## 5. 两个容易踩反的语义

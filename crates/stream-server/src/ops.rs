@@ -1073,6 +1073,8 @@ fn key_json(key: &crate::configedit::Key, text: &str) -> serde_json::Value {
     let object = doc.as_object_mut().expect("上面构造的一定是对象");
     object.insert("name".into(), key.name.into());
     object.insert("label".into(), key.label.into());
+    // 表单里那一格的名字。`label` 是给人读的句子，塞不进 320px 的标签。
+    object.insert("brief".into(), key.brief.into());
     // `written` 与 `raw` 一起给：表单要区分"这一项没写（用默认值）"与
     // "写了但是空字符串" —— 后者在 TLS 那几项里是有意义的状态。
     object.insert("written".into(), raw.is_some().into());
