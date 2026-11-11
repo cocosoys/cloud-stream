@@ -13,13 +13,17 @@
 | 卸载 | `cloud-setup.exe --uninstall` | 整段要 | `uninstall.rs` |
 | 只补防火墙 | `cloud-setup.exe --inbound` | 是 | `install.rs` |
 
-## 产物：一个目录、一个文件、一个 zip
+发给别人装的那一份外面还套了一层向导（`cloud-stream-setup.exe`，见下节
+「第三个外壳」）。那一层只管铺文件与注册卸载项，上面三个动作仍然是同一个 exe。
+
+## 产物：一个目录、两个文件、一个 zip
 
 ```text
 target\output\
   cloud-stream\          ← 运行根：exe / dll / 前端 / 证书 / 配置 / README
   cloud-stream.zip       ← 上面那个目录的压缩快照（部署上传用）
   cloud-setup.exe        ← 单文件安装器：自带整包（约 9 MB）
+  cloud-stream-setup.exe ← 向导版安装器：Inno 外壳（约 7.8 MB，见下节）
 ```
 
 `cloud-setup.exe` **不在** `cloud-stream\` 里面，这是刻意的：归档里放进
@@ -38,6 +42,93 @@ target\output\
 `target\output\cloud-stream`，再带 `--features embed` 和
 `CS_PAYLOAD_DIR=那个目录` 编一次，产物拷到 `target\output\cloud-setup.exe`。
 反过来的话，exe 里嵌的是一个还不存在的包。
+
+## 第三个外壳：`cloud-stream-setup.exe`（Inno 向导版）
+
+`cloud-setup.exe` 双击起来"没有界面"—— 只有一串自检输出和一个控制台窗口。发给
+不熟这套东西的人时缺三样很具体的能力：自己选装到哪个盘、看得到进度、装完之后
+能在「应用和功能」里找到它。所以 `deploy.ps1` 还编第三个产物：
+
+| | `cloud-setup.exe` | `cloud-stream-setup.exe` |
+|---|---|---|
+| 界面 | 控制台（四个按钮） | 向导：欢迎 → 目录 → 进度 → 完成 |
+| 装到哪 | `%LOCALAPPDATA%\cloud-stream` 固定 | 用户选的目录 + `\cloud-stream` |
+| 卸载入口 | 运行根里的控制台，点「卸载」 | 控制面板「应用和功能」 |
+| 提权 | 自己弹 UAC | `PrivilegesRequired=admin` |
+| 体积 | 8.7 MB | 7.84 MB |
+| 适合 | 自己的机器、脚本批量装 | 发给别人 |
+
+**它是外壳，不是第二套实现。** 装完之后的系统集成 —— 提权建计划任务、四条
+防火墙规则、端口选择、接管/还原默认录音设备 —— 仍然是同一个 exe 的三条命令，
+向导只在三个时机调它们：
+
+```text
+PrepareToInstall  自己做幂等停机：schtasks /End → taskkill /F /IM → 等 600 ms
+ssPostInstall     cloud-setup.exe --finish      --quiet --dir "<用户选的目录>"
+UninstallRun      cloud-setup.exe --uninstall --keep --yes --quiet --dir "<同上>"
+```
+
+`--keep` 说"别删文件"（文件归 Inno 删），`--quiet` 说"别弹框"（向导在负责告诉
+用户发生了什么）。两件事经常一起出现，但不是一回事。
+
+`--quiet` 是进程级开关（`sys::set_quiet`），不是给每个函数加参数：`dialog` 有
+二十多个调用点，逐个传参会把"静默"扩散进所有签名，而它本来只是"这一次运行"的
+一个属性。静默下 `dialog` 改写到 stderr、`confirm` 直接返回 true —— 静默和
+`--yes` 是同一件事的两面，外面那层已经问过了。
+
+### 为什么 `PrepareToInstall` 不干脆调旧版的 `--uninstall`
+
+被升级的那份 `cloud-setup.exe` 是**旧版本**，它不认识 `--quiet`。参数解析对不
+认识的开关是"忽略"（这是对的，否则加个新开关就会让老机器装不上），于是它会按
+老规矩弹一个「卸载完成」的框 —— 无人值守安装里向导背后没有人点确定，两个进程
+就那样互相等着。自己在向导里做幂等停机没有这个问题，也不需要旧版本配合。
+
+### 运行根里那份控制台不带整包
+
+payload 里**没有** `cloud-setup.exe`（`build.rs` 刻意跳过它，否则就是 exe 里
+嵌着包含自己的包）。Inno 需要往运行根补一份，所以构建时另外编一个
+`--target-dir target\inno-console` 的**不带 embed** 版本：748,032 B，对比 embed
+版的 8.7 MB。用独立 target 目录而不是反复切 features —— 同一个 target 目录下
+换 features 会让 cargo 把整个 crate 重编一遍。
+
+### 卸载要连空目录一起收掉
+
+`[UninstallDelete]` 两条，都是实机验出来的：
+
+```inno
+Type: filesandordirs; Name: "{app}\logs"   ; logs\*.log 是运行时写的，不在安装清单里
+Type: dirifempty;     Name: "{app}"        ; 目录本身也要收
+```
+
+不写第一条，用户卸完会看到一个只剩 `logs\*.log` 的目录（实机验过一次就是
+这样）。第二条用 `dirifempty` 而不是 `filesandordirs`：用户可能选一个已经装了
+别的东西的目录（`D:\Tools`），里面不该被清空。而只靠 Inno 自己的记录不够 ——
+安装前那个目录就存在时，它不认为这是自己建的。`stream-config.toml` 在安装清单
+里，会跟着删，不用写在这里。
+
+### 中文界面是 vendored 进来的
+
+Inno 6 自带的 `Languages\` 只有 29 种官方语言，**没有中文**。
+`toolchain\inno\ChineseSimplified.isl` 是从上游 vendored 的（维护者 Zhenghan
+Yang），构建因此不依赖本机装了什么。
+
+`.iss` 和 `.isl` 都必须是 **UTF-8 带 BOM**：`.isl` 从上游下载时没有 BOM，
+Inno 会按 ANSI 解析，中文全变成乱码。
+
+### 没有 ISCC 时只警告
+
+`deploy.ps1` 找不到 `ISCC.exe` 时不 throw —— 这是"少一个产物"，不是"构建坏了"，
+便携版照常出。装一个：
+
+```powershell
+winget install --id JRSoftware.InnoSetup -e
+```
+
+它默认装到用户级（`%LOCALAPPDATA%\Programs\Inno Setup 6`），所以脚本按"PATH →
+用户级 → Program Files"三档找，只认 `Program Files` 会在明明装了的时候报没装。
+
+> **MSI 走同一条分工**：两个 deferred CustomAction 调同一对 `--finish` /
+> `--uninstall --keep`，留给需要组策略 / SCCM 分发的场景。
 
 ## 同一个 exe 两个角色
 
@@ -250,6 +341,9 @@ finished: 2026-11-12 10:31:19
 | 删不掉时点名文件 | 独占打开一个文件（没有 `FILE_SHARE_DELETE`）再 `--purge` | 通过：退出码 8、目录保留、结论写着 `删不掉 ...\logs\held.log：另一个程序正在使用此文件 (os error 32)` |
 | `--plan` | 对真实整包目录跑 | 通过（任务/进程/规则/目录四项都能报出来） |
 | 提权两段串联、防火墙真建真删、录音设备真还原、真机点安装/卸载 | **未验证** —— 开发机上 `schtasks.exe` 被安全策略拦着，而且不该在别人的机器上改防火墙 | 待新机器验收 |
+| 向导版全新静默安装（`/VERYSILENT`） | `.150` 实机：`exit 0` / 6 s / 2023 文件 / 控制台 748,032 B（非 embed）/ 任务 `InteractiveToken` 指向新目录 / 8080 在听 / 卸载项出现 | 通过 |
+| 向导版覆盖安装（服务正在跑） | `.150` 实机：`exit 0`，pid 1236→3680，落定后 1 个进程，`IgnoreNew` 生效，看门狗日志两次 `PREFLIGHT listening` | 通过 |
+| 向导版卸载（控制面板 / `unins000.exe`） | `.150` 实机：`exit 0` / 2 s，进程 0、任务消失、卸载项 0、端口释放、防火墙规则 5→1（只剩人工建的 `ssh 22`）、**安装目录整个消失** | 通过 |
 
 ## 相关文档
 
