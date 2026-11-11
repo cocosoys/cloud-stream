@@ -212,7 +212,7 @@ index.html                    917 B   ← 判定「是不是 dashboard 构建」
 assets/index-*.js      738,508 B   React + 侧边栏 + 面板
 assets/index-*.css      39,323 B
 assets/selkies-core-*.js 535,115 B  核心：信令、解码、输入、统计浮层
-jsdb/                    1994 个   手柄映射库，按 VID/PID 分文件（五平台，清单里聚合成 5 条单元）
+jsdb/                   ~1995 个   手柄映射库，按 VID/PID 分文件（五平台，清单里聚合成 5 条单元；另有 `.upstream.json` 记来源，见 §7.19）
 codecs/libopus-wasm/         4 个   AudioWorklet 解码器
 brand/logo.svg           1,641 B   侧边栏品牌图
 manifest.json / favicon.ico / icon.png / icon-512.png
@@ -727,6 +727,39 @@ node 的 `rmSync` 包了一层），超过阈值就拒绝执行，构建中断�
 
 > 判断有没有踩到：看 zip 体积。完整包 ~1.16 MB，缺 jsdb 的 ~0.55 MB。部署日志
 > 不会告诉你。
+
+**补（2026-11-11）**：`raw.githubusercontent.com` 在本机仍然时通时不通（同日实测
+`api.github.com` 900 ms、raw 直接 connect timeout）。而上面那条三级退让有个代价：
+**已经解析到新 commit、却取不到字节时，包会悄悄退回一份更旧的映射** —— 症状不是
+构建失败，所以更难发现。取字节因此改成三个源依次试：
+
+```
+raw.githubusercontent.com            →  gcore.jsdelivr.net（按 commit 的 CDN）  →  ghfast.top
+```
+
+换通道不影响正确性：不管哪个源送来的字节，都要过同一道 git blob 校验，所以镜像
+只能校验失败、不能替换内容。顺带把 blob sha 的来源从 `/contents/<path>?ref=` 换成
+commit 的 root tree —— 前者为了一个字段要回 800 KB base64（整份文件），实测 25 s
+超时；tree 只有几 KB，同一个 sha。
+
+**同一批补了两件"这个包能不能复现"的事**（在 `selkies-web-core` 仓库，
+`3bcf154`）：
+
+* `gendb.js` 成功后写 `dist/jsdb/.upstream.json`：`repo` / `commit` / `blob` /
+  `pinned` / `source` / `fetched_at` / `mappings`。包自己就能回答"这近两千个映射
+  是哪一版"，不用重建 —— 重建只会拿到**当天**的上游，而不是产出它的那一版。
+  `deploy.ps1` 把它抄进 `manifest.json` 的 `web.gamepad_db`（老包没有这个文件时为
+  `null`，不算错误）。
+* `SDL_GAMEDB_COMMIT=<40 位 sha>` 锁住那一棵树；`deploy.ps1` 用
+  `CS_GAMEDB_COMMIT` 透传，形如：
+
+  ```powershell
+  $env:CS_GAMEDB_COMMIT = (Get-Content target\output\cloud-stream\selkies-web\jsdb\.upstream.json |
+      ConvertFrom-Json).commit
+  .\toolchain\deploy.ps1 -PackageOnly
+  ```
+
+  不设就仍然追 master —— 数据库是持续维护的，dev 构建该拿到新的。
 
 ---
 

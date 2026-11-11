@@ -604,6 +604,19 @@ function New-DeployBundle {
             files     = $web.Count
             bytes     = $webBytes
             index_md5 = (Get-Md5 (Join-Path $BundleDir 'selkies-web\index.html'))
+            # 手柄映射库的来源。gendb.js 每次成功都写这个文件；老包解开重建时
+            # 可能没有 —— 那时为 null，不是错误，只说明这版包答不出"映射库是哪版"。
+            gamepad_db = $(if (Test-Path (Join-Path $BundleDir 'selkies-web\jsdb\.upstream.json')) {
+                    $up = Get-Content (Join-Path $BundleDir 'selkies-web\jsdb\.upstream.json') -Raw |
+                        ConvertFrom-Json
+                    [ordered]@{
+                        repo     = $up.repo
+                        commit   = $up.commit
+                        blob     = $up.blob
+                        pinned   = $up.pinned
+                        mappings = $up.mappings
+                    }
+                } else { $null })
         }
         launchers = $LauncherNames
         tls      = [bool]$cert
@@ -1043,10 +1056,22 @@ try {
                 if (Test-Path $stale) { Remove-LocalPath $stale }
             }
 
+            # 手柄映射库（jsdb）默认追 SDL_GameControllerDB 的 master 最新提交，
+            # 于是同一个后端 commit 构建两次，包里近两千个 JSON 可能不同 ——
+            # manifest 里的 web 指纹也就不再能当"两次构建一样"的证据。
+            # 要可复现就设 CS_GAMEDB_COMMIT=<40 位 sha>（上一次用的是哪个，
+            # 看包里的 selkies-web\jsdb\.upstream.json）。
+            if ($env:CS_GAMEDB_COMMIT) {
+                if ($env:CS_GAMEDB_COMMIT -notmatch '^[0-9a-f]{40}$') {
+                    throw "CS_GAMEDB_COMMIT 要完整的 40 位 sha，收到 '$($env:CS_GAMEDB_COMMIT)'"
+                }
+                $env:SDL_GAMEDB_COMMIT = $env:CS_GAMEDB_COMMIT
+                Write-Note ("手柄映射库锁定在 {0}" -f $env:CS_GAMEDB_COMMIT)
+            }
+
             Push-Location $CoreDir
             try { Invoke-Native -Exe 'npm' -Arguments @('run', 'build') -Quiet } finally { Pop-Location }
             Write-Ok 'core 构建完成'
-
             Push-Location $DashDir
             try { Invoke-Native -Exe 'npm' -Arguments @('run', 'build') -Quiet } finally { Pop-Location }
             Write-Ok 'dashboard 构建完成'
