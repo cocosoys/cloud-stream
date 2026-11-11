@@ -1,4 +1,16 @@
 # MC 1.12.2-Forge 14.23.5.2864 命令行直启（免启动器，输出日志供排障）
+#
+# 状态（2026-11-11）：**不属于 cloud-stream 的构建或安装链**。它是游戏主机上
+# 手动排障时用的辅助脚本，留在仓库里只因为它记着几件踩过的事：
+#   * 1.12.2 的 classpath 必须从 version json 的 downloads.artifact.path 拼，
+#     不能按 name 猜；natives 不能上 classpath。
+#   * 参数要拼成**一个字符串**再交给 Start-Process —— 用数组传会被含空格的
+#     路径拆断，症状是"启动到一半找不到主类"。
+#   * 三处路径是本机写死的：$mc（.minecraft）/ $ver / $java（jdk8）。换机器
+#     先改这三行，别处不用动。
+# 目标主机 192.168.59.148 现在连不上（2026-11-11 实测 ssh 超时），.150 上既
+# 没有 C:\dev\mc 也没有 jdk8 —— 所以这份大概是它唯一还能读到的副本。真要恢复
+# 这套 MC 试玩链，按上面三条核一遍再跑。
 $ErrorActionPreference = 'Stop'
 $mc = 'C:\Users\Administrator\Desktop\.minecraft'
 $ver = '1.12.2-Forge_14.23.5.2864'

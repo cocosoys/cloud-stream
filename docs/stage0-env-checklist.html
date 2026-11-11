@@ -400,6 +400,18 @@ vcpkg list</pre>
     </tbody>
   </table>
   <p class="small">生成时间：2026-10-22 · 主控 SERVER001 · 路线 A 阶段 0 · 清单与脚本均位于 <span class="mono">C:\Users\user\Desktop\cloud-stream\</span></p>
+  <div class="warn">
+    <div class="lab">2026-11-11 补记</div>
+    本文是阶段 0 的<b>快照</b>，不再逐字代表现状。第 1 节提到"沿用
+    <span class="mono">build-shell.cmd</span> / <span class="mono">install-vcpkg-libs.cmd</span>
+    的 vcvars 前置包装"—— 其中 <span class="mono">build-shell.cmd</span> 与
+    <span class="mono">build-ws.cmd</span> 已删除：它们把 <span class="mono">vcvars64.bat</span>
+    和 <span class="mono">C:\dev\*</span> 的 PATH 写死在文件里，换一台机器就编不过。现在这件事由
+    <span class="mono">toolchain\build.ps1</span> 与 <span class="mono">deploy.ps1</span> 的
+    <span class="mono">Initialize-BuildEnv</span> 承担（三条环境变量优先、探测兜底），见
+    <span class="mono">CONTRIBUTING.md</span> 第 1 节。
+    <span class="mono">install-vcpkg-libs.cmd</span> 仍在。
+  </div>
 </section>
 
 </div>

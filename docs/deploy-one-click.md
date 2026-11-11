@@ -788,6 +788,23 @@ web 目录副本（§7.22）。
 
 清理后 `toolchain/` 123 MB → 221 KB。证书私钥、bench CSV、`vendor-backup/` 未动。
 
+**后续（2026-11-11）**：上面那张表里又有 4 个后来成了死文件，已删：
+
+| 删掉 | 为什么 |
+|---|---|
+| `build-ws.cmd` | 写死 `vcvars64.bat` 与 `C:\dev\*` 的 PATH；现在由 `toolchain\build.ps1` / `deploy.ps1` 的 `Initialize-BuildEnv` 负责。CONTRIBUTING.md 里"别去改脚本里写死的路径"说的就是它 |
+| `build-shell.cmd` | 同上，且只为编一个阶段 0 的冒烟 crate。那个 crate（`crates/shell`）留着，`cargo build --manifest-path crates/shell/Cargo.toml` 仍然能用 |
+| `distcheck.ps1` | 查的是已经不存在的 `C:\dev\selkies-web`。前端现在在仓库里，指纹走 `manifest.json` 与 `--task-xml` 那一类诊断 |
+| `logtriage.ps1` | 过滤的是 `C:\dev\stream\logs\stream-server.log`，而运行根现在在 `%LOCALAPPDATA%\cloud-stream`；同一件事 `collect-launch-facts.cmd` 已经做了（两个日志各拖尾 40 行） |
+
+`start-mc.ps1` **留下了**：它不是 cloud-stream 的构建件，是游戏主机上手动排障用
+的脚本。`.148` 现在 ssh 超时、`.150` 上既没有 `C:\dev\mc` 也没有 jdk8，所以这份
+大概是仅存的副本 —— 删掉就只剩记忆里的描述。改法是在文件头补一段状态说明，
+点明它不属于构建链、三处写死路径在哪、恢复这套 MC 试玩链要先核什么。
+
+同批还删了 `crates/stream-server/src/http/_backup/server-plain-http.rs.bak`
+（无任何引用的旧 HTTP 实现备份，`http/` 下只剩真正的模块）。
+
 ### 7.22 被控机上堆着构建端的东西（已清，回滚改到构建端）
 
 **现象**：`C:\dev` 从"能跑起来的最小集合"长成了现场仓库 —— `deploy\` 里 30 个文件
