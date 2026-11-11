@@ -26,11 +26,32 @@ windows-sys = { version = "0.52", features = [
     "Win32_System_Console",
     "Win32_Storage_FileSystem",
     "Win32_Security",
+    # 结论文件里的时间戳（`GetLocalTime`）。安装记录要能回答"这是哪一次"，
+    # 而 `SystemTime` 只能给出一个距 1970 的年数 —— 人看的不是那个。
+    "Win32_System_SystemInformation",
 ] }
 # 只用来读 `--ops config-get --ops-json`：配置表单要知道每个键现在是什么、
 # 接受什么范围，而这两件事只有服务端那份类型表说了算。仍然没有第二套实现 ——
 # 校验和写入统统在 `--ops config-set` 里。
 serde_json = "1.0"
+# 内嵌安装包：整包 24 MB，其中前端 2006 个文件。不压缩的话分发物就是一个
+# 24 MB 的 exe；gzip 之后约 9 MB（前端大多是 JS，压缩率很高）。
+#
+# 选 flate2 的理由和 `toml` 一样：它已经在 workspace 的 lock 里（stream-server
+# 用它做 PNG），本机 registry 缓存里有，所以这个依赖不新增任何下载、不引入新的
+# 传递依赖树。
+flate2 = "1.0"
+
+# build.rs 也要它：归档在构建期就被压好了（那时代价是零，运行时解压一次）。
+[build-dependencies]
+flate2 = "1.0"
+
+[features]
+# `--features embed` 时把 `target/output/cloud-stream` 打进 exe（见 build.rs）。
+#
+# 默认**不开**：`cargo build -p cloud-setup` 应该还是 2 秒、377 KB，方便改界面
+# 时快速迭代；只有 `deploy.ps1` 在打发布包时才需要那个 9 MB 的版本。
+embed = []
 
 [profile.dev]
 codegen-units = 2

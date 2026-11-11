@@ -10,13 +10,26 @@
 //! ```text
 //! 刷新状态 / 拍快照 / 回滚   ->  stream-server.exe --ops state|snapshot|rollback
 //! 更新                      ->  stream-server.exe --update check|apply
-//! 安装 / 卸载               ->  install.cmd / uninstall.cmd（提权窗口）
+//! 安装                      ->  本 exe 自己：--install（解压）→ --finish（管理员）
+//! 卸载                      ->  uninstall.cmd（提权窗口）
 //! 改配置                    ->  stream-server.exe --ops config-get|config-set
 //! ```
 //!
-//! 所以它和两个 cmd 脚本处在同一层，三个消费者一个后端。任何一个动作在窗口里
-//! 能做的，在命令行里也能做，反之亦然 —— 不存在"界面上能点、脚本里做不到"这种
-//! 只能靠人记住的差别。
+//! 所以它和 `uninstall.cmd` 处在同一层，多个消费者一个后端。任何一个动作在窗口
+//! 里能做的，在命令行里也能做，反之亦然 —— 不存在"界面上能点、脚本里做不到"
+//! 这种只能靠人记住的差别。
+//!
+//! # 同一个 exe 的两个角色
+//!
+//! 装上之后，这个 exe 就是控制台；而分发出去的那一份（带 `--features embed`
+//! 构建的）里还嵌着整个运行包，双击就要能装。判断依据不是"我是不是被双击了"
+//! ——那个问题没有答案，而是**我旁边有没有 `stream-server.exe`**：
+//!
+//! * 旁边有 → 装上之后的那一份（或者开发机上的整包目录），当控制台；
+//! * 旁边没有但有内置包 → 分发出去的那一份，当安装器。
+//!
+//! 归档里刻意没有这个 exe 自己（否则就成了"exe 里嵌着包含自己的包"）：安装器
+//! 解压完把自己复制进目标目录，从那以后它就是控制台。见 `pack::place_self`。
 //!
 //! # 为什么不用 Tauri / egui
 //!
@@ -25,16 +38,19 @@
 //! 增量成本是零个新依赖、几秒构建。代价是界面语言是 Win32 而不是 CSS —— 对这
 //! 个尺寸的界面，这笔账划算。
 //!
-//! # 提权的两个动作为什么在新窗口里跑
+//! # 提权的动作为什么在新窗口里跑
 //!
-//! `install.cmd` / `uninstall.cmd` 需要管理员。用 `runas` 拉起时输出在新开的
-//! 控制台里，本窗口抓不到 —— 与其假装抓到了再显示一半，不如明说"已在新窗口
-//! 运行"。
+//! `uninstall.cmd` 需要管理员。用 `runas` 拉起时输出在新开的控制台里，本窗口
+//! 抓不到 —— 与其假装抓到了再显示一半，不如明说"已在新窗口运行"。
 //!
-//! 安装这一条已经接回来了：`install.cmd` 会把自己的结论写进
+//! 但它仍然会写下结论：`install.cmd` / `uninstall.cmd` 都把过程写进
 //! `%ProgramData%\cloud-stream\last-install.txt`（固定路径，提权换账户也读得
 //! 到），本窗口在拉起之后盯着那个文件，出现 `=== RESULT:` 就把整段贴进日志。
-//! 卸载还没有这一步 —— 它跑完就把目录删了，需要另找落点。
+//!
+//! 安装现在是这个 exe 自己做的（`install` 模块），两段之间同样靠那个文件回传：
+//! 第一段在用户令牌下解压并写抬头，第二段在管理员令牌下建任务、放行防火墙，
+//! 写的是同一个文件、同一套标记。所以本窗口的"盯文件"逻辑一行都不用分情况 ——
+//! 换掉实现，不换掉契约。
 //!
 //! # 改配置为什么是表单而不是记事本
 //!
@@ -56,6 +72,13 @@
 //! panic → 进程没了）。把它指到 NUL 之后，那种写法至少不会炸。
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
+
+// 安装器的三条腿：`pack` 读内嵌包并铺到目标目录，`install` 走两段流程，
+// `report` 把经过写进那个"提权也能读"的结论文件。窗口与它们是同一个 exe 的
+// 两个角色 —— 谁上场由 `decide_mode` 说了算。
+mod install;
+mod pack;
+mod report;
 
 use std::sync::Mutex;
 
@@ -238,6 +261,44 @@ fn run_root() -> std::path::PathBuf {
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
+// ---------------------------------------------------------------------------
+// 这次当谁
+// ---------------------------------------------------------------------------
+
+/// 同一个 exe 的两个角色。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mode {
+    /// 窗口：装好之后的那一份。
+    Console,
+    /// 安装器：分发出去的那一份，自带有整个运行包。
+    Installer,
+}
+
+/// 这一轮启动该做什么。
+fn decide_mode(args: &[String]) -> Mode {
+    let explicit = args.iter().any(|a| a == "--install" || a == "--finish");
+    classify(
+        explicit,
+        pack::is_embedded(),
+        run_root().join("stream-server.exe").exists(),
+    )
+}
+
+/// 判据拆成三个布尔，是为了让"四种组合各是什么"能被测试钉住。
+///
+/// 关键的一条是**不按"我是不是被双击了"判断**：那个问题在进程里没有答案。
+/// 有答案的是"我旁边有没有 `stream-server.exe`" —— 装好的那一份一定有，
+/// 分发出去的那一份一定没有（包里的 exe 是解压完才复制进去的）。
+fn classify(explicit_install: bool, has_payload: bool, server_beside: bool) -> Mode {
+    if explicit_install {
+        return Mode::Installer;
+    }
+    if has_payload && !server_beside {
+        return Mode::Installer;
+    }
+    Mode::Console
 }
 
 /// 追加一行日志并刷新面板。
@@ -1279,6 +1340,17 @@ fn stdio_guard() {}
 fn main() {
     // 必须在任何输出之前（虽然现在一行都没有，但缺陷是"将来加一行就炸"）。
     stdio_guard();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // 诊断：把要注册的任务 XML 原样打出来。字段里排查"任务建不起来"靠它 ——
+    // 所以放在分流之前，任何一份 exe 都能问（不需要内置包）。
+    if args.iter().any(|a| a == "--task-xml") {
+        std::process::exit(install::print_task_xml());
+    }
+    // 安装器这一支不建窗口、不注册窗口类：它要的是一个提权后的进程在跑，
+    // 而不是一个窗口。所以分流放在这里，而不是窗口里加一个按钮分情况。
+    if decide_mode(&args) == Mode::Installer {
+        std::process::exit(install::run(&args));
+    }
     unsafe {
         let instance = GetModuleHandleW(std::ptr::null());
         let class_name = wide("CloudStreamSetup");
@@ -1428,5 +1500,22 @@ mod tests {
         // 按钮总宽不能超过内容宽度
         let last_x = CFG_BUTTONS.iter().map(|b| b.2 + b.3).max().unwrap();
         assert!(last_x <= COL_X[1] + FIELD_W, "按钮比内容还宽：{last_x}");
+    }
+
+    /// 角色矩阵。每条都对应一个真实场景，选错就是"双击装好的 exe 又装一遍"
+    /// 或者"分发出去的 exe 打不开、只弹一个空窗口"。
+    #[test]
+    fn role_matrix() {
+        // 分发出去的那一份：有包、旁边没有服务 → 安装器。
+        assert_eq!(classify(false, true, false), Mode::Installer);
+        // 装好之后的那一份：有包、旁边有服务 → 控制台。双击不再重装。
+        assert_eq!(classify(false, true, true), Mode::Console);
+        // 开发机构建：没有包 → 永远是控制台，哪怕旁边什么都没有（那时窗口
+        // 会老老实实说"找不到 stream-server.exe"）。
+        assert_eq!(classify(false, false, false), Mode::Console);
+        assert_eq!(classify(false, false, true), Mode::Console);
+        // 显式 --install 压过一切：修复安装靠它（旁边有服务也要重装）。
+        assert_eq!(classify(true, true, true), Mode::Installer);
+        assert_eq!(classify(true, false, false), Mode::Installer);
     }
 }
