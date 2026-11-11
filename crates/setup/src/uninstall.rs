@@ -95,6 +95,12 @@ struct Opts {
     plan: bool,
     /// 删目录之前要等这些进程退出（含本进程，由调用方传入）。
     wait: Vec<u32>,
+    /// 不弹任何框（给外面那层安装器的 `[UninstallRun]` 用）。
+    ///
+    /// `--keep` 与它常一起出现，但它们是两件事：`--keep` 说"别删文件"
+    /// （文件归外面那层删），`--quiet` 说"别弹框"（外面那层的卸载页在负责
+    /// 告诉用户发生了什么）。静默卸载里一个 MessageBox 会让进程一直等。
+    quiet: bool,
 }
 
 fn parse(args: &[String]) -> Result<Opts, String> {
@@ -108,6 +114,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         whatif: false,
         plan: false,
         wait: Vec::new(),
+        quiet: false,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -134,6 +141,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "--force" => opts.force = true,
             "--whatif" => opts.whatif = true,
             "--plan" => opts.plan = true,
+            "--quiet" | "--silent" => opts.quiet = true,
             // 其余忽略：窗口会把"我们这个 exe 的参数"整串传下来。
             _ => {}
         }
@@ -143,6 +151,11 @@ fn parse(args: &[String]) -> Result<Opts, String> {
 
 /// 入口。返回进程退出码。
 pub fn run(args: &[String]) -> i32 {
+    // 解析失败时还不知道 `--quiet`，先从原始参数里探一次 —— 外面那层
+    // 安装器的卸载页正等着这个进程返回，弹框会把它卡住。
+    if args.iter().any(|a| a == "--quiet" || a == "--silent") {
+        sys::set_quiet(true);
+    }
     let opts = match parse(args) {
         Ok(opts) => opts,
         Err(msg) => {
@@ -150,6 +163,7 @@ pub fn run(args: &[String]) -> i32 {
             return 2;
         }
     };
+    sys::set_quiet(opts.quiet);
     match opts.stage {
         Stage::Main => main_stage(&opts),
         Stage::Purge => purge_stage(&opts),
@@ -1414,5 +1428,19 @@ mod tests {
         let root = std::env::temp_dir().join(format!("cs-gone-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         assert!(remove_tree(&root).is_ok());
+    }
+
+    /// `--quiet` 与 `--keep` 常一起出现，但语义无关：前者"别弹框"，
+    /// 后者"别删文件"，两个都得各自认得出来。
+    #[test]
+    fn quiet_and_keep_are_independent_switches() {
+        let a = parse(&args(&["--uninstall", "--keep", "--quiet", "--yes"]));
+        let a = a.unwrap();
+        assert!(a.quiet && a.keep_files && a.yes);
+        assert!(!a.force && !a.plan);
+
+        let b = parse(&args(&["--silent"])).unwrap();
+        assert!(b.quiet);
+        assert!(!b.keep_files, "--quiet 不该顺带改 --keep");
     }
 }

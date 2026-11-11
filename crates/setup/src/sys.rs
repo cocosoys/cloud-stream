@@ -23,6 +23,7 @@
 
 use std::os::windows::process::CommandExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Globalization::{GetOEMCP, MultiByteToWideChar};
@@ -40,6 +41,24 @@ pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 // 说话
 // ---------------------------------------------------------------------------
 
+/// 这一次运行不说话（`--quiet`）。
+///
+/// 外面套了一层安装器（Inno / MSI）时用它：结论走**退出码 + 结论文件**，
+/// 弹框只会和外面那层向导打架。更糟的是无人值守安装里，一个 `MessageBox`
+/// 会让进程一直等到有人点确定 —— 那正是 `--quiet` 要消掉的东西。
+///
+/// 做成进程级开关而不是给每个函数加参数：`dialog` 的调用点有二十多个，
+/// 逐个传参会把"静默"扩散进所有签名，而它本来只是这一次运行的一个属性。
+static QUIET: AtomicBool = AtomicBool::new(false);
+
+pub fn set_quiet(on: bool) {
+    QUIET.store(on, Ordering::Relaxed);
+}
+
+pub fn quiet() -> bool {
+    QUIET.load(Ordering::Relaxed)
+}
+
 /// UTF-16 转换。Win32 的 `W` 系列全要这个，每个调用点自己写一遍就是
 /// `encode_utf16().chain(once(0))` 抄 N 遍。
 pub fn wide(text: &str) -> Vec<u16> {
@@ -49,7 +68,14 @@ pub fn wide(text: &str) -> Vec<u16> {
 /// 一个只有"知道了"按钮的对话框。
 ///
 /// `flags` 用 `MB_ICONERROR` / `MB_ICONWARNING` / `MB_ICONINFORMATION`。
+///
+/// `--quiet` 下不弹，改写到 stderr：文字本身有用（被重定向时能查），
+/// 但不能占着屏幕等人点。
 pub fn dialog(text: &str, caption: &str, flags: u32) {
+    if quiet() {
+        eprintln!("[{caption}] {text}");
+        return;
+    }
     let t = wide(text);
     let c = wide(caption);
     unsafe {
@@ -63,7 +89,13 @@ pub fn dialog(text: &str, caption: &str, flags: u32) {
 /// 第二个）—— 这里刻意**不加** `MB_DEFBUTTON2`：卸载和安装的确认框里，
 /// 用户是主动点进来的，回车等于确认是合理的。真正危险的那个（删整个目录）
 /// 在 `uninstall` 里单独列了清单。
+///
+/// `--quiet` 下视为"是"：静默和 `--yes` 是同一件事的两面 —— 外面那层
+/// 已经问过用户了。
 pub fn confirm(text: &str, caption: &str) -> bool {
+    if quiet() {
+        return true;
+    }
     let t = wide(text);
     let c = wide(caption);
     // IDYES = 6

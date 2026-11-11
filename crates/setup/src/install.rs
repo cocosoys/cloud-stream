@@ -98,6 +98,11 @@ struct Opts {
     task: String,
     /// 不问确认（给控制台的按钮用）。
     yes: bool,
+    /// 不弹任何框（给外面那层安装器用：Inno / MSI）。
+    ///
+    /// 语义是"结论只走退出码与结论文件"，不是"什么都不告诉你"——
+    /// `sys::set_quiet` 会把原本该弹的文字改写到 stderr。
+    quiet: bool,
 }
 
 fn parse(args: &[String]) -> Result<Opts, String> {
@@ -107,6 +112,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         account: None,
         task: TASK_NAME.to_owned(),
         yes: false,
+        quiet: false,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -126,6 +132,10 @@ fn parse(args: &[String]) -> Result<Opts, String> {
                 opts.task = value.clone();
             }
             "--yes" | "-y" => opts.yes = true,
+            // 外面那层安装器（Inno / MSI）用它：它的向导已经问过用户了，
+            // 这里再弹一个框就是两个成功提示、两次确认，无人值守时还会卡死。
+            // `--silent` 是同一个意思的别名（和 Inno 的 `/SILENT` 呼应）。
+            "--quiet" | "--silent" => opts.quiet = true,
             // 其余一律忽略：控制台会把这个 exe 和它自己的参数一起传下来，
             // 为了一个不认识的开关让安装失败是没道理的。
             _ => {}
@@ -136,6 +146,11 @@ fn parse(args: &[String]) -> Result<Opts, String> {
 
 /// 入口。返回进程退出码。
 pub fn run(args: &[String]) -> i32 {
+    // 参数解析失败时还不知道 `--quiet`，所以先从原始参数里探一次：
+    // 外面那层安装器传给我们的参数如果写错了，弹框会把它的向导卡住。
+    if args.iter().any(|a| a == "--quiet" || a == "--silent") {
+        sys::set_quiet(true);
+    }
     let opts = match parse(args) {
         Ok(opts) => opts,
         Err(msg) => {
@@ -143,6 +158,7 @@ pub fn run(args: &[String]) -> i32 {
             return 2;
         }
     };
+    sys::set_quiet(opts.quiet);
     match opts.stage {
         Stage::Unpack => unpack(&opts),
         Stage::Finish => finish(&opts),
@@ -1045,6 +1061,30 @@ mod tests {
         assert!(xml.contains("<Interval>PT1M</Interval>"));
         // 不允许把密码写进任务里 —— 这是这套东西从来不要密码的原因。
         assert!(!xml.to_lowercase().contains("<password"));
+    }
+
+    /// `--quiet` 要能被认出来，且 `--silent` 是它的别名。
+    ///
+    /// 这条开关的意义不在"少一个框"，而在于**外面那层安装器能不能活着等到
+    /// 我们返回**：无人值守安装里一个 MessageBox 会让进程一直等下去，
+    /// 外面那层就永远收不到退出码。
+    #[test]
+    fn quiet_is_parsed_and_has_an_alias() {
+        let a = parse(&[
+            "--finish".into(),
+            "--dir".into(),
+            r"D:\s".into(),
+            "--quiet".into(),
+        ])
+        .unwrap();
+        assert!(a.quiet);
+        assert_eq!(a.stage, Stage::Finish);
+
+        let b = parse(&["--silent".into()]).unwrap();
+        assert!(b.quiet);
+
+        // 不给就不静默 —— 双击场景还是要弹框的。
+        assert!(!parse(&["--install".into()]).unwrap().quiet);
     }
 
     /// `--task-xml` 的路径口径：三档优先级。
