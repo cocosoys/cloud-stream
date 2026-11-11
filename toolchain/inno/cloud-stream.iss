@@ -91,8 +91,14 @@ CloseApplications=no
 RestartApplications=no
 SetupLogging=yes
 AllowNoIcons=yes
-; 版本资源显式写，不靠 Inno 的默认推导：默认那套会把字符串按定长补空格，
-; 于是资源管理器里看到的是 "cloud-streamX" 这种尾巴（实测过一次）。
+; 版本资源显式写。两件事分清：
+;
+;   * "应用和功能"那张表读的是 AppVerName / DisplayVersion 这两个注册表值，
+;     不读这里 —— 所以这里填错不会让卸载列表显示错版本。
+;   * 这里填的是 exe 自己的属性页（右键 → 属性 → 详细信息）。不写会怎样：
+;     实测一个只有 AppName/AppVersion 的最小 .iss，编出来的 FileVersion
+;     整格是空的，ProductVersion 才有推导值。而这两格正是别人核对"你装的
+;     到底是哪一版"的地方（一起发出去的还有便携版与 zip）。
 VersionInfoVersion={#AppVersion}.0
 VersionInfoProductVersion={#AppVersion}
 VersionInfoProductTextVersion={#AppVersion}
@@ -101,6 +107,12 @@ VersionInfoCompany={#AppPublisher}
 VersionInfoProductName={#AppName}
 VersionInfoDescription={#AppName} 安装程序
 VersionInfoOriginalFileName=cloud-stream-setup.exe
+;
+; 核对这几个值**别用 PowerShell 的 Format-List**：版本资源的字符串是按定长
+; 补空格存的（Inno 有意如此，纯空格填充、没有 NUL），Format-List 遇到超过列宽
+; 的值会折行，看起来就像尾巴上多了字符 —— 上一轮据此误判成"Inno 在字符串后
+; 加 X"，还以为是加 VersionInfo* 之前的事。要核对就取属性本身
+; （$v.FileVersion / $v.ProductName）或看字符编码：实测末尾是 0x20。
 
 [Languages]
 Name: "chinesesimp"; MessagesFile: "ChineseSimplified.isl"
