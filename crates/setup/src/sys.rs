@@ -25,6 +25,7 @@ use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use windows_sys::Win32::Globalization::{GetOEMCP, MultiByteToWideChar};
 use windows_sys::Win32::UI::Shell::{IsUserAnAdmin, ShellExecuteW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     MessageBoxW, MB_ICONWARNING, MB_OK, MB_YESNO, SW_SHOWNORMAL,
@@ -73,24 +74,96 @@ pub fn confirm(text: &str, caption: &str) -> bool {
 // 跑系统程序
 // ---------------------------------------------------------------------------
 
-/// 跑一个系统命令，把 stdout 和 stderr 一起拿回来。
+/// 把一段子进程输出解成文本。
 ///
-/// 注意这是**文本**：`schtasks` 的输出在中文系统上是 GBK，转成 UTF-8 时非 ASCII
-/// 部分会变成替换字符。所以调用方只应在这段文本里找 ASCII 片段（`--run`、
-/// `InteractiveToken`、`<Enabled>false</Enabled>`），不要指望读中文。
-pub fn command(program: &str, args: &[&str]) -> Result<String, String> {
+/// # 为什么不能一律 `from_utf8_lossy`
+///
+/// 这里踩过一次坑，代价是一个假失败：`schtasks` 是**系统工具**，输出走控制台
+/// 代码页（中文机器是 936/GBK），`from_utf8_lossy` 会把
+/// `成功: 成功创建计划任务 "MCStreamSrv"。` 解成 `鎴愬姛: …`。而
+/// `register_task` 当时正是靠 `contains("成功")` 判断成败的 ——
+/// 于是**装成功也报失败**：任务已创建、服务已监听 8080，界面却弹"注册计划任务
+/// 失败"（2026-11-11 在 .150 上实测）。
+///
+/// 反过来的情况同样真实：`--ops rollback` 的输出来自我们自己那个 Rust 程序，
+/// 是 UTF-8。所以**先严格试 UTF-8，失败再按 OEM 代码页**，两边都不猜。
+///
+/// 边界：一段 GBK 字节恰好构成合法 UTF-8 的概率极低但不为零（GBK 首字节
+/// 0x81-0xFE 里有 0xC2-0xF4 这一段）。真撞上时会解成另一种文字 —— 所以
+/// **判成败不要看文本**，看退出码（`run` 会把它带回来）。
+pub fn decode(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_owned(),
+        Err(_) => decode_oem(bytes),
+    }
+}
+
+/// 按系统 OEM 代码页解码。
+///
+/// 用 `GetOEMCP()` 而不是写死 936：日文机是 932、西欧机是 850，`MultiByteToWideChar`
+/// 认识这些表，而我们把代码页写死就等于只支持一种 Windows。
+fn decode_oem(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return String::new();
+    }
+    let cp = unsafe { GetOEMCP() };
+    let len = unsafe {
+        MultiByteToWideChar(
+            cp,
+            0,
+            bytes.as_ptr(),
+            bytes.len() as i32,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if len <= 0 {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    // `len` 是 UTF-16 单元数（不含结尾 NUL，因为刚才传的 cchWideChar = 0）。
+    let mut wide = vec![0u16; len as usize];
+    let written = unsafe {
+        MultiByteToWideChar(
+            cp,
+            0,
+            bytes.as_ptr(),
+            bytes.len() as i32,
+            wide.as_mut_ptr(),
+            len,
+        )
+    };
+    if written <= 0 {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    wide.truncate(written as usize);
+    String::from_utf16_lossy(&wide)
+}
+
+/// 跑一个系统命令，返回 `(退出码, 输出)`。stdout 与 stderr 首尾相接。
+///
+/// **判成败用退出码，不要用文本。** 靠 `contains("success")` 判断有两个独立的
+/// 失效方式：文案随语言包变（英文机是 SUCCESS，中文机是"成功"），以及任何一次
+/// 编码变化让那句文案根本不存在。`schtasks` 的退出码只有 0 / 非 0 两种含义，
+/// 它不会翻译。
+pub fn run(program: &str, args: &[&str]) -> Result<(i32, String), String> {
     let out = std::process::Command::new(program)
         .args(args)
         .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|e| format!("起不了 {program}：{e}"))?;
-    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-    text.push_str(&String::from_utf8_lossy(&out.stderr));
-    if !out.status.success() && text.trim().is_empty() {
-        return Err(format!(
-            "{program} 退出码 {}",
-            out.status.code().unwrap_or(-1)
-        ));
+    let mut text = decode(&out.stdout);
+    text.push_str(&decode(&out.stderr));
+    Ok((out.status.code().unwrap_or(-1), text))
+}
+
+/// 跑一个系统命令，只要文本（不要退出码时用）。
+///
+/// 唯一的错误是"进程都没起来"；非 0 退出但**有输出**的，照样把输出交回去 ——
+/// 那种输出就是失败原因，吞掉它只会让人无从查起。
+pub fn command(program: &str, args: &[&str]) -> Result<String, String> {
+    let (code, text) = run(program, args)?;
+    if code != 0 && text.trim().is_empty() {
+        return Err(format!("{program} 退出码 {code}"));
     }
     Ok(text)
 }
@@ -109,9 +182,11 @@ pub fn netsh(raw: &str) -> Result<String, String> {
     if out.status.success() {
         return Ok(String::new());
     }
-    let mut text = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+    // 和 `command` 同一个理由：netsh 的报错是 GBK，直接 `from_utf8_lossy`
+    // 会把"需要提升的权限。"解成一串问号，而那正是要看的那句话。
+    let mut text = decode(&out.stderr).trim().to_owned();
     if text.is_empty() {
-        text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        text = decode(&out.stdout).trim().to_owned();
     }
     if text.is_empty() {
         text = format!("退出码 {}", out.status.code().unwrap_or(-1));
@@ -231,10 +306,52 @@ pub fn elevate_raw(params: &str, dir: &Path) -> Result<(), ElevateError> {
 /// **不能只写 `%USERNAME%`**：实测任务计划程序会拒绝注册，报
 /// "账户名与安全标识间无任何映射完成 (5,145)"。
 pub fn current_account() -> Option<String> {
-    let user = std::env::var("USERNAME").ok().filter(|s| !s.is_empty())?;
-    match std::env::var("USERDOMAIN") {
-        Ok(domain) if !domain.is_empty() => Some(format!("{domain}\\{user}")),
-        _ => Some(user),
+    // 先问 `whoami`。它给的 `computer\user` / `domain\user` 正是 Task Scheduler
+    // 认的那种写法，不依赖环境变量怎么填。
+    //
+    // # 为什么不能拿 `%USERDOMAIN%` 拼
+    //
+    // 工作组（非域）机器上 `%USERDOMAIN%` 会返回字面量 `WORKGROUP` —— 那是
+    // 工作组的名字，不是任何账户所在的容器。拼出来的 `WORKGROUP\admin` 到
+    // `schtasks /Create` 那里是"帐户名与安全标识间无任何映射完成"（.150 实测，
+    // 2026-11-11）。同一个 bug 只在"从会话/脚本里跑"时才露头：双击运行时
+    // `%USERDOMAIN%` 又是计算机名，看起来完全正常。
+    //
+    // whoami 的输出是 ASCII（账户名本身可能是中文，那种情况下面 `run` 已经按
+    // OEM 解过），第一行就是身份。
+    if let Ok((0, text)) = run("whoami", &[]) {
+        let line = text.lines().next().unwrap_or("").trim();
+        if line.contains('\\') {
+            return Some(line.to_owned());
+        }
+    }
+    // 退路：环境变量。`WORKGROUP` 不是容器名，遇到它就换成计算机名。
+    account_from_env(
+        std::env::var("USERNAME").ok(),
+        std::env::var("USERDOMAIN").ok(),
+        std::env::var("COMPUTERNAME").ok(),
+    )
+}
+
+/// `whoami` 不可用时的退路。
+///
+/// 抽成纯函数是为了能钉住 `WORKGROUP` 那条规则 —— 它是这次 bug 的核心，
+/// 而 `whoami` 在开发机上永远成功，这段代码平时根本走不到。
+fn account_from_env(
+    user: Option<String>,
+    domain: Option<String>,
+    computer: Option<String>,
+) -> Option<String> {
+    let user = user.filter(|s| !s.is_empty())?;
+    match domain.filter(|s| !s.is_empty()) {
+        // 域机器：`%USERDOMAIN%` 就是域名，直接用。
+        Some(d) if !d.eq_ignore_ascii_case("WORKGROUP") => Some(format!("{d}\\{user}")),
+        // 工作组机器：换成计算机名。都拿不到就只给用户名 ——
+        // 那在 Task Scheduler 里多半解析不了，但至少比 `WORKGROUP\x` 诚实。
+        _ => computer
+            .filter(|s| !s.is_empty())
+            .map(|c| format!("{c}\\{user}"))
+            .or(Some(user)),
     }
 }
 
@@ -339,5 +456,100 @@ mod tests {
         let path = tmp_file("empty", b"anything");
         assert!(!exe_has_marker(&path, ""));
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- 子进程输出的解码 -------------------------------------------------
+
+    /// ASCII 两边都要无损：`--run` / `InteractiveToken` 这些判据全在 ASCII 里，
+    /// 解码器连它们都动了就什么都别谈了。
+    #[test]
+    fn decode_keeps_ascii_untouched() {
+        assert_eq!(
+            decode(b"SUCCESS: The scheduled task \"MCStreamSrv\" was created."),
+            "SUCCESS: The scheduled task \"MCStreamSrv\" was created."
+        );
+        assert_eq!(decode(b""), "");
+    }
+
+    /// 我们自己那个 exe 的输出（`--ops rollback` 之类）是 UTF-8，不能被 OEM
+    /// 那一路劫走 —— 否则中文提示会变成同样难读的东西，只是换了个方向错。
+    #[test]
+    fn decode_prefers_utf8_when_bytes_are_valid_utf8() {
+        assert_eq!(decode("已放回配置".as_bytes()), "已放回配置");
+    }
+
+    /// GBK 字节必须按 OEM 代码页解回来。
+    ///
+    /// 这是 .150 上那次假失败的现场："成功" 两个字的 GBK 字节是 B3 C9 B9 A6，
+    /// 当成 UTF-8 解就是 `鎴愬姛`（并且 `from_utf8_lossy` 还会把不成序列的字节
+    /// 换成 U+FFFD），于是 `contains("成功")` 永远为假。
+    ///
+    /// 只在 936 的机器上立得住：换成 1252 的机器，同样的字节在那边本来就是
+    /// 另一串西欧字母，"GBK 被误当 UTF-8" 这个场景不存在。
+    #[test]
+    fn decode_reads_gbk_bytes_as_chinese() {
+        if unsafe { GetOEMCP() } != 936 {
+            return;
+        }
+        assert_eq!(decode(&[0xB3, 0xC9, 0xB9, 0xA6]), "成功");
+        // 整行（照抄 .150 上 schtasks 实际输出的字节）
+        let line = [
+            0xB3, 0xC9, 0xB9, 0xA6, b':', b' ', // "成功: "
+            0xB3, 0xC9, 0xB9, 0xA6, // "成功"
+        ];
+        assert_eq!(decode(&line), "成功: 成功");
+    }
+
+    /// 断言"按 UTF-8 解一定读不出『成功』" —— 这条钉住的不是解码器，而是
+    /// **当初那个判据为什么错**。将来有人想改回文本判定，会先看到这里。
+    #[test]
+    fn gbk_success_line_is_unreadable_as_utf8() {
+        let gbk = [0xB3, 0xC9, 0xB9, 0xA6];
+        let wrong = String::from_utf8_lossy(&gbk);
+        assert!(!wrong.contains('成'));
+        assert_ne!(wrong, "成功");
+    }
+
+    // ---- 账户名 -----------------------------------------------------------
+
+    /// 工作组机器上 `%USERDOMAIN%` 是 `WORKGROUP`，它**不是**容器名。
+    ///
+    /// .150 就栽在这里：拼出 `WORKGROUP\admin`，`schtasks /Create` 答
+    /// "帐户名与安全标识间无任何映射完成"。而同一台机器双击运行时
+    /// `%USERDOMAIN%` 又变成计算机名 —— 于是这个错只在脚本/会话里跑时才露头。
+    #[test]
+    fn workgroup_is_not_a_container_name() {
+        assert_eq!(
+            account_from_env(
+                Some("admin".to_owned()),
+                Some("WORKGROUP".to_owned()),
+                Some("DESKTOP-0L2MMH3".to_owned())
+            ),
+            Some("DESKTOP-0L2MMH3\\admin".to_owned())
+        );
+        // 大小写不敏感：环境变量里小写的 workgroup 也要认出来。
+        assert_eq!(
+            account_from_env(
+                Some("admin".to_owned()),
+                Some("workgroup".to_owned()),
+                Some("PC".to_owned())
+            ),
+            Some("PC\\admin".to_owned())
+        );
+        // 域机器照旧用域名。
+        assert_eq!(
+            account_from_env(
+                Some("me".to_owned()),
+                Some("CORP".to_owned()),
+                Some("PC".to_owned())
+            ),
+            Some("CORP\\me".to_owned())
+        );
+        // 连计算机名都没有：只给用户名，不要编一个域出来。
+        assert_eq!(
+            account_from_env(Some("me".to_owned()), None, None),
+            Some("me".to_owned())
+        );
+        assert_eq!(account_from_env(None, Some("CORP".to_owned()), None), None);
     }
 }

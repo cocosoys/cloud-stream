@@ -36,6 +36,10 @@ windows-sys = { version = "0.52", features = [
     # 也不需要 `Get-CimInstance` 那个慢得多的 PowerShell 版本）。
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Threading",
+    # 系统工具（schtasks / netsh）的输出是 GBK，不是 UTF-8。`MultiByteToWideChar`
+    # 是把它解回文字的唯一正路 —— 少了这个，一次"成功"会被读成一串乱码，
+    # 然后被判成失败（见 `sys::decode` 的注释）。
+    "Win32_Globalization",
 ] }
 # 只用来读 `--ops config-get --ops-json`：配置表单要知道每个键现在是什么、
 # 接受什么范围，而这两件事只有服务端那份类型表说了算。仍然没有第二套实现 ——

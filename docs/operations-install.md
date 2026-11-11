@@ -120,6 +120,34 @@ XML）。读它比 `schtasks /Query /XML` 好三处：
 拉不起服务，"任务残留 + 目录照删"因此是安全的。禁不掉才停手（退出码 1），
 而且停手之前一个文件都不动。
 
+### 判成败看退出码，不看文案
+
+安装那一步的 `/Create` 曾经用 `contains("success") || contains("成功")` 判断，
+2026-11-11 在 `.150` 上因此报了一次**不存在的失败**：
+
+```text
+注册计划任务失败：
+  schtasks 说: 鎴愬姛: 鎴愬姛鍒涘缓璁″垝浠诲姟 "MCStreamSrv"銆?
+任务 XML 留在：C:\Users\Admin\AppData\Local\Temp\cloud-stream-task-4804.xml
+文件已经在 C:\Users\Admin\AppData\Local\cloud-stream，但没有任务，开机不会自己起来。
+```
+
+而现场是：任务建好了、状态 Running、`listening on https://0.0.0.0:8080`。
+那句话原文是 `成功: 成功创建计划任务 "MCStreamSrv"。`，退出码 0 —— 只是被
+`from_utf8_lossy` 当成 UTF-8 解成了乱码，于是两个 `contains` 都为假。
+
+两处一起改的：
+
+* `sys::decode` 先严格试 UTF-8、失败再按 `GetOEMCP()` 走
+  `MultiByteToWideChar`。我们自己的 exe（`--ops rollback`）输出 UTF-8，
+  `schtasks` / `netsh` 输出 GBK，两头都要对；
+* `register_task` 只看退出码（`sys::run` 把它带回来）。文案本来也不可靠：
+  英文机说 `SUCCESS`、中文机说 `成功`、下个版本还可能换个说法，而退出码不翻译。
+
+连带的一个后果值得记住：那次失败发生在 `[3/4]`，`return 6` 把 `[4/4]` 的
+"启动并等应答"整段跳过了。服务之所以还是起来了，是任务的 `TimeTrigger`
+（`PT1M`）在下一分钟把它拉起来的 —— 也就是说**看门狗救了安装器一次**。
+
 ## 端口不在这里猜
 
 防火墙要放行哪个 TCP 端口、哪个 UDP 区间，问服务端自己：

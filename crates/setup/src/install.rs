@@ -355,7 +355,10 @@ fn finish(opts: &Opts) -> i32 {
         dialog(
             &format!(
                 "注册计划任务失败：\n\n{err}\n\n\
-                 文件已经在 {}，但没有任务，开机不会自己起来。",
+                 程序文件已经铺到 {}，缺的只是那个看门狗任务，所以开机不会自己起来。\n\n\
+                 常见原因是安全策略禁止创建计划任务，或者任务名被别的账户占着。\
+                 处理完之后，双击上面那个目录里的 cloud-setup.exe，点一次\
+                 「安装 / 修复」就会重试这一步。",
                 target.display()
             ),
             "安装",
@@ -746,6 +749,27 @@ fn xml_escape(text: &str) -> String {
     out
 }
 
+/// `/Create` 到底成没成。返回 `Some(原因)` = 失败。
+///
+/// **只看退出码。** 原来还看了一眼输出里有没有 `success` / `成功`，那个判据在
+/// .150 上把"创建成功"判成了失败：schtasks 的中文输出是 GBK，被当成 UTF-8 解码
+/// 之后那两个汉字根本不存在，`contains("成功")` 永远为假。结果任务建好了、服务
+/// 监听上 8080 了，界面弹的却是"注册计划任务失败"。
+///
+/// 换掉它不只是绕开编码：文案本来就不可依赖 —— 英文机说 `SUCCESS`、中文机说
+/// `成功`、下个版本还可能换个说法。退出码只有 0 与非 0 两种含义，不翻译。
+fn create_verdict(code: i32, output: &str) -> Option<String> {
+    if code == 0 {
+        return None;
+    }
+    let text = output.trim();
+    if text.is_empty() {
+        Some(format!("schtasks 退出码 {code}（没有任何输出）"))
+    } else {
+        Some(format!("schtasks 退出码 {code}：\n{text}"))
+    }
+}
+
 /// 注册 + 回读校验。
 ///
 /// 回读是必须的：任务可以创建成功却指向一个被截断的路径，或者带着没人想要的
@@ -770,36 +794,41 @@ fn register_task(
     }
     std::fs::write(&file, &bytes).map_err(|e| format!("写不进 {}：{e}", file.display()))?;
 
-    let create = command(
-        "schtasks",
-        &[
-            "/Create",
-            "/TN",
-            task,
-            "/XML",
-            file.to_string_lossy().as_ref(),
-            "/F",
-        ],
-    );
-    let create = create.map_err(|e| format!("schtasks 失败：{e}"))?;
-    if !create.trim().is_empty() {
-        // 成功时 schtasks 只说一句 "SUCCESS: ..."，那句话本身没有信息量。
-        // 失败时它会说原因，所以只在看起来不像成功时保留。
-        let lower = create.to_lowercase();
-        if !lower.contains("success") && !lower.contains("成功") {
-            // 失败时**留下** XML 文件：`schtasks` 的报错只到"XML 无效"这一层，
-            // 真正要看的是里面那个元素写错了，而文件已经删掉就没得看了。
-            return Err(format!(
-                "schtasks 说：{}\n\n任务 XML 留在：{}",
-                create.trim(),
-                file.display()
-            ));
-        }
+    let xml_path = file.to_string_lossy().into_owned();
+    let args = ["/Create", "/TN", task, "/XML", xml_path.as_str(), "/F"];
+    let mut outcome = sys::run("schtasks", &args)
+        .map_err(|e| format!("schtasks 起不来：{e}"))?;
+    if outcome.0 != 0 {
+        // 覆盖一个**正在运行**的任务会被拒（0x8004131F），而「安装 / 修复」用在
+        // 已经装过的机器上时任务恰恰在跑。先 `/End` 再试一次。
+        //
+        // 只在这时才停：无条件 `/End` 会让"因为别的原因建不起来"变成"顺手把
+        // 本来能跑的服务停了"—— 那是比装不上更糟的结果（.150 上真发生过一次）。
+        let _ = command("schtasks", &["/End", "/TN", task]);
+        outcome = sys::run("schtasks", &args)
+            .map_err(|e| format!("schtasks 起不来：{e}"))?;
     }
+    if let Some(why) = create_verdict(outcome.0, &outcome.1) {
+        // 失败时**留下** XML 文件：`schtasks` 的报错只到"XML 无效"这一层，
+        // 真正要看的是里面那个元素写错了，而文件已经删掉就没得看了。
+        return Err(format!("{why}\n\n任务 XML 留在：{}", file.display()));
+    }
+    // 成功时 schtasks 会打印一句"成功: 成功创建计划任务…"，那句话没有信息量，
+    // 所以不往结论文件里搬。**只有成功才删 XML** —— 失败那条路要把它留下来。
     let _ = std::fs::remove_file(&file);
 
-    let dump = command("schtasks", &["/Query", "/TN", task, "/XML"]).unwrap_or_default();
-    let dump = dump.to_lowercase();
+    // 回读。退出码非 0 时不要继续按"内容里没有 --run"报错 —— 那等于把
+    // "查询本身失败了"说成"任务建错了"，而这两件事要查的地方完全不同。
+    let dump = match sys::run("schtasks", &["/Query", "/TN", task, "/XML"]) {
+        Ok((0, text)) => text.to_lowercase(),
+        Ok((code, text)) => {
+            return Err(format!(
+                "任务已经创建，但回读时 schtasks 退出码 {code}：\n{}",
+                text.trim()
+            ))
+        }
+        Err(err) => return Err(format!("任务已经创建，但回读时出错：{err}")),
+    };
     if !dump.contains("--run") {
         return Err(format!(
             "任务建好了，但动作里没有 --run。用这条命令看一眼：\n\
@@ -952,5 +981,25 @@ mod tests {
         assert!(xml.contains("<Interval>PT1M</Interval>"));
         // 不允许把密码写进任务里 —— 这是这套东西从来不要密码的原因。
         assert!(!xml.to_lowercase().contains("<password"));
+    }
+
+    /// 成败只看退出码，不看文案。
+    ///
+    /// 第一条用例是 .150 上真实发生的事：`/Create` 退出码 0、任务创建成功，
+    /// 而那段输出在 Rust 里（GBK 被当 UTF-8）根本不含"成功"两个字 ——
+    /// 旧代码因此报了一个不存在的失败。这条测试锁死"退出码 0 就是成功"。
+    #[test]
+    fn create_verdict_trusts_the_exit_code() {
+        assert!(create_verdict(0, "成功: 成功创建计划任务 \"MCStreamSrv\"。").is_none());
+        assert!(create_verdict(0, "").is_none());
+        assert!(create_verdict(0, "WARNING: something benign").is_none());
+
+        let refused = create_verdict(1, "错误: 拒绝访问。").unwrap();
+        assert!(refused.contains("退出码 1"), "{refused}");
+        assert!(refused.contains("拒绝访问"), "{refused}");
+
+        // 非 0 且没有输出时也要把退出码说出来，而不是给一个空字符串。
+        let silent = create_verdict(0x8007_0005u32 as i32, "").unwrap();
+        assert!(silent.contains("没有任何输出"), "{silent}");
     }
 }
