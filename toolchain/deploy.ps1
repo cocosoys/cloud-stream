@@ -475,6 +475,8 @@ cloud-stream 被控端整包
   只想看它会做什么、不改动任何东西（命令行，输出直接打在屏幕上）：
      cloud-setup.exe --uninstall --plan     在某台机器上卸载会做什么
      cloud-setup.exe --task-xml             要注册的那个任务长什么样
+                                            （默认按它会装的目录算；换台机器看，
+                                              加 --dir D:\stream）
      cloud-setup.exe --inbound              只补那四条防火墙规则（要管理员）
 
 已经有任务在跑、只想换文件（deploy.ps1 的部署路径）

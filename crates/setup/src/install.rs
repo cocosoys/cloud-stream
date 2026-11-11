@@ -159,14 +159,78 @@ pub fn run(args: &[String]) -> i32 {
 ///
 /// 走 stdout 而不是弹窗：它和 `--print-config` 是一类东西 —— 结果本身就是答案，
 /// 管道能接、文件能存。
-pub fn print_task_xml() -> i32 {
-    let root = crate::run_root();
+///
+/// 里面的 `<Command>` 按 `task_root` 算：`--dir` → 自带 payload 时的默认安装目录
+/// → 运行根。**不要**改成"exe 所在目录" —— 从 `target\output\` 跑这条命令时，
+/// 那会指向安装器自己的位置，而它实际装到 `%LOCALAPPDATA%\cloud-stream`。
+///
+/// 实际路径打到 stderr，XML 只走 stdout：混进一行说明会让 `schtasks /XML`
+/// 直接判"无效"。
+pub fn print_task_xml(args: &[String]) -> i32 {
+    let opts = match parse(args) {
+        Ok(opts) => opts,
+        Err(msg) => {
+            // 这条命令天生是管道用法（`> task.xml`）。弹框会让脚本永远等在那儿，
+            // 而调用方本来就在看输出 —— 同样的话走 stderr 就够。
+            eprintln!("{msg}");
+            return 2;
+        }
+    };
+    let root = task_root(&opts);
+    // XML 走 stdout（它就是 `> task.xml` 要存下来的东西）；这行说明走 stderr，
+    // 混进 XML 会让 `schtasks /XML` 当场判"无效"。
+    eprintln!(
+        "# 任务里的路径按 {} 计算（要替别的机器或别的目录渲染，加 --dir）",
+        root.display()
+    );
     let account = sys::current_account().unwrap_or_else(|| r"DOMAIN\user".to_owned());
     print!(
         "{}",
         task_xml(&root.join("stream-server.exe"), &root, &account, &boundary())
     );
     0
+}
+
+/// `--task-xml` 该把路径算成哪个目录。
+///
+/// 这里必须和 `unpack` / `finish` 取 target 的**同一个顺序**，否则这条诊断会把
+/// 人领向错误结论：从 `target\output\` 跑 `--task-xml`，按 exe 所在目录会得到
+/// `target\output\stream-server.exe`，而 `--install` 实际铺到
+/// `%LOCALAPPDATA%\cloud-stream` 并让任务指向那里 —— 一个"看着像 bug 的正确答案"。
+///
+/// 三档，从上往下：
+/// 1. `--dir`：明确的意图，压过所有推断（替另一台机器渲染时用它）；
+/// 2. 这个 exe 自带 payload（安装器角色）：目标是它**将要**解压到的地方；
+/// 3. 其余（已经装在运行根里的那一份）：运行根就是目标。
+///
+/// 抽成纯函数是为了能钉住第 1、2 档的优先级 —— `pack::summary()` 依赖构建期
+/// 有没有 embed，测试里造不出那个条件。
+fn choose_task_root(
+    explicit: Option<&Path>,
+    has_payload: bool,
+    default_target: Option<PathBuf>,
+    run_root: &Path,
+) -> PathBuf {
+    if let Some(dir) = explicit {
+        return dir.to_path_buf();
+    }
+    if has_payload {
+        // 拿不到 `%LOCALAPPDATA%` 时退回运行根：这时给一个能看的路径，比不输出
+        // XML 有用 —— 反正真装的时候 `unpack` 会因为同一个原因弹框报错。
+        if let Some(dir) = default_target {
+            return dir;
+        }
+    }
+    run_root.to_path_buf()
+}
+
+fn task_root(opts: &Opts) -> PathBuf {
+    choose_task_root(
+        opts.dir.as_deref(),
+        pack::summary().is_some(),
+        pack::default_target(),
+        &crate::run_root(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -981,6 +1045,44 @@ mod tests {
         assert!(xml.contains("<Interval>PT1M</Interval>"));
         // 不允许把密码写进任务里 —— 这是这套东西从来不要密码的原因。
         assert!(!xml.to_lowercase().contains("<password"));
+    }
+
+    /// `--task-xml` 的路径口径：三档优先级。
+    ///
+    /// 第二条断言是这次修的 bug：安装器从 `target\output\` 这种"不是运行根"的
+    /// 地方被跑起来时，任务指向的必须是它**将要解压到**的目录，而不是它自己
+    /// 站的那个目录 —— 后者会让人以为任务指向了一个不存在的路径。
+    #[test]
+    fn task_root_prefers_explicit_then_payload_then_run_root() {
+        let here = Path::new(r"C:\dev\cloud-stream\target\output");
+        let install_to = PathBuf::from(r"C:\Users\x\AppData\Local\cloud-stream");
+        let asked = Path::new(r"D:\stream");
+
+        // 1. `--dir` 压过一切推断：替另一台机器渲染靠它。
+        assert_eq!(
+            choose_task_root(Some(asked), true, Some(install_to.clone()), here),
+            PathBuf::from(r"D:\stream")
+        );
+        assert_eq!(
+            choose_task_root(Some(asked), false, None, here),
+            PathBuf::from(r"D:\stream")
+        );
+
+        // 2. 自带 payload（安装器角色）：指向将要解压的地方。
+        assert_eq!(
+            choose_task_root(None, true, Some(install_to.clone()), here),
+            install_to
+        );
+
+        // 3. 拿不到 `%LOCALAPPDATA%`：退回运行根。真装时 `unpack` 会在同一处
+        //    弹框报错，所以这里给一个能看的路径，而不是拒绝输出 XML。
+        assert_eq!(choose_task_root(None, true, None, here), here);
+
+        // 4. 已经装在运行根里的那一份：运行根就是目标（payload 无从谈起）。
+        assert_eq!(
+            choose_task_root(None, false, Some(PathBuf::from(r"C:\elsewhere")), here),
+            here
+        );
     }
 
     /// 成败只看退出码，不看文案。

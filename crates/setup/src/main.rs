@@ -1365,9 +1365,10 @@ fn main() {
     stdio_guard();
     let args: Vec<String> = std::env::args().skip(1).collect();
     // 诊断：把要注册的任务 XML 原样打出来。字段里排查"任务建不起来"靠它 ——
-    // 所以放在分流之前，任何一份 exe 都能问（不需要内置包）。
+    // 所以放在分流之前，任何一份 exe 都能问（不需要内置包）。参数照传：
+    // `--dir` 能替另一台机器渲染，否则路径按"这个 exe 会装到哪儿"推。
     if args.iter().any(|a| a == "--task-xml") {
-        std::process::exit(install::print_task_xml());
+        std::process::exit(install::print_task_xml(&args));
     }
     // 替身（`--purge`）必须在角色判断**之前**截住：它跑在 `%TEMP%` 里，那儿
     // 没有 `stream-server.exe`，而它自带有内置包 —— 按下面的判据会被认成

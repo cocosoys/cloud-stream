@@ -192,6 +192,13 @@ stream-server.exe --print-config json   →   port / webrtc_udp_port_min / webrt
 起来"就靠它 —— `schtasks` 的报错只到"XML 无效"这一层。验证它用的是任务计划
 程序自己的解析器（`Register-ScheduledTask -Xml`，读完属性立刻注销）。
 
+里面 `<Command>` 的路径按**它真会装到哪儿**算，三档：`--dir` → 安装器自带 payload
+时的 `%LOCALAPPDATA%\cloud-stream` → 当前运行根。所以从 `target\output\` 这种
+非运行根目录跑，看到的也是 `%LOCALAPPDATA%\cloud-stream\stream-server.exe`，
+和 `--install` 实际注册的一致；要替另一台机器或另一个目录渲染，加
+`--dir D:\stream`。实际采用的路径另打一行到 stderr（`# 任务里的路径按 … 计算`），
+所以 `> task.xml` 存下来的仍然是纯 XML。
+
 ## 结论文件就是契约
 
 `%ProgramData%\cloud-stream\last-install.txt`，安装与卸载写同一个文件、同一套
@@ -227,7 +234,7 @@ finished: 2026-11-12 10:31:19
 
 | 参数 | 回答什么 |
 |---|---|
-| `--task-xml` | 要注册的那个任务长什么样 |
+| `--task-xml [--dir <路径>]` | 要注册的那个任务长什么样（路径按它会装到哪儿算，不是按 exe 所在目录） |
 | `--uninstall --plan` | 在这台机器上卸载会做什么（含"拒绝卸载"的理由） |
 | `--uninstall --whatif` | 同上，弹出窗口版（双击场景） |
 
