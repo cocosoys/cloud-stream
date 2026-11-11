@@ -123,7 +123,10 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "--purge" => opts.stage = Stage::Purge,
             "--dir" => {
                 let value = it.next().ok_or("--dir 后面要跟一个路径")?;
-                opts.dir = Some(PathBuf::from(value));
+                // 同 `install.rs`：MSI 传下来的目录带 `\.`（`[INSTALLDIR]` 自带
+                // 结尾反斜杠，点是为了躲引号转义）。这里同样按"路径就是路径"
+                // 归一化，删目录时才能和装的时候落在同一个字符串上。
+                opts.dir = Some(sys::normalize_dir(value));
             }
             "--task" => {
                 let value = it.next().ok_or("--task 后面要跟一个任务名")?;

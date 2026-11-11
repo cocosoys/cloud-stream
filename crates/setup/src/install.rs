@@ -124,7 +124,11 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "--inbound" => opts.stage = Stage::Inbound,
             "--dir" => {
                 let value = it.next().ok_or("--dir 后面要跟一个路径")?;
-                opts.dir = Some(PathBuf::from(value));
+                // 这里收到的路径不一定是人打的。外面那层安装器格式化目录属性时
+                // 自带结尾反斜杠，为了不让它把引号拼坏还要再补一个点 —— MSI 那侧
+                // 传下来的是 `C:\...\cloud-stream\.`。归一化放在解析点做一次，
+                // 下游（计划任务的 `<Command>`、`--task-xml` 渲染）就不会看到它。
+                opts.dir = Some(sys::normalize_dir(value));
             }
             "--account" => opts.account = it.next().cloned(),
             "--task" => {
@@ -355,7 +359,13 @@ fn unpack(opts: &Opts) -> i32 {
         return finish(&next);
     }
 
-    let account = opts.account.clone().or_else(sys::current_account);
+    // 空串按"没给"处理：外面那层安装器可能把 `--account ""` 传下来（属性没
+    // 被赋值时就是这种），而空账户到 `schtasks` 那里只会得到一句"XML 无效"。
+    let account = opts
+        .account
+        .clone()
+        .filter(|a| !a.trim().is_empty())
+        .or_else(sys::install_account);
     match elevate(&target, account.as_deref(), &opts.task) {
         Ok(()) => {
             report.note("elevate: 已在管理员窗口继续（结论由那一侧写进本文件）");
@@ -428,7 +438,15 @@ fn finish(opts: &Opts) -> i32 {
     }
 
     report.note(&format!("[3/4] 看门狗任务 {}", opts.task));
-    let account = opts.account.clone().or_else(sys::current_account);
+    // `install_account` 而不是 `current_account`：外面那层安装器（MSI）是拿
+    // SYSTEM 身份把这一段拉起来的，`whoami` 会答 `nt authority\system`，那样
+    // 任务会注册给 SYSTEM 并跑在 session 0 里 —— 装完一切正常、桌面却是空的。
+    // 空串同理按"没给"处理，见上面 `unpack` 那段。
+    let account = opts
+        .account
+        .clone()
+        .filter(|a| !a.trim().is_empty())
+        .or_else(sys::install_account);
     if let Err(err) = register_task(&target, &exe, account.as_deref(), &opts.task) {
         report.note(&format!("  [fail] {err}"));
         report.end("FAIL (task)");
@@ -449,8 +467,21 @@ fn finish(opts: &Opts) -> i32 {
     report.note("  [ok] 任务已注册并回读校验（--run / InteractiveToken）");
 
     report.note(&format!("[4/4] 启动并等 127.0.0.1:{} 应答", eff.port));
-    let _ = command("schtasks", &["/Run", "/TN", &opts.task]);
-    if !wait_port(eff.port, &report, 90) {
+    start_task(&opts.task, &report);
+    // 先等 20 秒，没应答就再 /Run 一次再等。为什么不是一次等 90 秒：
+    // "任务刚建好、Task Scheduler 还没把新实例排上" 与 "服务起来就崩了" 的症状
+    // 完全一样（都是端口不应答），而前者重来一次就好。
+    let mut up = wait_port(eff.port, &report, 20);
+    if !up {
+        report.note("  [retry] 20 秒没应答，再启动一次");
+        start_task(&opts.task, &report);
+        up = wait_port(eff.port, &report, 70);
+    }
+    if !up {
+        // 等满了还没人听，把现场的静态事实记下来。这条在 .150 上救过一次场：
+        // 计划任务每次启动都返回 2（找不到文件），而端口只是"没应答"—— 少了
+        // 这一行就只看得见后一半，然后去查一个不存在的依赖库问题。
+        report.note(&format!("  [dbg] {} {}", exe.display(), describe_file(&exe)));
         report.end("FAIL (no listener)");
         dialog(
             &format!(
@@ -946,6 +977,39 @@ fn boundary() -> String {
 // ---------------------------------------------------------------------------
 // 等应答 / 提权 / 对话框
 // ---------------------------------------------------------------------------
+
+/// 让任务跑起来，并把 `/Run` 自己的结果写进结论文件。
+///
+/// 原来这里是 `let _ = ...`，结果是排查时少一条关键线索：**`/Run` 失败**和
+/// **服务起来就崩**的症状完全一样（都是端口不应答），而前者要查任务、后者要查
+/// exe 和依赖库。.150 上那次升级失败就是被这一行瞒住的。
+fn start_task(task: &str, report: &Report) {
+    match sys::run("schtasks", &["/Run", "/TN", task]) {
+        Ok((0, _)) => report.note("  [ok] 已让任务启动"),
+        Ok((code, text)) => report.note(&format!(
+            "  [warn] schtasks /Run 退出码 {code}：{}",
+            text.trim()
+        )),
+        Err(err) => report.note(&format!("  [warn] schtasks /Run 起不来：{err}")),
+    }
+}
+
+/// 失败现场取证：这个文件此刻长什么样、能不能打开。
+///
+/// 只看"在不在"不够。.150 上升级失败时，文件在、大小也对，但计划任务每次启动都
+/// 返回 2（找不到文件）—— 也就是说 stat 成功、CreateProcess 失败。所以这里除了
+/// 大小还试一次实际打开，把"看得见但用不了"这种状态记进结论文件。
+fn describe_file(path: &Path) -> String {
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(err) => return format!("stat 失败：{err}"),
+    };
+    let opened = match std::fs::File::open(path) {
+        Ok(_) => "可读",
+        Err(_) => "打不开",
+    };
+    format!("size={} {opened}", meta.len())
+}
 
 /// 等端口开始应答。返回 false = 等满了还是没人听。
 fn wait_port(port: u16, report: &Report, tries: u32) -> bool {

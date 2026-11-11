@@ -25,6 +25,9 @@ windows-sys = { version = "0.52", features = [
     # `CreateFileW`（打开 NUL）的参数里有 SECURITY_ATTRIBUTES，所以 Security
     # 这个 feature 是被它连带的，不是我们要自己用。
     "Win32_System_Console",
+    # `--finish` 可能以 SYSTEM 身份被外面那层安装器拉起来（MSI 的 deferred
+    # 动作），那时要从活动控制台会话查出"游戏跑在谁那儿"。见 sys::install_account。
+    "Win32_System_RemoteDesktop",
     "Win32_Storage_FileSystem",
     "Win32_Security",
     # 结论文件里的时间戳（`GetLocalTime`）。安装记录要能回答"这是哪一次"，

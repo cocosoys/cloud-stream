@@ -21,12 +21,18 @@
 //! **完整的服务**：永不返回、占住端口、顺手把录音设备再抢一遍。所以调用方先用
 //! `exe_has_marker` 确认能力，这里再用超时兜住"确认了也不返回"的那一种。
 
+use std::ffi::c_void;
 use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use windows_sys::core::PWSTR;
 use windows_sys::Win32::Globalization::{GetOEMCP, MultiByteToWideChar};
+use windows_sys::Win32::System::RemoteDesktop::{
+    WTSFreeMemory, WTSGetActiveConsoleSessionId, WTSQuerySessionInformationW, WTSDomainName,
+    WTSUserName, WTS_CURRENT_SERVER_HANDLE,
+};
 use windows_sys::Win32::UI::Shell::{IsUserAnAdmin, ShellExecuteW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     MessageBoxW, MB_ICONWARNING, MB_OK, MB_YESNO, SW_SHOWNORMAL,
@@ -57,6 +63,32 @@ pub fn set_quiet(on: bool) {
 
 pub fn quiet() -> bool {
     QUIET.load(Ordering::Relaxed)
+}
+
+/// 把安装目录归一化：去掉结尾分隔符、重复分隔符与 `.` 段。
+///
+/// 两个真实来源，都不是手滑：
+///
+/// * 外面那层安装器格式化目录属性时**自带结尾反斜杠**（MSI 的 `[INSTALLDIR]`）；
+/// * 为了让那个反斜杠不把引号拼坏，MSI 那侧又在后面补了一个点
+///   （见 `toolchain/wix/cloud-stream.wxs`）—— 于是这里收到
+///   `C:\Program Files\cloud-stream\.`。
+///
+/// 不归一化的后果不是"跑不起来"，而是更难发现的那种：它会被原样写进计划任务的
+/// `<Command>`，变成 `...\cloud-stream\.\stream-server.exe`。能跑，但和
+/// `--task-xml` 渲染出来的、以及别的安装器写下的不一样 —— 部署侧按路径核对
+/// 任务指向谁时就会判成不匹配，然后让人去查一个根本不存在的问题。
+///
+/// 人手工打 `--dir D:\stream\` 也走这里。
+pub fn normalize_dir(text: &str) -> std::path::PathBuf {
+    let cleaned: std::path::PathBuf = Path::new(text).components().collect();
+    // 只由 `.` 或分隔符组成时清完是空路径：保留原样，让后面的检查去报
+    // "这不是个目录"，而不是悄悄变成"当前目录"。
+    if cleaned.as_os_str().is_empty() {
+        std::path::PathBuf::from(text)
+    } else {
+        cleaned
+    }
 }
 
 /// UTF-16 转换。Win32 的 `W` 系列全要这个，每个调用点自己写一遍就是
@@ -387,6 +419,93 @@ fn account_from_env(
     }
 }
 
+/// 用来装机的账户：**当前身份不是服务账户就用它，是就去找控制台会话的主人**。
+///
+/// 为什么需要这个：`--finish` 可能以 SYSTEM 身份被拉起来。MSI 的 deferred
+/// 自定义动作就是这种（`Impersonate="no"` + Type 18），Inno 那边如果哪天改成
+/// 服务里跑也一样。SYSTEM 下 `whoami` 答 `nt authority\system`，于是任务会被
+/// 注册给 SYSTEM —— **那正是最坏的失败方式**：安装成功、8080 有应答、任务也在
+/// 跑，但进程在 session 0 里，采集和 `SendInput` 看到的是一张空桌面。
+///
+/// 换谁：活动控制台会话的主人。游戏就跑在那一场会话里，看门狗要复用的也正是
+/// 那个用户的令牌（`InteractiveToken`）。
+///
+/// 拿不到控制台会话（无人登录、装机的机器还没人登过）时退回当前身份 —— 那多半
+/// 是 SYSTEM，任务注册会在 `schtasks` 那里失败并报出来，比悄悄注册给 SYSTEM 好。
+pub fn install_account() -> Option<String> {
+    let current = current_account();
+    match &current {
+        // 普通用户：就是它，不必再问 WTS。
+        Some(account) if !is_service_account(account) => current.clone(),
+        _ => console_session_account().or(current),
+    }
+}
+
+/// `NT AUTHORITY\SYSTEM` / `NT SERVICE\xxx` 这类不是"某个人"的账户。
+///
+/// `whoami` 在小写输出（`nt authority\system`），比较时统一折成小写。
+fn is_service_account(account: &str) -> bool {
+    let lower = account.to_ascii_lowercase();
+    lower.starts_with(r"nt authority\") || lower.starts_with(r"nt service\")
+}
+
+/// 活动控制台会话的主人。`None` = 没有会话、或者询问失败。
+fn console_session_account() -> Option<String> {
+    // WTSGetActiveConsoleSessionId 在没有控制台会话时返回 0xFFFFFFFF。
+    let session = unsafe { WTSGetActiveConsoleSessionId() };
+    if session == u32::MAX {
+        return None;
+    }
+    let user = query_session_string(session, WTSUserName)?;
+    let domain = query_session_string(session, WTSDomainName);
+    session_account_from(domain.as_deref(), &user)
+}
+
+/// 拼成 `DOMAIN\user`。
+///
+/// 单独拆出来是为了能钉住两条边界：用户名可能带域前缀（域账户在
+/// `WTSUserName` 里就是 `user`，但别赌），域名可能为空（某些会话配置下）。
+fn session_account_from(domain: Option<&str>, user: &str) -> Option<String> {
+    let user = user.trim();
+    if user.is_empty() {
+        return None;
+    }
+    // 已经带容器名了就别再套一层：`CORP\me` 变成 `CORP\CORP\me` 会在
+    // `schtasks` 那里报"帐户名与安全标识间无任何映射完成"。
+    if user.contains('\\') {
+        return Some(user.to_owned());
+    }
+    match domain.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(d) => Some(format!("{d}\\{user}")),
+        None => Some(user.to_owned()),
+    }
+}
+
+/// 问 WTS 一个字符串字段（用户名 / 域名）。
+fn query_session_string(session: u32, class: i32) -> Option<String> {
+    let mut buf: PWSTR = std::ptr::null_mut();
+    let mut size = 0u32;
+    let ok = unsafe {
+        WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, session, class, &mut buf, &mut size)
+    };
+    if ok == 0 || buf.is_null() {
+        if !buf.is_null() {
+            unsafe { WTSFreeMemory(buf as *mut c_void) };
+        }
+        return None;
+    }
+    let text = unsafe {
+        // 返回的是以 NUL 结尾的 UTF-16，长度字数在 size 里（含结尾 NUL）。
+        let mut len = 0usize;
+        while *buf.add(len) != 0 {
+            len += 1;
+        }
+        String::from_utf16_lossy(std::slice::from_raw_parts(buf, len))
+    };
+    unsafe { WTSFreeMemory(buf as *mut c_void) };
+    Some(text)
+}
+
 // ---------------------------------------------------------------------------
 // 能力探测
 // ---------------------------------------------------------------------------
@@ -583,5 +702,81 @@ mod tests {
             Some("me".to_owned())
         );
         assert_eq!(account_from_env(None, Some("CORP".to_owned()), None), None);
+    }
+
+    // ---- 安装目录归一化 ---------------------------------------------------
+
+    /// 四种真实的"看起来像路径"的字符串都收敛到同一个结果。
+    ///
+    /// 前两种在这个仓库里真的会发生：`C:\x\.` 来自 MSI 的
+    /// `--dir "[INSTALLDIR]."`，`C:\x\` 来自人手工打的 `--dir D:\stream\`。
+    /// 后两种是同一类东西的顺手版本（重复分隔符、点加结尾斜杠）。
+    #[test]
+    fn dir_normalization_collapses_dot_and_trailing_separator() {
+        assert_eq!(normalize_dir(r"C:\x\."), Path::new(r"C:\x"));
+        assert_eq!(normalize_dir(r"C:\x\"), Path::new(r"C:\x"));
+        assert_eq!(normalize_dir(r"C:\x\\"), Path::new(r"C:\x"));
+        assert_eq!(normalize_dir(r"C:\x\.\"), Path::new(r"C:\x"));
+        // 已经是干净路径的不能被改坏（大小写、空格、中文都得原样）。
+        assert_eq!(
+            normalize_dir(r"C:\Program Files\云流"),
+            Path::new(r"C:\Program Files\云流")
+        );
+    }
+
+    /// 只剩 `.` 或分隔符时**不**归一化 —— 归一化会得到一个空路径，而空路径在
+    /// 下游等于"当前目录"，那样卸载会去删一个谁都没让它删的地方。留着原样，
+    /// 让调用方那句"这不是个目录"的检查去接。
+    #[test]
+    fn dir_normalization_keeps_degenerate_input_verbatim() {
+        assert_eq!(normalize_dir("."), Path::new("."));
+        assert_eq!(normalize_dir(r"\"), Path::new(r"\"));
+        assert_eq!(normalize_dir(""), Path::new(""));
+    }
+
+    /// 相对路径也要保形：`components()` 会顺手吃掉开头的 `./`，但盘符和
+    /// 前缀段（`\\?\C:\`）不能被它改写 —— 卸载时长短路径混着用会认成两棵树。
+    #[test]
+    fn dir_normalization_preserves_prefixes() {
+        assert_eq!(normalize_dir(r"\\?\C:\x\."), Path::new(r"\\?\C:\x"));
+        assert_eq!(normalize_dir(r"..\x\"), Path::new(r"..\x"));
+    }
+
+    // ---- 装给谁 -----------------------------------------------------------
+
+    /// 服务账户不是"某个人"。这一条是 `--finish` 从 SYSTEM 里被拉起来时的
+    /// 判据：命中了就得去问控制台会话，否则任务会被注册给 SYSTEM。
+    #[test]
+    fn service_accounts_are_recognised() {
+        assert!(is_service_account(r"nt authority\system"));
+        // whoami 通常已是小写，但别赌大小写。
+        assert!(is_service_account(r"NT AUTHORITY\SYSTEM"));
+        assert!(is_service_account(r"NT AUTHORITY\LOCAL SERVICE"));
+        assert!(is_service_account(r"nt service\trustedinstaller"));
+        assert!(!is_service_account(r"desktop-0l2mmh3\admin"));
+        assert!(!is_service_account(r"CORP\me"));
+    }
+
+    /// 会话里查出来的两段拼成 `schtasks` 认的那种写法。
+    #[test]
+    fn session_account_is_domain_backslash_user() {
+        assert_eq!(
+            session_account_from(Some("DESKTOP-0L2MMH3"), "admin").as_deref(),
+            Some(r"DESKTOP-0L2MMH3\admin")
+        );
+        // 域名为空（某些会话配置）：只给用户名，不要编一个容器出来 —— 编出来的
+        // `WORKGROUP\x` 正是那条已经踩过的坑。
+        assert_eq!(session_account_from(None, "admin").as_deref(), Some("admin"));
+        assert_eq!(
+            session_account_from(Some("   "), "admin").as_deref(),
+            Some("admin")
+        );
+        // 已经带容器名的别再套一层：`CORP\CORP\me` 解析不了。
+        assert_eq!(
+            session_account_from(Some("CORP"), r"CORP\me").as_deref(),
+            Some(r"CORP\me")
+        );
+        // 空用户名 = 这个会话里没人（停在登录界面）。
+        assert_eq!(session_account_from(Some("X"), "  "), None);
     }
 }
