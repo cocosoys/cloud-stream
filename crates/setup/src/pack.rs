@@ -262,6 +262,49 @@ fn merge_into_place(staging: &Path, dest: &Path) -> Result<(), String> {
     }
 }
 
+/// 清掉上一轮"改名让路"留下的 `<文件>.old`。
+///
+/// `merge_into_place` 覆盖**正在运行的** exe 时会先把旧的改名成 `.old` ——
+/// Windows 允许重命名运行中的 exe，不允许覆盖它。那份旧文件在进程退出前删不掉，
+/// 而在此之前**没有任何一步会回头删它**：于是每台用便携安装器就地升级过的机器
+/// 都会长期多躺一个 20 MB 的 `stream-server.exe.old`（`.150` 上实测 21 MB，
+/// 而且不会有任何东西提示它在那儿）。
+///
+/// 时机选在 `--finish` 的末尾：服务刚被拉起来、端口已应答，上一版进程通常已经
+/// 退掉，那份 `.old` 不再被映射，删得掉。删不掉不报错 —— 说明还有进程握着自己
+/// 那一版（就地升级且没有重启的场景），下一次安装会再试一次。
+///
+/// 只删"旁边同名的那个文件还在"的 `.old`：那个前缀正是本模块自己起的名字，
+/// 而运行根里也可能有别人放的 `something.old`，不该顺手带走。
+pub fn sweep_old_copies(dest: &Path) -> usize {
+    let mut removed = 0;
+    let mut stack = vec![dest.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("old") {
+                continue;
+            }
+            // `a.exe.old` → `a.exe`：只有它还在，才说明这是改名让路的留底。
+            let original = path.with_extension("");
+            if !original.is_file() {
+                continue;
+            }
+            if std::fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
+
 /// 默认安装位置：`%LOCALAPPDATA%\cloud-stream`。
 ///
 /// 选这里而不是 `C:\Program Files` 的理由是这套东西**整包自包含**：配置、日志、
@@ -373,6 +416,35 @@ mod tests {
             "用户自己的文件被抹掉了 —— 重装不该动配置和日志"
         );
         assert!(!staging_path(&dest).exists(), "临时目录没清干净");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `.old` 留底的清扫：只删"改名让路"造出来的那种。
+    ///
+    /// 这个测试守的是"别顺便把别人的文件带走"：运行根里出现一个没有同名主体的
+    /// `foo.old` 时，那多半是用户自己放的，不该被安装器的清理逻辑吃掉。
+    #[test]
+    fn sweep_removes_only_renamed_for_way_copies() {
+        let root = std::env::temp_dir().join(format!("cs-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("selkies-web")).unwrap();
+
+        // 该删的：同名的那个文件还在（真实场景：运行中的 exe 被改名让路）。
+        std::fs::write(root.join("stream-server.exe"), b"new").unwrap();
+        std::fs::write(root.join("stream-server.exe.old"), b"old 21 MB").unwrap();
+        // 子目录里的也算：`merge_into_place` 是整树递归的。
+        std::fs::write(root.join("selkies-web").join("app.js"), b"new").unwrap();
+        std::fs::write(root.join("selkies-web").join("app.js.old"), b"old").unwrap();
+        // 不该删的：没有同名主体，不是我们起的名字。
+        std::fs::write(root.join("someone-else.old"), b"keep").unwrap();
+
+        let removed = sweep_old_copies(&root);
+        assert_eq!(removed, 2, "该删的没删够，或者把别人的文件也带走了");
+        assert!(!root.join("stream-server.exe.old").exists());
+        assert!(!root.join("selkies-web").join("app.js.old").exists());
+        assert!(root.join("someone-else.old").exists(), "没有同名主体的 .old 不该动");
+        assert!(root.join("stream-server.exe").exists(), "正本不能被动");
 
         let _ = std::fs::remove_dir_all(&root);
     }

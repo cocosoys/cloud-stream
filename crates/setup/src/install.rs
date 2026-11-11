@@ -472,6 +472,15 @@ fn finish(opts: &Opts) -> i32 {
         return 7;
     }
     report.note(&format!("  [ok] {}/api/status 所在端口已应答", eff.port));
+
+    // 上一轮"改名让路"留下的旧 exe，到这里才删得掉（进程已经换过一茬）。
+    // 不删的后果是每台就地升级过的机器都多躺一个 20 MB 的 `*.old`，而且没有
+    // 任何地方会提示它在那儿 —— 见 `pack::sweep_old_copies`。
+    let swept = pack::sweep_old_copies(&target);
+    if swept > 0 {
+        report.note(&format!("  [ok] 清掉 {swept} 个上一版的 .old 留底"));
+    }
+
     report.end("OK");
 
     let mut text = format!(
