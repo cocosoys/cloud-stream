@@ -460,9 +460,15 @@ cloud-stream 被控端整包
 里面的 exe 按自身位置推导路径，没有任何写死的目录。
 这里没有 .cmd / .ps1 / .vbs 启动脚本：装、卸、起、停都由 exe 自己做。
 
-装一台新机器（推荐）
+装一台新机器
+  最省事的一条：把 cloud-stream-setup.exe 拷过去双击。向导里能自己选装到
+  哪个盘（会在你选的位置下建一个 cloud-stream 子目录），装完在 Windows 的
+  「应用和功能」里能正常卸载，不用知道下面这些命令。
+  它和下面那个 cloud-setup.exe 都**不在**这个目录里 —— 这个目录正是它们
+  要铺下去的内容。
+
+  不要向导的那条路（也适合写进脚本批量装）：
   1) 只拷**一个文件**过去：cloud-setup.exe（自带这整个包，约 9 MB）。
-     它不在这个目录里 —— 这个目录正是它要铺下去的内容。
   2) 双击它。弹一次 UAC，然后它依次：把内置包解到
      %LOCALAPPDATA%\cloud-stream -> 放行 TCP 端口 / ping / WebRTC 的 UDP 段 ->
      建看门狗计划任务（不需要任何账户密码）-> 启动一次 -> 等端口应答 ->
@@ -669,6 +675,112 @@ function New-Installer {
     }
     Write-Ok ("安装器 {0}（{1:N1} MB，自带整包）md5={2}" -f (Split-Path -Leaf $InstallerExe), $mb,
         (Get-Md5 $InstallerExe))
+}
+
+<#
+.SYNOPSIS
+    编"向导版"安装器：Inno Setup 外壳 + 同一个 payload。
+
+.DESCRIPTION
+    两个安装器是同一份东西的两个外壳，不是两套实现：
+
+    * `cloud-setup.exe`（embed）—— 拷一个文件走天下，自带整包；
+    * `cloud-stream-setup.exe`（Inno）—— 正式分发，有向导、目录选择、
+      控制面板卸载项、跟随系统明暗。
+
+    区别只在外壳：系统集成仍然是 `cloud-setup.exe --finish` / `--uninstall --keep`。
+    所以这里要做的事很少 —— 编一份**不带 embed** 的控制台放进运行根，
+    然后把 payload 交给 ISCC。
+
+    没有 ISCC 时只警告、不 throw：这是"少一个产物"，不是"构建坏了"，
+    便携版还要照常出。
+#>
+function New-InnoInstaller {
+    param([string]$PayloadDir)
+
+    # ---- 1 找编译器 ------------------------------------------------------
+    # winget 默认装到用户级（%LOCALAPPDATA%\Programs），所以不能只看
+    # Program Files —— 只认那个路径的话，明明装了也会报"没装"。
+    $iscc = $null
+    $cmd = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+    if ($cmd) {
+        $iscc = $cmd.Source
+    } else {
+        foreach ($p in @(
+                (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'),
+                (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
+                (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
+            )) {
+            if ($p -and (Test-Path $p)) { $iscc = $p; break }
+        }
+    }
+    if (-not $iscc) {
+        Write-Note '没有 Inno Setup 编译器（ISCC.exe），跳过向导版安装器'
+        Write-Note '  装一个：winget install --id JRSoftware.InnoSetup -e'
+        return $null
+    }
+
+    # ---- 2 运行根里那一份控制台（不带 embed）------------------------------
+    # 不能复用 target\release 里的那份：那是 embed 版（8.7 MB），放进运行根
+    # 就是"exe 里又有整个包"，白占 8 MB。用独立 target 目录而不是反复切
+    # features：同一个 target 目录下换 features 会让 cargo 把整个 crate 重编。
+    if (-not $script:BuildEnvReady) { Initialize-BuildEnv }
+    $consoleDir = Join-Path $RepoRoot 'target\inno-console'
+    Write-Info '编运行根里的控制台（不带 embed）'
+    Invoke-Native -Exe 'cargo' -Arguments @(
+        'build', '--release', '-p', 'cloud-setup',
+        '--target-dir', $consoleDir,
+        '--manifest-path', (Join-Path $RepoRoot 'Cargo.toml')
+    ) -Quiet
+    $consoleExe = Join-Path $consoleDir 'release\cloud-setup.exe'
+    if (-not (Test-Path $consoleExe)) { throw "编完却找不到 $consoleExe" }
+
+    # ---- 3 版本号 --------------------------------------------------------
+    # 从 Cargo.toml 读，而不是从 git tag：这个值要出现在"应用和功能"里，
+    # 它必须和 exe 自己报的 /api/v1/version 是同一个来源。
+    $ver = '0.0.0'
+    $cargoToml = Join-Path $RepoRoot 'crates\stream-server\Cargo.toml'
+    if (Test-Path $cargoToml) {
+        $m = Select-String -Path $cargoToml -Pattern '(?m)^\s*version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"' |
+            Select-Object -First 1
+        if ($m) { $ver = $m.Matches[0].Groups[1].Value }
+    }
+
+    # ---- 4 编译 ----------------------------------------------------------
+    Write-Info "编向导版安装器（Inno，payload = $PayloadDir）"
+    $iss = Join-Path $RepoRoot 'toolchain\inno\cloud-stream.iss'
+    # 中文消息文件与 .iss 同目录，所以 ISCC 用相对路径就能找到它 ——
+    # 这也是把 .isl 放在 toolchain\inno\ 的原因（vendored，不依赖本机安装的
+    # Languages 目录：那个目录里根本没有中文）。
+    $env:CS_INNO_VERSION = $ver
+    $env:CS_INNO_PAYLOAD = $PayloadDir
+    $env:CS_INNO_CONSOLE = $consoleExe
+    $env:CS_INNO_OUT = Split-Path -Parent $PayloadDir
+    try {
+        $log = & $iscc $iss 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            # ISCC 的报错混在"Compressing: ..."几千行里，只留尾部会看不到原因。
+            $log | Where-Object { $_ -notmatch '^\s*(Compressing|Reading)' } |
+                Select-Object -Last 15 | ForEach-Object { Write-Host "    $_" }
+            throw "ISCC 退出码 $LASTEXITCODE"
+        }
+    } finally {
+        # 和 CS_PAYLOAD_DIR 同一个理由：环境变量泄漏会让下一次构建莫名其妙
+        # 用错 payload。
+        foreach ($n in 'CS_INNO_VERSION', 'CS_INNO_PAYLOAD', 'CS_INNO_CONSOLE', 'CS_INNO_OUT') {
+            Remove-Item "Env:\$n" -ErrorAction SilentlyContinue
+        }
+    }
+
+    $setup = Join-Path (Split-Path -Parent $PayloadDir) 'cloud-stream-setup.exe'
+    if (-not (Test-Path $setup)) { throw "ISCC 说成功，但没有 $setup" }
+    $mb = (Get-Item $setup).Length / 1MB
+    if ($mb -lt 3) {
+        # 一个 1 MB 的向导安装器说明 payload 没进去 —— 它装完会是个空目录。
+        throw "向导版安装器只有 $([math]::Round($mb, 2)) MB，payload 没被打进去"
+    }
+    Write-Ok ("向导版 {0}（{1:N1} MB，中文向导）md5={2}" -f (Split-Path -Leaf $setup), $mb, (Get-Md5 $setup))
+    return $setup
 }
 
 
@@ -970,6 +1082,8 @@ try {
         逼人构建前端。
     #>
     $packaged = $false
+    # StrictMode 下未定义的变量一读就抛，而出口那段要判断"向导版做出来了没"。
+    $InnoSetup = $null
     if (-not (Test-Path (Join-Path $DashDir 'dist\index.html'))) {
         Write-Step '汇总产物：跳过（本机没有 dashboard dist，整包不完整）'
         Write-Note '这一轮只发后端；下一次带前端的部署会把 target\output\cloud-stream 补齐'
@@ -978,6 +1092,8 @@ try {
         New-DeployBundle
         # 整包目录就位之后才能编安装器：payload **就是**这个目录。
         New-Installer -PayloadDir $BundleDir
+        # 向导版：同一个 payload，另一个外壳。缺 ISCC 时返回 $null，不影响上面那个。
+        $InnoSetup = New-InnoInstaller -PayloadDir $BundleDir
         $packaged = $true
     }
     $srcExe = $(if ($packaged) { Join-Path $BundleDir 'stream-server.exe' } else { $LocalExe })
@@ -1013,10 +1129,17 @@ try {
             ((Get-Item $BundleZip).Length / 1MB), (Get-Md5 $BundleZip))
         Write-Info "运行根 $BundleDir"
         Write-Info "压缩包 $BundleZip"
-        Write-Info ("安装器 {0}（{1:N1} MB）" -f $InstallerExe, ((Get-Item $InstallerExe).Length / 1MB))
-        Write-Note ('装一台新机器：只拷 cloud-setup.exe 过去双击。它自带整包、自己提权、' +
-            '建任务、放行防火墙、启动并等应答；目标目录默认 %LOCALAPPDATA%\cloud-stream。' +
-            '整包目录与 zip 是给"已经有任务在跑、只换文件"的部署路径用的。')
+        Write-Info ("便携安装器 {0}（{1:N1} MB，自带整包）" -f (Split-Path -Leaf $InstallerExe),
+            ((Get-Item $InstallerExe).Length / 1MB))
+        if ($InnoSetup) {
+            Write-Info ("向导安装器 {0}（{1:N1} MB，中文向导 / 自选目录 / 控制面板卸载项）" -f
+                (Split-Path -Leaf $InnoSetup), ((Get-Item $InnoSetup).Length / 1MB))
+        } else {
+            Write-Note '这一轮没有向导版安装器（本机没有 ISCC，见上面的提示）'
+        }
+        Write-Note ('发给别人装：拷 cloud-stream-setup.exe —— 向导、可以自己选目录、' +
+            '装完在"应用和功能"里能卸。只想要一个文件、不想看向导：拷 cloud-setup.exe，' +
+            '它自带整包，双击就是控制台。整包目录与 zip 是给"已经有任务在跑、只换文件"的部署路径用的。')
         return
     }
 
