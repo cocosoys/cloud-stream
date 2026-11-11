@@ -75,8 +75,8 @@
 | 7 | OpenSSH Server | 装 → `Set-Service sshd -StartupType Automatic` → `Start-Service sshd` → 放行 TCP 22 | 部署脚本第一步就超时（脚本会把这三行打出来） |
 | 8 | 目录 | `C:\dev\stream\logs`、`C:\dev\deploy`、`C:\dev\stream\selkies-web` | `-Bootstrap` 会建，但 exe/前端仍要落位 |
 | 9 | TLS 证书 | `C:\dev\stream\cert.pem` + `C:\dev\key.pem`，**SAN 里要有这台机器的新 IP** | 浏览器证书不匹配；剪贴板 API 直接不可用（非安全上下文） |
-| 10 | 计划任务 `MCStreamSrv` | 在运行根里**以管理员身份**跑一次 `setup-watchdog.bat`（不需要账户密码）：它会顺手放行入站、建任务、立刻启动并打印 `[ok]` / `[fail]` | `task MISSING`，切换阶段失败 |
-| 11 | **入站放行** | 管理员跑一次 `setup-inbound.cmd`，或让第 10 项代劳；判据是从别的机器 `ping <IP>` 有回、`curl -k https://<IP>:8080` 不是 TIMEOUT | 服务跑得好好的，但外部一律连不上：ping 无响应、8080 TIMEOUT（连 RST 都不回）。`stream-server.exe --run` 每次启动会尝试补，但提权失败时只能记一行日志 |
+| 10 | 计划任务 `MCStreamSrv` | 在运行根里**以管理员身份**跑一次 `cloud-setup.exe --install`（不需要账户密码）：它会顺手放行入站、建任务、立刻启动并打印 `[ok]` / `[fail]` | `task MISSING`，切换阶段失败 |
+| 11 | **入站放行** | 管理员跑一次 `cloud-setup.exe --inbound`，或让第 10 项代劳；判据是从别的机器 `ping <IP>` 有回、`curl -k https://<IP>:8080` 不是 TIMEOUT | 服务跑得好好的，但外部一律连不上：ping 无响应、8080 TIMEOUT（连 RST 都不回）。`stream-server.exe --run` 每次启动会尝试补，但提权失败时只能记一行日志 |
 
 额外两条只跟游戏有关，不属于推流链：
 
@@ -102,7 +102,7 @@ IP，拿构建端的覆盖等于把 HTTPS 换成浏览器报警）。
 
 | 端口 | 用途 | 现状 |
 |---|---|---|
-| TCP 8080 | HTTPS 页面 + WS 信令 + 文件传输 | `open-inbound.cmd` 建 `cloud-stream 8080`（profile=any） |
+| TCP 8080 | HTTPS 页面 + WS 信令 + 文件传输 | `cloud-setup.exe --inbound` 建 `cloud-stream 8080`（profile=any） |
 | UDP 40000-40049 | WebRTC 媒体，ICE **host** 候选 | `cloud-stream webrtc UDP`；区间由 `--webrtc-udp-port-min/max` 定（#122） |
 | 任意 TCP/UDP | `stream-server.exe` 本体 | `cloud-stream app` 程序规则，按路径匹配，覆盖改区间/换端口 |
 | TCP 22 | 部署（ssh/scp） | **不随包放行**；要远程部署才手动开 |
@@ -164,10 +164,14 @@ Host mc-admin-2
 
 ## 3 部署到新机器：命令
 
-### 3.0 只有一台机器时：拷整包
+### 3.0 只有一台机器时：拷一个 exe
 
-构建端跑一次部署（或只跑到「汇总产物」）就会得到 `target\output\cloud-stream`
-—— 这个目录本身就是运行根，脚本全部按自身位置推导路径，没有写死的 `C:\dev`。
+构建端跑一次部署（或只跑到「汇总产物」）会得到两样东西：
+
+* `target\output\cloud-setup.exe` —— **约 9 MB 的单文件**，整个运行包嵌在里面。
+  装一台新机器只需要把它拷过去双击。
+* `target\output\cloud-stream\` —— 解开后的运行根（目录）与 `cloud-stream.zip`，
+  那是给"手工摆位 / 现场调试"用的，不是安装路径。
 
 **新机器上先确认四件事**（缺了不是"跑不起来"，是"看起来跑起来了但没人能用"）：
 
@@ -178,36 +182,23 @@ Host mc-admin-2
 | **交互式已登录会话** | `quser` 看到 `console 1 运行中` | 任务建得出来但不会跑；从服务/session 0 起进程抓到空桌面 |
 | ~~账户有密码~~ | `net user %USERNAME%` 看 `Password required` | **不再是前提**（2026-11 改）：任务改用交互式令牌注册，不存凭据、不做批处理登录，空密码账户同样可用 |
 | 真实显示输出 | VMware SVGA 3D 或物理显示器，分辨率设成要推的尺寸 | 黑屏，或退化成 1024×768 |
-| **入站已放行** | 从别的机器 `ping <IP>`、`curl -k https://<IP>:8080` | 全部 TIMEOUT（连 RST 都不返回）就是整档被丢：服务跑得再好也连不上。管理员跑一次 `setup-inbound.cmd` |
+| **入站已放行** | 从别的机器 `ping <IP>`、`curl -k https://<IP>:8080` | 全部 TIMEOUT（连 RST 都不返回）就是整档被丢：服务跑得再好也连不上。管理员跑一次 `cloud-setup.exe --inbound` |
 
-**五步**（0–1 是包与解压，2–4 在新机器上做）：
+**三步**（0 取文件，1 在新机器上点一下，2 开浏览器）：
 
 ```powershell
-# 0. 取包：target\output\cloud-stream\（目录）或 cloud-stream.zip（约 8.6 MB）
-#    从网上 / IM 拿到的 zip 先解锁，否则 SmartScreen 会拦 exe 与 .cmd：
-Unblock-File .\cloud-stream.zip
+# 0. 只拷 target\output\cloud-setup.exe 这一个文件（约 9 MB）
+#    从网上 / IM 拿到的先解锁，否则 SmartScreen 会拦：
+Unblock-File .\cloud-setup.exe
+#    想先看它打算做什么、一个文件都不动：cloud-setup.exe --plan（不需要管理员）
 
-# 1. 解压到任意位置，例如 D:\stream（纯 ASCII 短路径最省事）
-#    判据：stream-server.exe 与 stream-config.toml 在同一层
-
-# 2. 证书 —— 包里那对 PEM 的 SAN 是 192.168.59.148 / .143
-#    a) 新机器 IP 就是这两个之一：不用动
-#    b) 只是先看看画面、不介意告警：留着，浏览器点"继续前往"（剪贴板不可用）
-#    c) 要剪贴板：在构建机重签，两份 PEM 覆盖运行根里的同名文件
-#         openssl req -x509 -newkey rsa:2048 -nodes -days 825 ^
-#           -keyout key.pem -out cert.pem -config toolchain\cert-san.cnf
-#       （先把 cert-san.cnf 的 CN 与 subjectAltName 改成新 IP。签出来仍会提示
-#        "不受信任"——自签就是这样，点继续即可，但上下文已是安全的，剪贴板可用）
-#    注意：删掉 cert.pem/key.pem 不是捷径 —— 那会退回明文 HTTP，剪贴板**照样**
-#    不可用（Clipboard API 要安全上下文），只是少了一个告警。
-
-# 3. 安装：双击 install.cmd —— 就这一步
-#    它自己弹 UAC 提权，然后一次做完：
-#      a) 检查包是否完整（缺 selkies-web 或缺 stream-config.toml 会当场停下）
-#      b) 放行 8080/TCP、ICMP echo、UDP 40000-40049 与程序规则
-#      c) 建 MCStreamSrv 任务：D:\stream\stream-server.exe --run
-#      d) 立刻启动一次，最多等 60 秒，然后打印 [ok] 和这台机器的访问地址
-#    只想知道它会做什么、不改动任何东西：install.cmd /check（不需要管理员）
+# 1. 双击 cloud-setup.exe
+#    窗口先显示这台机器当前的状态，点「安装 / 修复」。它会自己弹 UAC，然后：
+#      a) 把内嵌的包解压到 %LOCALAPPDATA%\cloud-stream（--dir 可改）
+#      b) 把自己复制到那个目录 —— 之后那儿也有一份控制台
+#      c) 放行 TCP 8080、ICMP echo、UDP 40000-40049 与程序规则
+#      d) 建 MCStreamSrv 任务：<运行根>\stream-server.exe --run
+#      e) 立刻启动一次，最多等 60 秒，结论贴回窗口的日志面板
 #
 #    **不需要任何账户密码**。任务注册成"仅当用户登录时运行"
 #    （InteractiveToken）：它复用当前登录会话已经持有的令牌，不做登录、
@@ -215,24 +206,29 @@ Unblock-File .\cloud-stream.zip
 #    任务落在**控制台上登录的那个账户**上，而不是"以管理员身份运行"时
 #    临时提权的那个身份 —— 因为桌面属于前者。
 #
-#    等价的手工路径（想分步做时用，install.cmd 内部调的就是它们）：
-#      右键 setup-watchdog.bat -> "以管理员身份运行"
-#      它做 a) b) c) d) 里除"包完整性检查"以外的全部，输出更细。
-#      只有极少数情况才需要指定账户：setup-watchdog.bat <account>
+#    没有窗口的机器（纯 ssh）走同一条命令：
+#      cloud-setup.exe --install --yes --dir D:\stream
 
-# 4. 浏览器打开 https://<本机IP>:8080/
-#    窗口里已经告诉你 [ok] 了；若还要复核，见下面的三条命令
+# 2. 浏览器打开 https://<本机IP>:8080/
+#    窗口里已经说了 [ok]；要复核的，见下面的三条命令
 ```
 
-第 3 步的 `[ok]` 意味着**本机 loopback 上的健康检查已返回 200**，也就是服务真的
-起来了。若它说 `[fail]`，窗口里会直接给出下一步（看哪两个日志、跑哪个脚本），
-不用猜。
+安装的 `[ok]` 意味着**本机 loopback 上的健康检查已返回 200**，也就是服务真的
+起来了。若是 `[fail]`，窗口里会直接给出下一步（看哪两个日志、跑哪条命令），
+不用猜。整条链的细节与"删不掉怎么办"见 `operations-install.md`。
+
+**证书**：包里那对 PEM 的 SAN 是 `192.168.59.148` / `.143`（`toolchain/cert-san.cnf`）。
+新机器 IP 不是它们时，最省事的做法是装完把两份 PEM 覆盖到运行根里重签的版本
+（`openssl req -x509 -newkey rsa:2048 -nodes -days 825 -keyout key.pem -out cert.pem -config toolchain\cert-san.cnf`，
+先把 CN 与 subjectAltName 改成新 IP）。签出来仍会提示"不受信任"—— 自签就是这样，
+点继续即可，但上下文已是安全的，剪贴板可用。**删掉 PEM 不是捷径** —— 那会退回
+明文 HTTP，剪贴板**照样**不可用（Clipboard API 要安全上下文），只是少了一个告警。
 
 **要不要口令**（默认没有：同网段任何人打开地址就能操作键鼠）：
 
 ```cmd
 :: 在运行根里双击 set-password.cmd 更省事；等价的单行是
-cd /d D:\stream
+cd /d "%LOCALAPPDATA%\cloud-stream"
 set-password.cmd
 ```
 
@@ -247,12 +243,12 @@ https://<本机IP>:8080/?token=<口令>
 按 OEM 代码页逐字节解析，中文口令到 exe 手上就变了。细节见
 `deploy-one-click.md` §7.26。
 
-**如果第 3 步是以普通权限双击的**（没有"以管理员身份运行"）：任务多半建得出来，
-但入站规则加不上，脚本会打印 `[inbound]` 警告并在 `[ok]` 后面提醒。补一次即可：
+**入站规则没加上怎么办**（UAC 被拒、或只提权了安装没提权规则）：补一次即可，
+不会碰任何文件：
 
 ```powershell
-# 管理员 PowerShell 或右键"以管理员身份运行"
-D:\stream\setup-inbound.cmd
+# 管理员 PowerShell，或右键"以管理员身份运行"
+D:\stream\cloud-setup.exe --inbound --dir D:\stream
 ```
 
 等价的单行命令（管理员）：
@@ -280,7 +276,7 @@ Get-NetConnectionProfile | Select-Object InterfaceAlias, NetworkCategory
 |---|---|---|
 | `stream-server.exe --run` 跑起来（看门狗每分钟一次，但只在真的要起进程时执行） | 查 `cloud-stream 8080` / `ICMPv4` 两条规则，缺了就补（提权才有权限；没权限只记一行）；有 `auth-token.txt` 就把口令传给 exe | `logs\watchdog.log` 的 `PREFLIGHT` 行 |
 | exe 启动后 | 自己另起 `--probe` 子进程，每 2.5 秒探一次 loopback，最多 30 秒 | 同上：`PREFLIGHT listening on 8080 after N probe(s)` 或 `PREFLIGHT NOT listening ...` + 三条最可能原因 + 下一步 |
-| `setup-watchdog.bat` 跑完 | 建任务（交互式令牌，无密码）→ 立刻启动 → 最多等 60 秒 → 打印 `[ok]` / `[fail]` | 屏幕上，窗口就是结果 |
+| 安装器跑完（`cloud-setup.exe --install`） | 建任务（交互式令牌，无密码）→ 立刻启动 → 最多等 60 秒 → 结论贴回窗口日志面板，同时写 `%ProgramData%\cloud-stream\last-install.txt` | 窗口面板 + 那个文件 |
 | `collect-launch-facts.cmd` | 第 9 节专门列入站：网络配置文件、本机 IPv4、两条规则的实际参数、最近 12 条 `PREFLIGHT` 行 | `cloud-stream-facts.txt` |
 
 所以"启动后发现没效果"必然留下痕迹：先看 `logs\watchdog.log` 里最后一条
@@ -295,7 +291,7 @@ preflight，所以窗口里看不到异常时，日志里也有判决。适合�
 **账户没有密码时**：照常建任务，不需要给账户设密码。任务用的是
 `InteractiveToken`（"仅当用户登录时运行"）—— 复用会话已有的令牌，不做批处理
 登录，所以 `LimitBlankPasswordUse=1` 根本不参与。这一条 2026-11 改过，
-老版本的 `schtasks /RP` 才要求密码，现在的 `setup-watchdog.bat` 不碰它。
+老版本的 `schtasks /RP` 才要求密码，现在的安装器不碰它。
 
 真正的前提只有一条：**那个会话是登录着的**。冷启动停在锁屏时，没有桌面可抓，
 任务也不会触发；要么人工登录一次，要么开自动登录（`Autologon` 用 LSA 加密存
@@ -321,38 +317,47 @@ Get-Content D:\stream\logs\stream-server.log | Select-String 'listening on' # ht
 ```
 
 页面 404 → `selkies-web\` 没解压全（`selkies-web\index.html` 必须在）；
-页面能开但黑屏 → 进程在 session 0，重跑 `setup-watchdog.bat`；
-任务"运行过"但端口不通 → 任务动作指向别的目录，重跑 `setup-watchdog.bat`；
+页面能开但黑屏 → 进程在 session 0，重跑一次 `cloud-setup.exe --install`；
+任务"运行过"但端口不通 → 任务动作指向别的目录，重跑一次 `cloud-setup.exe --install`；
 本机 `PREFLIGHT listening` 但别的机器打不开 → 入站规则或网络配置文件，
-`setup-inbound.cmd`。
+`cloud-setup.exe --inbound`。
 
 要改分辨率 / 帧率 / 码率：编辑运行根里的 `stream-config.toml`，或用
 `cloud-setup.exe` 的「改配置」按钮（默认
 1920×1080 / 60 fps / 2500 kbps），然后重启任务。改完别动计划任务本身。
 
 这一路不需要构建机、不需要 ssh、不需要工具链。包里的 `README.txt` 就是三步版
-（解压 → `install.cmd` → 浏览器）。
+（拷 exe → 双击 → 浏览器）。
 
-### 3.0.2 把一台机器退回去：`uninstall.cmd`
+### 3.0.2 把一台机器退回去：`cloud-setup.exe --uninstall`
 
-同一个目录里的 `uninstall.cmd`，双击即可（同样自己提权）。顺序是排过的，不是
-想起哪个做哪个：
+同一个目录里的 `cloud-setup.exe`，双击后点「卸载」即可（它会自己提权，然后
+**把窗口关掉** —— 那个窗口占着目录里的 exe，不退出谁都删不掉）。顺序是排过的，
+不是想起哪个做哪个：
 
 | 步骤 | 动作 | 为什么是这个顺序 |
 |---|---|---|
-| 1 | 停任务 + 注销 `MCStreamSrv` | 看门狗每分钟一次；先杀进程的话它会在这中间把服务拉回来，然后 exe 被占用、目录删不掉 |
-| 2 | 杀掉**本目录**下的 `stream-server.exe` | 按 `ExecutablePath` 前缀过滤，另一份安装在别处的不会被误杀 |
+| 1 | 停任务 + 注销 `MCStreamSrv` | 看门狗每分钟一次；先杀进程的话它会在这中间把服务拉回来，然后 exe 被占用、目录删不掉。删不掉时先 `--disable`：禁用之后它再也拉不起服务，所以"任务残留 + 目录照删"是安全的 |
+| 2 | 杀掉**本目录**下的 `stream-server.exe` | 按完整路径前缀过滤，另一份安装在别处的不会被误杀 |
 | 3 | 还原默认录音设备 | 服务启动时会把它切到虚拟麦，而进程从来是被强杀的；原值只在 `logs\mic-default.json`，这个文件下一步就随目录消失 |
-| 4 | 删四条入站规则（含程序规则） | 规则名是全局的，所以也会清掉"另一份副本"用的那几条 |
-| 5 | 删整个目录 | 脚本删不掉自己所在的目录，所以交给一个等 3 秒的 PowerShell 进程 |
+| 4 | 删四条入站规则（含程序规则） | 规则名是机器级的，所以也会清掉"另一份副本"用的那几条。端口不猜 —— 问 `--print-config json`，改过端口的机器也能清干净 |
+| 5 | 删整个目录 | 删不掉自己：先复制到 `%TEMP%`，用 `--purge --dir … --wait <pid>` 拉起替身，本进程退出；替身等 pid 消失后动手 |
+
+删不干净时它**不会假装成功**：目录留着，弹一个框把卡住的那个文件路径交给你
+（`另一个程序正在使用此文件`），结论文件里也写着。
 
 任务是"按目录认领"的：如果 `MCStreamSrv` 的动作指向别的目录，它会**跳过**并
-告诉你那个目录在哪（要强删加 `/force`）。另外两个模式：
+告诉你那个目录在哪（要强删加 `--force`）。另外三个模式：
 
 ```cmd
-uninstall.cmd /whatif    :: 只列清单，什么都不改（不需要管理员）
-uninstall.cmd /keep      :: 卸服务、留文件（换新版本重装时用）
+cloud-setup.exe --uninstall --plan     :: 只列清单，什么都不改、不弹框（不需要管理员）
+cloud-setup.exe --uninstall --whatif   :: 同一份清单，弹框显示
+cloud-setup.exe --uninstall --keep     :: 卸服务、留文件（换新版本重装时用）
 ```
+
+卸载前会把"这台机器的身份"（配置、证书、录音设备原值，几 KB）备份到
+`%ProgramData%\cloud-stream\uninstall-backup`；下次 `--install` 发现它在，
+就用 `--ops rollback` 放回去，所以"卸载 → 重装"不会静默丢掉端口和口令。
 
 不碰的东西：`--upload-dir` 指向的桌面目录里的文件、虚拟声卡驱动、VC++ 运行库。
 
@@ -398,16 +403,16 @@ ssh <别名> "powershell -c \"(Get-Process stream-server).SessionId\""     # 1�
 
 | 现象 | 原因 | 处置 |
 |---|---|---|
-| 页面能开、画面全黑 | 进程跑在 session 0（注册成服务、或任务没用交互式令牌），抓的是空桌面 | 部署体检打印 `session=0` 就是这条；用 `setup-watchdog.bat` 建任务 |
+| 页面能开、画面全黑 | 进程跑在 session 0（注册成服务、或任务没用交互式令牌），抓的是空桌面 | 部署体检打印 `session=0` 就是这条；重跑 `cloud-setup.exe --install` 建任务 |
 | 重启之后 8080 不通 | 没人登录 → 交互式任务不触发；或 `sshd` 是「手动」 | 开自动登录；`Set-Service sshd -StartupType Automatic` |
-| 页面打不开但 ssh 正常 | 新机器防火墙是开的，8080 没放行 | 管理员跑 `setup-inbound.cmd`（22 也要放行） |
-| **服务在跑、日志也写了 `starting`，但外部完全连不上** | 入站被整档丢弃：Public 配置文件默认丢全部入站（含 ICMP），VMware NAT / host-only 网卡常被判成 Public。表现是 `ping` 无响应、8080 **TIMEOUT**（不是 REFUSED） | 先看 `logs\watchdog.log` 最后一条 `PREFLIGHT`：若是 `listening on 8080`，问题就在网络层 —— 管理员跑 `setup-inbound.cmd`；`Get-NetConnectionProfile` 确认不是被 `Private` 规则挡在 Public 上 |
+| 页面打不开但 ssh 正常 | 新机器防火墙是开的，8080 没放行 | 管理员跑 `cloud-setup.exe --inbound`（22 也要放行） |
+| **服务在跑、日志也写了 `starting`，但外部完全连不上** | 入站被整档丢弃：Public 配置文件默认丢全部入站（含 ICMP），VMware NAT / host-only 网卡常被判成 Public。表现是 `ping` 无响应、8080 **TIMEOUT**（不是 REFUSED） | 先看 `logs\watchdog.log` 最后一条 `PREFLIGHT`：若是 `listening on 8080`，问题就在网络层 —— 管理员跑 `cloud-setup.exe --inbound`；`Get-NetConnectionProfile` 确认不是被 `Private` 规则挡在 Public 上 |
 | 日志里只有 `启动：<目录>`，没有 `PREFLIGHT` 行 | 跑的是旧包（新版的 `--run` 会自己 spawn `--probe`） | 用当前整包覆盖运行根；新版每次启动都会写 `PREFLIGHT` 判决 |
-| `setup-watchdog.bat` 打印 `[fail] nothing listening ... after 60 s` | 8080 被占用 / exe panic / 缺 VC++，三者之一 | 窗口里已列出要看的两份日志；或跑 `collect-launch-facts.cmd` |
+| 安装器的结论是 `[fail] nothing listening ... after 60 s` | 8080 被占用 / exe panic / 缺 VC++，三者之一 | `last-install.txt` 里已列出要看的两份日志；或跑 `collect-launch-facts.cmd` |
 | 证书报警、剪贴板失灵 | SAN 还是旧 IP；或根本没配证书（退回明文 http） | 按 §1.1 重签；剪贴板 API 要求安全上下文 |
 | 信令连上、视频不出 | 跨网段/跨 NAT，`ice_servers=[]` 只有 host candidate | 同网段部署，或后续接 STUN/TURN |
 | 指针灵敏度/界面缩放改了没反应还报错 | 服务用**非游戏账号**跑，改的是另一个 HKCU | `/RU` 必须是游戏所在的交互用户（现网 `Administrator`） |
-| 任务显示"运行过"，但页面 404 / 日志空 | 整包被搬到了别的目录，计划任务里还存着旧路径 | 在新目录重跑一次 `setup-watchdog.bat`；部署体检会把动作路径打出来 |
+| 任务显示"运行过"，但页面 404 / 日志空 | 整包被搬到了别的目录，计划任务里还存着旧路径 | 在新目录重跑一次 `cloud-setup.exe --install`；部署体检会把动作路径打出来 |
 
 ---
 

@@ -9,8 +9,9 @@ description = "可视化控制台：把安装/卸载/更新/修改四个动作�
 # 把结果画在窗口上。于是它不会把 30 MB 的推流依赖（webrtc / scrap / opus）
 # 拖进一个按钮窗口，也不会因为服务端某次重构编译不过。
 #
-# 它和 `install.cmd` / `uninstall.cmd` 处在同一层：三个消费者，一个后端
-# （`stream-server.exe --ops ...`）。没有第二套实现。
+# 它和服务端处在同一层：一个动作后端（`stream-server.exe --ops ...`），一个
+# 安装后端（这个 exe 的 `--install` / `--uninstall` / `--inbound`），窗口只是
+# 这两个后端的一个消费者。没有第二套实现。
 [dependencies]
 windows-sys = { version = "0.52", features = [
     "Win32_Foundation",

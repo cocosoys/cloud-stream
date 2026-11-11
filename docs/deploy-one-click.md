@@ -18,10 +18,24 @@
 > | `run-hidden.vbs` | 不需要（exe 是 GUI 子系统，窗口不会被创建） |
 > | `probe-listen.cmd` | `stream-server.exe --probe`（`--run` 自己 spawn） |
 >
-> 所以本文里凡是出现这四个文件名的地方，读起来都该替换成上表右列。**没有**逐行
+> 第二批（2026-11-12）删的是**安装那一层**：`install.cmd` / `uninstall.cmd` /
+> `setup-task.ps1` / `setup-watchdog.bat` / `open-inbound.cmd` / `setup-inbound.cmd`。
+> 全都并进了 `cloud-setup.exe` —— 同一个窗口既能看状态，也能装、能修、能卸：
+>
+> | 原来 | 现在 |
+> |---|---|
+> | `install.cmd` | `cloud-setup.exe --install`（双击窗口里的「安装 / 修复」） |
+> | `install.cmd /check` | `cloud-setup.exe --plan` |
+> | `uninstall.cmd` | `cloud-setup.exe --uninstall` |
+> | `uninstall.cmd /whatif` | `cloud-setup.exe --uninstall --plan` |
+> | `setup-task.ps1` + `setup-watchdog.bat` | `--install` 内部建任务（交互式令牌，无密码） |
+> | `open-inbound.cmd` / `setup-inbound.cmd` | `cloud-setup.exe --inbound` |
+>
+> 所以本文里凡是出现这些文件名的地方，读起来都该替换成上表右列。**没有**逐行
 > 重写的原因：这个文件的价值一半在“当时为什么这样”的推理链条里，把名词换掉会
 > 让那些段落失去时间坐标。当前形态的权威说明是
-> [`docs/operations-run.md`](operations-run.md)。
+> [`docs/operations-run.md`](operations-run.md)（运行）与
+> [`docs/operations-install.md`](operations-install.md)（安装/卸载）。
 >
 > 仍然准确的部分：上传/切换/回滚的时序、部署失败的各种成因、被控机的路径推导
 > 规则、健康检查与归档口径。

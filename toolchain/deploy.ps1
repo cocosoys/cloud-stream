@@ -10,16 +10,17 @@
       1. 预检（工具链、ssh 可达、cargo / npm）
       2. 构建后端 release
       3. 构建前端（core → dashboard 两级，顺序不能反）
-      4. 汇总产物到 target\output\cloud-stream（+ 同名 zip），上传从这里取
-      5. scp 上传（exe / DLL / zip / 十二个上机脚本 / 证书，内容一样就跳过）
-      6. MD5 双向核对
+      4. 汇总产物到 target\output\cloud-stream（+ 同名 zip）
+      5. 用 --features embed 把上面那个目录打进 target\output\cloud-setup.exe
+         —— 一个自带整包的单文件安装器（顺序不能反，见 New-Installer）
+      6. scp 上传（exe / DLL / zip / 三个上机脚本 / 证书 / 安装器，内容一样就跳过）
+      7. MD5 双向核对
 
     被控机做的事（由 deploy-remote.ps1 执行，脚本随包上传）：
-      7. 装启动脚本 → 停任务 → 杀进程 → 换 exe → 解压前端（暂存目录校验后
-         换名）→ 起任务
-      8. 本机轮询 /api/status 直到 200，并核对进程启动时间与日志
-      9. 成功后把这次真正发上去的产物归档到 target\deploy-archive
-     10. 失败时用归档里的上一版重发，并把原因打出来
+      8. 停任务 → 杀进程 → 换 exe → 解压前端（暂存目录校验后换名）→ 起任务
+      9. 本机轮询 /api/status 直到 200，并核对进程启动时间与日志
+     10. 成功后把这次真正发上去的产物归档到 target\deploy-archive
+     11. 失败时用归档里的上一版重发，并把原因打出来
 
     被控机上不保留任何备份（没有 .exe.prev，也没有 web 目录副本）：那里只放
     正在运行的正式产物。回滚材料留在构建端 —— 需要回滚的人坐在这台机器前，
@@ -58,8 +59,11 @@
 
 .PARAMETER PackageOnly
     只构建 + 打包，**不碰被控机**：不查 ssh、不上传、不重启。
-    产物落在 target\output\cloud-stream（运行根，可直接拷走）与同目录的
-    cloud-stream.zip，这一步跑完就可以把整包交给别人去装。
+    产物有两个，落在 target\output\：
+      cloud-stream\        运行根目录，可直接拷走（给调试、手工摆位用）
+      cloud-stream.zip     同上的压缩版
+      cloud-setup.exe      自带整包的单文件安装器，装新机器只需要它
+    这一步跑完就可以把 cloud-setup.exe 交给别人去装。
     用途是把"要一个能装到新机器上的包"和"部署到 .148"这两件事分开 ——
     前者不需要目标机开机，也不该因为 ssh 连不上而整条命令失败。
 
@@ -84,7 +88,7 @@
 
 .EXAMPLE
     pwsh toolchain/deploy.ps1 -PackageOnly
-    只出一个能装到新机器的整包（target\output\cloud-stream + zip），不连被控机。
+    只产出能装到新机器的东西（target\output\cloud-stream + zip + cloud-setup.exe），不连被控机。
 #>
 [CmdletBinding()]
 param(
@@ -113,6 +117,10 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+# 构建环境（MSVC 的 PATH/INCLUDE/LIB）备好了没。必须在 StrictMode 之后显式初始化：
+# 严格模式下读一个没赋过值的变量会直接抛错，而不是返回 $null。
+$script:BuildEnvReady = $false
+
 # 不要在这里动 [Console]::OutputEncoding。看着像是"修乱码"，实际是制造乱码：
 # 它只改 PowerShell 的编码，不改控制台代码页，中文 Windows 上新旧两套编码
 # 会在一层管道里打架，`pwsh deploy.ps1 > log.txt` 就会写进一堆 "棰勬" 这种
@@ -136,42 +144,46 @@ $RemoteExe = "$RemoteRoot\stream-server.exe"
 $RemoteLog = "$RemoteRoot\logs\stream-server.log"
 # 上机文件：跟着每次部署走。
 #
-# 这里原本有 start-stream.cmd / start-stream.60fps.cmd / run-hidden.vbs 三个。
-# 前两个把路径拼成命令行，第三个把黑框藏起来 —— 两件事现在都由 exe 自己做：
-# `--run` 从自身目录推导（docs/operations-run.md），而进程是 GUI 子系统，
-# Windows 不再替它创建控制台窗口。删掉这三行不是"把脚本翻译成 Rust"，是那一层
-# 职责本来就不该存在。
+# 这个列表从 12 项一路掉到 3 项，掉掉的每一批都不是"把脚本翻译成 Rust"，而是
+# 那一层职责本来就不该存在：
 #
-# collect-launch-facts.cmd 是"起不来"时的第一个动作：新设备上三种常见故障
-# （任务没跑 / 缺 VC++ / zip 没解压）都不写日志、窗口一闪就关，它一次收全。
-# setup-inbound.cmd 是第二课：Windows 防火墙在新机器上把所有入站（含 ICMP）
-# 都丢掉，于是"ping 不通、8080 超时"，而服务其实跑得好好的。
-# open-inbound.cmd 与 probe-listen.cmd 是同一课的自动化部分（前者幂等地补规则，
-# 后者在启动后 30 秒内把"到底有没有监听"写成一行 PREFLIGHT 日志）。
-# install.cmd / uninstall.cmd 是"一次点击"那一层：把上面的准备工作串成一条线，
-# 并且各自带一个只读模式（/check、/whatif）。它们不重新实现任何东西 —— install
-# 调 setup-task.ps1 + open-inbound.cmd，uninstall 调 netsh 与 --restore-mic，
-# 所以两条路径不会各自漂移。
+#   start-stream.cmd / start-stream.60fps.cmd / run-hidden.vbs
+#       —— 拼路径与藏黑框。`--run` 从自身目录推导（docs/operations-run.md），
+#       而进程是 GUI 子系统，Windows 不再替它创建控制台窗口。
+#   probe-listen.cmd
+#       —— 启动后 30 秒探活。`--probe` 干同一件事，输出同一行 PREFLIGHT。
+#   install.cmd / uninstall.cmd / setup-watchdog.bat / setup-task.ps1 /
+#   open-inbound.cmd / setup-inbound.cmd
+#       —— 装与卸的四层命令。现在是一个 exe：`cloud-setup.exe --install` /
+#       `--uninstall`，任务 XML、防火墙、端口全都由它自己算
+#       （docs/operations-install.md）。
+#
+# 剩下的两项脚本各有它"只能是脚本"的理由：一个要在 exe 起不来的时候收现场
+# （collect-launch-facts 跑的是 cmd 内建命令），一个只写一个文本文件
+# （set-password，用 cmd 是为了双击就能改，不需要另建一个窗口）。
 $LauncherNames = @(
     # 参数本体。路径类的那几条由 --run 从自身目录推导，分辨率/帧率/码率/编码器/
     # 输入策略在这里。它跟着部署走，所以"每次部署把参数覆盖回去"这个既有行为
     # 没有变；"每台机器的差异要留住"是安装器那一层的事，不在这里解决。
     'stream-config.toml',
-    'setup-watchdog.bat',
-    'setup-task.ps1',
-    'install.cmd',
-    'uninstall.cmd',
     'collect-launch-facts.cmd',
-    'setup-inbound.cmd',
-    'open-inbound.cmd',
     'set-password.cmd'
 )
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $LocalExe = Join-Path $RepoRoot 'target\release\stream-server.exe'
-# 可视化控制台。刻意不链接 stream-server（377 KB，秒开），所以是独立产物。
-# 它和 install.cmd / uninstall.cmd 处在同一层：三个消费者，一个后端。
+# 可视化控制台 / 安装器（同一个 exe 的两个角色）。刻意不链接 stream-server
+# （377 KB，秒开），所以是独立产物。
+#
+# **它不再进整包目录**：打包那一步会用 `--features embed` 把它重新编一遍，让
+# 它自带整个运行包，成品落在 `target\output\cloud-setup.exe` —— 一个文件就是
+# 一台能装的机器。理由有两个：
+#   * 包内再放一份 9 MB 的"自带同一份包"的 exe，是把自己复制了一遍；
+#   * 分发形式变成"拷一个 exe 过去双击"，而不是"解开一个目录再找里面的脚本"。
+# 装完之后 `place_self` 会把它复制进运行根，所以在被控机上它仍然是控制台。
 $LocalSetup = Join-Path $RepoRoot 'target\release\cloud-setup.exe'
+# 安装器成品：单个 exe，自带整包。
+$InstallerExe = Join-Path $RepoRoot 'target\output\cloud-setup.exe'
 # #17: 虚拟手柄的 DLL。必须和 exe 同目录（LoadLibraryW 先查应用目录），并且
 # 必须在进程停下之后才能覆盖 —— 已加载的 DLL 被持有，运行中覆盖是共享冲突。
 $LocalVigem = Join-Path $RepoRoot 'vendor\vigem\ViGEmClient.dll'
@@ -378,6 +390,10 @@ function Initialize-BuildEnv {
     }
     if (-not $env:VCPKG_ROOT) { $env:VCPKG_ROOT = 'C:\dev\vcpkg' }
 
+    # 给后面"还要再编一次"的地方一个明确的信号。**不能**用 `Get-Command cargo`
+    # 判断：裸 PowerShell 里 cargo 在 PATH 上（rustup 装的），缺的是 link.exe，
+    # 于是"能编"和"编不动"看起来一样，等到链接那一步才炸。
+    $script:BuildEnvReady = $true
     Write-Ok "MSVC $($toolset.Name) / SDK $($sdkVer.Name)"
 }
 
@@ -408,7 +424,7 @@ function Test-Health([int]$TimeoutSec) {
     target\release、DLL 在 vendor\vigem、前端在另一个仓库的 dist、启动脚本在
     toolchain\、证书只在被控机本地。于是"把一台新机器变成被控机"变成一串手工
     scp，漏一个就得到"能连上但没画面 / 有画面但没手柄 / 有手柄但剪贴板废掉"。
-    汇总之后，这个目录**就是**运行根：拷过去、双击 install.cmd，完事。
+    汇总之后，这个目录**就是**运行根：拷过去（或由安装器铺下去）就能跑。
 
     约定：运行根 <base>\stream 与本目录一一对应（相对路径全部自定位），所以
     "本地这份能跑"与"线上在跑"是同一批字节，不是两次拼装的结果。
@@ -433,49 +449,49 @@ function Write-BundleReadme([string]$Path, [bool]$Tls) {
     $tlsLine = if ($Tls) { 'cert.pem / key.pem  TLS 自签证书（浏览器会提示不受信任）' } else {
         '本包未附带证书 -> 明文 HTTP，剪贴板同步不可用（需要安全上下文）'
     }
+    # 浏览器地址跟着证书走：有证书就是 https，没有就是 http。写死其中一个，
+    # 另一半机器上就是一条打不开的链接 —— 而这种"照文档点、打不开"最难自查。
+    $scheme = if ($Tls) { 'https' } else { 'http' }
     $text = @"
 cloud-stream 被控端整包
 =======================
 
 这个目录就是被控机的运行根。位置随意：D:\stream、C:\dev\stream 都行，
-里面的 exe 与脚本都按自身位置推导路径，没有任何写死的目录。
+里面的 exe 按自身位置推导路径，没有任何写死的目录。
+这里没有 .cmd / .ps1 / .vbs 启动脚本：装、卸、起、停都由 exe 自己做。
 
-怎么用
-  1) 整包拷到目标机器（或解压同目录下的 cloud-stream.zip）。
-  2) 双击 install.cmd —— 就这么一步。
-     它自己弹 UAC 提权，然后依次：检查包是否完整 -> 放行 8080/ping/WebRTC 的 UDP
-     段 -> 建看门狗计划任务（不需要任何账户密码）-> 启动一次 -> 最多等 60 秒 ->
-     打印 [ok] 和这台机器的访问地址。失败时它会按最可能的原因给下一步，而不是
-     只说一句 fail。
-     只想看看它会做什么、不改动任何东西：install.cmd /check
-  3) 任务在登录时触发一次，之后每分钟一次，进程挂了 60 秒内自己回来。
-     想手工起一次：stream-server.exe --run
-     （临时改一次参数：stream-server.exe --run --fps 60 —— 命令行压过配置文件）
-  4) 浏览器打开 https://<本机IP>:8080/
-  5) 以后不要了：双击 uninstall.cmd —— 停任务、杀进程、删规则、把默认录音设备
-     还回去，最后删掉整个目录（/keep 只卸服务、留文件；/whatif 只列清单）。
+装一台新机器（推荐）
+  1) 只拷**一个文件**过去：cloud-setup.exe（自带这整个包，约 9 MB）。
+     它不在这个目录里 —— 这个目录正是它要铺下去的内容。
+  2) 双击它。弹一次 UAC，然后它依次：把内置包解到
+     %LOCALAPPDATA%\cloud-stream -> 放行 TCP 端口 / ping / WebRTC 的 UDP 段 ->
+     建看门狗计划任务（不需要任何账户密码）-> 启动一次 -> 等端口应答 ->
+     告诉你这台机器的访问地址。失败时它按最可能的原因给下一步。
+  3) 浏览器打开 ${scheme}://<本机IP>:8080/
+  4) 以后不要了：同一台机器上双击运行根里的 cloud-setup.exe -> 「卸载」。
+     它停任务、杀进程、把默认录音设备还回去、删防火墙规则，最后删掉整个目录。
+     删不掉的文件会点名告诉你（多半是有程序还开着里面的东西）。
 
-     install.cmd 干的事与下面这条完全一样，只是不用记顺序：
-       右键 setup-watchdog.bat -> "以管理员身份运行"
-     它同样不存凭据、不改账户；提权运行时它会顺手放行防火墙，并在建完任务后
-     立刻启动一次、等最多 60 秒，直接告诉你 [ok] 还是 [fail]。
+  只想看它会做什么、不改动任何东西（命令行，输出直接打在屏幕上）：
+     cloud-setup.exe --uninstall --plan     在某台机器上卸载会做什么
+     cloud-setup.exe --task-xml             要注册的那个任务长什么样
+     cloud-setup.exe --inbound              只补那四条防火墙规则（要管理员）
+
+已经有任务在跑、只想换文件（deploy.ps1 的部署路径）
+  把同目录的 zip 解到这台机器的运行根（比如 C:\dev\stream），然后重启任务：
+     schtasks /End /TN MCStreamSrv
+     schtasks /Run /TN MCStreamSrv
+  也可以双击运行根里的 cloud-setup.exe，点「安装 / 修复」（会顺带把任务与规则
+  重新做一遍）。
 
 目录说明
   stream-server.exe   采集 / 编码 / 信令 / HTTP / 文件传输，全在这一个进程
   ViGEmClient.dll     虚拟手柄客户端；缺了只降级成"没手柄"，其余照常
   selkies-web\        前端静态根（--dist 指向这里）
   logs\               stream-server.log 与 watchdog.log（进程起不来先看后者）
-  install.cmd         一键安装：检查 + 放行 + 建任务 + 启动 + 验证（/check 只读）
-  uninstall.cmd       一键卸载：任务 + 进程 + 规则 + 默认录音设备 + 整个目录
-                      （/keep 保留文件，/whatif 只列清单）
-  cloud-setup.exe     可视化控制台：状态 / 快照 / 回滚 / 更新 / 安装 / 卸载 / 改配置
   stream-config.toml  这台机器的常态：端口 / 分辨率 / 帧率 / 码率 / 编码器 / 输入策略
   auth-token.txt      访问口令（可选；没有就是同网段谁都能开）
-  setup-watchdog.bat  创建 MCStreamSrv 任务并验证一次启动（不碰账户密码）
-  setup-task.ps1      上面那条的实际执行者：按交互式令牌注册任务
   collect-launch-facts.cmd  起不来时双击它，生成一份事实清单（只读）
-  setup-inbound.cmd   管理员身份运行：放行 8080、ping 与 UDP 40000-40049（否则 WebRTC 切不过去）
-  open-inbound.cmd    上面那条规则的实际执行者，被 --run 在每次真启动时调用（幂等）
   set-password.cmd    设/改/清除访问口令（写 auth-token.txt，重启任务生效）
   manifest.json       本次构建的指纹：提交、时间、各文件 MD5、前端文件数
   $tlsLine
@@ -484,13 +500,11 @@ cloud-stream 被控端整包
   默认没有：同一网段任何人都能打开页面并操作键鼠。
   要的话双击 set-password.cmd 输一个（只限 ASCII），然后重启任务，之后
   浏览器必须带 token 打开一次：
-        https://<本机IP>:8080/?token=<口令>
+        ${scheme}://<本机IP>:8080/?token=<口令>
   前端会把它写进 cookie，同一浏览器之后直接输地址就行。
   口令存在 auth-token.txt；删掉它（或 set-password.cmd 里留空）就恢复开放。
 
 每次启动会自动做的事（不需要人守在那里）
-  * 查 8080 / ICMP / WebRTC UDP / app 四条入站规则，缺了就补（当前进程提权时）；补不上会把原因写进
-    logs\watchdog.log 的 PREFLIGHT 行，而不是安静地少一条规则
   * exe 自己另起一个 --probe 子进程，最多 30 秒，把结果写成
         PREFLIGHT listening on 8080 after N probe(s)
     或者
@@ -498,10 +512,11 @@ cloud-stream 被控端整包
     所以"启动后没反应"永远有带时间戳的一行可以看，不用猜。
 
 注意
-  * 计划任务的 /RU 必须是"能看见桌面"的那个登录用户；换成服务账户会抓到空桌面。
+  * 计划任务必须以"能看见桌面"的登录用户运行（InteractiveToken）；换成服务
+    账户会抓到一张空桌面 —— 采集和 SendInput 都是按会话隔离的。
   * 换机器要重签证书（SAN 里是 IP），否则浏览器报警、剪贴板不工作。
   * 外部机器连不上、本机 loopback 正常，多半是入站规则或网络配置文件
-    （VMware 的网卡常被判成"公用"）：管理员身份跑一次 setup-inbound.cmd。
+    （VMware 的网卡常被判成"公用"）：管理员身份跑一次 cloud-setup.exe --inbound。
   * 换分辨率 / 码率改 stream-config.toml（或控制台的「改配置」按钮），不要改计划任务。
   * 计划任务的动作就是 stream-server.exe --run，没有脚本中转；它自己从所在目录
     推导配置、前端、日志、证书、令牌的位置，所以整包搬到哪都能跑。
@@ -536,13 +551,11 @@ function New-DeployBundle {
     foreach ($name in $LauncherNames) {
         Copy-Item (Join-Path $PSScriptRoot $name) (Join-Path $BundleDir $name) -Force
     }
-    # 控制台跟着包走：没有它，这四个动作在这台机器上就只剩「跑脚本」一条路，
-    # 而脚本正是本轮要清掉的东西。缺了不算致命（服务照跑），所以只提示。
-    if (Test-Path $LocalSetup) {
-        Copy-Item $LocalSetup (Join-Path $BundleDir 'cloud-setup.exe') -Force
-    } else {
-        Write-Note '本机没有 cloud-setup.exe，包里缺可视化控制台（先构建 -Package cloud-setup）'
-    }
+    # 控制台不在这里拷进包里 —— 它是**产物目录的兄弟**，不是包里的一员。
+    # 打包的最后一步会用 `--features embed` 把它编成"自带这个包"的单文件
+    # 安装器，落在 `target\output\cloud-setup.exe`。放进包里有两个坏处：
+    # 体积翻一倍（包里含一份自带这个包的 9 MB exe），以及"我该双击哪个"
+    # 这个问题本来就不该存在。
 
     $cert = Resolve-CertPair
     if ($cert) {
@@ -605,6 +618,55 @@ function New-DeployBundle {
     if (-not $cert) {
         Write-Note "包里没有 cert.pem/key.pem：部署后是明文 HTTP，剪贴板同步不可用。把证书放到 $PSScriptRoot\cert-<IP末位>.pem 与 key-<IP末位>.pem 可自动带上。"
     }
+}
+
+<#
+    把刚打好的整包编进 cloud-setup.exe，成品是一个文件。
+
+    顺序不能反：payload **就是** `target\output\cloud-stream` 这个目录，所以
+    必须先有它、再编安装器。`build.rs` 里刻意跳过 `cloud-setup.exe` 自己 ——
+    否则就是"exe 里嵌着包含自己的包"。装的时候 `pack::place_self` 把它复制进
+    运行根，从那以后它就是控制台。
+
+    这里用 `-Exe` 而不是别的路径，是因为 `build.ps1` 走的是 workspace 的
+    `target\`：`-Package cloud-setup` 和这里编出来的是同一个文件，只是特征不同。
+#>
+function New-Installer {
+    param([string]$PayloadDir)
+
+    if (-not (Test-Path $LocalSetup) -and -not (Test-Path (Join-Path $RepoRoot 'Cargo.toml'))) {
+        Write-Note '没有 cargo 工作区，跳过安装器'
+        return
+    }
+    # `-SkipBuild` 时上面那一步不一定跑过 Initialize-BuildEnv。这里必须问"环境
+    # 备好了没"，而不是"cargo 在不在 PATH 上"（见 Initialize-BuildEnv 末尾）。
+    if (-not $script:BuildEnvReady) { Initialize-BuildEnv }
+
+    Write-Info "编安装器（--features embed，payload = $PayloadDir）"
+    $env:CS_PAYLOAD_DIR = $PayloadDir
+    try {
+        Invoke-Native -Exe 'cargo' -Arguments @(
+            'build', '--release', '-p', 'cloud-setup', '--features', 'embed',
+            '--manifest-path', (Join-Path $RepoRoot 'Cargo.toml')
+        ) -Quiet
+    } finally {
+        # 不清掉的话，下一次别的构建会莫名把这个目录当 payload 打进去 ——
+        # 一处环境变量泄漏，症状是"exe 突然变成 9 MB"。
+        Remove-Item Env:\CS_PAYLOAD_DIR -ErrorAction SilentlyContinue
+    }
+
+    if (-not (Test-Path $LocalSetup)) { throw "编完却找不到 $LocalSetup" }
+    $null = New-Item -ItemType Directory -Force -Path (Split-Path -Parent $InstallerExe)
+    Copy-Item $LocalSetup $InstallerExe -Force
+
+    $mb = (Get-Item $InstallerExe).Length / 1MB
+    if ($mb -lt 1) {
+        # 一个 400 KB 的安装器说明 embed 没生效 —— 它会装出一个空目录，而
+        # "装完什么都没有"是最难查的一种失败。
+        throw "安装器只有 $([math]::Round($mb, 2)) MB，embed 没生效（payload 没被打进去）"
+    }
+    Write-Ok ("安装器 {0}（{1:N1} MB，自带整包）md5={2}" -f (Split-Path -Leaf $InstallerExe), $mb,
+        (Get-Md5 $InstallerExe))
 }
 
 
@@ -912,6 +974,8 @@ try {
     } else {
         Write-Step '汇总产物（target\output\cloud-stream）'
         New-DeployBundle
+        # 整包目录就位之后才能编安装器：payload **就是**这个目录。
+        New-Installer -PayloadDir $BundleDir
         $packaged = $true
     }
     $srcExe = $(if ($packaged) { Join-Path $BundleDir 'stream-server.exe' } else { $LocalExe })
@@ -947,7 +1011,10 @@ try {
             ((Get-Item $BundleZip).Length / 1MB), (Get-Md5 $BundleZip))
         Write-Info "运行根 $BundleDir"
         Write-Info "压缩包 $BundleZip"
-        Write-Note '拷到新机器解压即运行根；先读包里的 README.txt，再双击 install.cmd（相当于 setup-watchdog.bat + 防火墙 + 验证一次做完）。'
+        Write-Info ("安装器 {0}（{1:N1} MB）" -f $InstallerExe, ((Get-Item $InstallerExe).Length / 1MB))
+        Write-Note ('装一台新机器：只拷 cloud-setup.exe 过去双击。它自带整包、自己提权、' +
+            '建任务、放行防火墙、启动并等应答；目标目录默认 %LOCALAPPDATA%\cloud-stream。' +
+            '整包目录与 zip 是给"已经有任务在跑、只换文件"的部署路径用的。')
         return
     }
 
@@ -972,9 +1039,11 @@ try {
         Send-File (Join-Path $PSScriptRoot $name) "$RemoteDeploy/$name"
     }
     Write-Ok ($LauncherNames -join ' / ')
-    if ($packaged -and (Test-Path (Join-Path $BundleDir 'cloud-setup.exe'))) {
-        Send-File (Join-Path $BundleDir 'cloud-setup.exe') "$RemoteDeploy/cloud-setup.exe"
-        Write-Ok 'cloud-setup.exe'
+    if ($packaged -and (Test-Path $InstallerExe)) {
+        # 安装器不再在包里，所以路径从产物目录取。被控机上它是控制台：放在
+        # 运行根里，双击就是那四个按钮。
+        Send-File $InstallerExe "$RemoteDeploy/cloud-setup.exe"
+        Write-Ok 'cloud-setup.exe（自带整包的安装器）'
     }
     # 证书只传到暂存区：被控端已有证书时不覆盖（SAN 里是那台机器的 IP），没有才装。
     foreach ($name in @('cert.pem', 'key.pem')) {
@@ -1132,9 +1201,9 @@ try {
         Write-Ok ("看门狗动作 {0}" -f ($actLine -replace '^act=', ''))
     } elseif ($actLine) {
         Write-Note ("看门狗动作指向别处：{0}" -f ($actLine -replace '^act=', ''))
-        Write-Note "  期望是 \"$expectExe --run\"；整包搬过位置后要重跑一次 setup-watchdog.bat"
+        Write-Note "  期望是 \"$expectExe --run\"；整包搬过位置后要在被控机重跑一次 cloud-setup.exe --install"
     } else {
-        Write-Note "查不到计划任务 $RemoteTask 的动作 —— 先在被控机跑一次 setup-watchdog.bat"
+        Write-Note "查不到计划任务 $RemoteTask 的动作 —— 先在被控机跑一次 cloud-setup.exe --install"
     }
 
     # ---- 10 归档（构建端唯一的备份）

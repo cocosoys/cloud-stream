@@ -1104,7 +1104,7 @@ fn clear_readonly(path: &Path) -> std::io::Result<()> {
 
 /// 把自己安排到下次开机时删除。
 ///
-/// 替身在 `%TEMP%` 里，属于"不删也不会有人发现"的一类；但一个 13 MB 的残骸
+/// 替身在 `%TEMP%` 里，属于"不删也不会有人发现"的一类；但一个 9 MB 的残骸
 /// 每次卸载留一个，攒起来就是垃圾。`MOVEFILE_DELAY_UNTIL_REBOOT` 是这件事的
 /// 标准做法：注册表里登记一条 PendingFileRenameOperations，重启时由内核执行。
 ///

@@ -8,7 +8,7 @@
 stream-server.exe --ops <verb> [选项]
 ```
 
-同一个 exe、同一份实现，被 `install.cmd`、`uninstall.cmd`、更新器、配置界面共同调用。目标机上只有 exe 是确定存在的，所以动作层放在这里，而不是再发一个 `backup.ps1`。
+同一个 exe、同一份实现，被 `cloud-setup.exe --install` / `--uninstall`、更新器、配置界面共同调用。目标机上只有 exe 是确定存在的，所以动作层放在这里，而不是再发一个 `backup.ps1`。
 
 ## 1. 为什么不放在配置层后面
 
@@ -88,8 +88,8 @@ stream-server.exe              ->  stream-server.exe.rollback-old
 
 | 动作 | 调用点 | 做法 |
 |---|---|---|
-| 安装 | `install.cmd /restore` | 重装时先把上次卸载存的身份放回来（不默认执行，见下） |
-| 卸载 | `uninstall.cmd` 第 5 步之前 | `--ops snapshot --ops-dir %ProgramData%\cloud-stream\uninstall-backup --ops-paths "stream-config.toml;config.toml;cert.pem;cert.key;logs\mic-default.json"` |
+| 安装 | `cloud-setup.exe --install`（`restore_identity`） | 装完之后发现上次卸载留下的备份，就用 `--ops rollback` 放回去（备份坏了只 warn，不挡安装） |
+| 卸载 | `cloud-setup.exe --uninstall` 第 5 步之前 | `--ops snapshot --ops-dir %ProgramData%\cloud-stream\uninstall-backup --ops-paths "stream-config.toml;config.toml;cert.pem;cert.key;logs\mic-default.json"` |
 | 更新 | 更新器（后续） | 覆盖 exe/DLL/前端之前 `snapshot`，验证 `/api/v1/version` 不对就 `rollback` |
 | 修改 | 配置界面（后续） | 写 `stream-config.toml` 之前 `snapshot`；"撤销上次修改"就是 `rollback` |
 
@@ -101,7 +101,9 @@ stream-server.exe              ->  stream-server.exe.rollback-old
 
 **显式点名时默认排除表要让路。** 全量快照排除 `logs/` 是为了省事，但卸载恰恰只要 `logs\mic-default.json`。第一次写这个过滤时就是这么错的：测试跑出来备份里一个文件都没有。现在规则是：全量用 `["logs","state"]`，显式点名用 `["state"]`（`state/` 永远不能进 —— 那里装的就是快照自己）。
 
-**旧 exe 的能力探测。** 0.3.0 之前的 exe 不认识 `--ops`，`Config::parse` 会忽略未知开关，于是它**会把整个服务拉起来**：不返回、占住 8080、还锁着 exe，而脚本正在删这个目录。这和当初 `--restore-mic` 踩的坑是同一个。两个脚本因此都在调用前做一次 `findstr` 探测，针是 `ops snapshot failed`（ops.rs 里的 `eprintln!` 文本），**不是** `--ops` —— rustc 会把短开关字面量折成立即数比较，开关名根本不在二进制里（实测：`ops snapshot failed` 有，`--ops` 没有）。探不到就跳过备份并说明，绝不盲跑。
+**旧 exe 的能力探测。** 0.3.0 之前的 exe 不认识 `--ops`，`Config::parse` 会忽略未知开关，于是它**会把整个服务拉起来**：不返回、占住 8080、还锁着 exe，而卸载正在删这个目录。这和当初 `--restore-mic` 踩的坑是同一个。卸载前的备份因此要先探一次，针是 `ops snapshot failed`（ops.rs 里的 `eprintln!` 文本），**不是** `--ops` —— rustc 会把短开关字面量折成立即数比较，开关名根本不在二进制里（实测：`ops snapshot failed` 有，`--ops` 没有）。探不到就跳过备份并说明，绝不盲跑。
+
+探测方式换过一次：起先两个 `.cmd` 脚本各跑一遍 `findstr`，现在由 `sys::exe_has_marker` 在进程内做（256 KB 分块 + 块间重叠，防止针跨块断掉）。少一次子进程不是重点，重点是 `findstr` 在 OEM 代码页下的行为不可控，而这次要读的是二进制而不是文本。装完之后的 `restore_identity` 不需要探 —— 它调用的是刚被解压出来的新 exe，天生认识 `--ops`。
 
 ## 7. 验证记录（本机，2026-11-10）
 
@@ -143,4 +145,4 @@ $ stream-server.exe --ops verify
 
 单元测试 18 条（`cargo test -p stream-server --lib`，共 371 passed / 0 failed），覆盖：跳过 `logs`/`state`、标签里的路径分隔符被清洗、回滚恢复改动与被删文件、多余文件让路、回滚可再回滚、二次回滚是空操作、`verify` 三分类、`gc` 的两条保留策略、前缀匹配与歧义拒绝、外置备份目录、`--ops-paths` 的精确匹配与目录递归。
 
-**未验证**：实机（`.150` 自 11-10 15:40 起离线）。上面的记录全部来自本机调试版 exe；release 产物与目标机行为要等机器回来后补。`install.cmd` / `uninstall.cmd` 的改动只做了静态校验（跳转目标全部可解析、纯 ASCII、CRLF 未破）和命令行级别的验证（把脚本实际会执行的 `--ops snapshot --ops-paths ...` 原样跑了一遍），**没有在真机上完整跑过安装/卸载**。
+**未验证**：实机（`.150` 自 11-10 15:40 起离线）。上面的记录全部来自本机调试版 exe；release 产物与目标机行为要等机器回来后补。`--uninstall` 那条链（备份 → 删目录 → 替身）做过本机 `--purge` 级的验证（见 `docs/operations-install.md` 第 9 节），但**没有在一台真装了服务的机器上完整跑过安装/卸载**。

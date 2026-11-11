@@ -448,7 +448,7 @@ pub fn render_toml(cfg: &Config) -> String {
 
     out.push_str("# ---------- ICE ----------\n");
     out.push_str("# WebRTC 的 UDP 端口区间。改成别的段就要同步防火墙规则\n");
-    out.push_str("# （toolchain/open-inbound.cmd 里的 `cloud-stream webrtc UDP`）。\n");
+    out.push_str("# （管理员跑一次 `cloud-setup.exe --inbound`，它按这个区间重建规则）。\n");
     out.push_str(&kv_num("webrtc_udp_port_min", u64::from(cfg.webrtc_udp_port_min)));
     out.push_str(&kv_num("webrtc_udp_port_max", u64::from(cfg.webrtc_udp_port_max)));
     out.push('\n');

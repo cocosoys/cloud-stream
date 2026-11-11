@@ -79,6 +79,11 @@ enum Stage {
     Unpack,
     /// 第二段：防火墙 + 任务 + 等应答（需要管理员）。
     Finish,
+    /// 只补防火墙规则（`--inbound`，需要管理员）。
+    ///
+    /// 这一步单独存在，是因为另外两种做法都太重：重跑 `--install` 会顺带覆盖
+    /// 程序文件（`setup-inbound.cmd` 被删掉之后，这儿是唯一的轻量入口）。
+    Inbound,
 }
 
 #[derive(Clone, Debug)]
@@ -110,6 +115,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             // 出现在这里就当它已经把 stage 定成 Unpack 了。
             "--install" => opts.stage = Stage::Unpack,
             "--finish" => opts.stage = Stage::Finish,
+            "--inbound" => opts.stage = Stage::Inbound,
             "--dir" => {
                 let value = it.next().ok_or("--dir 后面要跟一个路径")?;
                 opts.dir = Some(PathBuf::from(value));
@@ -140,6 +146,7 @@ pub fn run(args: &[String]) -> i32 {
     match opts.stage {
         Stage::Unpack => unpack(&opts),
         Stage::Finish => finish(&opts),
+        Stage::Inbound => inbound_only(&opts),
     }
 }
 
@@ -401,6 +408,103 @@ fn finish(opts: &Opts) -> i32 {
     }
     dialog(&text, "安装完成", MB_ICONINFORMATION);
     0
+}
+
+/// 只补入站规则：`--inbound`。
+///
+/// # 为什么值得单独一个开关
+///
+/// "能连上但没画面 / 外面 ping 不通 / 换了端口之后一切正常但别人打不开"这三
+/// 件事的共同解法是补四条防火墙规则，而它们本来住在 `setup-inbound.cmd` 与
+/// `open-inbound.cmd` 里。两个脚本删掉之后不能没有替代品：
+///
+/// * 重跑 `--install` 也能补，但它会顺带覆盖程序文件 —— 而"补一条规则"和
+///   "重装一次"的代价差一个数量级；
+/// * 让用户自己拼 `netsh` 就是在要求他记住端口号和 UDP 区间。
+///
+/// 端口与区间仍然问服务端自己（`--print-config json`），所以这个开关、安装
+/// 流程、服务启动时的自检，三处用的是同一份数字。
+fn inbound_only(opts: &Opts) -> i32 {
+    // 从整包目录里运行（`--dir` 或本 exe 所在目录）—— 这两个位置都可能有
+    // `stream-server.exe`，而"装到 %LOCALAPPDATA% 之后的控制台"就是后者。
+    let target = opts.dir.clone().unwrap_or_else(crate::run_root);
+    let exe = target.join("stream-server.exe");
+    if !exe.exists() {
+        dialog(
+            &format!(
+                "{} 里没有 stream-server.exe。\n\n\
+                 用 --dir 指向运行根，或者在那个目录里运行这个 exe。",
+                target.display()
+            ),
+            "放行防火墙",
+            MB_ICONERROR,
+        );
+        return 3;
+    }
+
+    if !elevated() {
+        let params = format!("--inbound --dir \"{}\"", target.display());
+        return match sys::elevate_raw(&params, &target) {
+            Ok(()) => 0,
+            Err(ElevateError::Denied) => {
+                dialog(
+                    "UAC 被拒绝了 —— 防火墙规则没有改动。\n\n\
+                     写防火墙规则必须管理员，这是 Windows 的限制。",
+                    "放行防火墙",
+                    MB_ICONWARNING,
+                );
+                5
+            }
+            Err(ElevateError::Failed(code)) => {
+                dialog(
+                    &format!("起不了管理员窗口（ShellExecute={code}）。"),
+                    "放行防火墙",
+                    MB_ICONERROR,
+                );
+                4
+            }
+        };
+    }
+
+    let eff = effective_config(&exe);
+    let report = Report::new();
+    report.resume(&target);
+    report.note(&format!("--- inbound {} ---", stamp()));
+    report.note(&format!("ports   : tcp {}", eff.port));
+    let ok = open_inbound(&exe, &eff, &report);
+    report.end(if ok { "OK (inbound)" } else { "WARN (inbound)" });
+
+    if ok {
+        let mut text = format!(
+            "四条入站规则已放行：\n\
+             TCP {}\nICMPv4 echo（让 ping 有应答）\n\
+             UDP {}-{}（WebRTC 媒体；缺了是\"连上但黑屏\"）\n\
+             程序本身（任何端口）",
+            eff.port, eff.udp_min, eff.udp_max
+        );
+        if let Some(ip) = local_ip() {
+            text.push_str(&format!(
+                "\n\n同一局域网里访问 http://{ip}:{}/",
+                eff.port
+            ));
+        }
+        dialog(&text, "放行防火墙", MB_ICONINFORMATION);
+        0
+    } else {
+        dialog(
+            &format!(
+                "有几条规则没建上 —— 多半是域策略或第三方防火墙接管了这一层。\n\n\
+                 经过写在：{}",
+                report
+                    .path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "（没写下来）".to_owned())
+            ),
+            "放行防火墙",
+            MB_ICONWARNING,
+        );
+        6
+    }
 }
 
 /// 服务端自己算出来的端口与 ICE 区间。

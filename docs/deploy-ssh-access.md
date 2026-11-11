@@ -70,7 +70,7 @@ Windows 的 `LimitBlankPasswordUse=1`（默认）禁止**空密码账户**做网
 sshd 属于网络登录，所以哪怕公钥完全正确也会被拒。脚本会检测这个策略并提示，
 但**不会**替用户设密码 —— 那是账户的事。
 
-之前 `setup-watchdog.bat` 那轮已经证明这台机器上确实存在空密码账户
+之前那一轮（当时的建任务脚本）已经证明这台机器上确实存在空密码账户
 （`schtasks /RP` 撞 `0x800704DD`）。如果 `.150` 是这种账户，先跑：
 
 ```bat
@@ -90,7 +90,7 @@ net user <account> *
 
 * 在 ssh 里直接跑 `GetCursorPos`，拿到的是 session 0 那个空桌面的坐标，永远 (0,0)；
 * 想抓真实数据，必须**从 ssh 发起、在交互会话里执行** —— 也就是项目里已经在用的
-  那招：`setup-task.ps1` 注册的 `Interactive` 计划任务。探针脚本由任务在 session 1
+  那招：`InteractiveToken` 计划任务（现在由 `cloud-setup.exe --install` 注册）。探针脚本由任务在 session 1
   里跑，把 JSON 写到 `C:\dev\stream\logs\`，再从 ssh 取走。
 
 不要为了"能远程跑命令"去开 3389：RDP 的暴露面比 ssh 大得多，而且同样要现场

@@ -109,20 +109,23 @@ stream-server.exe --config stream-config.toml --print-config
 `/api/v1/version`（`version` / `commit` / `dirty` / `built_at`），供更新器判断
 “要不要升级”。
 
-整包（含前端、证书、启动脚本）还有一个同名 zip，拷到新设备解压即可跑，见
-`docs/deploy-one-click.md` §1.1。在**新设备**上第一次用就是双击 `install.cmd`：
-它自己提权，然后一次做完检查包、放行入站、建看门狗任务、立刻启动并验证（打印
-`[ok]` 和本机访问地址），细节见 `docs/deploy-new-host.md` §3.0。`install.cmd` /
-`uninstall.cmd` 内部调的是同一批助手（`setup-task.ps1`、`open-inbound.cmd`、
-exe 的 `--restore-mic`），所以想分步做时 `setup-watchdog.bat` 依然可用；要撤掉
-一台机器就双击 `uninstall.cmd`（`/keep` 只卸服务留文件，`/whatif` 只列清单）。
+整包（含前端、证书）还有一个同名 zip，拷到新设备解压即可跑，见
+`docs/deploy-one-click.md` §1.1。
+
+**装一台新设备**是双击 `cloud-setup.exe`（就是控制台那个 exe，构建时用
+`--features embed` 把整包嵌了进去，约 9 MB）：它自己提权，然后一次做完解包、
+放行入站、建看门狗任务、立刻启动并验证（打印 `[ok]` 和本机访问地址），细节见
+`docs/deploy-new-host.md` §3.0。要撤掉一台机器就还双击它，点「卸载」——五步
+（停任务/杀进程/还录音设备/删规则/删目录）走完，删不掉的文件会点名告诉你。
+整包目录里**没有任何 .cmd / .ps1 / .vbs 启动脚本**，见
+[`docs/operations-install.md`](docs/operations-install.md)。
 
 目标机连 ssh 都还没有时（`deploy.ps1` 正是靠 ssh 才够得着它），先拷
 `toolchain\enable-ssh.ps1` 与 `enable-ssh.cmd` 过去双击一次：装 sshd、只对构建机
 放行 22、写入公钥并**先自测再关密码登录**，见 `docs/deploy-ssh-access.md`。
 
-启动脚本自己也会做两件事，不需要人守着：真启动前补入站规则（提权时），启动后
-另起 `probe-listen.cmd` 探 loopback，把结果写成 `logs\watchdog.log` 里的一行
+服务进程自己会做两件事，不需要人守着：`--run` 起来的进程另起一个 `--probe`
+子进程探 loopback（最多 30 秒），把结果写成 `logs\watchdog.log` 里的一行
 `PREFLIGHT listening on 8080 after N probe(s)` 或 `PREFLIGHT NOT listening ...`
 加三条候选原因。所以“启动了但打不开”永远有带时间戳的一行可查。
 
@@ -157,11 +160,11 @@ cd target\output\cloud-stream
 | `--display` | `0` | 默认采集哪块屏（索引 0 = 主屏，其余按枚举顺序）。页面的 `display_id`（`primary` / `display2`）会覆盖它；指定的屏不存在时采集如实失败，不会回落成主屏 |
 | `--mode` | `websockets` | 新浏览器（本地还没有选择记录）默认用哪种传输：`websockets` / `webrtc`。页面从 `/api/status` 读它，面板切换的模式选择优先于它 |
 | `--video-codec` | `vp9` | 视频编码：`vp9` / `vp8` / `h264`。`h264` 是硬编与 Safari/WebCodecs 兼容的通道，软编下也能跑 |
-| `--webrtc-udp-port-min` / `--webrtc-udp-port-max` | `40000` / `40049` | ICE 只会绑这一段 UDP（含两端），让防火墙规则写得出来。改了要同步 `open-inbound.cmd` 的 `cloud-stream webrtc UDP`；程序规则 `cloud-stream app` 仍覆盖任意端口 |
+| `--webrtc-udp-port-min` / `--webrtc-udp-port-max` | `40000` / `40049` | ICE 只会绑这一段 UDP（含两端），让防火墙规则写得出来。改了要让规则跟上：管理员跑一次 `cloud-setup.exe --inbound`；程序规则 `cloud-stream app` 仍覆盖任意端口 |
 | `--tune` | `tuned` | 软编实时参数组；`legacy` 复现 #95 之前的参数，仅用于同机 A/B |
 | `--log` | `logs\stream-server.log` | 日志落盘路径 |
 | `--no-hdr` | — | 关闭 HDR 采集路径 |
-| `--restore-mic` | — | 只把上次遗留的默认录音设备还原，然后立刻退出（不绑端口、不开日志）。给 `uninstall.cmd` 用；没有遗留记录时打印 `MICRESTORE nothing-to-do` |
+| `--restore-mic` | — | 只把上次遗留的默认录音设备还原，然后立刻退出（不绑端口、不开日志）。给卸载流程用；没有遗留记录时打印 `MICRESTORE nothing-to-do` |
 
 启动成功的标志是一行 `listening on https://0.0.0.0:8080 (TLS rustls 1.2/1.3)`。
 然后浏览器打开 `https://<host>:8080/`（自签证书需要先信任，或用 `-k` 类工具探测）。

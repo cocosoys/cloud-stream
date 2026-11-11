@@ -8,9 +8,9 @@
 //!
 //! # 为什么是这一个文件
 //!
-//! `%ProgramData%\cloud-stream\last-install.txt` 是 `install.cmd` 一直在写的
-//! 那个路径（`toolchain/install.cmd` 的 `:result_begin`），控制台窗口里的
-//! `watch_install_result` 正盯着它。**格式刻意保持一致**：
+//! `%ProgramData%\cloud-stream\last-install.txt` 是这个安装器一以贯之的那个
+//! 路径（它从前由 `toolchain/install.cmd` 写，那个脚本已经删了），控制台窗口
+//! 里的 `watch_install_result` 正盯着它。**格式刻意没变**：
 //!
 //! ```text
 //! cloud-stream install
@@ -22,9 +22,9 @@
 //! finished: 2026-11-12 10:31:19
 //! ```
 //!
-//! 于是控制台那一侧不需要改一行代码：它只认 `=== RESULT:` 这个标记，不关心
-//! 结论是 cmd 写的还是这个 exe 写的。这也是"一个后端、多个入口"那条线在这里
-//! 的延续 —— 换掉实现，不换掉契约。
+//! 于是控制台那一侧不需要跟着换实现：它只认 `=== RESULT:` 这个标记，不关心
+//! 是哪一代代码写的。这也是"一个后端、多个入口"那条线在这里的延续 ——
+//! 换掉实现，不换掉契约。
 //!
 //! # 为什么固定路径而不是 `%TEMP%`
 //!

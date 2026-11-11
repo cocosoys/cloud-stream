@@ -388,7 +388,7 @@ where
 
 /// `%ProgramData%\cloud-stream\last-install.txt`。
 ///
-/// 和 `install.cmd` 里 `RESULT` 的默认值是同一个路径，**两边必须一致**。
+/// 和 `report.rs` 里选的落点是同一个路径，**两边必须一致**。
 /// 刻意不是 `%TEMP%`：提权可能切换账户，那时提权进程的 `%TEMP%` 是本窗口
 /// 读不到的地方；`ProgramData` 对两侧是同一个字符串，也不用在
 /// cmd → PowerShell → CreateProcess 这条链上给路径加引号（引号就是在这条
@@ -417,7 +417,7 @@ fn watch_install_result(hwnd: HWND, path: std::path::PathBuf, started: std::time
         let grace = started
             .checked_sub(std::time::Duration::from_secs(3))
             .unwrap_or(started);
-        // 240 秒：install.cmd 自己最多等 60 秒探活，加上提权、防火墙、任务注册，
+        // 240 秒：安装自己最多等 60 秒探活，加上提权、防火墙、任务注册，
         // 留足余量。超时就明说，而不是永远转下去。
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
         loop {
@@ -429,7 +429,7 @@ fn watch_install_result(hwnd: HWND, path: std::path::PathBuf, started: std::time
                     ),
                     hwnd,
                 );
-                log("     提权那个窗口里有关键的 [ok]/[fail] 结论，请以它为准", hwnd);
+                log("     安装是另一个进程，它不往本窗口输出；结论只在那份文件里", hwnd);
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(700));
@@ -446,7 +446,7 @@ fn watch_install_result(hwnd: HWND, path: std::path::PathBuf, started: std::time
             if !text.contains("=== RESULT:") {
                 continue;
             }
-            log("-- 提权窗口的结论（读自 last-install.txt）--", hwnd);
+            log("-- 提权进程的结论（读自 last-install.txt）--", hwnd);
             for line in text.lines() {
                 log(line, hwnd);
             }
@@ -1190,7 +1190,7 @@ fn on_command(hwnd: HWND, id: i32) {
                 );
                 match sys::elevate_raw(&params, &root) {
                     Ok(()) => {
-                        log("-- 卸载已交给管理员窗口，本窗口即将关闭（它会先占着 exe）", hwnd);
+                        log("-- 卸载已交给提权进程，本窗口即将关闭（它要等本窗口退出才删得掉这个 exe）", hwnd);
                         // 必须真的退出：目录里有正在执行的 exe，谁都删不掉它。
                         unsafe {
                             DestroyWindow(hwnd);
@@ -1198,7 +1198,7 @@ fn on_command(hwnd: HWND, id: i32) {
                     }
                     Err(sys::ElevateError::Denied) => log("[warn] UAC 被拒绝，什么都没动", hwnd),
                     Err(sys::ElevateError::Failed(code)) => log(
-                        &format!("[fail] 起不了管理员窗口（ShellExecute={code}）"),
+                        &format!("[fail] 起不了提权进程（ShellExecute={code}）"),
                         hwnd,
                     ),
                 }
@@ -1374,6 +1374,11 @@ fn main() {
     // "安装器"，于是它去解压一个包，而不是去删目录。
     if args.iter().any(|a| a == "--purge") {
         std::process::exit(uninstall::run(&args));
+    }
+    // `--inbound` 同理提前：它既可能在整包目录里跑（那里有 stream-server.exe，
+    // 按判据是控制台），也可能在装好之后的运行根里跑。两种地方都要能补规则。
+    if args.iter().any(|a| a == "--inbound") {
+        std::process::exit(install::run(&args));
     }
     // 安装器这一支不建窗口、不注册窗口类：它要的是一个提权后的进程在跑，
     // 而不是一个窗口。所以分流放在这里，而不是窗口里加一个按钮分情况。

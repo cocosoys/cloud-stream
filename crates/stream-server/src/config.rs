@@ -198,9 +198,9 @@ pub struct Config {
     /// 地址**各绑一个 socket（IPv4 多网卡、非 link-local 的 IPv6 都算），一个
     /// 会话通常占 2–4 个。50 个端口对 `max_sessions=8` 留了足够余量。
     ///
-    /// 改了这里就要同步 `toolchain/open-inbound.cmd` 里的
-    /// `cloud-stream webrtc UDP` 规则（程序规则 `cloud-stream app` 仍然覆盖任意
-    /// 端口，但它绑绝对路径，换个目录解压就失效）。
+    /// 改了这里就要让防火墙规则跟上：管理员跑一次 `cloud-setup.exe --inbound`，
+    /// 它按这个区间重建 `cloud-stream webrtc UDP`（程序规则 `cloud-stream app`
+    /// 仍然覆盖任意端口，但它绑绝对路径，换个目录解压就失效）。
     pub webrtc_udp_port_min: u16,
     pub webrtc_udp_port_max: u16,
     /// #96: how long the client's game-mode ghost pointer stays on screen
@@ -355,7 +355,7 @@ impl Default for Config {
             // more CPU per frame on the software encoder, which matters on a
             // small host asked for 1080p60.
             video_codec: "vp9".to_owned(),
-            // #122: pinned so `open-inbound.cmd` can describe the range. The
+            // #122: pinned so the firewall rule can describe the range. The
             // library default is ":0" (a different random port per session),
             // which no firewall rule can follow -- see the field docs.
             webrtc_udp_port_min: 40000,
@@ -862,7 +862,7 @@ mod tests {
         assert_eq!(flipped.video_codec, "vp8");
     }
 
-    /// #122: 默认区间就是 `open-inbound.cmd` 里那条 UDP 规则写的区间。
+    /// #122: 默认区间就是防火墙里那条 UDP 规则要放行的区间（`--inbound` 建它）。
     ///
     /// 这两处必须一致 —— 它们描述的是同一件事，只是分别给 Windows 防火墙和
     /// webrtc 看。不一致的症状很隐蔽：ICE 的候选绑在 40500，规则放行的是

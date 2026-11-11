@@ -24,9 +24,13 @@
         <root>\stream-server.exe  ViGEmClient.dll
         <root>\cert.pem  key.pem
         <root>\selkies-web\  logs\
-        <root>\cloud-setup.exe  setup-watchdog.bat
-        <root>\collect-launch-facts.cmd  setup-inbound.cmd
-        <root>\open-inbound.cmd
+        <root>\cloud-setup.exe
+        <root>\collect-launch-facts.cmd  set-password.cmd
+
+    No .cmd / .ps1 / .vbs launcher exists any more: the task action is
+    `<root>\stream-server.exe --run`, and install / uninstall / firewall are
+    subcommands of cloud-setup.exe (docs/operations-run.md,
+    docs/operations-install.md).
 
     Steps: install launchers -> stop task (and disable its 1-minute trigger) ->
     kill -> swap -> re-enable -> start -> wait for the process.
@@ -108,15 +112,27 @@ $NewDll = Join-Path $Root 'ViGEmClient.new.dll'
 # wipe the tuning someone did on that box -- the exact class of loss this whole
 # layer exists to prevent.
 #
+# install.cmd / uninstall.cmd / setup-task.ps1 / setup-watchdog.bat /
+# open-inbound.cmd / setup-inbound.cmd used to be here too. They were the four
+# layers of "put this machine into service": batch quoting, a second round of
+# quoting through -Command, schtasks storing a password, netsh building the
+# same rule twice. All of it is `cloud-setup.exe --install` / `--uninstall` /
+# `--inbound` now, in one process, with no command line to assemble
+# (docs/operations-install.md). The firewall rules and the task are created by
+# that exe, not by anything shipped here.
+#
 # collect-launch-facts.cmd is the "it will not start" first responder; it ships
 # so the person at the machine does not need the repo to answer the question.
-# setup-inbound.cmd opens 8080 + ICMP; without it a fresh Windows drops every
-# inbound packet and the machine looks dead from the build machine.
-# open-inbound.cmd is the automated half of the same lesson: the launcher
-# calls it on every real start. The PREFLIGHT verdict it used to be paired
-# with now comes from `stream-server.exe --probe`, which --run spawns itself
-# (docs/operations-run.md), so there is no second script to ship.
-$Launchers = @('setup-watchdog.bat', 'collect-launch-facts.cmd', 'setup-inbound.cmd', 'open-inbound.cmd', 'set-password.cmd')
+# set-password.cmd only writes a text file; a real UI for it would be a second
+# window for one line of input.
+#
+# cloud-setup.exe rides along so the box keeps a *current* console: it is what
+# that person double-clicks for install / repair / uninstall / config, and an
+# old copy would answer with old rules (e.g. a version that still expects
+# install.cmd). It arrived in <deploy>\ like everything else and is copied into
+# the run root here. If someone has the window open, the copy fails on a sharing
+# violation and stays a NOTE -- the new one applies next time.
+$Launchers = @('collect-launch-facts.cmd', 'set-password.cmd', 'cloud-setup.exe')
 
 function Say([string]$Text) { Write-Output $Text }
 function Fail([string]$Text) { Write-Output "FAIL $Text"; exit 1 }
@@ -215,7 +231,11 @@ function Stop-Server {
     # stop and the swap a trigger would otherwise restart the exe we are about
     # to overwrite (Move-Item fails on a running image).
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    if (-not $task) { Fail "scheduled task $TaskName not found; run setup-watchdog.bat once" }
+    if (-not $task) {
+        Fail ("scheduled task $TaskName not found. On that machine run: " +
+            "cloud-setup.exe --install --yes  (it creates the task, the firewall rules " +
+            "and starts the service in one go)")
+    }
 
     if ($task.State -eq 'Running') {
         schtasks /End /TN $TaskName | Out-Null
