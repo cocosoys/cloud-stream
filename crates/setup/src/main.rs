@@ -11,13 +11,12 @@
 //! 刷新状态 / 拍快照 / 回滚   ->  stream-server.exe --ops state|snapshot|rollback
 //! 更新                      ->  stream-server.exe --update check|apply
 //! 安装                      ->  本 exe 自己：--install（解压）→ --finish（管理员）
-//! 卸载                      ->  uninstall.cmd（提权窗口）
+//! 卸载                      ->  本 exe 自己：--uninstall（提权整段）→ --purge（替身删目录）
 //! 改配置                    ->  stream-server.exe --ops config-get|config-set
 //! ```
 //!
-//! 所以它和 `uninstall.cmd` 处在同一层，多个消费者一个后端。任何一个动作在窗口
-//! 里能做的，在命令行里也能做，反之亦然 —— 不存在"界面上能点、脚本里做不到"
-//! 这种只能靠人记住的差别。
+//! 所以窗口只是这些命令的一个消费者，同一套动作在命令行里也能做，反之亦然 ——
+//! 不存在"界面上能点、命令行里做不到"这种只能靠人记住的差别。
 //!
 //! # 同一个 exe 的两个角色
 //!
@@ -38,19 +37,19 @@
 //! 增量成本是零个新依赖、几秒构建。代价是界面语言是 Win32 而不是 CSS —— 对这
 //! 个尺寸的界面，这笔账划算。
 //!
-//! # 提权的动作为什么在新窗口里跑
+//! # 提权的动作怎么把结果说出来
 //!
-//! `uninstall.cmd` 需要管理员。用 `runas` 拉起时输出在新开的控制台里，本窗口
-//! 抓不到 —— 与其假装抓到了再显示一半，不如明说"已在新窗口运行"。
+//! 安装的第二段、卸载的整段都需要管理员：`runas` 拉起的是另一个进程（往往
+//! 还是另一个账户），它的输出本窗口抓不到 —— 与其假装抓到了再显示一半，不如
+//! 走一个两边都能读的地方：`%ProgramData%\cloud-stream\last-install.txt`
+//! （固定路径，提权换账户也是同一个字符串）。本窗口在拉起之后盯着那个文件，
+//! 出现 `=== RESULT:` 就把整段贴进日志。
 //!
-//! 但它仍然会写下结论：`install.cmd` / `uninstall.cmd` 都把过程写进
-//! `%ProgramData%\cloud-stream\last-install.txt`（固定路径，提权换账户也读得
-//! 到），本窗口在拉起之后盯着那个文件，出现 `=== RESULT:` 就把整段贴进日志。
+//! 安装和卸载写的是同一个文件、同一套标记，所以本窗口的"盯文件"逻辑一行都
+//! 不用分情况 —— 换掉实现，不换掉契约。
 //!
-//! 安装现在是这个 exe 自己做的（`install` 模块），两段之间同样靠那个文件回传：
-//! 第一段在用户令牌下解压并写抬头，第二段在管理员令牌下建任务、放行防火墙，
-//! 写的是同一个文件、同一套标记。所以本窗口的"盯文件"逻辑一行都不用分情况 ——
-//! 换掉实现，不换掉契约。
+//! 卸载还多一件事：**它会把本窗口自己也删掉**（本 exe 就在那个目录里）。所以
+//! 点完卸载，本窗口必须真的退出；负责删目录的替身进程正等着它退。
 //!
 //! # 改配置为什么是表单而不是记事本
 //!
@@ -73,13 +72,17 @@
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
-// 安装器的三条腿：`pack` 读内嵌包并铺到目标目录，`install` 走两段流程，
-// `report` 把经过写进那个"提权也能读"的结论文件。窗口与它们是同一个 exe 的
-// 两个角色 —— 谁上场由 `decide_mode` 说了算。
+// 安装器的四条腿：`pack` 读内嵌包并铺到目标目录，`install` 走安装的两段
+// 流程，`uninstall` 走卸载的两段（主体 + 替身删目录），`report` 把经过写进
+// 那个"提权也能读"的结论文件，`sys` 是安装与卸载共用的那几个 Win32 调用。
+// 窗口与它们是同一个 exe 的两个角色 —— 谁上场由 `decide_mode` 说了算。
 mod install;
 mod pack;
 mod report;
+mod sys;
+mod uninstall;
 
+use std::os::windows::process::CommandExt;
 use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -88,7 +91,8 @@ use windows_sys::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetDlgItem, GetMessageW, GetWindowTextW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetDlgItem, GetMessageW,
+    GetWindowTextW,
     LoadCursorW, MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassW,
     SendMessageW, SetForegroundWindow, SetWindowTextW, SetWindowPos, ShowWindow, TranslateMessage,
     BS_PUSHBUTTON, CW_USEDEFAULT, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY,
@@ -278,7 +282,13 @@ enum Mode {
 
 /// 这一轮启动该做什么。
 fn decide_mode(args: &[String]) -> Mode {
-    let explicit = args.iter().any(|a| a == "--install" || a == "--finish");
+    // 卸载的两段也算"显式指定了角色"：`--purge` 尤其重要 —— 替身被复制到
+    // `%TEMP%` 里运行，那儿没有 `stream-server.exe`，而它自带有内置包，
+    // 按下面的判据会被认成"安装器"。判据本身不能改（它是对的），所以把
+    // "我是谁"这件事由参数说清楚。
+    let explicit = args
+        .iter()
+        .any(|a| a == "--install" || a == "--finish" || a == "--uninstall" || a == "--purge");
     classify(
         explicit,
         pack::is_embedded(),
@@ -335,8 +345,7 @@ fn set_state(text: &str, hwnd: HWND) {
 /// `CREATE_NO_WINDOW`（0x08000000）是必需的：不带它，每次刷新状态都会闪一下
 /// 黑框，而"点一下按钮闪三个黑框"是这类工具最先被骂的地方。
 fn run_capture(program: &std::path::Path, args: &[&str]) -> (i32, String) {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const CREATE_NO_WINDOW: u32 = sys::CREATE_NO_WINDOW;
     let output = std::process::Command::new(program)
         .args(args)
         .current_dir(run_root())
@@ -375,36 +384,6 @@ where
             PostMessageW(hwnd, WM_APP_DONE, 0, 0);
         }
     });
-}
-
-/// 提权运行一个 cmd 脚本。输出在新控制台里，抓不到 —— 这一点在界面上直说。
-fn run_elevated(hwnd: HWND, script: &str, extra: &str) {
-    let root = run_root();
-    let path = root.join(script);
-    if !path.exists() {
-        log(&format!("[fail] 找不到 {}", path.display()), hwnd);
-        return;
-    }
-    let params = format!("/c \"\"{}\" {}\"", path.display(), extra);
-    unsafe {
-        let verb = wide("runas");
-        let file = wide("cmd.exe");
-        let args = wide(&params);
-        let dir = wide(&root.display().to_string());
-        // 返回值 > 32 才算成功。<= 32 里 5 是"用户拒了 UAC"，其余是关联错误。
-        let rc = ShellExecuteW(hwnd, verb.as_ptr(), file.as_ptr(), args.as_ptr(), dir.as_ptr(), SW_SHOWNORMAL as i32);
-        if rc as isize > 32 {
-            log(
-                &format!("[ok] 已在提权窗口运行 {script} {extra}"),
-                hwnd,
-            );
-            log("     那个窗口里有关键的 [ok]/[fail] 结论，请以它为准", hwnd);
-        } else if rc as isize == 5 {
-            log("[warn] UAC 被拒绝，什么都没做", hwnd);
-        } else {
-            log(&format!("[fail] 无法启动 {script}（ShellExecute={rc}）"), hwnd);
-        }
-    }
 }
 
 /// `%ProgramData%\cloud-stream\last-install.txt`。
@@ -1157,7 +1136,13 @@ fn on_command(hwnd: HWND, id: i32) {
             });
         }
         BTN_INSTALL => {
-            // 先记下时间点再拉起提权窗口：上一次安装留下的 OK 不能冒充这一次。
+            // 走自己的 `--install`，不再调 `install.cmd`：那 525 行 cmd 现在
+            // 只剩"同一个 exe 的另一条启动路径"这一件事，而这条路径正是要删掉
+            // 的东西（见 docs/operations-install.md）。
+            //
+            // **不提权**：安装的第一段（解压 + 复制自己）必须在用户令牌下做，
+            // 否则 `runas` 换账户时 `%LOCALAPPDATA%` 会指到别人的家。提权发生在
+            // 第二段，由那个 child 自己发起 —— 也就是一次 UAC，而不是两次。
             let started = std::time::SystemTime::now();
             let path = install_result_path();
             if let Some(p) = &path {
@@ -1165,7 +1150,24 @@ fn on_command(hwnd: HWND, id: i32) {
                 // 真正的保险，这一行只是让文件干净一点）。
                 let _ = std::fs::remove_file(p);
             }
-            run_elevated(hwnd, "install.cmd", "/y");
+            let root = run_root();
+            let exe = root.join("cloud-setup.exe");
+            let dir_arg = root.to_string_lossy().into_owned();
+            match std::process::Command::new(&exe)
+                .args(["--install", "--yes", "--dir", &dir_arg])
+                .current_dir(&root)
+                .creation_flags(sys::CREATE_NO_WINDOW)
+                .spawn()
+            {
+                Ok(child) => log(
+                    &format!(
+                        "[i] 安装器已启动（pid {}）；它会在需要时自己请求管理员权限",
+                        child.id()
+                    ),
+                    hwnd,
+                ),
+                Err(err) => log(&format!("[fail] 起不了安装器：{err}"), hwnd),
+            }
             if let Some(p) = path {
                 watch_install_result(hwnd, p, started);
             }
@@ -1178,7 +1180,28 @@ fn on_command(hwnd: HWND, id: i32) {
                  %ProgramData%\\cloud-stream\\uninstall-backup\n\n继续？",
                 "卸载",
             ) {
-                run_elevated(hwnd, "uninstall.cmd", "/y");
+                let root = run_root();
+                // 把本进程的 pid 交出去：删目录时本窗口还占着这个目录里的
+                // `cloud-setup.exe`，负责删的替身要等我们退出才动手。
+                let params = format!(
+                    "--uninstall --yes --dir \"{}\" --wait {}",
+                    root.display(),
+                    std::process::id()
+                );
+                match sys::elevate_raw(&params, &root) {
+                    Ok(()) => {
+                        log("-- 卸载已交给管理员窗口，本窗口即将关闭（它会先占着 exe）", hwnd);
+                        // 必须真的退出：目录里有正在执行的 exe，谁都删不掉它。
+                        unsafe {
+                            DestroyWindow(hwnd);
+                        }
+                    }
+                    Err(sys::ElevateError::Denied) => log("[warn] UAC 被拒绝，什么都没动", hwnd),
+                    Err(sys::ElevateError::Failed(code)) => log(
+                        &format!("[fail] 起不了管理员窗口（ShellExecute={code}）"),
+                        hwnd,
+                    ),
+                }
             } else {
                 log("-- 已取消卸载", hwnd);
             }
@@ -1346,9 +1369,19 @@ fn main() {
     if args.iter().any(|a| a == "--task-xml") {
         std::process::exit(install::print_task_xml());
     }
+    // 替身（`--purge`）必须在角色判断**之前**截住：它跑在 `%TEMP%` 里，那儿
+    // 没有 `stream-server.exe`，而它自带有内置包 —— 按下面的判据会被认成
+    // "安装器"，于是它去解压一个包，而不是去删目录。
+    if args.iter().any(|a| a == "--purge") {
+        std::process::exit(uninstall::run(&args));
+    }
     // 安装器这一支不建窗口、不注册窗口类：它要的是一个提权后的进程在跑，
     // 而不是一个窗口。所以分流放在这里，而不是窗口里加一个按钮分情况。
     if decide_mode(&args) == Mode::Installer {
+        // 同一个 exe 两个方向：`--uninstall` 是卸，其余是装。
+        if args.iter().any(|a| a == "--uninstall") {
+            std::process::exit(uninstall::run(&args));
+        }
         std::process::exit(install::run(&args));
     }
     unsafe {

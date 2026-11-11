@@ -29,6 +29,12 @@ windows-sys = { version = "0.52", features = [
     # 结论文件里的时间戳（`GetLocalTime`）。安装记录要能回答"这是哪一次"，
     # 而 `SystemTime` 只能给出一个距 1970 的年数 —— 人看的不是那个。
     "Win32_System_SystemInformation",
+    # 卸载要按**完整路径**找进程：同一台机器上可能有另一个目录里的安装，
+    # 而任务管理器里两个 stream-server.exe 长得一模一样。ToolHelp 枚举 +
+    # QueryFullProcessImageNameW 拿路径，是这件事最轻的做法（不需要 WMI，
+    # 也不需要 `Get-CimInstance` 那个慢得多的 PowerShell 版本）。
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
 ] }
 # 只用来读 `--ops config-get --ops-json`：配置表单要知道每个键现在是什么、
 # 接受什么范围，而这两件事只有服务端那份类型表说了算。仍然没有第二套实现 ——

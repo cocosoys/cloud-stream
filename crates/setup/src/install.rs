@@ -43,16 +43,18 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use windows_sys::Win32::UI::Shell::{IsUserAnAdmin, ShellExecuteW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    MessageBoxW, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO, SW_SHOWNORMAL,
+    MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING,
 };
 
 use crate::pack;
 use crate::report::{stamp, Report};
-
-/// 子进程不要弹黑框。安装全程都是这个 exe 在动，闪一下就是"装了个奇怪的东西"。
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+// 这几个是和卸载共用的（`sys` 模块）：同一个对话框、同一个"跑系统命令"、
+// 同一套提权。放在一起是为了让"两个流程的行为一致"变成编译期的事实，
+// 而不是两处各写一遍再靠人记得同步。
+use crate::sys::{
+    self, command, confirm, dialog, elevated, netsh, ElevateError, CREATE_NO_WINDOW,
+};
 
 /// 看门狗任务名。与 `install.cmd` / `uninstall.cmd` / 文档里的名字必须一致 ——
 /// 三处都靠这个名字找到同一台机器上的同一个任务。
@@ -60,9 +62,12 @@ pub const TASK_NAME: &str = "MCStreamSrv";
 
 /// 防火墙规则名。前三条沿用 `open-inbound.cmd` 的拼写：老机器上已经存在的规则
 /// 会被先删后建，名字不同就会留下一堆"看起来有、实际重复"的残骸。
-const RULE_ICMP: &str = "cloud-stream ICMPv4";
-const RULE_UDP: &str = "cloud-stream webrtc UDP";
-const RULE_APP: &str = "cloud-stream app";
+// 三条规则名沿用 `open-inbound.cmd` 的拼写：老机器上已经存在的规则会被先删
+// 后建，名字不同就会留下一堆"看起来有、实际重复"的残骸。卸载要用同一批名字
+// 把它删干净，所以是 `pub(crate)` —— 三处（建、删、文档）共用一份字符串。
+pub(crate) const RULE_ICMP: &str = "cloud-stream ICMPv4";
+pub(crate) const RULE_UDP: &str = "cloud-stream webrtc UDP";
+pub(crate) const RULE_APP: &str = "cloud-stream app";
 
 // ---------------------------------------------------------------------------
 // 参数
@@ -149,7 +154,7 @@ pub fn run(args: &[String]) -> i32 {
 /// 管道能接、文件能存。
 pub fn print_task_xml() -> i32 {
     let root = crate::run_root();
-    let account = current_account().unwrap_or_else(|| r"DOMAIN\user".to_owned());
+    let account = sys::current_account().unwrap_or_else(|| r"DOMAIN\user".to_owned());
     print!(
         "{}",
         task_xml(&root.join("stream-server.exe"), &root, &account, &boundary())
@@ -263,7 +268,7 @@ fn unpack(opts: &Opts) -> i32 {
         return finish(&next);
     }
 
-    let account = opts.account.clone().or_else(current_account);
+    let account = opts.account.clone().or_else(sys::current_account);
     match elevate(&target, account.as_deref(), &opts.task) {
         Ok(()) => {
             report.note("elevate: 已在管理员窗口继续（结论由那一侧写进本文件）");
@@ -336,7 +341,7 @@ fn finish(opts: &Opts) -> i32 {
     }
 
     report.note(&format!("[3/4] 看门狗任务 {}", opts.task));
-    let account = opts.account.clone().or_else(current_account);
+    let account = opts.account.clone().or_else(sys::current_account);
     if let Err(err) = register_task(&target, &exe, account.as_deref(), &opts.task) {
         report.note(&format!("  [fail] {err}"));
         report.end("FAIL (task)");
@@ -399,8 +404,8 @@ fn finish(opts: &Opts) -> i32 {
 }
 
 /// 服务端自己算出来的端口与 ICE 区间。
-struct Effective {
-    port: u16,
+pub(crate) struct Effective {
+    pub(crate) port: u16,
     udp_min: u16,
     udp_max: u16,
 }
@@ -417,7 +422,12 @@ impl Default for Effective {
     }
 }
 
-fn effective_config(exe: &Path) -> Effective {
+/// 问服务端自己：既有的配置解析在它那儿（`configfile::resolve` 那三层）。
+///
+/// 卸载也要用它 —— 改过端口的机器上，规则名是 `cloud-stream 9000`，而卸载
+/// 那一侧如果假设 8080，就会留下一条指向旧端口的规则（不致命，但是"说好了
+/// 清干净"没做到）。
+pub(crate) fn effective_config(exe: &Path) -> Effective {
     let Ok(out) = std::process::Command::new(exe)
         .args(["--print-config", "json"])
         .creation_flags(CREATE_NO_WINDOW)
@@ -544,26 +554,6 @@ fn open_inbound(exe: &Path, eff: &Effective, report: &Report) -> bool {
         }
     }
     ok
-}
-
-/// 跑一条 netsh 子命令。成功返回空串，失败返回 stderr（给日志看）。
-fn netsh(raw: &str) -> Result<String, String> {
-    let out = std::process::Command::new("netsh")
-        .raw_arg(raw)
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|e| format!("起不了 netsh：{e}"))?;
-    if out.status.success() {
-        return Ok(String::new());
-    }
-    let mut text = String::from_utf8_lossy(&out.stderr).trim().to_owned();
-    if text.is_empty() {
-        text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    }
-    if text.is_empty() {
-        text = format!("退出码 {}", out.status.code().unwrap_or(-1));
-    }
-    Err(text)
 }
 
 // ---------------------------------------------------------------------------
@@ -768,19 +758,14 @@ fn local_ip() -> Option<std::net::IpAddr> {
     Some(ip)
 }
 
-enum ElevateError {
-    /// 用户拒了 UAC。
-    Denied,
-    /// 其它失败，带 ShellExecute 的返回值（<= 32 的都是错误码）。
-    Failed(isize),
-}
-
 /// 提权重新跑自己（`--finish`）。
 ///
 /// 不提权是不行的：`netsh advfirewall` 与在根任务文件夹里注册任务都要管理员。
 /// 但**只提权第二段** —— 解压已经在用户令牌下做完了（见模块头部）。
-fn elevate(target: &Path, account: Option<&str>, task: &str) -> Result<(), ElevateError> {
-    let me = std::env::current_exe().map_err(|_| ElevateError::Failed(0))?;
+///
+/// 参数的拼法在这里，而不是在 `sys` 里：什么阶段要带什么参数是这个流程自己的
+/// 知识（`--finish` / `--account` / `--task`），`sys` 只负责"帮我把它交出去"。
+fn elevate(target: &Path, account: Option<&str>, task: &str) -> Result<(), sys::ElevateError> {
     let mut params = format!("--install --finish --yes --dir \"{}\"", target.display());
     if let Some(account) = account {
         params.push_str(&format!(" --account \"{account}\""));
@@ -788,81 +773,9 @@ fn elevate(target: &Path, account: Option<&str>, task: &str) -> Result<(), Eleva
     if task != TASK_NAME {
         params.push_str(&format!(" --task \"{task}\""));
     }
-    let verb = wide("runas");
-    let file = wide(&me.to_string_lossy());
-    let args = wide(&params);
-    let dir = wide(&target.display().to_string());
-    let rc = unsafe {
-        ShellExecuteW(
-            0,
-            verb.as_ptr(),
-            file.as_ptr(),
-            args.as_ptr(),
-            dir.as_ptr(),
-            SW_SHOWNORMAL as i32,
-        )
-    } as isize;
-    if rc > 32 {
-        return Ok(());
-    }
-    if rc == 5 {
-        return Err(ElevateError::Denied);
-    }
-    // 1223 = ERROR_CANCELLED，也是"用户按了否"。
-    if rc == 1223 {
-        return Err(ElevateError::Denied);
-    }
-    Err(ElevateError::Failed(rc))
-}
-
-fn elevated() -> bool {
-    unsafe { IsUserAnAdmin() != 0 }
-}
-
-/// 当前账户，`DOMAIN\user` 形式（任务 XML 里 `UserId` 要的就是这个写法）。
-fn current_account() -> Option<String> {
-    let user = std::env::var("USERNAME").ok().filter(|s| !s.is_empty())?;
-    match std::env::var("USERDOMAIN") {
-        Ok(domain) if !domain.is_empty() => Some(format!("{domain}\\{user}")),
-        _ => Some(user),
-    }
-}
-
-fn wide(text: &str) -> Vec<u16> {
-    text.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-fn dialog(text: &str, caption: &str, flags: u32) {
-    let t = wide(text);
-    let c = wide(caption);
-    unsafe {
-        MessageBoxW(0, t.as_ptr(), c.as_ptr(), MB_OK | flags);
-    }
-}
-
-fn confirm(text: &str, caption: &str) -> bool {
-    let t = wide(text);
-    let c = wide(caption);
-    // IDYES = 6
-    unsafe { MessageBoxW(0, t.as_ptr(), c.as_ptr(), MB_YESNO | MB_ICONWARNING) == 6 }
-}
-
-/// 跑一个系统命令，把 stdout+stderr 一起拿回来。
-fn command(program: &str, args: &[&str]) -> Result<String, String> {
-    let out = std::process::Command::new(program)
-        .args(args)
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|e| format!("起不了 {program}：{e}"))?;
-    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-    text.push_str(&String::from_utf8_lossy(&out.stderr));
-    if !out.status.success() && text.trim().is_empty() {
-        return Err(format!(
-            "{program} 退出码 {}",
-            out.status.code().unwrap_or(-1)
-        ));
-    }
-    Ok(text)
+    // 失败值原样交给调用方：这里只关心"是不是用户拒了"，其余都是 ShellExecute
+    // 的错误码，而那个码比任何转述都有用。
+    sys::elevate_raw(&params, target)
 }
 
 #[cfg(test)]
