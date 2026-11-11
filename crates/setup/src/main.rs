@@ -44,6 +44,18 @@
 //! 完用启动时同一套解析器复查。界面自己不做判断，也不碰文件。
 //!
 //! 带 `--config` 启动会直接把表单打开（给快捷方式用）。
+//!
+//! # 为什么是 `windows_subsystem = "windows"`
+//!
+//! 这是个纯窗口程序：它没有一行 `println!`，所有反馈都在窗口和日志面板里。
+//! 挂 console 子系统的代价却是实打实的 —— 双击之后先弹一个黑框陪到最后，正是
+//! "用户感知"这个词最字面的意思。改成 GUI 子系统之后，双击就是只有窗口。
+//!
+//! `stdio_guard` 是配套的：GUI 进程的标准句柄默认无效，将来谁在这里加一句
+//! `println!` 调试，就会得到一个"窗口打开后立刻消失"的幽灵 bug（写失败 →
+//! panic → 进程没了）。把它指到 NUL 之后，那种写法至少不会炸。
+
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::sync::Mutex;
 
@@ -1213,7 +1225,60 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     }
 }
 
+/// GUI 子系统下的标准句柄兜底。
+///
+/// 见模块头部：这个 exe 没有 `println!`，但"标准句柄无效"是**进程级**的隐患
+/// —— 任何人将来在这里加一句调试输出，都会得到"窗口一闪就没了"。指到 `NUL`
+/// 之后，那种写法至少是安全的空操作。
+#[cfg(windows)]
+fn stdio_guard() {
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::Console::{
+        AttachConsole, GetStdHandle, SetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE,
+        STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    fn usable(handle: isize) -> bool {
+        handle != 0 && handle != INVALID_HANDLE_VALUE as isize
+    }
+
+    unsafe {
+        // 被重定向（管道、文件）时句柄有效，一个字都别动。
+        if usable(GetStdHandle(STD_OUTPUT_HANDLE)) {
+            return;
+        }
+        // 从命令行跑的时候接上父控制台 —— 从这里调试的人不该看不到输出。
+        if AttachConsole(ATTACH_PARENT_PROCESS) != 0
+            && usable(GetStdHandle(STD_OUTPUT_HANDLE))
+        {
+            return;
+        }
+        let nul = CreateFileW(
+            wide("NUL").as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            0,
+        );
+        if usable(nul) {
+            SetStdHandle(STD_INPUT_HANDLE, nul);
+            SetStdHandle(STD_OUTPUT_HANDLE, nul);
+            SetStdHandle(STD_ERROR_HANDLE, nul);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn stdio_guard() {}
+
 fn main() {
+    // 必须在任何输出之前（虽然现在一行都没有，但缺陷是"将来加一行就炸"）。
+    stdio_guard();
     unsafe {
         let instance = GetModuleHandleW(std::ptr::null());
         let class_name = wide("CloudStreamSetup");

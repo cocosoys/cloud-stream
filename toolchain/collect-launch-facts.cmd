@@ -68,7 +68,7 @@ chcp 65001 >nul 2>&1
 >> "%OUT%" dir /a "%ROOT%" 2>&1
 >> "%OUT%" echo.
 >> "%OUT%" echo -- files that must exist --
-for %%F in (stream-server.exe ViGEmClient.dll start-stream.cmd start-stream.60fps.cmd run-hidden.vbs setup-watchdog.bat setup-task.ps1 setup-inbound.cmd open-inbound.cmd probe-listen.cmd collect-launch-facts.cmd) do (
+for %%F in (stream-server.exe ViGEmClient.dll cloud-setup.exe stream-config.toml setup-watchdog.bat setup-task.ps1 setup-inbound.cmd open-inbound.cmd collect-launch-facts.cmd) do (
     if exist "%ROOT%\%%F" (
         >> "%OUT%" echo OK      %%F
     ) else (
@@ -131,7 +131,7 @@ if exist "%ROOT%\logs\watchdog.log" (
     >> "%OUT%" echo -- logs\watchdog.log --
     >> "%OUT%" "%PS%" -NoProfile -Command "Get-Content -LiteralPath '%ROOT%\logs\watchdog.log' -Tail 40" 2>&1
 ) else (
-    >> "%OUT%" echo no watchdog.log -- start-stream.cmd never ran from this folder
+    >> "%OUT%" echo no watchdog.log -- stream-server.exe --run never ran from this folder
 )
 >> "%OUT%" echo.
 if exist "%ROOT%\logs\stream-server.log" (
@@ -169,7 +169,7 @@ if exist "%ROOT%\logs\stream-server.log" (
 >> "%OUT%" echo -- rule "cloud-stream app" (program rule; covers any port) --
 >> "%OUT%" "%PS%" -NoProfile -Command "try { $r = Get-NetFirewallRule -DisplayName 'cloud-stream app' -ErrorAction Stop; $r | ForEach-Object { 'enabled=' + $_.Enabled + '  direction=' + $_.Direction + '  action=' + $_.Action + '  profile=' + $_.Profile }; $r | Get-NetFirewallApplicationFilter | ForEach-Object { 'program=' + $_.Program } } catch { 'NOT FOUND -- run setup-inbound.cmd as administrator' }" 2>&1
 >> "%OUT%" echo.
->> "%OUT%" echo -- startup verdicts from start-stream.cmd (PREFLIGHT lines) --
+>> "%OUT%" echo -- startup verdicts from the launcher (PREFLIGHT lines) --
 >> "%OUT%" "%PS%" -NoProfile -Command "if (Test-Path -LiteralPath '%ROOT%\logs\watchdog.log') { $l = Select-String -LiteralPath '%ROOT%\logs\watchdog.log' -Pattern 'PREFLIGHT' | Select-Object -Last 12; if ($l) { $l | ForEach-Object { $_.Line } } else { 'no PREFLIGHT lines -- this bundle predates the startup check' } } else { 'no watchdog.log -- start-stream.cmd never ran from this folder' }" 2>&1
 >> "%OUT%" echo.
 

@@ -2,8 +2,8 @@
 rem ---------------------------------------------------------------------------
 rem Create the MCStreamSrv watchdog task for THIS directory.
 rem
-rem Portable: the task action is "wscript.exe <this dir>\run-hidden.vbs", built
-rem from %~dp0, so the bundle can be unpacked anywhere.
+rem Portable: the task action is "<this dir>\stream-server.exe --run", built
+rem from %%~dp0, so the bundle can be unpacked anywhere.
 rem
 rem Usage, from the directory the bundle was unpacked into:
 rem
@@ -26,20 +26,24 @@ rem After: at logon, and every minute after that. Task Scheduler's "do not start
 rem a new instance" policy means that while the server is alive the trigger does
 rem nothing; when it dies the task completes and the next minute brings it back.
 rem
-rem wscript + run-hidden.vbs instead of cmd.exe directly: the trigger fires 1440
-rem times a day, and a console flashing on the game's desktop would steal focus.
+rem The task action is the server exe itself, not an interpreter wrapping a
+rem script. The reason the old launcher went through the script host at all was
+rem that a console-subsystem exe gets a console window from Task Scheduler --
+rem every trigger, 1440 times a day, each one stealing focus from the game. The
+rem server is a GUI-subsystem binary now, so no window is created and the layer
+rem is gone. See docs/operations-run.md.
 rem ---------------------------------------------------------------------------
 setlocal EnableExtensions
 
 set "ROOT=%~dp0"
 if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
-set "VBS=%ROOT%\run-hidden.vbs"
+set "SVEXE=%ROOT%\stream-server.exe"
 set "TASK=MCStreamSrv"
 set "WLOG=%ROOT%\logs\watchdog.log"
 if not exist "%ROOT%\logs" mkdir "%ROOT%\logs" >nul 2>&1
 
-if not exist "%VBS%" (
-    echo MISSING %VBS%
+if not exist "%SVEXE%" (
+    echo MISSING %SVEXE%
     echo Unpack the whole bundle, then run this script from its own directory.
     exit /b 1
 )
@@ -178,7 +182,8 @@ echo.
 echo -- next steps --
 echo   * the task fires at logon and every minute; a crash heals within 60 s
 echo   * it runs as the console user, with no password stored anywhere
-echo   * resolution / fps / bitrate live in start-stream.cmd, not in the task
+echo   * resolution / fps / bitrate live in stream-config.toml, not in the task
+echo   * hand-run one copy: stream-server.exe --run  [--fps N to override for this run]
 echo   * firewall, port and session facts: collect-launch-facts.cmd
 echo   * re-open the port by hand:            setup-inbound.cmd
 echo.

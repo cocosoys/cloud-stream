@@ -24,10 +24,9 @@
         <root>\stream-server.exe  ViGEmClient.dll
         <root>\cert.pem  key.pem
         <root>\selkies-web\  logs\
-        <root>\start-stream.cmd  start-stream.60fps.cmd
-        <root>\run-hidden.vbs  setup-watchdog.bat
+        <root>\cloud-setup.exe  setup-watchdog.bat
         <root>\collect-launch-facts.cmd  setup-inbound.cmd
-        <root>\open-inbound.cmd  probe-listen.cmd
+        <root>\open-inbound.cmd
 
     Steps: install launchers -> stop task (and disable its 1-minute trigger) ->
     kill -> swap -> re-enable -> start -> wait for the process.
@@ -47,7 +46,7 @@ param(
     [switch]$SkipBackend,
     [switch]$SkipFrontend,
     # Do not touch the launcher scripts. Used when the operator deliberately
-    # hand-edited start-stream.cmd on this box (resolution, upload root).
+    # hand-edited stream-config.toml on this box (resolution, upload root).
     [switch]$SkipLauncher,
     # Bootstrap mode: create the directories, install the launchers and stop.
     # No stop/start, no swap - this is the "first contact with a fresh machine"
@@ -96,23 +95,28 @@ $NewExe = Join-Path $Root 'stream-server.new.exe'
 $LiveDll = Join-Path $Root 'ViGEmClient.dll'
 $NewDll = Join-Path $Root 'ViGEmClient.new.dll'
 
-# Launchers travel with every deploy: the command line (--dist / --tls-cert /
-# --repeat-every) lives in start-stream.cmd, so replacing only the exe leaves the
-# flags frozen at the previous release. Installed by hash comparison, because
-# rewriting a .cmd that the watchdog is currently executing is a sharing
-# violation on a frontend-only deploy (nothing stops the batch in that path).
-# start-stream.60fps.cmd travels as well: a hand-run on this box has to use the
-# same flags as the watchdog, and the bundle is the only copy the person sitting
-# at that machine has. Nothing executes it, so it is never busy.
+# These travel with every deploy, installed by hash comparison.
+#
+# start-stream.cmd / start-stream.60fps.cmd / run-hidden.vbs used to be here.
+# They existed to build a command line and to hide the console window Task
+# Scheduler creates for a console-subsystem exe. Both jobs belong to the exe
+# now: `--run` derives every path from its own directory (docs/operations-run.md)
+# and the binary is GUI-subsystem, so no window is created. Nothing to ship.
+#
+# stream-config.toml is NOT here: the flags live in it now, but it is the
+# machine's steady state, not the build's. Overwriting it on every deploy would
+# wipe the tuning someone did on that box -- the exact class of loss this whole
+# layer exists to prevent.
+#
 # collect-launch-facts.cmd is the "it will not start" first responder; it ships
 # so the person at the machine does not need the repo to answer the question.
 # setup-inbound.cmd opens 8080 + ICMP; without it a fresh Windows drops every
 # inbound packet and the machine looks dead from the build machine.
-# open-inbound.cmd and probe-listen.cmd are the automated half of the same
-# lesson: start-stream.cmd calls the first on every real start, and spawns the
-# second to write one PREFLIGHT verdict into watchdog.log. Ship them or the
-# launcher silently skips its own preflight.
-$Launchers = @('start-stream.cmd', 'start-stream.60fps.cmd', 'run-hidden.vbs', 'setup-watchdog.bat', 'collect-launch-facts.cmd', 'setup-inbound.cmd', 'open-inbound.cmd', 'probe-listen.cmd', 'set-password.cmd')
+# open-inbound.cmd is the automated half of the same lesson: the launcher
+# calls it on every real start. The PREFLIGHT verdict it used to be paired
+# with now comes from `stream-server.exe --probe`, which --run spawns itself
+# (docs/operations-run.md), so there is no second script to ship.
+$Launchers = @('setup-watchdog.bat', 'collect-launch-facts.cmd', 'setup-inbound.cmd', 'open-inbound.cmd', 'set-password.cmd')
 
 function Say([string]$Text) { Write-Output $Text }
 function Fail([string]$Text) { Write-Output "FAIL $Text"; exit 1 }
@@ -182,8 +186,8 @@ function Install-Launchers {
             Say "OK  $name unchanged"
             continue
         }
-        # cmd.exe closes start-stream.cmd a moment after the exe it launched
-        # exits, so retry briefly instead of declaring the file unusable.
+        # A .cmd the watchdog is currently executing is a sharing violation
+        # for a moment; retry briefly instead of declaring the file unusable.
         $copied = $false
         $err = ''
         for ($i = 0; $i -lt 10; $i++) {
@@ -220,8 +224,10 @@ function Stop-Server {
     Disable-ScheduledTask -TaskName $TaskName | Out-Null
     Say 'OK  task disabled'
 
-    # /End only ends wscript.exe. stream-server.exe is a grandchild, so kill it
-    # explicitly and wait for the image to be released before touching the file.
+    # /End ends the task action, which is stream-server.exe itself now. The
+    # explicit kill stays: a copy started by hand (or left over from before the
+    # task was recreated) is not the task's child and would otherwise keep the
+    # exe file locked.
     for ($i = 0; $i -lt 20; $i++) {
         $p = Get-Process stream-server -ErrorAction SilentlyContinue
         if (-not $p) { break }
@@ -240,8 +246,9 @@ function Start-Server {
     Say 'OK  task enabled'
     schtasks /Run /TN $TaskName | Out-Null
 
-    # The launcher goes through wscript -> cmd -> exe; give it a moment and
-    # report the pid so the caller can check StartTime.
+    # The task action IS the exe, so a pid should appear within a moment. Give
+    # it a few seconds anyway and report the pid so the caller can check
+    # StartTime.
     for ($i = 0; $i -lt 60; $i++) {
         Start-Sleep -Milliseconds 500
         $p = Get-Process stream-server -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -268,7 +275,8 @@ Repair-LegacyLayout
 
 if ($OnlyLaunchers) {
     # Bootstrap path: install what we can and stop. The watchdog may be running
-    # start-stream.cmd right now, so a busy file is reported, never fatal.
+    # a .cmd the watchdog is executing right now, so a busy file is reported,
+    # never fatal.
     Install-Launchers
     Say 'DONE launchers only'
     exit 0
@@ -308,7 +316,7 @@ if (-not $SkipBackend) {
         Say "OK  dll in place $((Get-Item $LiveDll).Length) B md5 $(Get-Sha $LiveDll)"
     }
     # The launchers go in HERE, not in preflight: while the watchdog runs, its
-    # cmd.exe holds start-stream.cmd open and the copy is a sharing violation.
+    # the launcher may hold a .cmd open and the copy is a sharing violation.
     # Stop-Server has just released it, so this is the only reliable window.
     # Order matters for a layout change too - the new exe must be started by the
     # new launcher (it is the launcher that knows --dist moved into the root).
@@ -357,7 +365,7 @@ if (-not $SkipFrontend) {
 }
 
 # Frontend-only deploy never stopped the process, so the watchdog still has
-# start-stream.cmd open. Update what is free and say so; the rest takes effect
+# a .cmd open. Update what is free and say so; the rest takes effect
 # at the next restart, which is exactly the semantics of this switch.
 if ($SkipBackend) { Install-Launchers }
 

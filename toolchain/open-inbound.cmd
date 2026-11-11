@@ -6,7 +6,7 @@ rem Call it, do not double-click it -- setup-inbound.cmd is the human-facing
 rem wrapper (it shows the rules, self-tests 8080 and pauses).
 rem
 rem Called from three places, all of which used to leave this to the operator:
-rem   start-stream.cmd   on every launch (the watchdog fires every minute)
+rem   stream-server.exe --run   on every launch (the watchdog fires every minute)
 rem   setup-watchdog.bat after the task is created
 rem   setup-inbound.cmd  when somebody runs it by hand
 rem

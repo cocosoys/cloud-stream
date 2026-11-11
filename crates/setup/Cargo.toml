@@ -19,6 +19,13 @@ windows-sys = { version = "0.52", features = [
     "Win32_UI_HiDpi",
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",
+    # GUI 子系统的标准句柄兜底：没有控制台时把三个句柄指到 NUL，否则将来任何
+    # 一句 `println!` 都会 panic，而症状是"窗口一闪就没了"。
+    # `CreateFileW`（打开 NUL）的参数里有 SECURITY_ATTRIBUTES，所以 Security
+    # 这个 feature 是被它连带的，不是我们要自己用。
+    "Win32_System_Console",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
 ] }
 # 只用来读 `--ops config-get --ops-json`：配置表单要知道每个键现在是什么、
 # 接受什么范围，而这两件事只有服务端那份类型表说了算。仍然没有第二套实现 ——

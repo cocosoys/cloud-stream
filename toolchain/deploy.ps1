@@ -26,7 +26,7 @@
     而被控机上的 .prev 只会越积越多，没人会去轮转它。
 
     被控机上的路径全部由脚本自定位：运行根 <RemoteBase>\stream 里的
-    start-stream.cmd 用 %~dp0、run-hidden.vbs 用 WScript.ScriptFullName、
+    stream-server.exe 用 --run 从自身目录推导（docs/operations-run.md）、
     deploy-remote.ps1 用 $PSScriptRoot。没有任何一处写死 C:\dev —— 整包解压到
     别的盘、别的目录同样能跑，这对"快速把新设备变成被控设备"是硬要求。
 
@@ -124,8 +124,8 @@ Set-StrictMode -Version Latest
 #   <base>\stream\   运行根，与构建端 target\output\cloud-stream 一一对应
 #   <base>\deploy\   部署暂存（deploy-remote.ps1 + 传输中的文件）
 #
-# 运行根内部一律相对：start-stream.cmd 用 %~dp0、run-hidden.vbs 用
-# WScript.ScriptFullName、deploy-remote.ps1 用 $PSScriptRoot。所以把整包解压到
+# 运行根内部一律相对：stream-server.exe 的 --run 从自身目录推导（见
+# docs/operations-run.md），deploy-remote.ps1 用 $PSScriptRoot。所以把整包解压到
 # D:\games\stream 也能直接跑，这正是 -RemoteBase 存在的意义（整台机器换位置时
 # 只需要改这一个参数）。
 $RemoteBase = 'C:\dev'
@@ -134,31 +134,29 @@ $RemoteDeploy = Join-Path $RemoteBase 'deploy'
 $RemoteTask = 'MCStreamSrv'
 $RemoteExe = "$RemoteRoot\stream-server.exe"
 $RemoteLog = "$RemoteRoot\logs\stream-server.log"
-# 上机脚本：跟着每次部署走（命令行参数写在 start-stream.cmd 里，只换 exe
-# 不换它，参数就永远停在上一次）。
-# start-stream.60fps.cmd 是同一个命令行的"手工版"（不进计划任务），它的存在
-# 意义就是让人在被控机上用和看门狗完全一致的参数跑一次 —— 包里缺了它，
-# 那台机器就只能从仓库里翻，而拿到包的人手里没有仓库。
+# 上机文件：跟着每次部署走。
+#
+# 这里原本有 start-stream.cmd / start-stream.60fps.cmd / run-hidden.vbs 三个。
+# 前两个把路径拼成命令行，第三个把黑框藏起来 —— 两件事现在都由 exe 自己做：
+# `--run` 从自身目录推导（docs/operations-run.md），而进程是 GUI 子系统，
+# Windows 不再替它创建控制台窗口。删掉这三行不是"把脚本翻译成 Rust"，是那一层
+# 职责本来就不该存在。
+#
 # collect-launch-facts.cmd 是"起不来"时的第一个动作：新设备上三种常见故障
 # （任务没跑 / 缺 VC++ / zip 没解压）都不写日志、窗口一闪就关，它一次收全。
 # setup-inbound.cmd 是第二课：Windows 防火墙在新机器上把所有入站（含 ICMP）
 # 都丢掉，于是"ping 不通、8080 超时"，而服务其实跑得好好的。
-# open-inbound.cmd 与 probe-listen.cmd 是同一课的自动化部分，被 start-stream.cmd
-# 和 setup-watchdog.bat 调用：前者幂等地补规则，后者在启动后 30 秒内把
-# "到底有没有监听"写成一行 PREFLIGHT 日志。少了它们，启动失败仍然没有痕迹。
+# open-inbound.cmd 与 probe-listen.cmd 是同一课的自动化部分（前者幂等地补规则，
+# 后者在启动后 30 秒内把"到底有没有监听"写成一行 PREFLIGHT 日志）。
 # install.cmd / uninstall.cmd 是"一次点击"那一层：把上面的准备工作串成一条线，
 # 并且各自带一个只读模式（/check、/whatif）。它们不重新实现任何东西 —— install
 # 调 setup-task.ps1 + open-inbound.cmd，uninstall 调 netsh 与 --restore-mic，
 # 所以两条路径不会各自漂移。
 $LauncherNames = @(
-    'start-stream.cmd',
-    'start-stream.60fps.cmd',
-    # 参数本体。start-stream.cmd 只传路径与环境相关的那几条，分辨率/帧率/
-    # 码率/编码器/输入策略都在这个文件里。它跟着部署走（和过去命令行写在
-    # start-stream.cmd 里完全同构），所以"每次部署把参数覆盖回去"这个既有
-    # 行为没有变；"每台机器的差异要留住"是安装器那一层的事，不在这里解决。
+    # 参数本体。路径类的那几条由 --run 从自身目录推导，分辨率/帧率/码率/编码器/
+    # 输入策略在这里。它跟着部署走，所以"每次部署把参数覆盖回去"这个既有行为
+    # 没有变；"每台机器的差异要留住"是安装器那一层的事，不在这里解决。
     'stream-config.toml',
-    'run-hidden.vbs',
     'setup-watchdog.bat',
     'setup-task.ps1',
     'install.cmd',
@@ -166,12 +164,14 @@ $LauncherNames = @(
     'collect-launch-facts.cmd',
     'setup-inbound.cmd',
     'open-inbound.cmd',
-    'probe-listen.cmd',
     'set-password.cmd'
 )
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $LocalExe = Join-Path $RepoRoot 'target\release\stream-server.exe'
+# 可视化控制台。刻意不链接 stream-server（377 KB，秒开），所以是独立产物。
+# 它和 install.cmd / uninstall.cmd 处在同一层：三个消费者，一个后端。
+$LocalSetup = Join-Path $RepoRoot 'target\release\cloud-setup.exe'
 # #17: 虚拟手柄的 DLL。必须和 exe 同目录（LoadLibraryW 先查应用目录），并且
 # 必须在进程停下之后才能覆盖 —— 已加载的 DLL 被持有，运行中覆盖是共享冲突。
 $LocalVigem = Join-Path $RepoRoot 'vendor\vigem\ViGEmClient.dll'
@@ -438,7 +438,7 @@ cloud-stream 被控端整包
 =======================
 
 这个目录就是被控机的运行根。位置随意：D:\stream、C:\dev\stream 都行，
-里面的脚本全部按自身位置推导路径，没有任何写死的目录。
+里面的 exe 与脚本都按自身位置推导路径，没有任何写死的目录。
 
 怎么用
   1) 整包拷到目标机器（或解压同目录下的 cloud-stream.zip）。
@@ -449,7 +449,8 @@ cloud-stream 被控端整包
      只说一句 fail。
      只想看看它会做什么、不改动任何东西：install.cmd /check
   3) 任务在登录时触发一次，之后每分钟一次，进程挂了 60 秒内自己回来。
-     想手工起一次：start-stream.cmd
+     想手工起一次：stream-server.exe --run
+     （临时改一次参数：stream-server.exe --run --fps 60 —— 命令行压过配置文件）
   4) 浏览器打开 https://<本机IP>:8080/
   5) 以后不要了：双击 uninstall.cmd —— 停任务、杀进程、删规则、把默认录音设备
      还回去，最后删掉整个目录（/keep 只卸服务、留文件；/whatif 只列清单）。
@@ -467,15 +468,14 @@ cloud-stream 被控端整包
   install.cmd         一键安装：检查 + 放行 + 建任务 + 启动 + 验证（/check 只读）
   uninstall.cmd       一键卸载：任务 + 进程 + 规则 + 默认录音设备 + 整个目录
                       （/keep 保留文件，/whatif 只列清单）
-  start-stream.cmd    命令行参数都在这里：分辨率 / 帧率 / 码率 / 证书
-  start-stream.60fps.cmd 手工起一次用（同一个命令行，不进计划任务）
-  run-hidden.vbs      计划任务的实际入口，无窗口，避免每分钟闪一次黑框
+  cloud-setup.exe     可视化控制台：状态 / 快照 / 回滚 / 更新 / 安装 / 卸载 / 改配置
+  stream-config.toml  这台机器的常态：端口 / 分辨率 / 帧率 / 码率 / 编码器 / 输入策略
+  auth-token.txt      访问口令（可选；没有就是同网段谁都能开）
   setup-watchdog.bat  创建 MCStreamSrv 任务并验证一次启动（不碰账户密码）
   setup-task.ps1      上面那条的实际执行者：按交互式令牌注册任务
   collect-launch-facts.cmd  起不来时双击它，生成一份事实清单（只读）
   setup-inbound.cmd   管理员身份运行：放行 8080、ping 与 UDP 40000-40049（否则 WebRTC 切不过去）
-  open-inbound.cmd    上面那条规则的实际执行者，被启动脚本自动调用（幂等）
-  probe-listen.cmd    启动后 30 秒内把"有没有监听"写进 watchdog.log
+  open-inbound.cmd    上面那条规则的实际执行者，被 --run 在每次真启动时调用（幂等）
   set-password.cmd    设/改/清除访问口令（写 auth-token.txt，重启任务生效）
   manifest.json       本次构建的指纹：提交、时间、各文件 MD5、前端文件数
   $tlsLine
@@ -491,8 +491,8 @@ cloud-stream 被控端整包
 每次启动会自动做的事（不需要人守在那里）
   * 查 8080 / ICMP / WebRTC UDP / app 四条入站规则，缺了就补（当前进程提权时）；补不上会把原因写进
     logs\watchdog.log 的 PREFLIGHT 行，而不是安静地少一条规则
-  * 起 exe 之后另起一个探针，最多 30 秒，把结果写成
-        PREFLIGHT listening on 8080 after N probe(s): local status 200
+  * exe 自己另起一个 --probe 子进程，最多 30 秒，把结果写成
+        PREFLIGHT listening on 8080 after N probe(s)
     或者
         PREFLIGHT NOT listening on 8080 ... + 三条最可能的原因 + 下一步
     所以"启动后没反应"永远有带时间戳的一行可以看，不用猜。
@@ -502,7 +502,9 @@ cloud-stream 被控端整包
   * 换机器要重签证书（SAN 里是 IP），否则浏览器报警、剪贴板不工作。
   * 外部机器连不上、本机 loopback 正常，多半是入站规则或网络配置文件
     （VMware 的网卡常被判成"公用"）：管理员身份跑一次 setup-inbound.cmd。
-  * 换分辨率 / 码率改 start-stream.cmd，不要改计划任务。
+  * 换分辨率 / 码率改 stream-config.toml（或控制台的「改配置」按钮），不要改计划任务。
+  * 计划任务的动作就是 stream-server.exe --run，没有脚本中转；它自己从所在目录
+    推导配置、前端、日志、证书、令牌的位置，所以整包搬到哪都能跑。
 "@
     # UTF-8 带 BOM：记事本与 PowerShell 5.1 都按 BOM 判编码，中文才不会乱码。
     [System.IO.File]::WriteAllText($Path, $text, (New-Object System.Text.UTF8Encoding($true)))
@@ -533,6 +535,13 @@ function New-DeployBundle {
     if (Test-Path $LocalVigem) { Copy-Item $LocalVigem $dllPath -Force }
     foreach ($name in $LauncherNames) {
         Copy-Item (Join-Path $PSScriptRoot $name) (Join-Path $BundleDir $name) -Force
+    }
+    # 控制台跟着包走：没有它，这四个动作在这台机器上就只剩「跑脚本」一条路，
+    # 而脚本正是本轮要清掉的东西。缺了不算致命（服务照跑），所以只提示。
+    if (Test-Path $LocalSetup) {
+        Copy-Item $LocalSetup (Join-Path $BundleDir 'cloud-setup.exe') -Force
+    } else {
+        Write-Note '本机没有 cloud-setup.exe，包里缺可视化控制台（先构建 -Package cloud-setup）'
     }
 
     $cert = Resolve-CertPair
@@ -623,10 +632,13 @@ function Save-DeployArchive {
     }
 
     $exeMd5 = $(if (Test-Path $ArchiveExe) { Get-Md5 $ArchiveExe } else { $null })
-    # 启动脚本也进归档：参数在 start-stream.cmd 里，回滚只退 exe 会让旧二进制
-    # 跑新参数（--dist 指到不存在的目录、证书路径换了 …）。一起退才叫回滚。
+    # 上机文件也进归档：回滚要退的是一整套，只退 exe 会留下"新 exe + 旧配置"这种
+    # 从来没有人测过的组合。
     foreach ($name in $LauncherNames) {
         Copy-Item (Join-Path $PSScriptRoot $name) (Join-Path $ArchiveDir $name) -Force
+    }
+    if (Test-Path $LocalSetup) {
+        Copy-Item $LocalSetup (Join-Path $ArchiveDir 'cloud-setup.exe') -Force
     }
     $dllMd5 = $(if (Test-Path $ArchiveDll) { Get-Md5 $ArchiveDll } else { $null })
     $zipMd5 = $(if (Test-Path $ArchiveZip) { Get-Md5 $ArchiveZip } else { $null })
@@ -954,12 +966,16 @@ try {
         Send-File $ZipPath "$RemoteDeploy/selkies-web.zip"
         Write-Ok 'selkies-web.zip'
     }
-    # 启动脚本上传到 deploy\，由被控端的 deploy-remote.ps1 在切换窗口里装进运行根。
-    # 每轮都发：参数在 start-stream.cmd 里，只换 exe 会让参数停在上一次。
+    # 上机文件上传到 deploy\，由被控端的 deploy-remote.ps1 在切换窗口里装进运行根。
+    # 每轮都发：这里的每一项都是"只换一份就会前后不一致"的东西。
     foreach ($name in $LauncherNames) {
         Send-File (Join-Path $PSScriptRoot $name) "$RemoteDeploy/$name"
     }
     Write-Ok ($LauncherNames -join ' / ')
+    if ($packaged -and (Test-Path (Join-Path $BundleDir 'cloud-setup.exe'))) {
+        Send-File (Join-Path $BundleDir 'cloud-setup.exe') "$RemoteDeploy/cloud-setup.exe"
+        Write-Ok 'cloud-setup.exe'
+    }
     # 证书只传到暂存区：被控端已有证书时不覆盖（SAN 里是那台机器的 IP），没有才装。
     foreach ($name in @('cert.pem', 'key.pem')) {
         $c = Join-Path $BundleDir $name
@@ -1111,12 +1127,12 @@ try {
         "ForEach-Object { `$_.Actions | ForEach-Object { 'act=' + `$_.Execute + ' ' + `$_.Arguments } }"
     $t = Invoke-Ssh "powershell -NoProfile -Command `"$taskProbe`"" -AllowFail
     $actLine = ($t.Output -split "`r?`n" | Where-Object { $_ -like 'act=*' } | Select-Object -First 1)
-    $expectVbs = Join-Path $RemoteRoot 'run-hidden.vbs'
-    if ($actLine -and $actLine.ToLower().Contains($expectVbs.ToLower())) {
+    $expectExe = Join-Path $RemoteRoot 'stream-server.exe'
+    if ($actLine -and $actLine.ToLower().Contains($expectExe.ToLower() + ' --run')) {
         Write-Ok ("看门狗动作 {0}" -f ($actLine -replace '^act=', ''))
     } elseif ($actLine) {
         Write-Note ("看门狗动作指向别处：{0}" -f ($actLine -replace '^act=', ''))
-        Write-Note "  期望包含 $expectVbs；整包搬过位置后要重跑一次 setup-watchdog.bat"
+        Write-Note "  期望是 \"$expectExe --run\"；整包搬过位置后要重跑一次 setup-watchdog.bat"
     } else {
         Write-Note "查不到计划任务 $RemoteTask 的动作 —— 先在被控机跑一次 setup-watchdog.bat"
     }

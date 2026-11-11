@@ -64,6 +64,19 @@ windows-sys = { version = "0.52", features = [
     "Win32_System_DataExchange",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
+    # `--run` 用命名互斥量判"是不是已经有一个实例在跑" —— 比 `tasklist` 按
+    # 映像名匹配准（两个不同目录的同名 exe 会被它认成同一个），也不需要找一个
+    # 不受 PATH 污染的 find.exe。
+    "Win32_System_Threading",
+    "Win32_Security",
+    # 看门狗日志的行首时间是**本地时间**（原来 cmd 写的是 `%date% %time%`）。
+    # 混进 UTC 会让"日志里 08:00、屏幕上 16:00"变成一次排查事故。
+    "Win32_System_SystemInformation",
+    # GUI 子系统的 stdio 兜底：没有控制台时把三个句柄指到 NUL，否则 `println!`
+    # 会 panic（GUI 进程启动时标准句柄是无效的）。`CreateFileW` 用来打开 NUL
+    # 与 CONOUT$。
+    "Win32_System_Console",
+    "Win32_Storage_FileSystem",
     "Win32_Media",
 ] }
 flate2 = "1.0"

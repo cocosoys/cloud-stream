@@ -43,7 +43,7 @@ stream-server.exe --update apply    覆盖 + 验证，失败自动回滚
 ```text
 %ProgramData%\cloud-stream\update\
     stream-server.exe
-    start-stream.cmd
+    stream-config.toml
     selkies-web\...
 ```
 

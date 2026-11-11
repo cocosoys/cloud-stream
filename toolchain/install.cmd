@@ -139,9 +139,7 @@ call :note [0/4] bundle check
 set "BAD=0"
 
 call :need "%EXE%"                        stream-server.exe
-call :need "%ROOT%\start-stream.cmd"      start-stream.cmd
 call :need "%ROOT%\stream-config.toml"    stream-config.toml
-call :need "%ROOT%\run-hidden.vbs"        run-hidden.vbs
 call :need "%ROOT%\setup-task.ps1"        setup-task.ps1
 call :need "%ROOT%\open-inbound.cmd"      open-inbound.cmd
 call :need "%ROOT%\selkies-web\index.html" selkies-web\index.html
@@ -415,7 +413,7 @@ exit /b 0
 rem ---------------------------------------------------------------------------
 rem :need <absolute path> <name shown>
 rem One missing file is enough to stop: a bundle without the web root serves a
-rem directory listing, and one without run-hidden.vbs registers a task that
+rem directory listing, and one missing setup-task.ps1 registers a task that
 rem fires every minute and does nothing.
 rem ---------------------------------------------------------------------------
 :need

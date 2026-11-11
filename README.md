@@ -179,6 +179,7 @@ cd target\output\cloud-stream
 | [`docs/configuration.md`](docs/configuration.md) | **配置：三层优先级、完整键表、`--print-config` 回环、改错时的行为** |
 | [`docs/operations-rollback.md`](docs/operations-rollback.md) | **快照与回滚：`--ops snapshot/rollback/verify`，四个动作的失败兜底** |
 | [`docs/operations-update.md`](docs/operations-update.md) | **更新：`--update check/apply`，三种验版本口径、自动回滚、更新包放哪** |
+| [`docs/operations-run.md`](docs/operations-run.md) | **服务怎么被拉起来：`--run`、GUI 子系统与 stdio 的三种处境、单实例、退出码** |
 | [`docs/console.md`](docs/console.md) | **可视化控制台 `cloud-setup.exe`：四个动作的按钮版，七个按钮各落到哪条命令** |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | **参与开发：环境、构建、测试、提交规范、硬规矩** |
 | [`docs/roadmap-l2-l3-gaps.md`](docs/roadmap-l2-l3-gaps.md) | 全量盘点：已完成 / 部分 / 未做，逐项拆解 |

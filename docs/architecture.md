@@ -36,6 +36,8 @@
 | `ops` | 快照/回滚/校验：四个动作（装/卸/更新/改）的失败兜底 | 1.0k | `ops::try_run`、`snapshot`、`rollback` |
 | `update` | 检查/覆盖/验版本：更新动作的实现，失败自动回滚 | 0.9k | `update::try_run`、`check`、`apply` |
 | `configedit` | 按键读改配置：类型表、校验、原子写，`--ops config-get/config-set` 的实现 | 0.5k | `configedit::KEYS`、`set`、`validate` |
+| `run` | `--run`：从自身目录推导配置/前端/日志/证书/令牌，取代 `start-stream.cmd` | 0.3k | `run::expand_if_requested` |
+| `boot` | GUI 子系统的平台准备：stdio 兜底、panic 落盘 | 0.2k | `boot::prepare` |
 
 ## 3. 一次推流经过哪些模块
 

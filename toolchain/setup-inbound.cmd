@@ -3,7 +3,7 @@ rem ---------------------------------------------------------------------------
 rem Open the inbound paths a controlled machine needs, from its own console.
 rem
 rem Run it as administrator (right-click -> Run as administrator). The work is
-rem done by open-inbound.cmd, the same helper start-stream.cmd and
+rem done by open-inbound.cmd, the same helper the launcher and
 rem setup-watchdog.bat call -- this file is the interactive wrapper: it shows
 rem the profile, the resulting rules and a loopback self-test, then pauses so
 rem the window does not vanish before anybody reads it.
@@ -70,7 +70,7 @@ rem would run a different binary with different flags.
 "%SystemRoot%\System32\curl.exe" -sk -m 4 -o NUL -w "https 8080 = HTTP %%{http_code}\n" https://127.0.0.1:8080/api/v1/health
 if errorlevel 1 (
     echo   nothing is listening on 8080 yet -- start the server, then run this
-    echo   check again:  start-stream.cmd
+    echo   check again:  stream-server.exe --run
 )
 
 echo.

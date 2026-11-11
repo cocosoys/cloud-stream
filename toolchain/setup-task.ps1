@@ -5,6 +5,18 @@
 # quote characters; nesting that through cmd -> powershell -Command is exactly
 # where the old one-liner kept breaking.
 #
+# THE ACTION IS THE SERVER ITSELF: "stream-server.exe --run"
+#
+#   It used to be the Windows Script Host pointed at run-hidden.vbs. That
+#   indirection existed for one reason only: a console-subsystem exe started by
+#   Task Scheduler gets a console window created for it, once per minute, and
+#   each one steals foreground focus from whatever game is running. The script
+#   hid that window; it could not stop it being created.
+#
+#   The server is now a GUI-subsystem binary (main.rs: windows_subsystem =
+#   "windows"), so Windows creates no window for it at all. See
+#   docs/operations-run.md.
+#
 # WHY THERE IS NO PASSWORD
 #
 #   The task must run inside the session that owns the desktop: screen capture
@@ -64,15 +76,27 @@ try {
     Fail 1 "root directory not found: $Root"
 }
 
-$vbs = Join-Path $Root 'run-hidden.vbs'
-if (-not (Test-Path -LiteralPath $vbs)) {
-    Fail 1 "missing $vbs -- unpack the whole bundle, then run this from its own directory"
+$exe = Join-Path $Root 'stream-server.exe'
+if (-not (Test-Path -LiteralPath $exe)) {
+    Fail 1 "missing $exe -- unpack the whole bundle, then run this from its own directory"
 }
 
 # ---- 2 definition ----------------------------------------------------------
-# The action keeps exactly the shape the old /TR had: wscript.exe "<vbs>".
-# Quoting is done once, here, instead of being escaped through three layers.
-$action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument ('"{0}"' -f $vbs)
+# The action is the server itself with `--run`, not a script interpreter.
+#
+# It used to be the Windows Script Host pointed at run-hidden.vbs, and that
+# indirection existed for exactly one reason: a console-subsystem exe started by
+# Task Scheduler gets a console window created for it -- once per minute, each
+# time stealing foreground focus from whatever game is running. The script hid
+# that window; it could not stop it from being created.
+#
+# The server is now a GUI-subsystem binary (main.rs: windows_subsystem =
+# "windows"), so Windows does not create a window for it at all and the layer is
+# gone. See docs/operations-run.md.
+#
+# -WorkingDirectory is the run root: `--run` passes absolute paths itself, but a
+# hand-edited config could still say dist = 'selkies-web'.
+$action = New-ScheduledTaskAction -Execute $exe -Argument '--run' -WorkingDirectory $Root
 
 # Two triggers on purpose:
 #   * at logon  -- no dead window after a reboot/logon; the old minute-only
@@ -127,8 +151,8 @@ Write-Output "  logon    = $logon (no password stored)"
 Write-Output "  action   = $actLine"
 Write-Output "  triggers = $($trgNames -join ', ')"
 
-if ($actLine -notmatch 'run-hidden\.vbs') {
-    Write-Output '  [warn] the task action does not mention run-hidden.vbs. Inspect with:'
+if ($actLine -notmatch '--run') {
+    Write-Output '  [warn] the task action does not pass --run. Inspect with:'
     Write-Output "         Get-ScheduledTask -TaskName $TaskName | Select-Object -Expand Actions"
     exit 3
 }

@@ -309,6 +309,48 @@ pub fn default_path() -> Option<PathBuf> {
     Some(exe.parent()?.join("config.toml"))
 }
 
+/// 整包分发里那份配置的名字。
+///
+/// 和 `config.toml` 是两个名字、两套来源：`config.toml` 是“exe 旁边自动发现”
+/// 的开发机习惯，`stream-config.toml` 是分发包里随包带来的那一份（以前由
+/// `start-stream.cmd` 用 `--config` 显式指定）。名字不同本身是历史包袱，但它
+/// 已经被大量部署引用，改名的代价远大于把两处查找合并到这一个函数里。
+pub const BUNDLE_CONFIG: &str = "stream-config.toml";
+
+/// 整包分发目录的标志物：前端目录。
+///
+/// 它比“旁边有没有某个脚本”可靠 —— 脚本正在被删掉（四个动作全部收进 exe），
+/// 而前端目录是服务真的要用到的东西，缺了它页面直接 404。
+const BUNDLE_MARKER: &str = "selkies-web";
+
+/// 这次运行该读哪一份配置：`--config` 优先，其次 exe 旁边的两份。
+///
+/// 返回 `Some` 不代表文件存在（`--config` 之外的路径允许缺失）。
+///
+/// 三处（`Config::parse`、`--ops`、`--run`）共用这一份而不是各写一遍：各写一遍
+/// 的结果是屏幕说 A、写入落在 B —— 配置表单那次就差点这样。
+pub fn resolve(explicit: Option<&Path>) -> Option<PathBuf> {
+    if let Some(path) = explicit {
+        return Some(path.to_path_buf());
+    }
+    let primary = default_path()?;
+    if primary.exists() {
+        return Some(primary);
+    }
+    let sibling = primary.with_file_name(BUNDLE_CONFIG);
+    if sibling.exists() {
+        return Some(sibling);
+    }
+    // 两份都不存在时，要在**新建**这一份时挑对名字。判据是布局而不是文件名：
+    // 整包分发必有 `selkies-web`，开发机直接 `cargo run` 不会有。挑错名字的
+    // 后果是“表单里改了、服务没读”—— 一个纯粹由猜错文件名造成的故障。
+    if primary.with_file_name(BUNDLE_MARKER).exists() {
+        Some(sibling)
+    } else {
+        Some(primary)
+    }
+}
+
 /// `--print-config` 的 toml 形态。
 ///
 /// 手写而不是 `toml::to_string`：注释和分组是这个输出的主要价值 —— 它同时也是

@@ -76,7 +76,7 @@
 | 8 | 目录 | `C:\dev\stream\logs`、`C:\dev\deploy`、`C:\dev\stream\selkies-web` | `-Bootstrap` 会建，但 exe/前端仍要落位 |
 | 9 | TLS 证书 | `C:\dev\stream\cert.pem` + `C:\dev\key.pem`，**SAN 里要有这台机器的新 IP** | 浏览器证书不匹配；剪贴板 API 直接不可用（非安全上下文） |
 | 10 | 计划任务 `MCStreamSrv` | 在运行根里**以管理员身份**跑一次 `setup-watchdog.bat`（不需要账户密码）：它会顺手放行入站、建任务、立刻启动并打印 `[ok]` / `[fail]` | `task MISSING`，切换阶段失败 |
-| 11 | **入站放行** | 管理员跑一次 `setup-inbound.cmd`，或让第 10 项代劳；判据是从别的机器 `ping <IP>` 有回、`curl -k https://<IP>:8080` 不是 TIMEOUT | 服务跑得好好的，但外部一律连不上：ping 无响应、8080 TIMEOUT（连 RST 都不回）。`start-stream.cmd` 每次启动会尝试补，但提权失败时只能记一行日志 |
+| 11 | **入站放行** | 管理员跑一次 `setup-inbound.cmd`，或让第 10 项代劳；判据是从别的机器 `ping <IP>` 有回、`curl -k https://<IP>:8080` 不是 TIMEOUT | 服务跑得好好的，但外部一律连不上：ping 无响应、8080 TIMEOUT（连 RST 都不回）。`stream-server.exe --run` 每次启动会尝试补，但提权失败时只能记一行日志 |
 
 额外两条只跟游戏有关，不属于推流链：
 
@@ -188,7 +188,7 @@ Host mc-admin-2
 Unblock-File .\cloud-stream.zip
 
 # 1. 解压到任意位置，例如 D:\stream（纯 ASCII 短路径最省事）
-#    判据：stream-server.exe 与 start-stream.cmd 在同一层
+#    判据：stream-server.exe 与 stream-config.toml 在同一层
 
 # 2. 证书 —— 包里那对 PEM 的 SAN 是 192.168.59.148 / .143
 #    a) 新机器 IP 就是这两个之一：不用动
@@ -203,9 +203,9 @@ Unblock-File .\cloud-stream.zip
 
 # 3. 安装：双击 install.cmd —— 就这一步
 #    它自己弹 UAC 提权，然后一次做完：
-#      a) 检查包是否完整（缺 selkies-web 或缺 run-hidden.vbs 会当场停下）
+#      a) 检查包是否完整（缺 selkies-web 或缺 stream-config.toml 会当场停下）
 #      b) 放行 8080/TCP、ICMP echo、UDP 40000-40049 与程序规则
-#      c) 建 MCStreamSrv 任务：wscript.exe "D:\stream\run-hidden.vbs"
+#      c) 建 MCStreamSrv 任务：D:\stream\stream-server.exe --run
 #      d) 立刻启动一次，最多等 60 秒，然后打印 [ok] 和这台机器的访问地址
 #    只想知道它会做什么、不改动任何东西：install.cmd /check（不需要管理员）
 #
@@ -236,7 +236,7 @@ cd /d D:\stream
 set-password.cmd
 ```
 
-它写 `auth-token.txt`，`start-stream.cmd` 下次启动读它并传 `--auth-token`。之后
+它写 `auth-token.txt`，`--run` 下次启动读它并传 `--auth-token`。之后
 浏览器必须带 token 打开一次：
 
 ```
@@ -278,8 +278,8 @@ Get-NetConnectionProfile | Select-Object InterfaceAlias, NetworkCategory
 
 | 时机 | 动作 | 结果写在哪 |
 |---|---|---|
-| `start-stream.cmd` 跑起来（看门狗每分钟一次，但只在真的要起进程时执行） | 查 `cloud-stream 8080` / `ICMPv4` 两条规则，缺了就补（提权才有权限；没权限只记一行）；有 `auth-token.txt` 就把口令传给 exe | `logs\watchdog.log` 的 `PREFLIGHT` 行 |
-| exe 启动后 | 另起 `probe-listen.cmd`，每 5 秒探一次 loopback，最多 30 秒 | 同上：`PREFLIGHT listening on 8080 after N probe(s)` 或 `PREFLIGHT NOT listening ...` + 三条最可能原因 + 下一步 |
+| `stream-server.exe --run` 跑起来（看门狗每分钟一次，但只在真的要起进程时执行） | 查 `cloud-stream 8080` / `ICMPv4` 两条规则，缺了就补（提权才有权限；没权限只记一行）；有 `auth-token.txt` 就把口令传给 exe | `logs\watchdog.log` 的 `PREFLIGHT` 行 |
+| exe 启动后 | 自己另起 `--probe` 子进程，每 2.5 秒探一次 loopback，最多 30 秒 | 同上：`PREFLIGHT listening on 8080 after N probe(s)` 或 `PREFLIGHT NOT listening ...` + 三条最可能原因 + 下一步 |
 | `setup-watchdog.bat` 跑完 | 建任务（交互式令牌，无密码）→ 立刻启动 → 最多等 60 秒 → 打印 `[ok]` / `[fail]` | 屏幕上，窗口就是结果 |
 | `collect-launch-facts.cmd` | 第 9 节专门列入站：网络配置文件、本机 IPv4、两条规则的实际参数、最近 12 条 `PREFLIGHT` 行 | `cloud-stream-facts.txt` |
 
@@ -287,7 +287,7 @@ Get-NetConnectionProfile | Select-Object InterfaceAlias, NetworkCategory
 `PREFLIGHT`，它要么说 `listening on 8080`（那就是网络/防火墙），要么直接给出
 "8080 被占用 / 进程 panic / 加载器失败"三选一。
 
-**不建任务的最小路径**：双击 `start-stream.cmd`。它开一个黑窗口跑
+**不建任务的最小路径**：在运行根敲 `stream-server.exe --run`。它不开窗口跑
 `stream-server.exe`（关窗口 = 停服务），崩溃不会自愈。它同样会做上面那套
 preflight，所以窗口里看不到异常时，日志里也有判决。适合先验证画面，再回头
 建任务。
@@ -301,7 +301,7 @@ preflight，所以窗口里看不到异常时，日志里也有判决。适合�
 任务也不会触发；要么人工登录一次，要么开自动登录（`Autologon` 用 LSA 加密存
 口令，比在注册表里写明文强）。
 
-**不想建任务的最小路径**：双击 `start-stream.cmd`。它开一个黑窗口跑
+**不想建任务的最小路径**：在运行根敲 `stream-server.exe --run`。它不开窗口跑
 `stream-server.exe`（关窗口 = 停服务），崩溃不会自愈。它同样会做上面那套
 preflight，所以窗口里看不到异常时，日志里也有判决。适合先验证画面，再回头
 建任务。把它放进 `shell:startup` 也能开机自起，但同样只在登录后发生、且没有
@@ -326,7 +326,8 @@ Get-Content D:\stream\logs\stream-server.log | Select-String 'listening on' # ht
 本机 `PREFLIGHT listening` 但别的机器打不开 → 入站规则或网络配置文件，
 `setup-inbound.cmd`。
 
-要改分辨率 / 帧率 / 码率：编辑运行根里的 `start-stream.cmd`（默认
+要改分辨率 / 帧率 / 码率：编辑运行根里的 `stream-config.toml`，或用
+`cloud-setup.exe` 的「改配置」按钮（默认
 1920×1080 / 60 fps / 2500 kbps），然后重启任务。改完别动计划任务本身。
 
 这一路不需要构建机、不需要 ssh、不需要工具链。包里的 `README.txt` 就是三步版
@@ -401,7 +402,7 @@ ssh <别名> "powershell -c \"(Get-Process stream-server).SessionId\""     # 1�
 | 重启之后 8080 不通 | 没人登录 → 交互式任务不触发；或 `sshd` 是「手动」 | 开自动登录；`Set-Service sshd -StartupType Automatic` |
 | 页面打不开但 ssh 正常 | 新机器防火墙是开的，8080 没放行 | 管理员跑 `setup-inbound.cmd`（22 也要放行） |
 | **服务在跑、日志也写了 `starting`，但外部完全连不上** | 入站被整档丢弃：Public 配置文件默认丢全部入站（含 ICMP），VMware NAT / host-only 网卡常被判成 Public。表现是 `ping` 无响应、8080 **TIMEOUT**（不是 REFUSED） | 先看 `logs\watchdog.log` 最后一条 `PREFLIGHT`：若是 `listening on 8080`，问题就在网络层 —— 管理员跑 `setup-inbound.cmd`；`Get-NetConnectionProfile` 确认不是被 `Private` 规则挡在 Public 上 |
-| 日志里只有 `starting`，没有后半句 | 包内缺 `probe-listen.cmd`（旧包），或 `start-stream.cmd` 是旧版 | 用当前整包覆盖运行根；新版每次启动都会写 `PREFLIGHT` 判决 |
+| 日志里只有 `启动：<目录>`，没有 `PREFLIGHT` 行 | 跑的是旧包（新版的 `--run` 会自己 spawn `--probe`） | 用当前整包覆盖运行根；新版每次启动都会写 `PREFLIGHT` 判决 |
 | `setup-watchdog.bat` 打印 `[fail] nothing listening ... after 60 s` | 8080 被占用 / exe panic / 缺 VC++，三者之一 | 窗口里已列出要看的两份日志；或跑 `collect-launch-facts.cmd` |
 | 证书报警、剪贴板失灵 | SAN 还是旧 IP；或根本没配证书（退回明文 http） | 按 §1.1 重签；剪贴板 API 要求安全上下文 |
 | 信令连上、视频不出 | 跨网段/跨 NAT，`ice_servers=[]` 只有 host candidate | 同网段部署，或后续接 STUN/TURN |
@@ -414,7 +415,7 @@ ssh <别名> "powershell -c \"(Get-Process stream-server).SessionId\""     # 1�
 
 - 同一份整包（`target\output\cloud-stream.zip`）可以发到所有机器；`-SkipBuild`
   时也能直接复用上一轮的产物。
-- 每台机器各自的：证书（IP 不同）、计划任务（控制台账户不同，但不需要密码）、`start-stream.cmd`
+- 每台机器各自的：证书（IP 不同）、计划任务（控制台账户不同，但不需要密码）、`stream-config.toml`
   里的分辨率 / 码率参数（`--upload-dir` 已按账户推导，通常不用改）。
 - 现在**没有**集中管理面：每台一套 `-Target`，靠 ssh 别名区分；`/api/v1/health`
   是单机自述，不做聚合。

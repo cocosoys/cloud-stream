@@ -111,7 +111,7 @@ rustc 把引号原样带进链接命令行，link.exe 去找一个名字里真�
 
 **跨进程改不了别的窗口里的控件。** 验证表单时用一个小程序发窗口消息，`SetWindowTextW` / `GetWindowTextW` 对**另一个进程**里的控件一律无效（前者返回 0，后者返回空），必须用 `WM_SETTEXT` / `WM_GETTEXT` 让系统编组。这不是控制台的 bug，但"用脚本驱动界面自测"这件事会在这里静默失败 —— 第一次就是这么被骗的：控件没改成，保存报了"没有改动"，我还以为是保存逻辑坏了。
 
-**`config.toml` 与 `stream-config.toml` 不是同一个名字。** `--ops state` 原本只报 `config.toml (absent)`，而整包分发的那份叫 `stream-config.toml`、由 `start-stream.cmd --config` 显式指定 —— 于是屏幕上写着"没有配置文件"，实际上文件就在旁边、服务正在用它。现在 `state` 在默认位置不存在时会再看一眼同目录的 `stream-config.toml`。刻意**没有**改 `configfile::default_path`：那是启动时的自动发现逻辑，动它等于改变已有部署的加载行为。
+**`config.toml` 与 `stream-config.toml` 不是同一个名字。** `--ops state` 原本只报 `config.toml (absent)`，而整包分发的那份叫 `stream-config.toml`、由 `--run` 用 `--config` 显式指定 —— 于是屏幕上写着"没有配置文件"，实际上文件就在旁边、服务正在用它。现在 `state` 在默认位置不存在时会再看一眼同目录的 `stream-config.toml`。刻意**没有**改 `configfile::default_path`：那是启动时的自动发现逻辑，动它等于改变已有部署的加载行为。
 
 ## 7. 状态
 

@@ -950,41 +950,12 @@ fn summarize(snapshot: &Snapshot) -> serde_json::Value {
 
 /// 这台机器实际读的是哪份配置。
 ///
-/// `--config` 优先，其次默认位置。默认位置还要再分两种：`Config::parse` 自动
-/// 发现的是 exe 旁的 `config.toml`，但整包分发的那份叫 `stream-config.toml`
-/// 且由 `start-stream.cmd --config` 显式指定。只报 `config.toml (absent)`
-/// 会让人以为自己没配置，而实际上文件就在旁边、服务也在用它 —— 所以这里退
-/// 一步再找一个，纯只读。
-///
-/// 刻意**不改** `configfile::default_path`：那是启动时的自动发现逻辑，动它等于
-/// 改变已有部署的加载行为，不属于"报告得更准"。
-///
-/// 两份都不存在时这个函数还要**决定新建哪一份**：整包分发的布局里服务是用
-/// `--config stream-config.toml` 起的，那就得建那一份（见下面的证据）。
-///
-/// `state` 与 `config-get` / `config-set` 共用这一处：三处各写一遍，迟早有一
-/// 处先漂走，然后屏幕说 A、写入落在 B。
+/// 逻辑在 `configfile::resolve` 里 —— `Config::parse` 与 `--run` 用的是同一份
+/// 判断。这里留一层薄包装只是为了让调用点的 `crate::ops::resolve_config(...)`
+/// 读起来仍然像"我要这份"，而实现只有一处。三处各写一遍的结果，是屏幕说 A、
+/// 写入落在 B（配置表单那次就差点这样）。
 fn resolve_config(explicit: Option<&Path>) -> Option<PathBuf> {
-    if let Some(path) = explicit {
-        return Some(path.to_path_buf());
-    }
-    let primary = crate::configfile::default_path()?;
-    if primary.exists() {
-        return Some(primary);
-    }
-    let sibling = primary.with_file_name("stream-config.toml");
-    if sibling.exists() {
-        return Some(sibling);
-    }
-    // 两份都不存在时，看这份安装是不是整包分发的：`start-stream.cmd` 里写死了
-    // `--config %ROOT%\stream-config.toml`，于是服务只认那一份。此时若把表单
-    // 的改动存进 `config.toml`，就是"改了没反应"—— 一个纯粹由猜错文件名造成
-    // 的故障，而旁边那个脚本本身就是证据。
-    if primary.with_file_name("start-stream.cmd").exists() {
-        Some(sibling)
-    } else {
-        Some(primary)
-    }
+    crate::configfile::resolve(explicit)
 }
 
 /// 补空格到指定的**显示**宽度。

@@ -30,6 +30,7 @@
 //! security   横切：鉴权策略、主体、事件
 //! ops        横切：快照/回滚/校验，四个动作的共同底座（先于 config 执行）
 //! update     横切：检查/覆盖/验版本，更新动作的实现（先于 config 执行）
+//! run        横切：`--run` 把自身目录展开成参数，取代 start-stream.cmd
 //! configedit 横切：按键读改配置 + 校验，替代"用记事本改 TOML"（被 ops 使用）
 //! config     横切：命令行解析，无下游依赖
 //! ```
@@ -38,6 +39,7 @@
 //! 这条规则写在 `docs/architecture.md`，改动模块归属时先改文档再改代码。
 
 pub mod app;
+pub mod boot;
 pub mod config;
 pub mod configedit;
 pub mod configfile;
@@ -46,6 +48,7 @@ pub mod http;
 pub mod ops;
 pub mod pipeline;
 pub mod platform;
+pub mod run;
 pub mod security;
 pub mod signaling;
 pub mod update;

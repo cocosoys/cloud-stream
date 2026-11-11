@@ -430,7 +430,12 @@ impl Config {
         }
 
         let from_default_location = explicit.is_none();
-        if let Some(path) = explicit.or_else(crate::configfile::default_path) {
+        // `resolve` 而不是 `default_path`：整包分发里那份叫 `stream-config.toml`，
+        // 而 `default_path` 只认 `config.toml`。用后者的话，**不带任何参数**双击
+        // exe（或计划任务漏了 `--run`）会读不到配置、静默跑在 1080p30 默认值上
+        // —— 一个"看起来正常、实际忽略了每一处调整"的故障。`--run` 与 `--ops`
+        // 用的是同一份判断，三处合一。
+        if let Some(path) = explicit.or_else(|| crate::configfile::resolve(None)) {
             // 显式 `--config` 是"我说了有这么一份"，找不到就是错；默认位置只是
             // 顺手看一眼，不存在属于常态。
             if !from_default_location || path.exists() {

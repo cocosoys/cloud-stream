@@ -90,6 +90,20 @@ pub async fn run() -> anyhow::Result<()> {
     if let Some(code) = crate::update::try_run(&argv) {
         std::process::exit(code);
     }
+    // `--probe` 必须排在 `--run` 前面：展开 `--run` 时会 spawn 一个探测进程，
+    // 而那个进程进来的参数就是 `--probe ...`。两者不会同时出现在一条命令行上，
+    // 但这个顺序让“探测进程自己再去展开一次 --run”这种事不可能发生。
+    if let Some(code) = crate::run::probe_try_run(&argv) {
+        std::process::exit(code);
+    }
+
+    // `--run`：把“整包分发的目录布局”展开成一张普通命令行（见 `run.rs`）。
+    //
+    // 位置是刻意的：晚于上面三个一次性动作（它们更该赢 —— `--version` 和
+    // `--run` 一起敲时，人想看的是版本，不是把服务起来），早于下面的配置解析
+    // （展开出来的那串参数里就有 `--config`，`Config::parse` 的第一遍扫描要能
+    // 看到它）。
+    let argv = crate::run::expand_if_requested(argv);
 
     // #65: Windows 默认定时器粒度（~15.6 ms）会让 beat 的 `sleep` 超调，即使
     // beat 是 5.8 ms，循环也会被压到 ~57 Hz。一毫秒的粒度让 settle sleep 落在
@@ -105,7 +119,15 @@ pub async fn run() -> anyhow::Result<()> {
     let cfg = match config::Config::parse(argv) {
         Ok(cfg) => Arc::new(cfg),
         Err(err) => {
+            // GUI 子系统下 stderr 指向 NUL（见 `boot` 模块），所以这句话通常会
+            // 消失 —— 而配置错误恰恰是唯一必须有一个人看到的东西。`--run`
+            // 启动时同时写一份进 `logs\watchdog.log`，那是那台机器上仅存的线索。
             eprintln!("config error: {err}");
+            if crate::run::launched_by_run() {
+                if let Some(root) = crate::run::root() {
+                    crate::run::note(&root, &format!("config error: {err}"));
+                }
+            }
             std::process::exit(2);
         }
     };

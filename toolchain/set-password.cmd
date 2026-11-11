@@ -3,11 +3,11 @@ rem ---------------------------------------------------------------------------
 rem Set the password this machine requires before it streams.
 rem
 rem Run it, type a password, restart the task. The password lands in
-rem auth-token.txt next to this script; start-stream.cmd passes it to the exe
+rem auth-token.txt next to this script; --run passes it to the exe
 rem as --auth-token, and the server then answers 401 to every /api/ request
 rem that does not present it.
 rem
-rem Why a file and not a flag in start-stream.cmd: that file is ASCII, read byte
+rem Why a file and not a flag on the command line: that file is ASCII, read byte
 rem by byte in the OEM code page. A password with a non-ASCII character would be
 rem mangled before the exe saw it. Hence the ASCII-only rule enforced below --
 rem it is a cmd boundary, not a security opinion.

@@ -6,6 +6,26 @@
 > 脚本：`toolchain/deploy.ps1`（本机）、`toolchain/deploy-remote.ps1`（被控机）。
 > 最后核对：2026-11-03，部署机 `192.168.59.148`，`ssh mc-admin`。
 
+> ## ⚠ 本文写于启动脚本被删之前
+>
+> `start-stream.cmd` / `start-stream.60fps.cmd` / `run-hidden.vbs` /
+> `probe-listen.cmd` 这四个**已经不存在**了。它们做的事现在由两个参数承担：
+>
+> | 原来 | 现在 |
+> |---|---|
+> | `start-stream.cmd` | `stream-server.exe --run`（从自身目录推导一切） |
+> | `start-stream.60fps.cmd` | `stream-server.exe --run --fps 60` |
+> | `run-hidden.vbs` | 不需要（exe 是 GUI 子系统，窗口不会被创建） |
+> | `probe-listen.cmd` | `stream-server.exe --probe`（`--run` 自己 spawn） |
+>
+> 所以本文里凡是出现这四个文件名的地方，读起来都该替换成上表右列。**没有**逐行
+> 重写的原因：这个文件的价值一半在“当时为什么这样”的推理链条里，把名词换掉会
+> 让那些段落失去时间坐标。当前形态的权威说明是
+> [`docs/operations-run.md`](operations-run.md)。
+>
+> 仍然准确的部分：上传/切换/回滚的时序、部署失败的各种成因、被控机的路径推导
+> 规则、健康检查与归档口径。
+
 ---
 
 ## 0 一条命令
@@ -147,14 +167,11 @@ UAC，然后检查包、放行入站、建任务、立刻起一次并打印 `[ok
 | `target\output\cloud-stream\stream-server.exe` | `C:\dev\stream\stream-server.exe` | 采集 / 编码 / 信令 / HTTP 静态 / 文件传输，全部逻辑 | **要** |
 | `…\ViGEmClient.dll` | `C:\dev\stream\ViGEmClient.dll` | #17 虚拟手柄的客户端 DLL，服务端运行时 `LoadLibraryW` 取；缺了只降级成"没手柄" | **要**（已加载的 DLL 有共享锁，只能在停进程后覆盖） |
 | `…\selkies-web\`（打包 1,214,640 B） | `C:\dev\stream\selkies-web\` | 前端整页（2008 个文件） | 不要 |
-| `…\start-stream.cmd` | `C:\dev\stream\start-stream.cmd` | **命令行参数全在这**，路径按 `%~dp0` 推导 | 下次启动生效 |
-| `…\start-stream.60fps.cmd` | `C:\dev\stream\start-stream.60fps.cmd` | 同一命令行的"手工版"，让人在被控机上用和看门狗一致的参数跑一次；任务不执行它 | 不要 |
-| `…\run-hidden.vbs` | `C:\dev\stream\run-hidden.vbs` | 无窗口启动，避免每分钟闪一次黑框 | 下次启动生效 |
+| `…\stream-config.toml` | `C:\dev\stream\stream-config.toml` | **参数本体**；路径由 `--run` 从自身目录推导 | 下次启动生效 |
 | `…\setup-watchdog.bat` | `C:\dev\stream\setup-watchdog.bat` | 建/重建看门狗任务，任务动作按自身位置生成 | 不要 |
 | `…\collect-launch-facts.cmd` | `C:\dev\stream\collect-launch-facts.cmd` | 起不来时的第一个动作：双击生成事实清单（只读） | 不要 |
 | `…\setup-inbound.cmd` | `C:\dev\stream\setup-inbound.cmd` | 管理员运行一次：放行 TCP 8080、ICMP、UDP 40000-40049 与 `stream-server.exe` 程序规则，否则外部一概连不上、WebRTC 切不过去 | 不要 |
-| `…\open-inbound.cmd` | `C:\dev\stream\open-inbound.cmd` | 上面那条规则的幂等实现，`start-stream.cmd` 每次真启动时调用；无输出，只回退出码 | 下次启动生效 |
-| `…\probe-listen.cmd` | `C:\dev\stream\probe-listen.cmd` | 启动后另起一个进程探 loopback，把判决写进 `watchdog.log` 的 `PREFLIGHT` 行 | 下次启动生效 |
+| `…\open-inbound.cmd` | `C:\dev\stream\open-inbound.cmd` | 上面那条规则的幂等实现，`--run` 每次真启动时调用；无输出，只回退出码 | 下次启动生效 |
 | `…\set-password.cmd` | `C:\dev\stream\set-password.cmd` | 设 / 改 / 清访问口令，结果写入 `auth-token.txt` | 下次启动生效 |
 | `…\cert.pem` / `key.pem` | `C:\dev\stream\cert.pem` / `key.pem` | 仅当被控机**没有**证书时安装（SAN 是那台机器的 IP，不能拿构建端覆盖） | 要（`--tls-*` 在启动参数里） |
 | `toolchain\deploy-remote.ps1` | `C:\dev\deploy\deploy-remote.ps1` | 被控端执行体（`deploy\` 里唯一的常驻文件） | 不要 |
@@ -193,10 +210,10 @@ manifest.json / favicon.ico / icon.png / icon-512.png
 |---|---|---|
 | sshd 服务 | `sshd`，启动类型 **Automatic** | 重启后还能连进来；改一次永久生效 |
 | 防火墙 | `OpenSSH SSH Server (sshd)`，TCP 22 入站 | 同上 |
-| 计划任务 | `MCStreamSrv`，登录时 + 每 1 分钟，动作 = `<运行根>\run-hidden.vbs` | 看门狗（#81），交互式令牌创建，不需要密码 |
+| 计划任务 | `MCStreamSrv`，登录时 + 每 1 分钟，动作 = `<运行根>\stream-server.exe --run` | 看门狗（#81），交互式令牌创建，不需要密码 |
 | TLS 证书 | `C:\dev\stream\cert.pem` / `key.pem` | 自签，静态；脚本只检查存在 |
 | 目录 | `C:\dev\stream\logs`、`C:\dev\stream\selkies-web`、`C:\dev\deploy` | 建一次（幂等） |
-| 上传根 | `--upload-dir %USERPROFILE%\Desktop` | 在 `start-stream.cmd` 里，按运行账户推导 |
+| 上传根 | `--upload-dir %USERPROFILE%\Desktop` | 在 `run.rs` 里，按运行账户推导 |
 
 ### 1.3 明确**不**进部署链的
 
@@ -241,11 +258,10 @@ pwsh toolchain/deploy.ps1 -WebRoot D:\src\cloud-stream-web
 
 | 路径 | 谁在引用 | 怎么来的 |
 |---|---|---|
-| `<根>\stream-server.exe` | `start-stream.cmd` | `%~dp0` |
-| `<根>\selkies-web` | `start-stream.cmd` 的 `--dist` | `%~dp0`；`config.rs` 的默认值也是相对的 `selkies-web` |
+| `<根>\stream-server.exe` | `--run` | exe 自身目录（`run::root`） |
+| `<根>\selkies-web` | `--run` 的 `--dist` | exe 自身目录；`config.rs` 的默认值也是相对的 `selkies-web` |
 | `<根>\cert.pem` / `key.pem` | `--tls-cert` / `--tls-key` | `%~dp0`；两个都在才启用 TLS |
 | `<根>\logs\stream-server.log` | `--log` | `%~dp0`；体检读它 |
-| `<根>\run-hidden.vbs` | 计划任务的 `/TR` | `setup-watchdog.bat` 用 `%~dp0` 生成；`run-hidden.vbs` 自己再用 `WScript.ScriptFullName` 找同级目录 |
 | `<base>\deploy\selkies-web.zip` | `deploy-remote.ps1` 的 `-WebZip` | `$PSScriptRoot` |
 | `<base>\stream` | `deploy-remote.ps1` 的 `-Root` 默认值 | `$PSScriptRoot` 的上一级 + `stream` |
 
@@ -1040,16 +1056,15 @@ Cookie: selkies_token=test123 -> 200
       （只换前端时中间一行是 `pid=...（未重启，会话保持）`，这是正常的，见 §7.15；
       全量部署时中间一行可能是 `pid=...（新进程）` 加一条说明 —— 指针日志刷屏会把
       启动行挤出日志尾部，端口通即视为在监听，见 §7.17）
-- [ ] 体检里 `看门狗动作` 指向 `<运行根>\run-hidden.vbs`（不是旧目录）
+- [ ] 体检里 `看门狗动作` 是 `<运行根>\stream-server.exe --run`（不是旧目录）
 - [ ] `curl -sk https://192.168.59.148:8080/ | grep -o 'assets/[^"]*'` 有两行
 - [ ] 浏览器强刷后**左侧有工具栏**（没有 = 服务成 core 构建了，§7.1）
 - [ ] 右上角有统计面板，右边缘有粉色胶囊
 - [ ] 故意失败一次能回滚：`-SkipFrontend` 上传一个坏 zip，或直接跑 `-Rollback`
 - [ ] 被控机上只有正式产物：`C:\dev\stream` 里没有 `*.prev` / `*.new.*`，
       `C:\dev\deploy` 只剩 `deploy-remote.ps1` 与九个上机脚本（zip 解压完即删）
-- [ ] 运行根里九个上机脚本都在：`start-stream.cmd` / `start-stream.60fps.cmd` /
-      `run-hidden.vbs` / `setup-watchdog.bat` / `collect-launch-facts.cmd` /
-      `setup-inbound.cmd` / `open-inbound.cmd` / `probe-listen.cmd` /
+- [ ] 运行根里五个上机脚本都在：`setup-watchdog.bat` / `setup-task.ps1` /
+      `collect-launch-facts.cmd` / `setup-inbound.cmd` / `open-inbound.cmd` /
       `set-password.cmd`
       （少一个就是有人改了 `$LauncherNames` 而没改 `$Launchers`，打包与安装用的是
       两份列表）
@@ -1106,7 +1121,7 @@ curl.exe -sk -o NUL -w '%{http_code}' https://192.168.59.148:8080/api/status
 | ssh 通 | `ssh mc-admin hostname` | 主机名 |
 | sshd 自启 | `ssh mc-admin 'powershell -c "Get-Service sshd \| Select Status,StartType"'` | `Running Automatic` |
 | 看门狗起了没 | `ssh mc-admin 'powershell -c "(Get-ScheduledTask -TaskName MCStreamSrv).State"'` | `Running` |
-| 看门狗指向哪 | `ssh mc-admin 'powershell -c "(Get-ScheduledTask -TaskName MCStreamSrv).Actions \| % { $_.Arguments }"'` | `<运行根>\run-hidden.vbs` |
+| 看门狗指向哪 | `ssh mc-admin 'powershell -c "(Get-ScheduledTask -TaskName MCStreamSrv).Actions \| % { $_.Arguments }"'` | `<运行根>\stream-server.exe --run` |
 | 服务在跑 | `curl.exe -sk https://192.168.59.148:8080/api/status` | `ok` |
 | 进程会话 | `ssh mc-admin 'powershell -c "Get-Process stream-server \| Select Id,SessionId"'` | `SessionId=1` |
 | 证书 | `ssh mc-admin 'powershell -c "Get-ChildItem C:\dev\stream\cert.pem \| Select LastWriteTime"'` | 自查是否过期 |
@@ -1194,7 +1209,7 @@ RunAs` 重开自己，**原窗口直接退出**。所以屏幕上永远只有一
 **可回传**：让用户在动手之前先跑一次，把输出贴过来，比来回猜"你那台机器缺什么"
 快得多。两者都不需要管理员、都不改任何状态，因此在任何权限下都能跑。
 
-`/check` 会检查：exe / `start-stream.cmd` / `run-hidden.vbs` / `setup-task.ps1` /
+`/check` 会检查：exe / `stream-config.toml` / `setup-task.ps1` /
 `open-inbound.cmd` / `selkies-web\index.html` 是否齐全，`vcruntime140.dll` 是否
 存在（缺了 exe 连 `main()` 都到不了，日志里一个字都不会有），已存在的任务指向
 哪里，8080 是否已被别的程序占用。
