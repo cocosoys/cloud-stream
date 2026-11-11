@@ -692,6 +692,31 @@ function New-Installer {
 
 <#
 .SYNOPSIS
+    编运行根里那份控制台（不带 embed），返回 exe 路径。
+
+.DESCRIPTION
+    两个外壳都用它，所以抽出来：Inno 把它铺进 `{app}`，MSI 把它当组件收进去。
+
+    不能复用 `target\release` 里的那份 —— 那是 embed 版（8.7 MB），放进运行根
+    就是"exe 里又有整个包"，白占 8 MB。用独立 target 目录而不是反复切
+    features：同一个 target 目录下换 features 会让 cargo 把整个 crate 重编一遍。
+#>
+function Get-ConsoleExe {
+    if (-not $script:BuildEnvReady) { Initialize-BuildEnv }
+    $consoleDir = Join-Path $RepoRoot 'target\inno-console'
+    Write-Info '编运行根里的控制台（不带 embed）'
+    Invoke-Native -Exe 'cargo' -Arguments @(
+        'build', '--release', '-p', 'cloud-setup',
+        '--target-dir', $consoleDir,
+        '--manifest-path', (Join-Path $RepoRoot 'Cargo.toml')
+    ) -Quiet
+    $consoleExe = Join-Path $consoleDir 'release\cloud-setup.exe'
+    if (-not (Test-Path $consoleExe)) { throw "编完却找不到 $consoleExe" }
+    return $consoleExe
+}
+
+<#
+.SYNOPSIS
     编"向导版"安装器：Inno Setup 外壳 + 同一个 payload。
 
 .DESCRIPTION
@@ -734,19 +759,7 @@ function New-InnoInstaller {
     }
 
     # ---- 2 运行根里那一份控制台（不带 embed）------------------------------
-    # 不能复用 target\release 里的那份：那是 embed 版（8.7 MB），放进运行根
-    # 就是"exe 里又有整个包"，白占 8 MB。用独立 target 目录而不是反复切
-    # features：同一个 target 目录下换 features 会让 cargo 把整个 crate 重编。
-    if (-not $script:BuildEnvReady) { Initialize-BuildEnv }
-    $consoleDir = Join-Path $RepoRoot 'target\inno-console'
-    Write-Info '编运行根里的控制台（不带 embed）'
-    Invoke-Native -Exe 'cargo' -Arguments @(
-        'build', '--release', '-p', 'cloud-setup',
-        '--target-dir', $consoleDir,
-        '--manifest-path', (Join-Path $RepoRoot 'Cargo.toml')
-    ) -Quiet
-    $consoleExe = Join-Path $consoleDir 'release\cloud-setup.exe'
-    if (-not (Test-Path $consoleExe)) { throw "编完却找不到 $consoleExe" }
+    $consoleExe = Get-ConsoleExe
 
     # ---- 3 版本号 --------------------------------------------------------
     # 从 Cargo.toml 读，而不是从 git tag：这个值要出现在"应用和功能"里，
@@ -794,6 +807,126 @@ function New-InnoInstaller {
     }
     Write-Ok ("向导版 {0}（{1:N1} MB，中文向导）md5={2}" -f (Split-Path -Leaf $setup), $mb, (Get-Md5 $setup))
     return $setup
+}
+
+<#
+.SYNOPSIS
+    编第三个外壳：MSI（WiX）。给组策略 / SCCM 那类"管理员推"的场景。
+
+.DESCRIPTION
+    三个外壳，同一份 payload，同一对系统集成命令 —— 区别只在"谁铺文件、
+    谁记录卸载项"：
+
+      cloud-setup.exe        自己解压自己，控制台在运行根里
+      cloud-stream-setup.exe Inno：向导、自选目录、控制面板卸载项
+      cloud-stream.msi       Windows Installer：/qn 静默、INSTALLDIR= 指定目录、
+                              升级/修复/卸载都归 msiexec 管
+
+    这里**不做**任何新的系统集成。建任务、防火墙、录音设备仍然由 MSI 里的
+    两个 deferred CustomAction 调 cloud-setup.exe 那两条命令完成，见
+    toolchain/wix/cloud-stream.wxs 的头部说明。
+
+    没有 WiX 时只警告、不 throw：三个安装器里缺一个不是"构建坏了"。
+#>
+function New-MsiInstaller {
+    param([string]$PayloadDir)
+
+    # ---- 1 工具链 --------------------------------------------------------
+    # WiX 3.11 是 xcopy 部署的（33 MB zip 解压即用，跑在系统自带的 .NET
+    # Framework 上）。不装 SDK、不进 PATH —— 放在 target\ 下，和别的构建产物
+    # 一起被清理，也让"这台机器上有没有 WiX"不影响别人克隆下来能不能编。
+    $wixBin = Join-Path $RepoRoot 'target\wix-tools\bin'
+    $candle = Join-Path $wixBin 'candle.exe'
+    $light = Join-Path $wixBin 'light.exe'
+    $heat = Join-Path $wixBin 'heat.exe'
+    if (-not ((Test-Path $candle) -and (Test-Path $light) -and (Test-Path $heat))) {
+        Write-Note '没有 WiX 工具链，跳过 MSI'
+        Write-Note '  一次性准备（解压到 target\wix-tools\bin）：'
+        Write-Note '  curl -L -o wix.zip https://ghfast.top/https://github.com/wixtoolset/wix3/releases/download/wix3112rtm/wix311-binaries.zip'
+        Write-Note '  unzip wix.zip -d target\wix-tools\bin'
+        return $null
+    }
+
+    $work = Join-Path $RepoRoot 'target\wix'
+    if (Test-Path $work) { Remove-LocalPath $work }
+    New-Item -ItemType Directory -Path $work -Force | Out-Null
+
+    # ---- 2 版本号 --------------------------------------------------------
+    # 和 Inno 那边同一个来源：crates\stream-server\Cargo.toml。MSI 的 Version
+    # 只能是 x.y.z（major 上限 255），这里恰好是三段。
+    $ver = '0.0.0'
+    $cargoToml = Join-Path $RepoRoot 'crates\stream-server\Cargo.toml'
+    if (Test-Path $cargoToml) {
+        $m = Select-String -Path $cargoToml -Pattern '(?m)^\s*version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"' |
+            Select-Object -First 1
+        if ($m) { $ver = $m.Matches[0].Groups[1].Value }
+    }
+
+    # ---- 3 heat：前端树 --------------------------------------------------
+    # 近两千个文件，手写没有意义。要点：
+    #   -cg WebFiles  主文件里按 ComponentGroupRef 引用这个名字
+    #   -dr WEBFILES  组件直接落在 selkies-web 那个目录下（-srd 抑制根目录元素）
+    #   -ag           组件 GUID 交给 candle 按 keypath 生成 —— **确定性**的。
+    #                 用 -gg（构建时随机生成）会让同一个文件每次构建换个 GUID，
+    #                 升级时 MSI 就认不出"这是同一份文件"。
+    #   -var           源文件路径写成 $(var.WebSource)\...，路径不进 .wxs
+    $webSrc = Join-Path $PayloadDir 'selkies-web'
+    if (-not (Test-Path $webSrc)) { throw "MSI 需要 $webSrc，但它不存在" }
+    $webWxs = Join-Path $work 'web.wxs'
+    Write-Info '收前端树（heat，近两千个文件）'
+    Invoke-Native -Exe $heat -Arguments @(
+        'dir', $webSrc,
+        '-cg', 'WebFiles',
+        '-dr', 'WEBFILES',
+        '-ag',
+        '-srd',
+        '-sreg', '-scom',
+        '-var', 'var.WebSource',
+        '-nologo',
+        '-out', $webWxs
+    ) -Quiet
+    if (-not (Test-Path $webWxs)) { throw "heat 没产出 $webWxs" }
+
+    # ---- 4 candle + light ------------------------------------------------
+    Write-Info "编 MSI（WiX，payload = $PayloadDir）"
+    $wxs = Join-Path $RepoRoot 'toolchain\wix\cloud-stream.wxs'
+    # 和 Inno 那边用的同一份（不带 embed）。MSI 也要它：运行根里的控制台是
+    # 用户点「卸载 / 修复」的入口，缺了它 MSI 装出来的目录少一个 exe。
+    $consoleExe = Get-ConsoleExe
+
+    $candleBase = @(
+        '-nologo',
+        '-arch', 'x64',
+        "-dAppVersion=$ver",
+        "-dBundleDir=$PayloadDir",
+        "-dConsoleExe=$consoleExe",
+        "-dWebSource=$webSrc"
+    )
+    # 一次编一个文件、各给一个 -out：candle 只有在 -out 以反斜杠结尾时才把它
+    # 当目录，而 PowerShell 会把结尾那个反斜杠吃掉 —— 与其绕这个，不如分两次。
+    Invoke-Native -Exe $candle -Arguments ($candleBase + @('-out', "$work\cloud-stream.wixobj", $wxs)) -Quiet
+    Invoke-Native -Exe $candle -Arguments ($candleBase + @('-out', "$work\web.wixobj", $webWxs)) -Quiet
+
+    $msi = Join-Path (Split-Path -Parent $PayloadDir) 'cloud-stream.msi'
+    if (Test-Path $msi) { Remove-LocalPath $msi }
+    # -b 把"找不到源文件"的当前目录钉在工作目录上，否则 light 会去 exe 所在
+    # 目录找，报一堆看不出所以然的 LGHT0103。
+    Invoke-Native -Exe $light -Arguments @(
+        '-nologo',
+        '-b', $work,
+        '-out', $msi,
+        "$work\cloud-stream.wixobj",
+        "$work\web.wixobj"
+    ) -Quiet
+
+    if (-not (Test-Path $msi)) { throw "light 说成功，但没有 $msi" }
+    $mb = (Get-Item $msi).Length / 1MB
+    if ($mb -lt 3) {
+        # 一个 1 MB 的 MSI 说明前端树没进去 —— 装完会是个只有 exe 的空壳。
+        throw "MSI 只有 $([math]::Round($mb, 2)) MB，payload 没被打进去"
+    }
+    Write-Ok ("MSI {0}（{1:N1} MB，v{2}）md5={3}" -f (Split-Path -Leaf $msi), $mb, $ver, (Get-Md5 $msi))
+    return $msi
 }
 
 
@@ -1107,8 +1240,9 @@ try {
         逼人构建前端。
     #>
     $packaged = $false
-    # StrictMode 下未定义的变量一读就抛，而出口那段要判断"向导版做出来了没"。
+    # StrictMode 下未定义的变量一读就抛，而出口那段要判断"向导版/MSI 做出来了没"。
     $InnoSetup = $null
+    $MsiInstaller = $null
     if (-not (Test-Path (Join-Path $DashDir 'dist\index.html'))) {
         Write-Step '汇总产物：跳过（本机没有 dashboard dist，整包不完整）'
         Write-Note '这一轮只发后端；下一次带前端的部署会把 target\output\cloud-stream 补齐'
@@ -1119,6 +1253,8 @@ try {
         New-Installer -PayloadDir $BundleDir
         # 向导版：同一个 payload，另一个外壳。缺 ISCC 时返回 $null，不影响上面那个。
         $InnoSetup = New-InnoInstaller -PayloadDir $BundleDir
+        # MSI：同一个 payload，第三个外壳。缺 WiX 时同样返回 $null。
+        $MsiInstaller = New-MsiInstaller -PayloadDir $BundleDir
         $packaged = $true
     }
     $srcExe = $(if ($packaged) { Join-Path $BundleDir 'stream-server.exe' } else { $LocalExe })
@@ -1162,9 +1298,16 @@ try {
         } else {
             Write-Note '这一轮没有向导版安装器（本机没有 ISCC，见上面的提示）'
         }
+        if ($MsiInstaller) {
+            Write-Info ("MSI {0}（{1:N1} MB，msiexec /qn 静默 / INSTALLDIR= 指定目录 / 组策略与 SCCM 可推）" -f
+                (Split-Path -Leaf $MsiInstaller), ((Get-Item $MsiInstaller).Length / 1MB))
+        } else {
+            Write-Note '这一轮没有 MSI（本机没有 WiX 工具链，见上面的提示）'
+        }
         Write-Note ('发给别人装：拷 cloud-stream-setup.exe —— 向导、可以自己选目录、' +
             '装完在"应用和功能"里能卸。只想要一个文件、不想看向导：拷 cloud-setup.exe，' +
-            '它自带整包，双击就是控制台。整包目录与 zip 是给"已经有任务在跑、只换文件"的部署路径用的。')
+            '它自带整包，双击就是控制台。要批量推/让它归 msiexec 管：用 cloud-stream.msi。' +
+            '整包目录与 zip 是给"已经有任务在跑、只换文件"的部署路径用的。')
         return
     }
 

@@ -125,6 +125,13 @@ stream-server.exe --config stream-config.toml --print-config
 另一套实现 —— 建任务、防火墙、录音设备仍然由 `cloud-setup.exe --finish` /
 `--uninstall --keep` 做，两条命令和上面那个双击流程完全一样。
 
+需要组策略 / SCCM 推的时候用 `cloud-stream.msi`（约 7.7 MB，`msiexec /i ... /qn`，
+`INSTALLDIR=` 可改目录）：它是**第三个外壳**，系统集成还是那两条命令 —— 连
+"修复前先停服务"都复用 `--uninstall --keep`。没给 `ACCOUNT=` 时由控制台自己去问
+活动控制台会话的主人，所以以 SYSTEM 身份推送也不会把任务注册到 session 0。
+四条路（装/修复/升级/卸载）都在实机上验过，踩过的五个坑写在
+[`docs/operations-install.md`](docs/operations-install.md) 的「第三个外壳」那节。
+
 目标机连 ssh 都还没有时（`deploy.ps1` 正是靠 ssh 才够得着它），先拷
 `toolchain\enable-ssh.ps1` 与 `enable-ssh.cmd` 过去双击一次：装 sshd、只对构建机
 放行 22、写入公钥并**先自测再关密码登录**，见 `docs/deploy-ssh-access.md`。

@@ -128,7 +128,126 @@ winget install --id JRSoftware.InnoSetup -e
 用户级 → Program Files"三档找，只认 `Program Files` 会在明明装了的时候报没装。
 
 > **MSI 走同一条分工**：两个 deferred CustomAction 调同一对 `--finish` /
-> `--uninstall --keep`，留给需要组策略 / SCCM 分发的场景。
+> `--uninstall --keep`，留给需要组策略 / SCCM 分发的场景。细节见下一节。
+
+## 第三个外壳：MSI（WiX）
+
+`toolchain\wix\cloud-stream.wxs` + `deploy.ps1` 的 `New-MsiInstaller`。三个外壳
+一份 payload，系统集成仍然只有那两条命令 —— MSI 这边连"停服务"都是复用
+`--uninstall --keep`，没有第三套逻辑。
+
+```powershell
+# 一次性：解压即用，不装 SDK、不进 PATH（33 MB zip，跑系统自带 .NET Framework）
+curl -L -o wix.zip https://ghfast.top/https://github.com/wixtoolset/wix3/releases/download/wix3112rtm/wix311-binaries.zip
+unzip wix.zip -d target\wix-tools\bin
+
+.\toolchain\deploy.ps1 -PackageOnly      # 顺带出 target\output\cloud-stream.msi
+```
+
+没有 `target\wix-tools\bin` 时只警告并跳过 MSI，便携版和向导版照常出 —— 和
+"没装 Inno" 同一个分寸：少一个产物不是构建坏了。
+
+### 四档都在 .150 上跑过
+
+| 动作 | 命令 | 结果 |
+|---|---|---|
+| 装新机 | `msiexec /i cloud-stream.msi /qn` | exit 0，2022 文件、任务指向 `...\cloud-stream\stream-server.exe`、8080 在听、5 条规则、ARP 有 `0.4.0` |
+| 修复 | `msiexec /famus {ProductCode} /qn` | exit 0（此前 1641），服务换了个 pid 继续在听 |
+| 升级 | `msiexec /i cloud-stream-0.4.1.msi /qn` | exit 0，12 秒；ARP 只剩 `0.4.1` 一条 |
+| 卸载 | `msiexec /x {ProductCode} /qn` | exit 0，目录消失、任务消失、规则 5→1（只留我们自己那条 ssh）、ARP 清空 |
+
+### 五条用错误换来的结论
+
+**1. 自定义动作要用 Type 18（`BinaryKey`），不是 Type 34（`Directory`）**
+
+Type 34 是"跑刚装进 Program Files 的那一份"。在这里跑不起来：日志里 `FileCopy`
+就在前面几秒、文件确实装上了，MSI 却在**排程那一刻**报 `Error 1721`（程序无法
+运行），把 `[INSTALLDIR].` 补上也不解决。改成
+`<Binary Id="ConsoleBin" SourceFile="$(var.ConsoleExe)"/>` + `BinaryKey` 一次
+通过。代价是 .msi 里多存 752 KB（非 embed 的那份控制台，不是 8.7 MB 那个）。
+
+顺带解决一个隐患：跑的是**这个 MSI 自己带的**新版控制台，不是被升级的旧版。
+
+**2. `[INSTALLDIR]` 自带结尾反斜杠，`--dir` 要归一化**
+
+格式化的目录属性结尾一定带 `\`，于是 `--dir "[INSTALLDIR]"` 变成
+`"C:\...\cloud-stream\"`，MSI 再把结尾反斜杠转义成 `\"` —— 引号当场就断。
+`.wxs` 里的写法是 `--dir "[INSTALLDIR]."`（一个点让反斜杠后面跟字符）。
+
+但那个点会原样漏进计划任务的 `<Command>`，变成
+`...\cloud-stream\.\stream-server.exe`：能跑，却和 `--task-xml` 渲染出来的、
+以及别的安装器写下的不是同一个字符串 —— 部署侧按路径核对任务时就会判成不匹配。
+所以 `--dir` 的解析点统一过一次 `sys::normalize_dir`（吃掉结尾分隔符、重复
+分隔符与 `.` 段），两处 caller 都走它。
+
+**3. deferred 动作里 `[%USERDOMAIN]\[%USERNAME]` 不会被求值**
+
+原来属性表里写 `Value="[%USERDOMAIN]\[%USERNAME]"`，安装时因为命令行显式给了
+`ACCOUNT=` 看不出问题；修复（没人给）时日志里是：
+
+```text
+Property(S): ACCOUNT = [%USERDOMAIN]\[%USERNAME]
+```
+
+原样的字符串进了命令行，控制台拿到不存在的账户名，`schtasks` 失败，
+`Return="check"` 把它变成 1603。deferred 动作在**服务端**排程，环境变量只在
+客户端那一侧有意义。
+
+改成分工：MSI 只负责**转达**（有人显式给了 `ACCOUNT` 就传下去，供 SCCM 那种
+以 SYSTEM 推送、机器上又没人的场景），没人给就让控制台自己去问 ——
+`sys::install_account`：当前身份是服务账户（`NT AUTHORITY\*` / `NT SERVICE\*`）
+时，用 `WTSQuerySessionInformationW` 查活动控制台会话的主人。那本来就是系统
+集成该知道的事，而且比环境变量可靠（.150 的 `%USERNAME%` 是"Windows 用户"，
+拿它拼账户名只会得到一个假身份）。
+
+顺带一条纪律：**任务绝不能注册给 SYSTEM**。SYSTEM 跑在 session 0，采集和
+`SendInput` 看到的是一张空桌面 —— 安装成功、8080 有应答、任务也在跑，然后
+网页上全是黑的。
+
+**4. 升级要"覆盖安装"，不能"删了又写"**
+
+默认的 `Schedule="afterInstallInitialize"` 是先把旧版卸掉（文件被删）再铺新的。
+0.4.0 升 0.4.1 时实测卡在这里：观察器逐秒确认文件在、大小也对，但排程出来的
+计划任务**每一次启动都返回 2（找不到文件）** —— `--finish` 的两次 `/Run` 和
+每分钟的定时触发全一样，直到 MSI 事务结束（回滚）之后手动 `/Run` 立刻就好。
+那个"删了又写"的路径在事务里是个空壳。
+
+改成 `Schedule="afterInstallExecute"`（先装新版、再卸旧版）就没有这一步：新版
+直接盖在旧文件上，文件从头到尾都在。旧版卸载随后发生，而它那些文件用的是
+**同一批组件 GUID**（heat `-ag` 按 keypath 确定性生成），引用计数还在，不会
+把刚装好的文件删掉。代价是系统集成必须排在 `RemoveExistingProducts` 之后 ——
+旧版卸载里那条 `--uninstall --keep` 会把任务和规则再删一遍。
+
+**5. 修复/升级前必须先把服务停下**
+
+不停就换文件，MSI 会在 `InstallValidate` 阶段让 Restart Manager 抢着去关占用者，
+关不掉就把替换排到重启：修复返回 **1641**（`ERROR_SUCCESS_REBOOT_INITIATED`）
+而不是 0，服务在重启前一直是停的。所以 `StopBeforeInstall` 排在 `InstallFiles`
+之前（条件 `Installed AND NOT REMOVE~="ALL"`，覆盖修复与升级，不碰全新安装）。
+
+### 两个不那么显眼但会出事的细节
+
+**目录本身要显式 `RemoveFolder`。** 文件、`selkies-web\`、`logs\` 全没了，
+`C:\Program Files\cloud-stream` 自己留着 —— Windows Installer 只删"表里写了的
+目录"，不会因为一个目录空了就顺手删。而 `RemoveFolders` 按表的**书写顺序**
+处理、只删"那一刻已经空了的"，所以收根目录那一条必须排在 `logs\` **之后**
+（`DirCleanup` 组件在 feature 末尾）。
+
+**不做开始菜单快捷方式。** per-machine 装到 Program Files 时，
+`ProgramMenuFolder` 在链接期被 ICE38/43/57 判成"往用户配置里装东西"，而那三条
+说的问题是真实的。取舍：MSI 是给管理员批量推的，控制台在已知路径下
+（`Program Files\cloud-stream\cloud-setup.exe`）；要快捷方式的人用向导版。
+
+其它几条小的：`Language="2052"` 必须配 `Codepage="936"`（否则 light 按 1252
+处理，中文串报 `LGHT0311`）；`NeverOverwrite` 放在 `Component` 上（v3 的 `File`
+没有这个属性）；XML 注释里**不能出现两个连字符**，命令行开关只能出现在
+`ExeCommand` 属性里。
+
+### 已知残留
+
+安装失败回滚时，`--finish` 已经建好的防火墙规则不会跟着消失 —— netsh 建的规则
+不在 MSI 的事务里。再装一次会复用它们（规则名固定），所以不影响正确性，但
+"装失败了却留下四条规则"这件事只能靠卸载收。
 
 ## 同一个 exe 两个角色
 

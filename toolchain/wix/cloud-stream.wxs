@@ -1,0 +1,347 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  cloud-stream 的第三个外壳：MSI（WiX 3.11）。
+
+  和前两个外壳的分工完全一样，别在这里重新发明：
+
+      谁铺文件      这个文件（WiX）／Inno／那个自带整包的 exe，三选一
+      谁做系统集成  cloud-setup.exe。永远只有两条命令：
+                      装完 ：完成系统集成（建任务、防火墙、启动并等应答）
+                      卸前 ：停服务并保留文件
+
+  这两条命令的字面量只出现在下面两个 CustomAction 的 ExeCommand 里 —— 必须
+  有开关的地方才写开关，别的地方一律用文字描述（XML 注释里连写两个减号是
+  非法的，这也是为什么本文件的注释里看不到那些开关）。
+
+  也就是说 MSI 只做"把一个目录铺到 Program Files、并把卸载项交给 Windows
+  Installer"，提权建计划任务、四条防火墙规则、接管/还原默认录音设备仍然由
+  cloud-setup.exe 干。三个外壳共用同一套判断，第二套实现迟早和第一套分叉
+  （见 crates/setup/src/install.rs 的模块头）。
+
+  为什么是 WiX 3 而不是 4/5：v4 起 WiX 是 dotnet 工具，要先装 .NET SDK；这里
+  只需要能产出 .msi，v3.11 的 candle/light/heat 是 xcopy 部署的自包含二进制
+  （33 MB 的 zip，解压即用，跑在系统自带的 .NET Framework 上）。将来真要换
+  v4，换的只是编译命令，下面这些 Id 与顺序都不动。
+
+  编译入口是 toolchain/deploy.ps1 的 New-MsiInstaller，它负责：用 heat 把
+  selkies-web 收成 web.wxs（近两千个文件，手写没有意义）、传 -d 变量进来、
+  跑 candle 与 light。
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+
+  <!--
+    UpgradeCode 是"这套产品"的身份证，跨版本不变 —— MajorUpgrade 靠它认出
+    "这是同一个产品的旧版本"。Product Id 写 * 让每次构建生成新的，这样两个
+    不同版本才不会互相认为是"已安装"。
+  -->
+  <Product Id="*"
+           Name="cloud-stream"
+           Language="2052"
+           Codepage="936"
+           Version="$(var.AppVersion)"
+           Manufacturer="SOYS"
+           UpgradeCode="{1BCD03BD-040A-47EC-9B81-899597792568}">
+
+    <Package InstallerVersion="500"
+             Compressed="yes"
+             InstallScope="perMachine"
+             Platform="x64"
+             Description="cloud-stream 被控端"
+             Comments="装完由运行根里的 cloud-setup.exe 完成系统集成（建任务、放行防火墙）"
+             InstallPrivileges="elevated" />
+
+    <!--
+      升级：先装新的、再删旧的（默认行为）。降级直接拒 —— 把 0.4 装到 0.5 上面
+      会把任务 XML 换成旧的，而任务里的路径口径改过一次。
+    -->
+    <!--
+      升级的次序：**先装新版、再卸旧版**（afterInstallExecute）。
+
+      默认的 afterInstallInitialize 是反过来的：先把旧版卸掉（文件被删），再把
+      新版铺回去。.150 上实测这条路走不通 —— 0.4.0 升 0.4.1 时，旧版卸载删掉了
+      stream-server.exe，新版 InstallFiles 又写了一份（观察器逐秒确认文件在、
+      大小也对），但紧接着排程出来的计划任务**每一次启动都返回 2（找不到文件）**：
+      系统集成那一步的两次 /Run 和每分钟的定时触发全一样，直到事务结束
+      （回滚）之后手动 /Run 立刻就好。那个"删了又写"的路径在事务里是个空壳，
+      这是 MSI 内部行为，不该由我们去赌。
+
+      改成"覆盖安装"就没有"删了又写"这一步：新版直接盖在旧文件上（服务已经在
+      上一个动作里停掉，不会被占用），文件从头到尾都在。旧版卸载随后发生，而它
+      那些文件用的是**同一批组件 GUID**（heat -ag 按 keypath 确定性生成），引用
+      计数还在，所以不会把刚装好的文件删掉。
+
+      代价：系统集成必须排在旧版卸载**之后**，否则旧版卸载里那条"卸载但保留
+      文件"的命令会把刚注册好的任务和规则再删一遍。
+    -->
+    <MajorUpgrade DowngradeErrorMessage="这台机器上已经装了更新版本的 cloud-stream。先卸载它，或者装同一版或更新的一版。"
+                  Schedule="afterInstallExecute" />
+
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <!--
+      账户：装完之后那个计划任务要跑在**谁**的桌面会话里。
+
+      **这里不填默认值，是实测出来的。** 原来写的是
+      Value="[%USERDOMAIN]\[%USERNAME]"，安装（命令行给了 ACCOUNT=）时看不出
+      问题，修复（/famus，没人给 ACCOUNT）时日志里能读到两行：属性表里 ACCOUNT
+      的值仍是那个带百分号的字面量，随后排程出的自定义动作命令行里也原样出现
+      它 —— `[%...]` 根本没被求值。控制台于是拿到一个不存在的账户名，
+      `schtasks` 报错，Return="check" 把它变成 1603。
+
+      原因：deferred 动作在**服务端**排程，而环境变量只在客户端那一侧有意义；
+      这个上下文里 `[%USERNAME]` 既不是"发起的用户"，也换不出字面量。
+
+      所以改成分工：MSI 只负责**转达**（有人显式给了 ACCOUNT 就传下去，供
+      SCCM/组策略那种以 SYSTEM 推送、机器上又没人的场景用），没人给就让
+      cloud-setup.exe 自己去问活动控制台会话的主人（见 sys::install_account）。
+      那本来就是系统集成那一步该知道的事，顺带把"装和修走同一套"这条守住了。
+    -->
+    <Property Id="ACCOUNT" Secure="yes" />
+
+    <Property Id="ARPNOMODIFY" Value="1" />
+    <Property Id="ARPCOMMENTS" Value="卸载会连同配置与证书一起删掉（和向导版一致）。" />
+
+    <!--
+      ACCOUNT 可能来自命令行（SCCM），而命令行属性默认不会传到提权后的服务端
+      进程 —— 上面那个 Secure="yes" 就是为了它。不标的话 ACCOUNT= 会被静默丢掉，
+      然后系统集成那一步收到一个空账户，装完看起来成功、任务却注册不上。
+
+      INSTALLDIR 同理：silent 装到 D:\xxx 时它也是命令行给的。
+    -->
+    <Property Id="INSTALLDIR" Secure="yes" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <!--
+          INSTALLDIR 是公共属性，所以 msiexec INSTALLDIR="D:\Tools\cloud-stream"
+          能覆盖它。注意这里**不**再追加一层 cloud-stream：向导版是"用户选父目录
+          再追加子目录"，而 MSI 的惯例是"INSTALLDIR 就是要装到的那个目录"。两套
+          语义混起来会让批处理把文件铺到 D:\Tools\cloud-stream\cloud-stream。
+        -->
+        <Directory Id="INSTALLDIR" Name="cloud-stream">
+          <Directory Id="WEBFILES" Name="selkies-web" />
+          <Directory Id="LOGDIR" Name="logs" />
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <!-- ================= 程序文件 ================= -->
+
+    <Component Id="MainExe" Guid="{D6135D4A-AC27-48D4-920E-4D98F94161D1}" Directory="INSTALLDIR" Win64="yes">
+      <File Id="StreamServerExe" Source="$(var.BundleDir)\stream-server.exe" KeyPath="yes" Vital="yes" />
+      <!-- 记一个运行根路径，卸载时自查用；KeyPath 在上面的 File 上 -->
+      <RegistryValue Root="HKLM" Key="Software\cloud-stream" Name="Root" Type="string" Value="[INSTALLDIR]" KeyPath="no" />
+    </Component>
+
+    <Component Id="ViGEm" Guid="{D5386967-75BD-4CD4-8C90-990DF69DC85C}" Directory="INSTALLDIR" Win64="yes">
+      <File Id="ViGEmDll" Source="$(var.BundleDir)\ViGEmClient.dll" KeyPath="yes" />
+    </Component>
+
+    <!-- 运行根里的控制台。来源是"不带 embed"那份（748 KB），不是分发用的 8.7 MB。 -->
+    <Component Id="Console" Guid="{F3B285C9-10DF-49E0-AD20-CC402B9B87C9}" Directory="INSTALLDIR" Win64="yes">
+      <File Id="ConsoleExe" Source="$(var.ConsoleExe)" KeyPath="yes" Vital="yes" />
+    </Component>
+
+    <!--
+      NeverOverwrite 给三类"这台机器的身份"：配置文件、证书、私钥。MSI 默认在
+      重装/修复时会把它们换成包里的默认值 —— 那就是"修一下"顺手把用户调好的
+      分辨率、口令和证书换掉。这三样是这个产品最不该动的东西。
+    -->
+    <Component Id="Config" Guid="{8F9F9CD8-A72B-4511-8297-96B749462888}" Directory="INSTALLDIR" Win64="yes" NeverOverwrite="yes">
+      <File Id="StreamConfig" Source="$(var.BundleDir)\stream-config.toml" KeyPath="yes" />
+    </Component>
+
+    <Component Id="Cert" Guid="{DA726FED-5331-416E-B372-ECE8CEA1019C}" Directory="INSTALLDIR" Win64="yes" NeverOverwrite="yes">
+      <File Id="CertPem" Source="$(var.BundleDir)\cert.pem" KeyPath="yes" />
+    </Component>
+
+    <Component Id="Key" Guid="{B60EC7F5-F076-41C7-9D93-F96CF03985B3}" Directory="INSTALLDIR" Win64="yes" NeverOverwrite="yes">
+      <File Id="KeyPem" Source="$(var.BundleDir)\key.pem" KeyPath="yes" />
+    </Component>
+
+    <Component Id="Scripts" Guid="{F770EB0F-56D4-4D70-A01A-C242882F470F}" Directory="INSTALLDIR" Win64="yes">
+      <File Id="SetPasswordCmd" Source="$(var.BundleDir)\set-password.cmd" KeyPath="yes" />
+      <File Id="CollectFactsCmd" Source="$(var.BundleDir)\collect-launch-facts.cmd" />
+    </Component>
+
+    <Component Id="Readme" Guid="{7FD34C03-4191-4DCB-A4F8-EF18E453286E}" Directory="INSTALLDIR" Win64="yes">
+      <File Id="ReadmeTxt" Source="$(var.BundleDir)\README.txt" KeyPath="yes" />
+    </Component>
+
+    <Component Id="Manifest" Guid="{5341A475-E309-4D88-A3D2-EE21632E6336}" Directory="INSTALLDIR" Win64="yes">
+      <File Id="ManifestJson" Source="$(var.BundleDir)\manifest.json" KeyPath="yes" />
+    </Component>
+
+    <!--
+      logs\ 是服务运行时自己建的，里面的日志不在 MSI 的安装清单里 —— 卸载时
+      Windows Installer 不会碰它们，用户会看到一个只剩日志的目录（Inno 那版
+      实机验过一次就是这样）。RemoveFile 把内容清掉，再 RemoveFolder 收目录。
+
+      Inno 那边是"目录不空就留着"的语义，这里会连用户自己丢进去的东西一起删。
+      差异是故意的：MSI 卸载对管理员来说是"这台机器上不要再有这个软件"，而
+      向导版是给个人用的、宁可少删。
+    -->
+    <Component Id="LogsCleanup" Guid="{5FF01BD5-A766-4A34-9EE7-349EE02BFAEF}" Directory="LOGDIR" Win64="yes">
+      <CreateFolder />
+      <RemoveFile Id="LogsAll" Name="*" On="uninstall" />
+      <RemoveFolder Id="LogsFolder" On="uninstall" />
+    </Component>
+
+    <!--
+      这里**不做**开始菜单/桌面快捷方式。per-machine 装到 Program Files 时，
+      ProgramMenuFolder 在链接期被 ICE38/43/57 判成"往用户配置里装东西"，而
+      那三条 ICE 指出的问题是真实的：per-machine 组件不该拿 HKCU 当 keypath，
+      拿 HKLM 当 keypath 又不该往用户配置里写快捷方式。
+
+      取舍：MSI 是给管理员批量推的，控制台在已知路径下
+      （Program Files\cloud-stream\cloud-setup.exe）；要快捷方式的人用向导版，
+      那边 Inno 的 {group} 天然就是"所有用户"。
+    -->
+
+    <!--
+      前端树由 heat 收（近两千个文件）。它用 -ag 让 candle 按 keypath 生成组件
+      GUID：同一个文件在同一安装位置永远得到同一个 GUID，跨版本升级才认得"这是
+      那份文件"，而不是当成新组件把旧的留在地上。
+    -->
+    <!--
+      安装根目录本身也要收（Inno 那边是 `dirifempty`）。第一次实测漏了这一步：
+      文件、`selkies-web\`、`logs\` 全没了，`C:\Program Files\cloud-stream`
+      自己留着 —— Windows Installer 只删"表里写了的目录"，它不会因为一个目录
+      空了就顺手删掉它。
+
+      为什么单独一个组件、而且排在 feature 的最后：RemoveFolders 按 RemoveFolder
+      表的**书写顺序**处理，只删"那一刻已经空了的"。写在 `logs\` 前面，处理到它
+      时 `logs\` 还在，于是它不空、跳过去、再也不回头。
+
+      CreateFolder 不写：这个目录装文件时就存在了，写它只会让 MSI 认作"我建的"
+      而在修复时做多余的事。组件没有文件做 keypath 也成立 —— 上面 LogsCleanup
+      就是同一种东西。
+    -->
+    <Component Id="DirCleanup" Guid="{9C2E6C41-1F6B-4A1E-9A63-0D2C6F0B7A55}" Directory="INSTALLDIR" Win64="yes">
+      <RemoveFolder Id="InstallDirFolder" On="uninstall" />
+    </Component>
+
+    <Feature Id="Main" Title="cloud-stream" Level="1" Display="expand">
+      <ComponentRef Id="MainExe" />
+      <ComponentRef Id="ViGEm" />
+      <ComponentRef Id="Console" />
+      <ComponentRef Id="Config" />
+      <ComponentRef Id="Cert" />
+      <ComponentRef Id="Key" />
+      <ComponentRef Id="Scripts" />
+      <ComponentRef Id="Readme" />
+      <ComponentRef Id="Manifest" />
+      <ComponentRef Id="LogsCleanup" />
+      <ComponentGroupRef Id="WebFiles" />
+      <ComponentRef Id="DirCleanup" />
+    </Feature>
+
+    <!-- ================= 系统集成（两个动作，不多不少） ================= -->
+
+    <!--
+      控制台那份 exe 单独进 Binary 表：下面的自定义动作按 BinaryKey 取它。
+
+      为什么不让它跑"刚装进 Program Files 的那一份"（Type 34，Directory +
+      ExeCommand）：那个写法在这里实测跑不起来 —— 文件确实已经装上、日志里
+      FileCopy 就在前面几秒，但 MSI 在**排程那一刻**就报
+      Error 1721（"程序无法运行"），前置换 Type 34 也没用。Binary 这条路是
+      deferred 动作的常规写法，代价只是 .msi 里多存 752 KB（非 embed 的那份
+      控制台，不是 8.7 MB 那个）。
+
+      顺带解决一个隐患：跑的是**这个 MSI 自己带的**新版控制台，不是被升级的
+      旧版。旧版不认识静默开关，会忽略它并按老规矩弹框 —— 无人值守安装里没人
+      点确定，外面那层就永久挂住（Inno 那边踩过，见 cloud-stream.iss 的
+      PrepareToInstall 注释）。
+    -->
+    <Binary Id="ConsoleBin" SourceFile="$(var.ConsoleExe)" />
+
+    <!--
+      Impersonate="no" 加 deferred：以 SYSTEM 跑，防火墙与 schtasks 都要管理员。
+      代价是它不能自己去问"我是谁"，所以账户要么由调用方给（ACCOUNT），要么由
+      控制台绕过身份问题自己去查活动控制台会话（见 ACCOUNT 那段注释）。
+
+      两个动作、互斥的条件：MSI 的 ExeCommand 是静态字符串，没法"有就带上"，
+      所以这里显式分成"给了账户"和"没给"两条。多一条动作比在控制台里给空字符串
+      开后门容易看懂 —— 后者会让 "空账户" 变成一个需要被默默容忍的输入。
+
+      Return="check"：集成失败就让安装失败并回滚。这个产品"装完但没跑起来"和
+      "没装上"一样糟 —— 前者更难发现。
+
+      命令里那个 [INSTALLDIR] 后面的点不是笔误：格式化的目录属性**自带结尾
+      反斜杠**，于是给目录参数加引号时就变成 "C:\Program Files\cloud-stream\"，
+      MSI 再把结尾那个反斜杠转义成 \" —— 引号当场就断了。加一个点让反斜杠后面
+      跟字符，路径语义不变（Windows 把 \. 归一化成 .），控制台那边会用
+      sys::normalize_dir 把点吃掉，免得它漏进计划任务的 <Command>。
+    -->
+    <CustomAction Id="FinishService"
+                  BinaryKey="ConsoleBin"
+                  ExeCommand="--finish --quiet --dir &quot;[INSTALLDIR].&quot; --account &quot;[ACCOUNT]&quot;"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check" />
+
+    <CustomAction Id="FinishServiceOwnAccount"
+                  BinaryKey="ConsoleBin"
+                  ExeCommand="--finish --quiet --dir &quot;[INSTALLDIR].&quot;"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check" />
+
+    <!--
+      卸载同理：先停任务、杀进程、还录音设备、删防火墙规则，并**保留文件**
+      （keep 开关），文件由 Windows Installer 自己删 —— 两套东西同时删同一批
+      文件，最先出问题的永远是"谁先删"。
+
+      Return="ignore"：卸载不该因为"任务本来就不在了"而失败并回滚 —— 那会把
+      用户留在"卸不掉"的状态里。
+    -->
+    <CustomAction Id="StopAndUninstall"
+                  BinaryKey="ConsoleBin"
+                  ExeCommand="--uninstall --keep --yes --quiet --dir &quot;[INSTALLDIR].&quot;"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <!--
+      修复（/famus）和升级都得先把服务停下，再让 Windows Installer 去动文件。
+
+      修复没这一步的实测结果：`stream-server.exe` 正被占用，MSI 把替换排到重启，
+      返回 1641（ERROR_SUCCESS_REBOOT_INITIATED）而不是 0 —— 安装方看到的是
+      "装完了但得重启"，服务在重启前一直是停的。
+
+      升级没这一步的结果是反过来的一半：文件是被旧版卸载删掉的，新版盖上去之后
+      反而启动不了（见上面 MajorUpgrade 那段）。停下来之后文件就能原地覆盖。
+
+      和 Inno 那边一个道理（它在 PrepareToInstall 里自己 schtasks /End 加
+      taskkill）：能不能换掉文件，取决于那一刻还有没有人开着它。
+
+      复用卸载那条命令（带保留文件的开关），而不是再加一个"只停服务"的开关：
+      停服务 = 删任务 + 按路径杀进程，而这两件事卸载已经做对了，包括"只杀 exe
+      在这个目录里的"那条判据。代价是过程中防火墙规则和任务会被删了又建 ——
+      紧随其后的那个动作会把它们原样建回来。
+
+      Return="ignore"：这里失败不该让安装回滚，文件替换那一步会自己报错。
+    -->
+    <CustomAction Id="StopBeforeInstall"
+                  BinaryKey="ConsoleBin"
+                  ExeCommand="--uninstall --keep --yes --quiet --dir &quot;[INSTALLDIR].&quot;"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <InstallExecuteSequence>
+      <!-- 升级与修复：先停服务，否则文件要么被占用（修复）、要么被删了又写（升级） -->
+      <Custom Action="StopBeforeInstall" Before="InstallFiles">Installed AND NOT REMOVE~="ALL"</Custom>
+      <!--
+        "NOT Installed OR REINSTALL"：只在装新机、修复、升级时做系统集成。
+        排在 RemoveExistingProducts 之后 —— 升级时旧版卸载排在 InstallExecute
+        之后，它会把任务和规则删掉，所以集成必须比它更晚。
+      -->
+      <Custom Action="FinishService" After="RemoveExistingProducts">(NOT Installed OR REINSTALL OR UPGRADINGPRODUCTCODE) AND ACCOUNT</Custom>
+      <Custom Action="FinishServiceOwnAccount" After="FinishService">(NOT Installed OR REINSTALL OR UPGRADINGPRODUCTCODE) AND NOT ACCOUNT</Custom>
+      <!-- 卸载前必须先把服务停下，否则文件删不掉、任务还指着将被删的 exe -->
+      <Custom Action="StopAndUninstall" Before="RemoveFiles">REMOVE~="ALL"</Custom>
+    </InstallExecuteSequence>
+
+  </Product>
+</Wix>
