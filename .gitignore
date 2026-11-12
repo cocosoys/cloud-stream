@@ -65,3 +65,9 @@ __pycache__/
 
 # 提交信息的临时落点（bash 里 heredoc 会被拦，只能先写文件再 `git commit -F`）
 .git-commit-msg.tmp
+
+# ---- 外部参考物 /temp/ ----
+# temp/ 放的是"从外面拿进来对照用"的东西：几猫那份单文件 FPS 是 1:1 相对指针
+# 契约的参考实现（docs/roadmap-future.md §1.2 就是围绕它写的），要入库。
+# 同一目录里的 *.txt 是提交信息草稿、抓取片段之类的中间物，不进。
+/temp/*.txt
