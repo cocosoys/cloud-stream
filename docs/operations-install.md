@@ -85,6 +85,27 @@ usUninstall       逐条调 --uninstall-step <步骤> --quiet --dir "<同上>"
 也就是说，"并入 unins000"搬过去的是**顺序**，不是**判断** —— 所以它没有变成
 第二套实现。
 
+### 一条硬约束：`--uninstall-step` 绝不能开窗口
+
+同一个 exe 有两个角色（窗口 / 命令行），分工靠 `main.rs` 里的 `decide_mode` 判：
+旁边有 `stream-server.exe` 就是"控制台"。而**装好之后的 exe 旁边一定有它**，
+所以任何"命令行一次走完"的开关都必须在角色判断**之前**被截住，不能靠 `decide_mode`
+猜。漏一个的后果不是少个功能，而是：
+
+```text
+卸载器 Exec(..., ewWaitUntilTerminated)  ──等──▶  stream-setting.exe --uninstall-step task
+        ▲                                                    │
+        └──────────── 开了个 SW_HIDE 的窗口，等消息循环 ◀──────┘
+```
+
+两边互相等，卸载永远停在第一步；而且 `uninstall::run` 根本没被调用，结论文件
+一个字节都没写，Inno 的日志也停在那一步之前 —— 现场看起来完全像"卸载器自己
+卡住了"。`.150` 上就是这样：第一次卸载从 10:36 挂到 11:19（我手动杀掉那个
+隐藏窗口才拿到 `退出码 -1`），五步一步都没走。现在 `--uninstall-step` /
+`--purge` / `--inbound` 都在 `decide_mode` 之前分流，并且
+`CLI_SWITCHES` + `every_cli_switch_stays_out_of_the_window` 单测把这件事钉住
+（加新开关忘了登记会红）。
+
 `--keep` 仍然在（MSI 的卸载动作在用）：说"别删文件"，文件归外面那层删。
 `--quiet` 说"别弹框" —— 两件事经常一起出现，但不是一回事。
 
@@ -499,6 +520,9 @@ finished: 2026-11-12 10:31:19
 | 向导版全新静默安装（`/VERYSILENT`） | `.150` 实机：`exit 0` / 6 s / 2023 文件 / 控制台 748,032 B（非 embed）/ 任务 `InteractiveToken` 指向新目录 / 8080 在听 / 卸载项出现 | 通过 |
 | 向导版覆盖安装（服务正在跑） | `.150` 实机：`exit 0`，pid 1236→3680，落定后 1 个进程，`IgnoreNew` 生效，看门狗日志两次 `PREFLIGHT listening` | 通过 |
 | 向导版卸载（控制面板 / `unins000.exe`） | `.150` 实机：`exit 0` / 2 s，进程 0、任务消失、卸载项 0、端口释放、防火墙规则 5→1（只剩人工建的 `ssh 22`）、**安装目录整个消失** | 通过 |
+| 向导版卸载（六步编排版，`CurUninstallStepChanged` 逐条调 `--uninstall-step`） | `.150` 实机：`Uninstallation process succeeded / Removed all? Yes / Need to restart Windows? No`；五步报告各 `RESULT: OK`；目录消失、任务 gone、规则 5→1、ARP 0、`%ProgramData%\cloud-stream\uninstall-backup` 新增一份快照 | 通过 |
+| 开着工具箱窗口卸载（`{app}` 里有正在执行的 exe） | `.150` 实机：先 `Start-Process {app}\stream-setting.exe` 让窗口挂着，再跑卸载器 → `procs` 步报 `[ok] 关掉了同目录下的控制台窗口`，目录照样整个消失。**修复前**同样的场景残留一个装着 `unins000.exe` 的空目录（日志 `Failed to delete directory (32)`） | 通过 |
+| 从改名前的版本（`cloud-setup.exe`）升级上来 | 代码已改（`PrepareToInstall` 认两个名字 + `[InstallDelete]` 清老名字），但机器上没有这种旧安装可试 | **未验证** |
 | 就地升级留下的 `*.old` 会被收掉 | `.150` 实机：先在运行根造 `probe-sibling.dll` + `probe-sibling.dll.old`（该删）与 `not-ours.old`（没有同名主体，不该动），再跑一次升级安装 → 结论文件里 `[ok] 清掉 1 个上一版的 .old 留底`，前者消失、后者保留、正本完好 | 通过 |
 
 ## 相关文档

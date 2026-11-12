@@ -74,6 +74,24 @@ impl Report {
         self.open(target, false)
     }
 
+    /// 追加一次**独立**的事件：不截断，但照写抬头。
+    ///
+    /// 单步卸载命令（`--uninstall-step`）专用。六步共用同一个 `last-install.txt`
+    /// 而每一步都是独立进程，`start` 会互相截断 —— 实机上一次卸载跑完只剩最后
+    /// 一步（`identity`）那一份，前五步"结束了哪个进程、哪条规则没删掉"全丢，
+    /// 而恰好是那几行才能回答"为什么没卸干净"。Inno 的日志只有退出码，没有这些。
+    pub fn append(&self, target: &Path, mode: &str) -> bool {
+        if !self.open(target, false) {
+            return false;
+        }
+        self.note("");
+        self.note("----------------------------------------");
+        self.note(&format!("mode    : {mode}"));
+        self.note(&format!("target  : {}", target.display()));
+        self.note(&format!("started : {}", stamp()));
+        true
+    }
+
     fn open(&self, target: &Path, truncate: bool) -> bool {
         for candidate in candidates(target) {
             if let Some(parent) = candidate.parent() {

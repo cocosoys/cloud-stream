@@ -277,15 +277,27 @@ enum Mode {
     Installer,
 }
 
+/// 让这一轮"显式指定了角色"的开关。
+///
+/// 抽成常量是因为漏掉一个的后果不是"少个功能"，而是**开一个没人能关的窗口**：
+/// 装好之后的 exe 旁边有 `stream-server.exe`，判据会把它认成控制台。
+/// `--uninstall-step` 就是这样漏过一次的（见 `main` 里那一段），所以它同时
+/// 在 `main` 里被提前截住 —— 两处都在，是因为"判据不能改"和"开关可能还会加"。
+const CLI_SWITCHES: &[&str] = &[
+    "--install",
+    "--finish",
+    "--uninstall",
+    "--purge",
+    "--uninstall-step",
+];
+
 /// 这一轮启动该做什么。
 fn decide_mode(args: &[String]) -> Mode {
-    // 卸载的两段也算"显式指定了角色"：`--purge` 尤其重要 —— 替身被复制到
+    // 卸载的几段也算"显式指定了角色"：`--purge` 尤其重要 —— 替身被复制到
     // `%TEMP%` 里运行，那儿没有 `stream-server.exe`，而它自带有内置包，
     // 按下面的判据会被认成"安装器"。判据本身不能改（它是对的），所以把
     // "我是谁"这件事由参数说清楚。
-    let explicit = args
-        .iter()
-        .any(|a| a == "--install" || a == "--finish" || a == "--uninstall" || a == "--purge");
+    let explicit = args.iter().any(|a| CLI_SWITCHES.contains(&a.as_str()));
     classify(
         explicit,
         pack::is_embedded(),
@@ -1318,6 +1330,24 @@ fn main() {
     if args.iter().any(|a| a == "--purge") {
         std::process::exit(uninstall::run(&args));
     }
+    // `--uninstall-step` 必须在这里截住，**不能落进下面的角色判断**。
+    //
+    // 这是一条实机撞出来的死锁，代价是"整台机器看起来失联、卸载一行日志都没写"：
+    //
+    //   装好之后的 exe 旁边一定有 `stream-server.exe`，按 `classify` 的判据它是
+    //   **控制台**。于是卸载器 `Exec(..., ewWaitUntilTerminated)` 起的那个
+    //   `stream-setting.exe --uninstall-step task` 去建了一个窗口、进消息循环
+    //   等着人点按钮；而窗口是 `SW_HIDE` 的，没有人能点。两个进程互相等：
+    //   卸载器等子进程退出，子进程等一个永远不会来的消息。
+    //
+    // 更麻烦的是它的**症状**：`uninstall::run` 根本没被调用，report 文件一个
+    // 字节都没写，Inno 的日志也停在这一步之前 —— 现场看起来完全像"卸载器自己
+    // 卡住了"，而不是"我们开错了窗口"。
+    //
+    // 和 `--purge` 同一类：这类开关一律在角色判断之前分流，判据本身不动。
+    if args.iter().any(|a| a == "--uninstall-step") {
+        std::process::exit(uninstall::run(&args));
+    }
     // `--inbound` 同理提前：它既可能在整包目录里跑（那里有 stream-server.exe，
     // 按判据是控制台），也可能在装好之后的运行根里跑。两种地方都要能补规则。
     if args.iter().any(|a| a == "--inbound") {
@@ -1505,5 +1535,25 @@ mod tests {
         // 显式 --install 压过一切：修复安装靠它（旁边有服务也要重装）。
         assert_eq!(classify(true, true, true), Mode::Installer);
         assert_eq!(classify(true, false, false), Mode::Installer);
+    }
+
+    /// `CLI_SWITCHES` 里每一个都必须被判成"安装器"，一个都不能漏。
+    ///
+    /// 这条守的是一个**已经发生过**的故障：`--uninstall-step` 漏在列表外，
+    /// 而装好之后的 exe 旁边就有 `stream-server.exe`（判据把它认成控制台），
+    /// 于是卸载器起的子进程开了个 `SW_HIDE` 的窗口进消息循环，卸载器
+    /// `ewWaitUntilTerminated` 等它退出 —— 互相等，卸载停在第 1 步，日志一片
+    /// 空白。症状看起来像"卸载器卡住"，根因是"我们开错了窗口"。
+    ///
+    /// 加新开关时如果忘了进这个列表，这里会红。
+    #[test]
+    fn every_cli_switch_stays_out_of_the_window() {
+        for sw in CLI_SWITCHES {
+            assert_eq!(
+                decide_mode(&[(*sw).to_owned()]),
+                Mode::Installer,
+                "{sw} 会被判成控制台，也就是开一个没人能关的窗口"
+            );
+        }
     }
 }

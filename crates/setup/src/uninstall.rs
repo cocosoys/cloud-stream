@@ -214,7 +214,9 @@ pub fn run(args: &[String]) -> i32 {
 fn run_step(opts: &Opts, name: &str) -> i32 {
     let dir = opts.dir.clone().unwrap_or_else(crate::run_root);
     let report = Report::new();
-    report.start(&dir, &format!("uninstall-step {name}"));
+    // `append` 而不是 `start`：六步是六个进程，共用 `last-install.txt`，
+    // 截断的话只剩最后一步的记录（见 `Report::append` 的注释）。
+    report.append(&dir, &format!("uninstall-step {name}"));
     report.note(&format!("elevated: {}", sys::elevated()));
     report.note(&format!("dir: {}", dir.display()));
 
@@ -381,12 +383,16 @@ fn step_task(dir: &Path, task: &str, force: bool, report: &Report) -> TaskEnd {
     stop_task(task, dir, force, report)
 }
 
-/// 第 2 步：停掉这个目录下的 `stream-server.exe`。
+/// 第 2 步：停掉这个目录下的 `stream-server.exe`，以及开在这个目录里的控制台。
+///
+/// 顺序不能反：先收服务，再收控制台。控制台是 `{app}` 里正在执行的那个 exe，
+/// 它不关，Inno 最后删目录那一步就会失败（见 `APP_EXES` 的注释）。
 fn step_procs(dir: &Path, report: &Report) {
     let killed = kill_servers_under(dir, Some(report));
     if killed == 0 {
         report.note("  [ok] 这个目录下没有在跑的实例");
     }
+    kill_consoles_under(dir, report);
     // 给了时间还不退，就别假装删得动。
     if !wait_no_server(dir, 30) {
         report.note("  [warn] 还有进程没退干净，后面删目录可能会失败");
@@ -845,7 +851,15 @@ fn settings_disabled(xml: &str) -> bool {
 /// 按**完整路径**过滤是全部要点：同一台机器上另一个目录里的安装不该被这一个
 /// 卸载掉。任务管理器里两个同名 exe 长得一模一样，只有路径能分开。
 pub(crate) fn server_pids_under(dir: &Path) -> Vec<u32> {
+    pids_under(dir, &["stream-server.exe"])
+}
+
+/// 同上，但按调用方给的名字表收。名字为空时什么也不返回。
+fn pids_under(dir: &Path, names: &[&str]) -> Vec<u32> {
     let mut out = Vec::new();
+    if names.is_empty() {
+        return out;
+    }
     unsafe {
         let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if snap == INVALID_HANDLE_VALUE {
@@ -856,7 +870,7 @@ pub(crate) fn server_pids_under(dir: &Path) -> Vec<u32> {
         if Process32FirstW(snap, &mut entry) != 0 {
             loop {
                 let name = wide_z(&entry.szExeFile);
-                if name.eq_ignore_ascii_case("stream-server.exe") {
+                if names.iter().any(|n| name.eq_ignore_ascii_case(n)) {
                     if let Some(path) = image_path(entry.th32ProcessID) {
                         if path_under(&path, dir) {
                             out.push(entry.th32ProcessID);
@@ -895,9 +909,49 @@ unsafe fn image_path(pid: u32) -> Option<PathBuf> {
     )))
 }
 
+/// 这个目录下"开着的窗口"，它们会挡住删目录。
+///
+/// `stream-setting.exe` 是工具箱（装好之后那一份就在 `{app}` 里）；
+/// `cloud-setup.exe` 是 2026-11 改名之前的名字，老机器上可能还开着一个。
+///
+/// 为什么控制台也要收：`{app}` 里**正在执行的文件删不掉**（Windows 的影像段
+/// 不带 `FILE_SHARE_DELETE`）。用户从工具箱点"卸载"的那一刻，那个窗口就开在
+/// `{app}\stream-setting.exe` 上，于是 Inno 走到删目录时拿到共享冲突，日志里
+/// 只留一句 `Failed to delete directory (32). Will retry later.`，然后 ARP 清空
+/// 了、任务没了、规则也清了，可目录还在 —— 实机撞到过一次，里面只剩一个
+/// `unins000.exe` 和一个空目录，看起来像"卸载器不会删目录"，其实是"我们自己
+/// 那个窗口没关"。
+const CONSOLE_EXES: &[&str] = &["stream-setting.exe", "cloud-setup.exe"];
+
 fn kill_servers_under(dir: &Path, report: Option<&Report>) -> usize {
+    kill_pids_under(dir, &["stream-server.exe"], report)
+}
+
+/// 结束同目录下的控制台，**不包括自己**。
+///
+/// 不含自己这条是必须的：这一步本身就是
+/// `{app}\stream-setting.exe --uninstall-step procs` 在跑，把自己杀了，
+/// 后面三步（还录音设备 / 删规则 / 备份身份）就没人做了。
+///
+/// 副作用要提前说清楚：用户点"卸载"的那个窗口会在这里消失。卸载期间界面归
+/// 卸载器，窗口留着只会挡住它要删的文件。
+fn kill_consoles_under(dir: &Path, report: &Report) -> usize {
+    let killed = kill_pids_under(dir, CONSOLE_EXES, Some(report));
+    if killed > 0 {
+        report.note("  [ok] 关掉了同目录下的控制台窗口（它正开着 {app} 里的 exe，会挡住删目录）");
+    }
+    killed
+}
+
+/// 按名字 + 完整路径收进程。`names` 之外的一律不动。
+fn kill_pids_under(dir: &Path, names: &[&str], report: Option<&Report>) -> usize {
+    let me = std::process::id();
     let mut killed = 0;
-    for pid in server_pids_under(dir) {
+    for pid in pids_under(dir, names) {
+        // 自己不能杀：那会让调用方（正是一次 `--uninstall-step`）当场消失。
+        if pid == me {
+            continue;
+        }
         let ok = unsafe {
             let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
             if handle == 0 {
