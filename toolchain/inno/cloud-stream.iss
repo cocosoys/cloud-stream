@@ -20,6 +20,18 @@
 #define TaskName "MCStreamSrv"
 #define AppPublisher "SOYS"
 
+; 安装器自己的图标，也是"应用和功能"里那一行的图标（UninstallDisplayIcon 指
+; 的是控制台 exe，它的图标同样来自这个文件）。
+;
+; 只此一份：仓库根的 res\app.ico。两个 exe 在构建时把同一份文件嵌进 PE，
+; MSI 用 ARPPRODUCTICON 指同一份。换图标就是换那一个文件，四个出口一起变。
+;
+; 相对路径按**本脚本所在目录**解析（Inno 的 SourceDir 默认如此），所以
+; ..\..\res\app.ico 正是仓库根下的 res\app.ico。
+#ifndef AppIcon
+  #define AppIcon "..\..\res\app.ico"
+#endif
+
 ; ---------------------------------------------------------------------------
 ; 构建输入（环境变量 → 预处理常量）
 ;
@@ -85,6 +97,9 @@ WizardStyle=modern dynamic windows11
 ; 真正的进度条在"正在安装"页，由文件复制驱动。
 UninstallDisplayName={#AppName}
 UninstallDisplayIcon={app}\{#ConsoleExe}
+; 向导窗口、安装包自己的图标、以及"应用和功能"里那一行。缺了它 Inno 用自带的
+; 默认图标，看起来像别人家的安装器。
+SetupIconFile={#AppIcon}
 ; 我们的 exe 是常驻服务，Inno 的"检测占用程序"会把它当成用户没关的窗口。
 ; 占用问题自己在 PrepareToInstall 里处理（先 --uninstall --keep）。
 CloseApplications=no

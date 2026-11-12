@@ -92,7 +92,7 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetDlgItem, GetMessageW,
-    GetWindowTextW,
+    GetWindowTextW, LoadIconW,
     LoadCursorW, MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassW,
     SendMessageW, SetForegroundWindow, SetWindowTextW, SetWindowPos, ShowWindow, TranslateMessage,
     BS_PUSHBUTTON, CW_USEDEFAULT, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY,
@@ -1393,13 +1393,20 @@ fn main() {
     unsafe {
         let instance = GetModuleHandleW(std::ptr::null());
         let class_name = wide("CloudStreamSetup");
+        // 窗口标题栏、Alt+Tab、任务栏读的是"窗口类的图标"，而不是 exe 的。
+        // 不填（`hIcon: 0`）时系统给一个通用图标 —— 右键属性里明明有图标，
+        // 运行时却是白纸，这种不一致最容易被当成"图标没生效"。
+        //
+        // 编号 1 是硬约定：`build.rs` 里那句 `1 ICON` 就是它。改了任一边，
+        // 这个窗口会安静地退回通用图标（LoadIconW 失败给 0，不报错）。
+        let app_icon = LoadIconW(instance, 1 as *const u16);
         let wc = WNDCLASSW {
             style: 0,
             lpfnWndProc: Some(wndproc),
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: instance,
-            hIcon: 0,
+            hIcon: app_icon,
             hCursor: LoadCursorW(0, 32512 as *const u16),
             // COLOR_BTNFACE + 1：用系统对话框底色，跟随用户的浅色/深色主题。
             hbrBackground: 16,
@@ -1418,7 +1425,7 @@ fn main() {
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: instance,
-            hIcon: 0,
+            hIcon: app_icon,
             hCursor: LoadCursorW(0, 32512 as *const u16),
             hbrBackground: 16,
             lpszMenuName: std::ptr::null(),

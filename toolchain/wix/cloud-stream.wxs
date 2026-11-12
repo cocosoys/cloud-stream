@@ -102,6 +102,18 @@
     <Property Id="ARPCOMMENTS" Value="卸载会连同配置与证书一起删掉（和向导版一致）。" />
 
     <!--
+      "应用和功能"里那个图标。不写这一条时 Windows Installer 会去
+      UninstallString 指的 msiexec.exe 上取图标 —— 用户看到的是 Windows 的
+      标志，分不出这是自己的哪个产品。
+
+      图标本身来自仓库里唯一那份 res\app.ico，和两个 exe 的图标是同一个文件：
+      三个外壳、四个出口，一处定义。ARPPRODUCTICON 引用的是下面 Icon 表的 Id，
+      不是路径。
+    -->
+    <Icon Id="AppIcon" SourceFile="$(var.IconFile)" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+
+    <!--
       ACCOUNT 可能来自命令行（SCCM），而命令行属性默认不会传到提权后的服务端
       进程 —— 上面那个 Secure="yes" 就是为了它。不标的话 ACCOUNT= 会被静默丢掉，
       然后系统集成那一步收到一个空账户，装完看起来成功、任务却注册不上。

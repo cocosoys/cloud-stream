@@ -15,9 +15,11 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 fn main() {
     embed_manifest();
+    embed_icon();
     embed_payload();
 }
 
@@ -47,6 +49,96 @@ fn embed_manifest() {
         "cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}",
         manifest.display()
     );
+}
+
+// ---------------------------------------------------------------------------
+// 图标
+// ---------------------------------------------------------------------------
+
+/// 把软件图标嵌进 exe。
+///
+/// 资源管理器、任务栏、UAC 提权弹窗、防火墙的"是否允许此应用"读的都是 PE 里
+/// 那一个 `ICON` 资源。窗口标题栏上那个小图标不在这里 —— 它是 `main.rs` 里
+/// `LoadIconW(实例, 1)` 的事，两者读的是同一份资源，所以编号必须是 1。
+///
+/// 和 `embed_manifest` 同一个取舍：**不引入资源编译的 crate**（`winres` /
+/// `embed-resource`），直接调 MSVC 自带的 `rc.exe`。少一个依赖，也少一份
+/// "它会不会在 CI 上想联网"的不确定性。
+///
+/// 唯一的代价是 rc.exe 得在 PATH 上 —— 它和 `link.exe` 在同一个目录，
+/// `toolchain\build.ps1` 已经把那个目录放到了最前面。找不到时只警告不失败：
+/// 图标是外观，为一个外观让构建停住，代价不对等。
+fn embed_icon() {
+    println!("cargo:rerun-if-changed=../../res/app.ico");
+
+    let Ok(out_dir) = std::env::var("OUT_DIR").map(PathBuf::from) else {
+        return;
+    };
+    let dir = std::env::current_dir().expect("拿不到当前目录");
+    let icon = dir.join("..").join("..").join("res").join("app.ico");
+    let name = "cloud-setup.ico";
+    if let Err(err) = std::fs::copy(&icon, out_dir.join(name)) {
+        println!(
+            "cargo:warning=读不到 {}（{err}），cloud-setup.exe 将不带图标",
+            icon.display()
+        );
+        return;
+    }
+    let Some(rc) = find_rc() else {
+        println!("cargo:warning=rc.exe 没找到，cloud-setup.exe 将不带图标");
+        return;
+    };
+
+    let rc_path = out_dir.join("cloud-setup.rc");
+    let res_path = out_dir.join("cloud-setup.res");
+    // 图标先抄进 OUT_DIR，.rc 里只写相对文件名。绝对路径要转义反斜杠、要加
+    // 引号，而 rc 按系统 ANSI 代码页读 .rc —— 仓库哪天落到带中文的路径下，
+    // 那种写法会在别人机器上变成"找不到文件"。
+    if std::fs::write(&rc_path, format!("1 ICON \"{name}\"\n")).is_err() {
+        return;
+    }
+
+    // `current_dir(out_dir)` 不能省：rc 解析相对名用的是*进程当前目录*，
+    // 不是 .rc 文件所在的目录。
+    let status = Command::new(&rc)
+        .current_dir(&out_dir)
+        .arg("/nologo")
+        .arg("/fo")
+        .arg(&res_path)
+        .arg(&rc_path)
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            println!("cargo:rustc-link-arg-bins={}", res_path.display());
+        }
+        Ok(s) => println!(
+            "cargo:warning=rc.exe 退出码 {:?}，跳过图标（构建继续）",
+            s.code()
+        ),
+        Err(err) => println!("cargo:warning=rc.exe 起不来（{err}），跳过图标"),
+    }
+}
+
+/// 找 `rc.exe`：先看 `RC` 环境变量，再在 PATH 里找。
+///
+/// 和 `stream-server/build.rs` 里那份是同一个逻辑。构建脚本之间没法共享代码
+/// （它们各自独立编译），所以这十几行是刻意重复的 —— 比为了复用去加一个
+/// "构建脚本库" crate 便宜。
+fn find_rc() -> Option<PathBuf> {
+    if let Some(explicit) = std::env::var_os("RC") {
+        let path = PathBuf::from(explicit);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join("rc.exe");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------

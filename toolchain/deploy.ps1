@@ -900,7 +900,10 @@ function New-MsiInstaller {
         "-dAppVersion=$ver",
         "-dBundleDir=$PayloadDir",
         "-dConsoleExe=$consoleExe",
-        "-dWebSource=$webSrc"
+        "-dWebSource=$webSrc",
+        # 和两个 exe 的图标是同一个文件（res\app.ico），只是这里供
+        # "应用和功能"那条 ARPPRODUCTICON 用。
+        "-dIconFile=$(Join-Path $RepoRoot 'res\app.ico')"
     )
     # 一次编一个文件、各给一个 -out：candle 只有在 -out 以反斜杠结尾时才把它
     # 当目录，而 PowerShell 会把结尾那个反斜杠吃掉 —— 与其绕这个，不如分两次。

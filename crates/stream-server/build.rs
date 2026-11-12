@@ -35,6 +35,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CS_GIT_COMMIT");
     println!("cargo:rerun-if-env-changed=CS_GIT_DIRTY");
     println!("cargo:rerun-if-env-changed=CS_BUILT_AT");
+    // 图标是发布物的一部分：改了它，exe 必须重建。
+    println!("cargo:rerun-if-changed=../../res/app.ico");
 
     let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_owned());
 
@@ -112,10 +114,31 @@ fn emit_version_resource(version: &str, commit: &str, built_at: &str) {
     let numeric = numeric_version(version);
     let rc_path = out_dir.join("stream-server.rc");
     let res_path = out_dir.join("stream-server.res");
+    // 图标和版本资源共用这一个 .rc：`res\app.ico` 是仓库里唯一那份图标定义，
+    // 四个出口（两个 exe、Inno 安装器、MSI 的"应用和功能"条目）都指它。
+    //
+    // 先把它抄进 OUT_DIR，再用**相对文件名**引用（下面的 `current_dir`）。
+    // 这两步都是为了让 .rc 里不出现路径：绝对路径要转义反斜杠、要加引号，
+    // 而 rc 按系统 ANSI 代码页读 .rc —— 仓库哪天落到带中文的路径下，那种写法
+    // 会在别人的机器上变成"找不到文件"。相对名没有这些问题。
+    let icon_name = "stream-server.ico";
+    let icon_dst = out_dir.join(icon_name);
+    let icon_src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../res/app.ico");
+    let icon_line = match std::fs::copy(&icon_src, &icon_dst) {
+        Ok(_) => format!("1 ICON \"{icon_name}\"\n"),
+        Err(err) => {
+            println!(
+                "cargo:warning=读不到 {}（{err}），exe 将不带图标",
+                icon_src.display()
+            );
+            String::new()
+        }
+    };
     // 描述一律用 ASCII：rc.exe 按系统 ANSI 代码页读取 .rc，写中文会在非中文
     // 系统上变成乱码，而这个文件本来是给"看到 exe 属性"的人读的。
     let text = format!(
-        "#include <winver.h>\n\
+        "{icon_line}\
+         #include <winver.h>\n\
          1 VERSIONINFO\n\
          FILEVERSION {numeric}\n\
          PRODUCTVERSION {numeric}\n\
@@ -149,7 +172,11 @@ fn emit_version_resource(version: &str, commit: &str, built_at: &str) {
         return;
     }
 
+    // `current_dir(out_dir)`：上面的 `icon_name` 是相对名，rc 解析它用的是
+    // *进程当前目录*，不是 .rc 文件所在的目录 —— 不切过去就会去 crates\
+    // stream-server 里找一个不存在的 app.ico。
     let status = Command::new(&rc)
+        .current_dir(&out_dir)
         .arg("/nologo")
         .arg("/fo")
         .arg(&res_path)
