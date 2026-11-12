@@ -74,7 +74,7 @@
 ## 3. 起不来的时候：`--diagnose`
 
 「程序信息」那三行回答的是"现在是什么状态"，回答不了"为什么起不来"。后者归
-`stream-server.exe --diagnose`：九节事实一次写成 `cloud-stream-facts.txt`
+`stream-server.exe --diagnose`：十节事实一次写成 `cloud-stream-facts.txt`
 （运行根 + 桌面各一份），只读、不启动服务、不改任何东西。两个 exe 都认这个
 开关 —— `stream-setting.exe --diagnose` 会转调过去，因为两个 exe 躺在同一个
 目录里，敲错名字是常态。
@@ -84,10 +84,15 @@
 `vcruntime140.dll` 跟着包走（app-local 部署），那个失败模式消失了，脚本也就
 没有存在理由了。
 
-九节的顺序与旧脚本一致（会话 / 账户策略 / 包内容 / 加载器前提 / 运行状态 /
+前九节的顺序与旧脚本一致（会话 / 账户策略 / 包内容 / 加载器前提 / 运行状态 /
 日志尾部 / 任务计划事件 / Defender / 入站可达性），所以文档里"看第 9 节"这类
 说法继续有效。第 5 节会**排除自己**：诊断进程的映像名也叫 `stream-server.exe`，
 把它列进"在跑的实例"正好把这一节要回答的问题答反。
+
+第 10 节是后来加的，不属于"起不来"，属于"起来了但鼠标不跟手"：它读系统的指针
+设置（`SPI_GETMOUSESPEED` / `SPI_GETMOUSE`）与 `HKCU\Control Panel\Mouse` 的持久化
+值，两者并排显示，再附上最近 6 条 `host pointer …` 日志 —— 用来把"钉不住"、
+"钉住了没还原"、"根本没有会话在跑"分开。细节见 `docs/pointer-1to1.md`。
 
 ## 4. 配置表单
 

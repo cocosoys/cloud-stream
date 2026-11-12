@@ -64,11 +64,11 @@ const SPI_SETMOUSESPEED: u32 = 0x0071;
 const SPI_GETLOGICALDPIOVERRIDE: u32 = 0x009E;
 const SPI_SETLOGICALDPIOVERRIDE: u32 = 0x009F;
 // #96: the pointer-acceleration triple. `SPI_GETMOUSE`/`SPI_SETMOUSE` pass it
-// through `pvParam` as an array of three `INT`s —
-// `{MouseSpeed, MouseThreshold1, MouseThreshold2}`. `MouseSpeed` is the
-// "enhance pointer precision" switch (0 = off, 1/2 = the two acceleration
-// curves); the thresholds only decide when a curve bends, so they are carried
-// through untouched and only ever handed back on release.
+// through `pvParam` as an array of three `INT`s in the order
+// `{threshold1, threshold2, acceleration}` — see [`Accel`], which is where that
+// order is spelled out and where getting it wrong is described. The two
+// thresholds only decide when a curve bends, so they are carried through
+// untouched and only ever handed back on release.
 const SPI_GETMOUSE: u32 = 0x0003;
 const SPI_SETMOUSE: u32 = 0x0004;
 /// Persist the change in the user profile.
@@ -102,8 +102,30 @@ pub const BASE_DPI: u32 = 400;
 /// the ghost falls behind by the same factor the hand moves.
 pub const UNIT_SPEED: u8 = 10;
 
-/// Windows' pointer-acceleration triple: `[MouseSpeed, threshold1, threshold2]`.
+/// Windows' pointer-acceleration triple, **in the order `SPI_GETMOUSE` uses**:
+/// `{threshold1, threshold2, acceleration}`.
+///
+/// #124/B — that is not the order of the registry's three values, which are
+/// `MouseSpeed`, `MouseThreshold1`, `MouseThreshold2`. On a stock machine
+/// `HKCU\Control Panel\Mouse` holds `1 / 6 / 10` while `SPI_GETMOUSE` returns
+/// `6 / 10 / 1` for the same settings: the API puts the switch **last** and the
+/// two thresholds first. Believing otherwise is not a cosmetic mistake —
+/// [`accel_off_triple`] then cleared `threshold1` instead of the switch, and
+/// the readback that was supposed to catch it (`triple[0] == 0`) agreed with
+/// the write, so a pin that had left acceleration on reported success. Use the
+/// named indices below; never `[0]`.
 pub type Accel = [i32; 3];
+
+/// Where each component sits in [`Accel`]: thresholds first, switch last.
+///
+/// The two orders are one swap apart and the values are all small integers, so
+/// a wrong index reads as a plausible number instead of failing loudly. Names
+/// are the only thing that keeps them apart.
+pub const ACCEL_T1: usize = 0;
+/// See [`ACCEL_T1`].
+pub const ACCEL_T2: usize = 1;
+/// `0` = acceleration off, `1`/`2` = the two acceleration curves.
+pub const ACCEL_SWITCH: usize = 2;
 
 /// Windows' pointer-speed steps 1..=20 as the DPI they mean against
 /// [`BASE_DPI`]. `SPEED_DPI[n - 1]` is step `n`; step 10, the OS default, is
@@ -252,7 +274,7 @@ pub fn current_accel() -> Option<Accel> {
 
 /// Whether the host is accelerating the pointer ("enhance pointer precision").
 pub fn accel_on() -> Option<bool> {
-    current_accel().map(|accel| accel[0] != 0)
+    current_accel().map(|accel| accel[ACCEL_SWITCH] != 0)
 }
 
 /// The same triple with the acceleration switch off and the thresholds kept.
@@ -261,7 +283,9 @@ pub fn accel_on() -> Option<bool> {
 /// the values the user's own profile holds, and they decide where the curve
 /// bends once it is switched back on.
 fn accel_off_triple(accel: Accel) -> Accel {
-    [0, accel[1], accel[2]]
+    let mut off = accel;
+    off[ACCEL_SWITCH] = 0;
+    off
 }
 
 /// Write the acceleration triple. `broadcast` is off for the same reason
@@ -465,7 +489,7 @@ pub fn pin_pointer() -> Result<AppliedPin, String> {
 
     // Already 1:1: record where to return to and write nothing. Writing would
     // be two broadcasts for a setting that is not going to move.
-    if saved.speed == UNIT_SPEED && saved.accel[0] == 0 {
+    if saved.speed == UNIT_SPEED && saved.accel[ACCEL_SWITCH] == 0 {
         slot.saved = Some(saved);
         slot.active = true;
         return Ok(AppliedPin {
@@ -483,7 +507,7 @@ pub fn pin_pointer() -> Result<AppliedPin, String> {
     // it can, the reading is the outcome (#95).
     let speed_ok = now_speed.map(|step| step == UNIT_SPEED).unwrap_or(wrote_speed);
     let accel_ok = now_accel
-        .map(|triple| triple[0] == 0)
+        .map(|triple| triple[ACCEL_SWITCH] == 0)
         .unwrap_or(wrote_accel);
     if speed_ok && accel_ok {
         slot.saved = Some(saved);
@@ -507,7 +531,7 @@ pub fn pin_pointer() -> Result<AppliedPin, String> {
             None => String::from("unknown"),
         },
         match now_accel {
-            Some(triple) => if triple[0] == 0 { "off" } else { "on" },
+            Some(triple) => if triple[ACCEL_SWITCH] == 0 { "off" } else { "on" },
             None => "unknown",
         },
     ))
@@ -775,12 +799,25 @@ mod tests {
 
     /// Switching the acceleration off must not drop the thresholds: they are
     /// the user's own profile values and they are what the release writes back.
+    ///
+    /// #124/B — the arrays below are in `SPI_GETMOUSE` order
+    /// (`{threshold1, threshold2, switch}`): the switch is the **last** slot.
+    /// This test used to assert `[1, 6, 10] -> [0, 6, 10]`, i.e. that the first
+    /// slot was the switch — and it passed, because the implementation had made
+    /// the same mistake. The pin therefore cleared `threshold1` (making every
+    /// movement enter the accelerated band) while leaving acceleration on, and
+    /// its readback checked the same wrong slot and reported success. The values
+    /// here are what a stock machine actually holds: `HKCU\Control Panel\Mouse`
+    /// = `1 / 6 / 10`, `SPI_GETMOUSE` = `6 / 10 / 1`.
     #[test]
     fn turning_acceleration_off_keeps_the_thresholds() {
-        assert_eq!(accel_off_triple([1, 6, 10]), [0, 6, 10]);
-        assert_eq!(accel_off_triple([2, 4, 12]), [0, 4, 12]);
+        assert_eq!(accel_off_triple([6, 10, 1]), [6, 10, 0]);
+        assert_eq!(accel_off_triple([4, 12, 2]), [4, 12, 0]);
         // Already off: the triple is unchanged, so the pin's write is a no-op.
-        assert_eq!(accel_off_triple([0, 6, 10]), [0, 6, 10]);
+        assert_eq!(accel_off_triple([6, 10, 0]), [6, 10, 0]);
+        // The switch really is last; if that ever changes, every index in this
+        // module has to change with it.
+        assert_eq!(ACCEL_SWITCH, 2);
     }
 
     /// #96, live: pin, read back, release, and assert the host is where it
@@ -809,7 +846,7 @@ mod tests {
         assert_eq!(applied.speed, UNIT_SPEED);
         assert_eq!(pinned_speed, Some(UNIT_SPEED), "the pin did not take the speed");
         assert_eq!(
-            pinned_accel.map(|triple| triple[0]),
+            pinned_accel.map(|triple| triple[ACCEL_SWITCH]),
             Some(0),
             "the pin did not turn acceleration off"
         );

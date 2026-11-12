@@ -974,8 +974,8 @@ rem ... dies on "/I" — the guard ...
   任务详情与 `LastTaskResult`、两份日志尾部、任务计划事件、Defender 状态。
   它**不启动 exe** —— 会抢屏和 8080，也可能和已在工作的实例打架；只给出一行
   "手工复现"的命令。
-  **2026-11 并入 `stream-server.exe --diagnose`**：九节照旧，只是不再需要"不依赖
-  VC++ 的脚本"这个前提（`vcruntime140.dll` 已随包走）。
+  **2026-11 并入 `stream-server.exe --diagnose`**：前九节照旧，只是不再需要"不依赖
+  VC++ 的脚本"这个前提（`vcruntime140.dll` 已随包走）；另加第 10 节指针 1:1 基线。
 - 这个脚本自己的两个坑与 `find.exe` 同源：`powershell` 要写**全路径**
   （PATH 里若有 pwsh 7，裸名字会跑到别的版本上），并把 `PSModulePath` 收窄到
   5.1 的模块目录（否则 5.1 去加载 pwsh 的模块，弹"不受信任的发布者"交互提示，

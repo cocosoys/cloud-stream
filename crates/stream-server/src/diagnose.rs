@@ -14,12 +14,17 @@
 //! 工具箱一键调用、才不会随包布局变化而腐掉（旧脚本里那份"必须存在的文件"
 //! 清单把它自己都列进去了）。
 //!
-//! # 为什么九节、为什么这个顺序
+//! # 为什么十节、为什么这个顺序
 //!
-//! 顺序照抄旧脚本：文档里"看第 9 节"这类引用继续有效，两边的事实清单能逐节
-//! 对照。九节按"从外到内"排 —— 先确认人在哪台机器的哪个会话上（1、2），再看
-//! 包本身缺不缺东西（3、4），然后才是进程/任务/日志（5、6），最后是任务计划
-//! 事件、杀软与入站可达性（7、8、9）。
+//! 1–9 的顺序照抄旧脚本：文档里"看第 9 节"这类引用继续有效，两边的事实清单
+//! 能逐节对照。这九节按"从外到内"排 —— 先确认人在哪台机器的哪个会话上
+//! （1、2），再看包本身缺不缺东西（3、4），然后才是进程/任务/日志（5、6），
+//! 最后是任务计划事件、杀软与入站可达性（7、8、9）。
+//!
+//! 第 10 节是 2026-11 加的，不属于"起不起得来"，而属于"起来了但手感不对"，
+//! 所以排在最后：前九节全部 OK 之后，人才会开始追究"为什么游戏里转不动"。
+//! 它只读两处 —— 系统的指针设置（进程内 `SPI_GET*`，不需要管理员）和日志里
+//! 那三行钉住记录 —— 就可以把"钉不住"与"钉住了但被别的东西改回去"分开。
 //!
 //! # 只读
 //!
@@ -35,6 +40,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use crate::configfile;
+use crate::dispatch::hostui::{self, ACCEL_SWITCH, ACCEL_T1, ACCEL_T2};
 
 /// 输出文件名。与旧脚本一致：回传流程、文档、口头说法都不用改。
 const FACTS_FILE: &str = "cloud-stream-facts.txt";
@@ -44,6 +50,13 @@ const LOG_TAIL: usize = 40;
 
 /// 任务名。安装器建的那个。
 const TASK_NAME: &str = "MCStreamSrv";
+
+/// 服务自己的日志。第 6 节拖尾、第 10 节筛指针记录，读的是同一份，所以名字
+/// 只在这里出现一次。
+const SERVER_LOG: &str = "stream-server.log";
+
+/// `--run` 包装器的日志。
+const WATCHDOG_LOG: &str = "watchdog.log";
 
 /// `--diagnose` 在命令行里吗。
 ///
@@ -108,7 +121,7 @@ fn desktop_dir() -> Option<PathBuf> {
     desktop.is_dir().then_some(desktop)
 }
 
-/// 九节正文。
+/// 十节正文。
 fn collect(root: &Path) -> String {
     let mut out = String::with_capacity(16 * 1024);
     let _ = writeln!(out, "cloud-stream launch facts");
@@ -125,6 +138,7 @@ fn collect(root: &Path) -> String {
     section_task_events(&mut out);
     section_defender(&mut out);
     section_inbound(&mut out, root);
+    section_pointer(&mut out, root);
 
     let _ = writeln!(out, "==== done ====");
     out
@@ -383,7 +397,7 @@ fn effective_port(root: &Path) -> u16 {
 
 fn section_logs(out: &mut String, root: &Path) {
     let _ = writeln!(out, "==== 6. logs (tail {LOG_TAIL} each) ====");
-    let watchdog = root.join("logs").join("watchdog.log");
+    let watchdog = root.join("logs").join(WATCHDOG_LOG);
     if watchdog.is_file() {
         let _ = writeln!(out, "-- logs\\watchdog.log --");
         out.push_str(&tail(&watchdog, LOG_TAIL));
@@ -394,7 +408,7 @@ fn section_logs(out: &mut String, root: &Path) {
         );
     }
     let _ = writeln!(out);
-    let server = root.join("logs").join("stream-server.log");
+    let server = root.join("logs").join(SERVER_LOG);
     if server.is_file() {
         let _ = writeln!(out, "-- logs\\stream-server.log --");
         out.push_str(&tail(&server, LOG_TAIL));
@@ -537,7 +551,7 @@ fn section_inbound(out: &mut String, root: &Path) {
     // 启动期自检的结论行。这是"服务自己怎么看"与"外面怎么看"之间最短的一条
     // 线索：它在每次启动时写一行，成功失败都有。
     let _ = writeln!(out, "-- 启动自检结论（watchdog.log 里的 PREFLIGHT）--");
-    let watchdog = root.join("logs").join("watchdog.log");
+    let watchdog = root.join("logs").join(WATCHDOG_LOG);
     match std::fs::read(&watchdog) {
         Ok(bytes) => {
             let text = decode(&bytes);
@@ -558,6 +572,401 @@ fn section_inbound(out: &mut String, root: &Path) {
             let _ = writeln!(out, "没有 watchdog.log —— 计划任务没有从这个目录跑过");
         }
     }
+    let _ = writeln!(out);
+}
+
+// ---------------------------------------------------------------------------
+// 10. 指针 1:1 基线
+// ---------------------------------------------------------------------------
+
+/// 这台机器现在会不会把相对位移改掉。三态。
+///
+/// 为什么不直接报 `hostui::pointer_pinned()`：那是**进程内**的 static，诊断是
+/// 另一个进程，读出来永远是 `false` —— 报它等于报一个恒假的字段。而
+/// `SPI_GETMOUSESPEED` / `SPI_GETMOUSE` 读的是系统设置，跨进程可见，所以这一节
+/// 能回答的是"这台机器此刻的基线是什么"；"上一次会话有没有把它钉住"要去日志
+/// 里找，两件事分开说，才不会把"没有会话在跑"读成"钉不住"。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Baseline {
+    /// 加速关着、速度档在 `UNIT_SPEED`：一个 count 就是一个像素。
+    OneToOne { thresholds: (i32, i32) },
+    /// 有东西会改位移。两项各自可能读不到。
+    Bent {
+        speed: Option<u8>,
+        accel_on: Option<bool>,
+    },
+    /// 两项都读不到：没有交互桌面（服务会话、会话 0）。
+    Unknown,
+}
+
+/// 判定。纯函数，测试不依赖一台真的装着鼠标驱动的机器。
+fn baseline(speed: Option<u8>, accel: Option<hostui::Accel>) -> Baseline {
+    if speed.is_none() && accel.is_none() {
+        return Baseline::Unknown;
+    }
+    let accel_on = accel.map(|triple| triple[ACCEL_SWITCH] != 0);
+    if speed == Some(hostui::UNIT_SPEED) && accel_on == Some(false) {
+        let thresholds = accel
+            .map(|triple| (triple[ACCEL_T1], triple[ACCEL_T2]))
+            .unwrap_or((0, 0));
+        Baseline::OneToOne { thresholds }
+    } else {
+        Baseline::Bent { speed, accel_on }
+    }
+}
+
+/// 速度档相当于基准 DPI 的多少倍。去掉多余的零：`1x` 而不是 `1.00x`，否则
+/// "正好 1:1" 与 "差一点点" 在视觉上要数小数点才分得出来。
+fn gain_text(dpi: u32) -> String {
+    let mut text = format!("{:.2}", f64::from(dpi) / f64::from(hostui::BASE_DPI));
+    while text.ends_with('0') {
+        text.pop();
+    }
+    if text.ends_with('.') {
+        text.pop();
+    }
+    text
+}
+
+/// 配置里 `pointer_recenter`（B 的边缘重定位）的值。`None` = 没有配置文件。
+fn configured_recenter(root: &Path) -> Option<bool> {
+    for name in [configfile::BUNDLE_CONFIG, "config.toml"] {
+        let path = root.join(name);
+        if !path.is_file() {
+            continue;
+        }
+        if let Ok(file) = configfile::load(&path) {
+            return Some(file.pointer_recenter.unwrap_or(false));
+        }
+    }
+    None
+}
+
+/// `HKCU\Control Panel\Mouse` 里持久化的加速三元组。
+///
+/// 为什么不用 `reg.exe`：它是一个外部进程，在某些机器上会被策略拦掉，而这一段
+/// 的全部意义就是和运行时值对比 —— 拿不到就等于没有。`RegGetValueW` 是同一份
+/// 数据的进程内读法，不落盘、不弹窗。
+///
+/// 三个值都是 `REG_SZ` 形式的数字（"1"、"6"、"10"），不是 `DWORD`，所以要走
+/// 字符串再解析；用 `RRF_RT_REG_SZ` 让 API 自己拒绝别的类型，省一层判断。
+#[cfg(windows)]
+fn profile_triple() -> Option<[i32; 3]> {
+    use windows_sys::Win32::System::Registry::{
+        RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_SZ,
+    };
+
+    const SUBKEY: &str = r"Control Panel\Mouse";
+
+    fn one(subkey: &[u16], name: &str) -> Option<i32> {
+        let value: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut buf = [0u16; 32];
+        let mut len = std::mem::size_of_val(&buf) as u32;
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                subkey.as_ptr(),
+                value.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr() as *mut std::ffi::c_void,
+                &mut len,
+            )
+        };
+        // `ERROR_SUCCESS` 是 0；这里不引常量，返回值本身就是错误码。
+        if status != 0 {
+            return None;
+        }
+        let used = (len as usize / 2).min(buf.len());
+        String::from_utf16_lossy(&buf[..used])
+            .trim_end_matches('\0')
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    let subkey: Vec<u16> = SUBKEY.encode_utf16().chain(std::iter::once(0)).collect();
+    Some([
+        one(&subkey, "MouseSpeed")?,
+        one(&subkey, "MouseThreshold1")?,
+        one(&subkey, "MouseThreshold2")?,
+    ])
+}
+
+/// 非 Windows 上没有这份注册表。项目本身只支持 Windows，这个分支存在只是
+/// 为了让 `cargo check` 在别的平台上不炸。
+#[cfg(not(windows))]
+fn profile_triple() -> Option<[i32; 3]> {
+    None
+}
+
+/// 注册表的 `{MouseSpeed, Threshold1, Threshold2}` 换算成 `SPI_GETMOUSE` 的
+/// `{Threshold1, Threshold2, switch}` 顺序。
+///
+/// 两边的排列只差首末互换，而所有分量都是小整数 —— 直接拿数组比会得出"永久
+/// 不一致"的假结论（本机的 `1 / 6 / 10` 对 `6 / 10 / 1` 就是同一份数据）。这个
+/// 换算同时也是 [`hostui::Accel`] 那段注释的证据：三个值一一对上，说明顺序确实
+/// 是阈值在前、开关在后。
+fn profile_as_spi_order(profile: [i32; 3]) -> [i32; 3] {
+    [profile[1], profile[2], profile[0]]
+}
+
+/// 判定结论的人话。拆出来是为了让"速度档 10 + 加速开着"不被说成
+/// "速度档在放大位移" —— 档 10 本身正好是 1 倍，放大全部来自曲线。
+fn bent_reason(speed: Option<u8>, accel_on: Option<bool>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    match speed {
+        Some(step) if step == hostui::UNIT_SPEED => {}
+        Some(step) => {
+            let dpi = hostui::dpi_for_speed(u32::from(step));
+            parts.push(format!(
+                "速度档 {step} 在把位移放大到 {}x",
+                gain_text(dpi)
+            ));
+        }
+        None => parts.push(String::from("速度档读不到")),
+    }
+    match accel_on {
+        Some(true) => parts.push(String::from("加速曲线开着")),
+        Some(false) => {}
+        None => parts.push(String::from("加速读不到")),
+    }
+    if parts.is_empty() {
+        // 到不了：两项都正常就该是 `OneToOne`。留一句话总比输出空白强。
+        String::from("两项都正常")
+    } else {
+        parts.join("，")
+    }
+}
+
+/// 日志里含任一关键字的最后 `keep` 行。
+fn last_matching(path: &Path, needles: &[&str], keep: usize) -> Vec<String> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    let text = decode(&bytes);
+    let hits: Vec<String> = text
+        .lines()
+        .filter(|line| needles.iter().any(|needle| line.contains(needle)))
+        .map(|line| line.trim_end().to_owned())
+        .collect();
+    let start = hits.len().saturating_sub(keep);
+    hits[start..].to_vec()
+}
+
+/// 第 10 节：为什么"游戏里转不动"有时候不是配置问题。
+///
+/// 相对位移（`m2`）走的是 Windows 的两层加工：加速度曲线把位移变成手速的函数，
+/// 速度档再整体乘一个倍数。两者各自都能让"玩家调灵敏度"失效 —— 曲线是非线性的，
+/// 慢移 1 倍、快甩 2 倍，滑块无处可调。`#124` 的 A 项在有会话锁指针时把两者都钉
+/// 到 1:1，这一节是它的验尸工具：基线是什么、钉住的记录有没有出现、B 开了没有。
+fn section_pointer(out: &mut String, root: &Path) {
+    let _ = writeln!(out, "==== 10. pointer 1:1 baseline ====");
+
+    let speed = hostui::current_speed();
+    let accel = hostui::current_accel();
+    let verdict = baseline(speed, accel);
+
+    let _ = writeln!(
+        out,
+        "-- 系统设置（进程内读 SPI_GET*，不需要管理员，不影响任何设置）--"
+    );
+    match speed {
+        Some(step) => {
+            let dpi = hostui::dpi_for_speed(u32::from(step));
+            let _ = writeln!(
+                out,
+                "speed      step {step} = {dpi} DPI（基准 {} DPI 的 {}x）",
+                hostui::BASE_DPI,
+                gain_text(dpi)
+            );
+        }
+        None => {
+            let _ = writeln!(out, "speed      读不到（这个会话没有交互桌面）");
+        }
+    }
+    match accel {
+        Some(triple) => {
+            let _ = writeln!(
+                out,
+                "accel      {}，thresholds {} / {}（顺序：t1, t2, switch）",
+                if triple[ACCEL_SWITCH] == 0 {
+                    "off"
+                } else {
+                    "ON"
+                },
+                triple[ACCEL_T1],
+                triple[ACCEL_T2]
+            );
+            if triple[ACCEL_SWITCH] != 0 {
+                let (t1, t2) = (triple[ACCEL_T1], triple[ACCEL_T2]);
+                let _ = writeln!(
+                    out,
+                    "           慢移不放大，超过 {t1} 进 2 倍档，超过 {t2} 进 4 倍档 —— 这是曲线，不是常数"
+                );
+                // 默认值是 6 / 10，t1 大于 t2 不是 Windows 会写出来的形状。
+                if t1 > t2 {
+                    let _ = writeln!(
+                        out,
+                        "           注意：threshold1 比 threshold2 大，两个阈值是反的 —— \
+                         有程序改过它，曲线因此不再有三段"
+                    );
+                }
+            }
+        }
+        None => {
+            let _ = writeln!(out, "accel      读不到（同上）");
+        }
+    }
+
+    match verdict {
+        Baseline::OneToOne { thresholds } => {
+            let _ = writeln!(
+                out,
+                "verdict    OK 1:1 —— 加速关着、速度档在 {}，一个 count 就是一个像素 \
+                 （恢复时会写回 thresholds {} / {}）",
+                hostui::UNIT_SPEED,
+                thresholds.0,
+                thresholds.1
+            );
+        }
+        Baseline::Bent { speed, accel_on } => {
+            let _ = writeln!(
+                out,
+                "verdict    NOT 1:1 —— {}",
+                bent_reason(speed, accel_on)
+            );
+            let _ = writeln!(
+                out,
+                "           空闲时这样是**正常的**：只有游戏模式会话锁住指针期间才钉 1:1，\
+                 锁一解开就还原。要证明钉得住，下一节看日志。"
+            );
+        }
+        Baseline::Unknown => {
+            let _ = writeln!(
+                out,
+                "verdict    UNKNOWN —— 两项都读不到。多半跑在会话 0（服务会话）或没有桌面，\
+                 这种情况下 pin 也必然失败，见下面的日志与第 5 节的 LogonType"
+            );
+        }
+    }
+    let _ = writeln!(out);
+
+    let _ = writeln!(
+        out,
+        "-- 持久化值（HKCU\\Control Panel\\Mouse，进程内读，不经过 reg.exe）--"
+    );
+    match profile_triple() {
+        Some(profile) => {
+            let _ = writeln!(
+                out,
+                "profile    MouseSpeed={}  Threshold1={}  Threshold2={}",
+                profile[0], profile[1], profile[2]
+            );
+            match accel {
+                Some(runtime) if runtime == profile_as_spi_order(profile) => {
+                    let _ = writeln!(
+                        out,
+                        "runtime    Threshold1={}  Threshold2={}  switch={}",
+                        runtime[ACCEL_T1], runtime[ACCEL_T2], runtime[ACCEL_SWITCH]
+                    );
+                    let _ = writeln!(
+                        out,
+                        "           两者是同一份数据 —— SPI 把开关放在末位、阈值放在前面，\
+                         字段名对齐后完全一致，没有第三方在中间改它"
+                    );
+                }
+                Some(runtime) => {
+                    let _ = writeln!(
+                        out,
+                        "runtime    Threshold1={}  Threshold2={}  switch={}  ← **不一致**",
+                        runtime[ACCEL_T1], runtime[ACCEL_T2], runtime[ACCEL_SWITCH]
+                    );
+                    let _ = writeln!(
+                        out,
+                        "           运行时值优先（它才是生效的那个）。不一致说明有程序用 \
+                         SPI_SETMOUSE 改了会话值却没写回配置 —— 鼠标驱动、厂商工具、\
+                         远程桌面客户端都会这么干。"
+                    );
+                    let _ = writeln!(
+                        out,
+                        "           这也是这一节以 SPI 为准、而不是直接读注册表的原因：\
+                         注册表只能说明\"上次保存的是什么\"。"
+                    );
+                }
+                None => {
+                    let _ = writeln!(out, "           运行时值读不到，无法对比");
+                }
+            }
+        }
+        None => {
+            let _ = writeln!(
+                out,
+                "profile    读不到 —— 键不存在或被策略挡住；只能以上面的运行时值为准"
+            );
+        }
+    }
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "-- 配置开关 --");
+    match configured_recenter(root) {
+        Some(true) => {
+            let _ = writeln!(
+                out,
+                "pointer_recenter  ON  —— 指针贴到被串流屏幕边缘 2 px 内会被拉回中心（B 生效）"
+            );
+        }
+        Some(false) => {
+            let _ = writeln!(
+                out,
+                "pointer_recenter  off —— 边缘重定位没开；长距离转视角仍会顶到屏幕边（用 --pointer-recenter 打开）"
+            );
+        }
+        None => {
+            let _ = writeln!(
+                out,
+                "pointer_recenter  off（没有配置文件，取默认值）—— 边缘重定位没开"
+            );
+        }
+    }
+    let _ = writeln!(out);
+
+    let _ = writeln!(
+        out,
+        "-- 最近一次钉住的结果（{SERVER_LOG}，最后 6 条）--"
+    );
+    let log = root.join("logs").join(SERVER_LOG);
+    let hits = last_matching(&log, &["host pointer"], 6);
+    if hits.is_empty() {
+        let _ = writeln!(
+            out,
+            "没有记录 —— 没有任何会话在相对模式下跑过，或日志已经轮转"
+        );
+    } else {
+        for line in &hits {
+            let _ = writeln!(out, "{line}");
+        }
+    }
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "-- 怎么读这一节 --");
+    let _ = writeln!(
+        out,
+        "1) 现在 NOT 1:1 不代表坏了；钉住只活在一次游戏模式会话期间。"
+    );
+    let _ = writeln!(
+        out,
+        "2) 日志里出现 \"auto-pinned to 1:1 ... strategy=pinned\" = 钉成功；"
+    );
+    let _ = writeln!(
+        out,
+        "   strategy=already 表示本来就 1:1（常见于已经关掉加速的机器）。"
+    );
+    let _ = writeln!(
+        out,
+        "3) 出现 \"could not pin\" 才是真故障：要么这个会话没有交互桌面（第 5 节 \
+         LogonType 必须是 Interactive），要么鼠标驱动在覆盖（上面注册表那一段）。"
+    );
     let _ = writeln!(out);
 }
 
@@ -751,6 +1160,157 @@ mod tests {
         let empty = dir.join("empty");
         std::fs::create_dir_all(&empty).unwrap();
         assert_eq!(effective_port(&empty), 8080);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 只有"加速关着 **且** 速度档在 10"才算 1:1。少任意一条都是曲线。
+    ///
+    /// 数组按 `SPI_GETMOUSE` 的顺序写：`{threshold1, threshold2, switch}` ——
+    /// 开关在末位，不是首位（这正是 #124/B 修掉的那个错误）。
+    #[test]
+    fn only_both_halves_make_it_one_to_one() {
+        assert_eq!(
+            baseline(Some(hostui::UNIT_SPEED), Some([6, 10, 0])),
+            Baseline::OneToOne { thresholds: (6, 10) },
+            "加速关 + 档位 10 才是 1:1"
+        );
+        // 档位 10 但加速开着：慢移 1 倍、快甩 2 倍，正是玩家调不动的那种。
+        assert_eq!(
+            baseline(Some(hostui::UNIT_SPEED), Some([6, 10, 1])),
+            Baseline::Bent {
+                speed: Some(hostui::UNIT_SPEED),
+                accel_on: Some(true),
+            }
+        );
+        // 加速关着但档位在 15（800 DPI = 2 倍）。
+        assert_eq!(
+            baseline(Some(15), Some([6, 10, 0])),
+            Baseline::Bent {
+                speed: Some(15),
+                accel_on: Some(false),
+            }
+        );
+    }
+
+    /// 只读到一半时不能判成 1:1，也不能判成"读不到" —— 后者会让第 5 节的
+    /// LogonType 被冤枉。读到的那一半就足够说明"不是 1:1"了。
+    #[test]
+    fn half_a_reading_is_still_bent() {
+        assert_eq!(
+            baseline(Some(15), None),
+            Baseline::Bent {
+                speed: Some(15),
+                accel_on: None,
+            }
+        );
+        assert_eq!(
+            baseline(None, Some([6, 10, 1])),
+            Baseline::Bent {
+                speed: None,
+                accel_on: Some(true),
+            }
+        );
+        // 速度档读不到、加速关着：可能是 1:1，但没有证据，按"不是"处理。
+        assert_eq!(
+            baseline(None, Some([6, 10, 0])),
+            Baseline::Bent {
+                speed: None,
+                accel_on: Some(false),
+            }
+        );
+    }
+
+    /// 注册表与 SPI 的排列差一次首末互换。拿原数组直接比会永远"不一致"，
+    /// 而这个假警报会把一台正常的机器指到"有程序在改它"上去。
+    #[test]
+    fn the_two_orders_are_one_swap_apart() {
+        // 本机实测：注册表 1 / 6 / 10，SPI 读 6 / 10 / 1。
+        assert_eq!(profile_as_spi_order([1, 6, 10]), [6, 10, 1]);
+        // 换算之后才是可比的形式。
+        assert_eq!(
+            baseline(Some(hostui::UNIT_SPEED), Some(profile_as_spi_order([0, 6, 10]))),
+            Baseline::OneToOne { thresholds: (6, 10) },
+            "注册表里加速是 0（关），换算后应当判成 1:1"
+        );
+    }
+
+    /// 服务会话（会话 0）里两项都读不到。这时必须报 UNKNOWN —— 报 NOT 1:1
+    /// 会把"没有桌面"误导成"设置不对"。
+    #[test]
+    fn nothing_readable_is_unknown() {
+        assert_eq!(baseline(None, None), Baseline::Unknown);
+    }
+
+    /// 倍率文本：整数不带小数点，否则"正好 1:1"要数零才看得出来。
+    #[test]
+    fn gain_text_drops_the_decimals_it_does_not_need() {
+        assert_eq!(gain_text(400), "1");
+        assert_eq!(gain_text(800), "2");
+        assert_eq!(gain_text(1200), "3");
+        assert_eq!(gain_text(1400), "3.5");
+        assert_eq!(gain_text(500), "1.25");
+    }
+
+    /// 只取含关键字的行、只留最后几条，且不把别的日志行混进来。
+    #[test]
+    fn last_matching_keeps_the_tail_of_the_hits_only() {
+        let dir = std::env::temp_dir().join(format!("cs-diag-log-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stream-server.log");
+        std::fs::write(
+            &path,
+            "booting\n\
+             host pointer auto-pinned to 1:1 (speed=10)\n\
+             encoding started\n\
+             host pointer released (p,0)\n\
+             idle\n",
+        )
+        .unwrap();
+        assert_eq!(
+            last_matching(&path, &["host pointer"], 6),
+            vec![
+                String::from("host pointer auto-pinned to 1:1 (speed=10)"),
+                String::from("host pointer released (p,0)"),
+            ]
+        );
+        // `keep` 比命中数少时只留尾部。
+        assert_eq!(last_matching(&path, &["host pointer"], 1).len(), 1);
+        // 文件不存在不是错误：这是"日志没生成"的常态。
+        assert!(last_matching(&dir.join("nope.log"), &["host pointer"], 6).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 档 10 本身是 1 倍，所以"加速开着"那句不能说成"速度档在放大位移"——
+    /// 否则运维看到的是"档位不对"，去调档位，而真正的原因在曲线上。
+    #[test]
+    fn the_reason_names_only_the_half_that_is_actually_bending() {
+        let accel_only = bent_reason(Some(hostui::UNIT_SPEED), Some(true));
+        assert!(accel_only.contains("加速曲线开着"), "{accel_only}");
+        assert!(!accel_only.contains("速度档"), "{accel_only}");
+
+        let speed_only = bent_reason(Some(15), Some(false));
+        assert!(speed_only.contains("速度档 15"), "{speed_only}");
+        assert!(speed_only.contains("2x"), "800 DPI 是 2 倍：{speed_only}");
+        assert!(!speed_only.contains("加速"), "{speed_only}");
+
+        let both = bent_reason(Some(15), Some(true));
+        assert!(both.contains("速度档 15") && both.contains("加速曲线开着"), "{both}");
+    }
+
+    /// B 的开关必须从配置读：诊断里写死 `false` 就没法回答"我明明开了"。
+    #[test]
+    fn recenter_flag_comes_from_the_config_file() {
+        let dir = std::env::temp_dir().join(format!("cs-diag-recenter-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(configured_recenter(&dir), None, "没有配置文件");
+        std::fs::write(dir.join(configfile::BUNDLE_CONFIG), "pointer_recenter = true\n").unwrap();
+        assert_eq!(configured_recenter(&dir), Some(true));
+        std::fs::write(dir.join(configfile::BUNDLE_CONFIG), "port = 9000\n").unwrap();
+        assert_eq!(
+            configured_recenter(&dir),
+            Some(false),
+            "配置文件在但没写这一项 = 默认关"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

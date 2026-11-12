@@ -82,6 +82,10 @@ windows-sys = { version = "0.52", features = [
     # 是 936），按 UTF-8 硬读会得到一串问号。`MultiByteToWideChar` 是那个回退，
     # 而问号恰好是诊断文件里最没用的东西。
     "Win32_Globalization",
+    # `--diagnose` 第 10 节：把 `HKCU\Control Panel\Mouse` 的持久化值和
+    # `SPI_GETMOUSE` 的运行时值对比。原来这一节调 `reg.exe`，那是外部进程 ——
+    # 机器上被策略拦掉时整段就没了，而这一段存在的意义就是对比。
+    "Win32_System_Registry",
 ] }
 flate2 = "1.0"
 # #55: clipboard uplink chunks arrive base64-encoded (clipboard-worker-bridge).

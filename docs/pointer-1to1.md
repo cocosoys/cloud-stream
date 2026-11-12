@@ -49,6 +49,39 @@
 - 钉的是**进程级**设置，多页面同时锁定时一个解锁就还原——和 `ghost-cursor.md §6`
   登记的行为一致，单实例单桌面部署下遇不到。
 
+### 勘误（#124/B 发现，已修）：这一项原本是坏的
+
+`pin_pointer` 依赖的 `hostui::Accel` 把三元组当成 `{MouseSpeed, t1, t2}`，而
+`SPI_GETMOUSE` 的实际顺序是 **`{threshold1, threshold2, acceleration}`** —— 开关在
+**末位**。三个分量都是小整数，所以读错只是读到另一个"看起来合理"的数，不会报错。
+
+后果不是"效果差一点"，是**方向反了**：
+
+| | 原实现 | 实际写入的含义 |
+| --- | --- | --- |
+| `accel_off_triple` | `[0, accel[1], accel[2]]` | **t1 被清成 0**（每个位移都进高档），加速开关仍是原值（通常为开） |
+| 读回判定 | `triple[0] == 0` | 读到的是 t1，恒为 0 → **报"已关闭"** |
+
+写入和校验错在同一个位置，于是"钉住了"是自证的：日志写 `accel_off=true`，玩家却
+仍觉得灵敏度不线性，因为曲线其实被加强了。同一处错误还让 `accel_on()` 在加速**已关**
+的机器上返回 `true`，那种机器上 `pin_pointer` 会判定失败并回滚 —— 也就是说，"本来
+就 1:1"的机器反而钉不上。
+
+修法：`Accel` 增加具名索引 `ACCEL_T1 / ACCEL_T2 / ACCEL_SWITCH`，全部改用索引访问，
+`accel_off_triple` 改成"复制后把 `ACCEL_SWITCH` 置 0"。回归测试
+`turning_acceleration_off_keeps_the_thresholds` 原来断言的正是错误行为
+（`[1,6,10] → [0,6,10]`），现在断言 `[6,10,1] → [6,10,0]`。
+
+本机实测数据（这次是两边都能读才发现的）：
+
+```
+HKCU\Control Panel\Mouse   MouseSpeed=1  Threshold1=6  Threshold2=10
+SPI_GETMOUSE               6  10  1        ← 同一份数据，顺序不同
+```
+
+`--diagnose` 第 10 节现在会把这两个并排打出来，字段名对齐后再比 —— 直接拿数组比会
+得到一个"永久不一致"的假警报。
+
 ---
 
 ## B. 边缘重定位（`--pointer-recenter`，默认关）
@@ -133,22 +166,85 @@ OS 光标就是屏幕上**第二个**指针，而且它停在"上一次绝对位
 
 ---
 
+## 怎么当场确认（装完机就走这三步）
+
+`--diagnose` 第 10 节就是为了回答"钉没钉上"而加的 —— 前两步不需要连客户端：
+
+```text
+stream-server.exe --diagnose
+```
+
+本机实跑的一段（关键几行）：
+
+```text
+==== 10. pointer 1:1 baseline ====
+speed      step 10 = 400 DPI（基准 400 DPI 的 1x）
+accel      ON，thresholds 6 / 10（顺序：t1, t2, switch）
+verdict    NOT 1:1 —— 加速曲线开着
+
+-- 持久化值（HKCU\Control Panel\Mouse，进程内读，不经过 reg.exe）--
+profile    MouseSpeed=1  Threshold1=6  Threshold2=10
+runtime    Threshold1=6  Threshold2=10  switch=1
+           两者是同一份数据 —— SPI 把开关放在末位、阈值放在前面 …
+-- 配置开关 --
+pointer_recenter  off —— 边缘重定位没开
+-- 最近一次钉住的结果（stream-server.log，最后 6 条）--
+没有记录 —— 没有任何会话在相对模式下跑过，或日志已经轮转
+```
+
+怎么读：
+
+| 看到 | 含义 |
+| --- | --- |
+| `verdict NOT 1:1` | **空闲时是正常的**。钉只在游戏模式会话期间存在，锁一解开就还原 |
+| `verdict UNKNOWN` | 这个会话读不到设置（会话 0 / 没有桌面）。这种环境里 pin 必然失败，先查第 5 节的 `LogonType` |
+| 日志 `auto-pinned … strategy=pinned` | 钉成功，而且真的写了值 |
+| 日志 `strategy=already` | 本来就 1:1（加速已经关着），没有写 |
+| 日志 `could not pin` | 真故障：没有交互桌面，或鼠标驱动在覆盖（`runtime` 与 `profile` 会显示不一致） |
+| 日志 `host pointer not restored` | 还原失败 —— 这台桌面会停在"加速关 / 档位 10"，要人工改回 |
+| `runtime` 与 `profile` 不一致 | 有程序在改会话值，或上一次 pin 没还原（进程被杀） |
+
+三步：
+
+1. **装完机先跑一次**。`verdict` 是 `NOT 1:1` 属正常；`UNKNOWN` 要修。
+2. **开一次游戏模式会话**，转几圈，再跑一次。日志应出现 `auto-pinned`；开了
+   `--pointer-recenter` 时统计行还会有 `clip=`。
+3. **结束后再跑一次**。日志应出现 `host pointer released`，且 `runtime` 与 `profile`
+   回到一致 —— 这一条才是"还原真的生效"的证据，比手感可靠。
+
+第 3 步为什么重要：pin 是**改系统设置**。进程在钉住期间被杀（任务管理器结束、蓝屏），
+还原就不会发生，这台桌面会一直停在"加速关、档位 10"。第 10 节把 `runtime` 和
+`profile` 并排放，正是为了让这种事在一份文件里露出来，而不是等下一个玩家说"鼠标怪怪的"。
+
+---
+
 ## 验证状态
 
-**已做（单测，432 passed）**：
+**已做（单测，440 passed / 1 ignored）**：
 
 - `recenter_target`：中间 / 四条边 / 远边差一位 / 负原点（副屏在左）/ 退化目标。
 - `should_suppress_abs`：四种组合的真值表。
 - `--pointer-recenter`：默认关、出现即开、与其它参数顺序无关。
 - `pointer_recenter` 的 TOML 回环（`--print-config` 贴回去逐字段相等）。
+- `accel_off_triple`：清开关不动阈值（`[6,10,1] → [6,10,0]`）、已关时原样、开关索引为 2。
+- `baseline`：三态判定 + "只读到一半仍算不是 1:1" + 两种排列的换算。
+- `--diagnose` 第 10 节：倍率文本、日志尾部筛选、`pointer_recenter` 从配置读。
 
-**未做（要实机）**：
+**实机**：
+
+- `CLOUD_STREAM_LIVE_SPI=1 cargo test -p stream-server --lib -- live_pin` 通过：
+  pin → 读回 `speed=10 / switch=0` → release → 设置完整复原（本机
+  `MouseSpeed=1 / t1=6 / t2=10 / MouseSensitivity=10` 前后一致）。
+- `--diagnose` 第 10 节在本机跑通，`profile` 与 `runtime` 判为同一份数据。
+
+**未做（要实机 + 真实客户端）**：
 
 1. 连一个真实 pointer-lock 客户端，连续转 10 圈不卡；日志出现
    `host pointer auto-pinned to 1:1`、`pointer lock -> on`、结束时
    `host pointer released` 三行。
 2. 开 `--pointer-recenter` 跑同一段，`clip=` 必须 > 0，且手感不是"每次贴边都顿一下"。
-3. `dmax` 的窗口最大值应 < 400；`dm/m2` 应趋近 1.0（现在是 2.0，就是没关加速的样子）。
+3. `dmax` 的窗口最大值应 < 400；`dm/m2` 应趋近 1.0 —— 这一条在 accel 顺序修正之后
+   才有意义：之前 `pin` 名义上成功，实际把曲线加强了，`dm/m2` 只会更糟。
 
 ---
 

@@ -297,7 +297,7 @@ Get-NetConnectionProfile | Select-Object InterfaceAlias, NetworkCategory
 | `stream-server.exe --run` 跑起来（看门狗每分钟一次，但只在真的要起进程时执行） | 查 `cloud-stream 8080` / `ICMPv4` 两条规则，缺了就补（提权才有权限；没权限只记一行） | `logs\watchdog.log` 的 `PREFLIGHT` 行 |
 | exe 启动后 | 自己另起 `--probe` 子进程，每 2.5 秒探一次 loopback，最多 30 秒 | 同上：`PREFLIGHT listening on 8080 after N probe(s)` 或 `PREFLIGHT NOT listening ...` + 三条最可能原因 + 下一步 |
 | 安装器跑完（`stream-setting.exe --install`） | 建任务（交互式令牌，无密码）→ 立刻启动 → 最多等 60 秒 → 结论贴回窗口日志面板，同时写 `%ProgramData%\cloud-stream\last-install.txt` | 窗口面板 + 那个文件 |
-| `stream-server.exe --diagnose` | 九节现场取证：OS/会话、账户策略、包完整性、VC 运行库、端口与任务、两份日志尾部、任务计划事件、Defender、入站可达性（含最近 12 条 `PREFLIGHT`） | `cloud-stream-facts.txt`（运行根 + 桌面各一份） |
+| `stream-server.exe --diagnose` | 十节现场取证：OS/会话、账户策略、包完整性、VC 运行库、端口与任务、两份日志尾部、任务计划事件、Defender、入站可达性（含最近 12 条 `PREFLIGHT`）、指针 1:1 基线（运行时的 `SPI_GETMOUSE` 对比 `HKCU\Control Panel\Mouse`，附最近 6 条 `host pointer` 日志） | `cloud-stream-facts.txt`（运行根 + 桌面各一份） |
 
 所以"启动后发现没效果"必然留下痕迹：先看 `logs\watchdog.log` 里最后一条
 `PREFLIGHT`，它要么说 `listening on 8080`（那就是网络/防火墙），要么直接给出
@@ -429,7 +429,7 @@ ssh <别名> "powershell -c \"(Get-Process stream-server).SessionId\""     # 1�
 | 页面打不开但 ssh 正常 | 新机器防火墙是开的，8080 没放行 | 管理员跑 `stream-setting.exe --inbound`（22 也要放行） |
 | **服务在跑、日志也写了 `starting`，但外部完全连不上** | 入站被整档丢弃：Public 配置文件默认丢全部入站（含 ICMP），VMware NAT / host-only 网卡常被判成 Public。表现是 `ping` 无响应、8080 **TIMEOUT**（不是 REFUSED） | 先看 `logs\watchdog.log` 最后一条 `PREFLIGHT`：若是 `listening on 8080`，问题就在网络层 —— 管理员跑 `stream-setting.exe --inbound`；`Get-NetConnectionProfile` 确认不是被 `Private` 规则挡在 Public 上 |
 | 日志里只有 `启动：<目录>`，没有 `PREFLIGHT` 行 | 跑的是旧包（新版的 `--run` 会自己 spawn `--probe`） | 用当前整包覆盖运行根；新版每次启动都会写 `PREFLIGHT` 判决 |
-| 安装器的结论是 `[fail] nothing listening ... after 60 s` | 8080 被占用 / exe panic / 缺 VC++，三者之一 | `last-install.txt` 里已列出要看的两份日志；或跑 `stream-server.exe --diagnose`（九节事实清单） |
+| 安装器的结论是 `[fail] nothing listening ... after 60 s` | 8080 被占用 / exe panic / 缺 VC++，三者之一 | `last-install.txt` 里已列出要看的两份日志；或跑 `stream-server.exe --diagnose`（十节事实清单） |
 | 证书报警、剪贴板失灵 | SAN 还是旧 IP；或根本没配证书（退回明文 http） | 按 §1.1 重签；剪贴板 API 要求安全上下文 |
 | 信令连上、视频不出 | 跨网段/跨 NAT，`ice_servers=[]` 只有 host candidate | 同网段部署，或后续接 STUN/TURN |
 | 指针灵敏度/界面缩放改了没反应还报错 | 服务用**非游戏账号**跑，改的是另一个 HKCU | `/RU` 必须是游戏所在的交互用户（现网 `Administrator`） |

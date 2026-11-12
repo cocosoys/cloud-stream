@@ -147,6 +147,9 @@ s' = (gain^(1/3) × (0.6s + 0.2) − 0.2) / 0.6,   s = 0.5
 `C:\dev\mc\start-mc.ps1`（计划任务 MCGame 的动作）在启动游戏前：
 
 1. `HKCU\Control Panel\Mouse` 关闭指针加速 + `SPI_SETMOUSE(0,0,0)` 立即生效
+   （三个 0 是按 `{阈值1, 阈值2, 开关}` 传的，所以顺带把两个阈值也清成 0。对 MC 来说
+   无所谓 —— 加速已经关了，阈值不再参与计算；但别把这一行照抄进"要保留用户曲线"的
+   代码里，那时应当只清末位。见 [`pointer-1to1.md`](pointer-1to1.md)）
 2. 把 `options.txt` 的 `mouseSensitivity` 写成 0.5
 
 MC 退出时会用自己的内存值重写 options.txt，所以每次启动都重新写 = "启动即默认"。
