@@ -351,11 +351,38 @@ pub fn resolve(explicit: Option<&Path>) -> Option<PathBuf> {
     }
 }
 
+/// 老位置的口令文件（`auth-token.txt`）。
+///
+/// 2026-11 之前口令**只能**放在这里：`set-password.cmd` 写它，`--run` 读出来
+/// 转成 `--auth-token` 传给服务。现在正式位置是配置里的 `auth_token`（能进
+/// 表单、能进 `--ops` 的备份与回滚、能写非 ASCII），这个文件只剩一个作用：
+/// 让老机器升级上来时不用重新设一遍口令。
+///
+/// 它由 [`crate::config::Config::parse`] 在**应用配置文件之前**读，也就是优先
+/// 级最低的那一层。这个顺序是刻意的：两份来源都有值时，配置赢。反过来做的
+/// 故障很具体 —— 有人在界面上改了口令、重启却不生效，而日志里什么都看不出来
+/// （旧实现是靠 `--run` 拼出 `--auth-token`，命令行永远压过文件）。
+///
+/// 取第一个非空行而不是第一行：令牌文件很容易被记事本存成"开头一个空行"，
+/// 而整份读进来会把换行一起塞进口令，现象是"口令怎么都不对"。
+///
+/// 返回 `None` 有两种情况，不必区分：文件不存在（常态），或者读不出来
+/// （权限/编码问题）—— 后者按"没有口令"处理，与 `--run` 时代的行为一致。
+pub fn read_legacy_token(dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join(LEGACY_TOKEN_FILE)).ok()?;
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_owned)
+}
+
+/// 老口令文件名。`--run` 与升级逻辑都认这个名字。
+pub const LEGACY_TOKEN_FILE: &str = "auth-token.txt";
+
 /// `--print-config` 的 toml 形态。
 ///
 /// 手写而不是 `toml::to_string`：注释和分组是这个输出的主要价值 —— 它同时也是
-/// 人写配置文件时的模板，而序列化器不会替你解释 `webrtc_udp_port_min` 是干什么的。
-///
+/// 人写配置文件时的模板，而序列化器不会替你解释 `webrtc_udp_port_min` 是干什么的。///
 /// 全文件必须能**回环**：`render_toml(cfg)` 再解析回来必须得到同一个 `cfg`。
 /// 有一个测试守着这一条，因为手写的格式化最容易和结构体悄悄分叉。
 pub fn render_toml(cfg: &Config) -> String {
@@ -544,6 +571,32 @@ mod tests {
         let path = dir.join("config.toml");
         std::fs::write(&path, text).unwrap();
         path
+    }
+
+    /// 老口令文件里的前导空行、行尾空白、多行内容都不该变成口令的一部分。
+    ///
+    /// 这个文件现在只是升级兼容层，但"读法"仍然是原来那套：记事本存出来的
+    /// 令牌文件经常开头空一行，而整份读进来会把换行也塞进口令，现象是
+    /// "口令怎么都不对"。
+    #[test]
+    fn legacy_token_is_the_first_non_empty_line() {
+        let dir =
+            std::env::temp_dir().join(format!("cs-legacy-token-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+
+        std::fs::write(dir.join(LEGACY_TOKEN_FILE), "\r\n  abc123  \r\ndef456\r\n").unwrap();
+        assert_eq!(
+            read_legacy_token(&dir).as_deref(),
+            Some("abc123"),
+            "前导空行要跳过，前后空格要去掉，第二行不该被带进来"
+        );
+
+        std::fs::write(dir.join(LEGACY_TOKEN_FILE), "   \r\n\r\n").unwrap();
+        assert_eq!(read_legacy_token(&dir), None, "全空白等于没有口令");
+
+        std::fs::remove_file(dir.join(LEGACY_TOKEN_FILE)).unwrap();
+        assert_eq!(read_legacy_token(&dir), None, "文件不存在不是错误");
+        let _ = std::fs::remove_dir(&dir);
     }
 
     /// 手写的 `render_toml` 必须和结构体保持同步 —— 漏掉一个键、拼错一个名字，

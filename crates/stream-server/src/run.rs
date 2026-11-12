@@ -33,7 +33,6 @@ const LOG_DIR: &str = "logs";
 /// 钟跑一次的探针会把真正的服务日志冲成一片噪声。
 const WATCHDOG_LOG: &str = "watchdog.log";
 const SERVER_LOG: &str = "stream-server.log";
-const AUTH_FILE: &str = "auth-token.txt";
 const CERT_FILE: &str = "cert.pem";
 const KEY_FILE: &str = "key.pem";
 
@@ -145,24 +144,6 @@ fn upload_dir() -> Option<PathBuf> {
     Some(if desktop.exists() { desktop } else { profile })
 }
 
-/// 读 `auth-token.txt` 的第一行**非空**内容。
-///
-/// 取第一个非空行而不是第一行：原来的 `for /f` 本来就跳过空行，而令牌文件很容
-/// 易被记事本存成"开头一个空行"。整份读进来更不行 —— 换行会一起塞进
-/// `--auth-token`，现象是"令牌怎么都不对"，且完全看不出原因。
-fn read_token(root: &Path) -> std::io::Result<Option<String>> {
-    let text = match std::fs::read_to_string(root.join(AUTH_FILE)) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err),
-    };
-    Ok(text
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .map(str::to_owned))
-}
-
 /// 拼出完整的命令行。
 ///
 /// 出错返回的是**给人看的一句话**，它会被原样写进 `watchdog.log` —— 服务没起
@@ -236,13 +217,22 @@ fn build(extra: &[String]) -> Result<Vec<String>, String> {
         push("--upload-dir", &upload.to_string_lossy());
     }
 
-    match read_token(&dir) {
-        Ok(Some(token)) => {
-            push("--auth-token", &token);
-            note(&dir, "已启用 auth-token.txt —— 浏览器要在地址后加 ?token=");
-        }
-        Ok(None) => note(&dir, "没有 auth-token.txt —— 能连上端口的人都能访问 /api/*"),
-        Err(err) => note(&dir, &format!("auth-token.txt 读不出来（{err}），按没有处理")),
+    // 口令的**来源**不在这一层了。
+    //
+    // 2026-11 之前是这里读 `auth-token.txt` 再 push 一个 `--auth-token` 进
+    // 命令行 —— 于是它永远压过配置文件：有人在界面上改了口令、重启却不生效，
+    // 而任何日志里都看不出原因。现在口令是配置里的 `auth_token` 一项，
+    // `Config::parse` 读（配置文件优先，同目录的 txt 兜底，见 config.rs）。
+    //
+    // 这里只留一句状态：`watchdog.log` 是"服务没起来"时唯一能看到的东西，
+    // "到底要不要口令"值得记一笔。判断顺序必须与 `Config::parse` 一致。
+    let auth_from_config = crate::configfile::load(&config)
+        .ok()
+        .and_then(|file| file.auth_token)
+        .filter(|token| !token.is_empty());
+    match auth_from_config.or_else(|| crate::configfile::read_legacy_token(&dir)) {
+        Some(_) => note(&dir, "已设置访问口令 —— 浏览器要在地址后加 ?token="),
+        None => note(&dir, "没有设置访问口令 —— 能连上端口的人都能访问 /api/*"),
     }
 
     out.extend(extra.iter().cloned());
@@ -410,27 +400,6 @@ mod tests {
         out.extend(extra.iter().cloned());
         assert_eq!(out.last().unwrap(), "60");
         assert_eq!(out[out.len() - 2], "--fps");
-    }
-
-    /// 令牌文件里的前导空行、行尾空白、多行内容都不该进 `--auth-token`。
-    #[test]
-    fn token_is_the_first_non_empty_line() {
-        let dir = std::env::temp_dir().join(format!("cs-token-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        // 记事本存出来经常是这个样子：开头一个空行，末尾一个空行。
-        std::fs::write(dir.join(AUTH_FILE), "\r\n  abc123  \r\ndef456\r\n").unwrap();
-        assert_eq!(
-            read_token(&dir).unwrap().as_deref(),
-            Some("abc123"),
-            "前导空行要跳过，前后空格要去掉，第二行的内容不该被带进来"
-        );
-
-        std::fs::write(dir.join(AUTH_FILE), "   \r\n\r\n").unwrap();
-        assert_eq!(read_token(&dir).unwrap(), None, "全空白等于没有令牌");
-
-        std::fs::remove_file(dir.join(AUTH_FILE)).unwrap();
-        assert_eq!(read_token(&dir).unwrap(), None, "文件不存在不是错误");
-        let _ = std::fs::remove_dir(&dir);
     }
 
     /// 时间戳的形状要和旧日志对得上，否则拿来 diff 会一片噪声。

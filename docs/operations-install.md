@@ -20,11 +20,18 @@
 
 ```text
 target\output\
-  cloud-stream\          ← 运行根：exe / dll / 前端 / 证书 / 配置 / README
+  cloud-stream\          ← 运行根：exe / 两个 dll / 前端 / 证书 / 配置 / README
   cloud-stream.zip       ← 上面那个目录的压缩快照（部署上传用）
   stream-setting.exe        ← 单文件安装器：自带整包（约 9 MB）
   cloud-stream-setup.exe ← 向导版安装器：Inno 外壳（约 7.8 MB，见下节）
 ```
+
+运行根里那个多出来的 dll 是 `vcruntime140.dll`（124 KB）：Rust 的 msvc 目标
+默认动态链接 VC++ 运行时，而安装器不装运行库，一台裸装的 Win10 LTSC 上双击
+会**毫无反应**（进程在加载器里就死了，没有窗口、没有日志）。随包带一份放
+exe 同目录是 app-local 部署 —— 加载器优先找同目录，它不是 KnownDLL，所以
+"缺 VC++"不再是失败模式。这也是 `collect-launch-facts.cmd` 消失的前提：
+那个脚本存在的唯一理由就是"exe 起不来时谁来收现场"。
 
 `stream-setting.exe` **不在** `cloud-stream\` 里面，这是刻意的：归档里放进
 `stream-setting.exe` 就是"exe 里嵌着包含自己的包"。装完之后 `pack::place_self`

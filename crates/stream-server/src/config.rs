@@ -429,6 +429,24 @@ impl Config {
             }
         }
 
+        // 口令的老位置：`auth-token.txt`。
+        //
+        // 它排在配置文件**之前**（后面 `file.apply` 会覆盖它），也就是优先级
+        // 最低的一层。2026-11 之前这文件是唯一的来源，由 `--run` 读出来拼成
+        // `--auth-token`；那样做的后果是命令行压过配置文件 —— 有人在界面上
+        // 改了口令、重启却没生效，而任何日志里都看不出来为什么。
+        //
+        // 现在反过来：配置文件里的 `auth_token` 赢，txt 只在配置没写这一项时
+        // 兜底。老机器升级上来行为不变，界面一设就以界面为准。
+        if let Some(dir) = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+        {
+            if let Some(legacy) = crate::configfile::read_legacy_token(&dir) {
+                cfg.auth_token = Some(legacy);
+            }
+        }
+
         let from_default_location = explicit.is_none();
         // `resolve` 而不是 `default_path`：整包分发里那份叫 `stream-config.toml`，
         // 而 `default_path` 只认 `config.toml`。用后者的话，**不带任何参数**双击

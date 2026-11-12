@@ -158,16 +158,17 @@ $RemoteLog = "$RemoteRoot\logs\stream-server.log"
 #       `--uninstall`，任务 XML、防火墙、端口全都由它自己算
 #       （docs/operations-install.md）。
 #
-# 剩下的两项脚本各有它"只能是脚本"的理由：一个要在 exe 起不来的时候收现场
-# （collect-launch-facts 跑的是 cmd 内建命令），一个只写一个文本文件
-# （set-password，用 cmd 是为了双击就能改，不需要另建一个窗口）。
+# 2026-11 起目录里不再有那两个脚本，各自被一个命令取代：
+#   collect-launch-facts.cmd  ->  stream-setting.exe --diagnose（九节现场取证）
+#   set-password.cmd          ->  配置表单里的"访问口令"一格（写 TOML 的 auth_token）
+#
+# 它们当年"只能是脚本"的唯一理由是"exe 起不来时谁来收现场"—— 而那个前提
+# 现在没了：随包的 app-local `vcruntime140.dll` 让"缺 VC++"不再是失败模式。
 $LauncherNames = @(
     # 参数本体。路径类的那几条由 --run 从自身目录推导，分辨率/帧率/码率/编码器/
     # 输入策略在这里。它跟着部署走，所以"每次部署把参数覆盖回去"这个既有行为
     # 没有变；"每台机器的差异要留住"是安装器那一层的事，不在这里解决。
-    'stream-config.toml',
-    'collect-launch-facts.cmd',
-    'set-password.cmd'
+    'stream-config.toml'
 )
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
@@ -445,6 +446,59 @@ function Resolve-CertPair {
     return $null
 }
 
+function Find-CrtDll {
+    # 找一份可以随包分发的 `vcruntime140.dll`。
+    #
+    # 为什么要带：Rust 的 msvc target 默认**动态**链接 VC++ 运行时（产物里能
+    # 看到 `VCRUNTIME140.dll` 这个导入名），而安装器不装运行库。于是一台
+    # 全新裸装的 Win10 LTSC / Server 上，双击没有反应、没有任何日志 —— 因为
+    # 它在加载器里就死了，根本轮不到写日志。
+    #
+    # 为什么是 app-local 而不是打 vc_redist：微软支持把 CRT 放进 exe 同目录
+    # （加载器优先找同目录，`vcruntime140.dll` 不是 KnownDLL）。124 KB 换掉
+    # 一个"装完起不来"的失败模式，而 vc_redist 是 25 MB 且要一次提权安装。
+    #
+    # 来源优先 VS 的 redist 目录而不是 System32：System32 里那份是操作系统
+    # 更新上去的版本，分发它等于分发系统文件；Redist 那一份就是给这个用的。
+    #
+    # **vswhere 在这里靠不住**：这台构建机是 BuildTools-only 安装，没有
+    # installer 记录，`vswhere -all` 直接返回 `[]` —— 于是第一次跑这段代码时
+    # 静默落到了 System32。`build.ps1` 早就为同一件事写了硬编码兜底
+    # （`Initialize-BuildEnv`），这里照抄它：两处必须认同一批路径，否则
+    # "能编"和"知道从哪拿运行时"会指向不同的 VS。
+    $candidates = @()
+    $roots = @()
+
+    if ($env:VCToolsRedistDir) {
+        $roots += $env:VCToolsRedistDir
+    }
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (Test-Path $vswhere) {
+        $vs = & $vswhere -latest -products * -property installationPath 2>$null
+        if ($vs) { $roots += (Join-Path $vs 'VC\Redist\MSVC') }
+    }
+    $roots += @(
+        'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Redist\MSVC',
+        'C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Redist\MSVC',
+        'C:\BuildTools\VC\Redist\MSVC'
+    )
+
+    foreach ($root in $roots) {
+        if (-not (Test-Path $root)) { continue }
+        $candidates += Get-ChildItem -Path $root -Recurse -Filter 'vcruntime140.dll' -ErrorAction SilentlyContinue |
+            # 只要桌面（x64）那一份。`...\onecore\x64\...` 也匹配 "x64"，但它是
+            # OneCore 变体，装到普通 Windows 上是错的。
+            Where-Object { $_.FullName -match '\\x64\\Microsoft\.VC' -and $_.FullName -notmatch '\\onecore\\' } |
+            # 版本号目录（14.44.35112）优先于 `v143` 那种别名目录：别名指向的
+            # 是"当前工具集"，而版本号目录是实际被编进去的那个。
+            Sort-Object @{ Expression = { $_.FullName -match '\\\d+\.\d+\.\d+\\' }; Descending = $true }, FullName |
+            Select-Object -ExpandProperty FullName
+    }
+
+    $candidates += Join-Path $env:SystemRoot 'System32\vcruntime140.dll'
+    return ($candidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1)
+}
+
 function Write-BundleReadme([string]$Path, [bool]$Tls) {
     $tlsLine = if ($Tls) { 'cert.pem / key.pem  TLS 自签证书（浏览器会提示不受信任）' } else {
         '本包未附带证书 -> 明文 HTTP，剪贴板同步不可用（需要安全上下文）'
@@ -489,28 +543,36 @@ cloud-stream 被控端整包
   把同目录的 zip 解到这台机器的运行根（比如 C:\dev\stream），然后重启任务：
      schtasks /End /TN MCStreamSrv
      schtasks /Run /TN MCStreamSrv
-  也可以双击运行根里的 stream-setting.exe，点「安装 / 修复」（会顺带把任务与规则
-  重新做一遍）。
+  也可以双击运行根里的 stream-setting.exe —— 打开就是「程序信息」，顶上三行是
+  服务 / 端口 / 看门狗的实时状态（要重做任务与防火墙规则，就重跑一次安装器）。
 
 目录说明
   stream-server.exe   采集 / 编码 / 信令 / HTTP / 文件传输，全在这一个进程
   ViGEmClient.dll     虚拟手柄客户端；缺了只降级成"没手柄"，其余照常
+  vcruntime140.dll    VC++ 运行时。跟着包走（app-local）：这台机器没装 VC++
+                      也能跑。缺了才会出现"双击毫无反应"
   selkies-web\        前端静态根（--dist 指向这里）
   logs\               stream-server.log 与 watchdog.log（进程起不来先看后者）
-  stream-config.toml  这台机器的常态：端口 / 分辨率 / 帧率 / 码率 / 编码器 / 输入策略
-  auth-token.txt      访问口令（可选；没有就是同网段谁都能开）
-  collect-launch-facts.cmd  起不来时双击它，生成一份事实清单（只读）
-  set-password.cmd    设/改/清除访问口令（写 auth-token.txt，重启任务生效）
+  stream-config.toml  这台机器的常态：端口 / 分辨率 / 帧率 / 码率 / 编码器 /
+                      输入策略，以及访问口令（auth_token）
   manifest.json       本次构建的指纹：提交、时间、各文件 MD5、前端文件数
   $tlsLine
 
 要不要口令
   默认没有：同一网段任何人都能打开页面并操作键鼠。
-  要的话双击 set-password.cmd 输一个（只限 ASCII），然后重启任务，之后
-  浏览器必须带 token 打开一次：
+  要的话双击 stream-setting.exe →「改配置」→ 在"访问口令"那一格输一个，保存
+  后重启任务（改配置只写文件，重启才生效），之后浏览器必须带 token 打开一次：
         ${scheme}://<本机IP>:8080/?token=<口令>
   前端会把它写进 cookie，同一浏览器之后直接输地址就行。
-  口令存在 auth-token.txt；删掉它（或 set-password.cmd 里留空）就恢复开放。
+  口令存在 stream-config.toml 的 auth_token（明文，这份文件别提交到公开仓库）；
+  把那一格清空并保存，就恢复成"不需要口令"。
+
+起不来怎么办
+  双击 stream-setting.exe →「程序信息」先看三行状态；还是在原地：
+        stream-server.exe --diagnose
+  它把九类事实（会话、包内容、运行库、进程与端口、任务、日志尾部、任务计划
+  事件、Defender、入站可达性）写成 cloud-stream-facts.txt，桌面也放一份。
+  只读，不启动服务、不改任何东西。
 
 每次启动会自动做的事（不需要人守在那里）
   * exe 自己另起一个 --probe 子进程，最多 30 秒，把结果写成
@@ -556,6 +618,15 @@ function New-DeployBundle {
     $dllPath = Join-Path $BundleDir 'ViGEmClient.dll'
     if (Test-Path $LocalExe) { Copy-Item $LocalExe $exePath -Force }
     if (Test-Path $LocalVigem) { Copy-Item $LocalVigem $dllPath -Force }
+
+    # VC++ 运行时跟着包走（app-local）。理由见 Find-CrtDll：这是"装了起不来"
+    # 这个失败模式的根治，而不是垫一块提示文字。
+    $crtDll = Find-CrtDll
+    if ($crtDll) {
+        Copy-Item $crtDll (Join-Path $BundleDir 'vcruntime140.dll') -Force
+    } else {
+        Write-Note '找不到 vcruntime140.dll：缺 VC++ 运行库的机器上双击会毫无反应（在装了 VS 的机器上构建，或放一份到 toolchain\）'
+    }
     foreach ($name in $LauncherNames) {
         Copy-Item (Join-Path $PSScriptRoot $name) (Join-Path $BundleDir $name) -Force
     }
@@ -599,6 +670,12 @@ function New-DeployBundle {
             } else { $null })
         dll      = $(if (Test-Path $dllPath) {
                 [ordered]@{ bytes = (Get-Item $dllPath).Length; md5 = (Get-Md5 $dllPath) }
+            } else { $null })
+        # app-local 的 VC++ 运行时。`null` = 没带上，那台机器遇到"缺 VC++"
+        # 的老故障就还是会双击没反应 —— 所以它是包指纹里该有的一项。
+        crt      = $(if (Test-Path (Join-Path $BundleDir 'vcruntime140.dll')) {
+                $crtPath = Join-Path $BundleDir 'vcruntime140.dll'
+                [ordered]@{ bytes = (Get-Item $crtPath).Length; md5 = (Get-Md5 $crtPath) }
             } else { $null })
         web      = [ordered]@{
             files     = $web.Count

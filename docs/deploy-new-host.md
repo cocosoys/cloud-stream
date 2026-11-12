@@ -226,22 +226,38 @@ Unblock-File .\stream-setting.exe
 
 **要不要口令**（默认没有：同网段任何人打开地址就能操作键鼠）：
 
-```cmd
-:: 在运行根里双击 set-password.cmd 更省事；等价的单行是
-cd /d "%LOCALAPPDATA%\cloud-stream"
-set-password.cmd
+最省事的是双击运行根里的 `stream-setting.exe`，点「改配置」，找到"访问口令"
+那一格填一个、保存，然后重启任务（改配置只写文件，重启才生效）。不想点窗口
+就直接编辑 `stream-config.toml`：
+
+```toml
+auth_token = 'x'      # 把 x 换成你的口令；'…' 是 TOML 单引号字符串
 ```
 
-它写 `auth-token.txt`，`--run` 下次启动读它并传 `--auth-token`。之后
-浏览器必须带 token 打开一次：
+保存后重启任务：
+
+```cmd
+schtasks /End /TN MCStreamSrv
+schtasks /Run /TN MCStreamSrv
+```
+
+之后浏览器必须带 token 打开一次：
 
 ```
 https://<本机IP>:8080/?token=<口令>
 ```
 
-前端会把它存进 cookie，同一浏览器之后直接输地址就行。口令限 ASCII —— `.cmd`
-按 OEM 代码页逐字节解析，中文口令到 exe 手上就变了。细节见
-`deploy-one-click.md` §7.26。
+前端会把它存进 cookie，同一浏览器之后直接输地址就行。
+
+口令**不再限 ASCII**：以前它是 `set-password.cmd` 写的纯文本文件，要经过 cmd
+的 OEM 代码页，中文进去就变了。现在它走 TOML（UTF-8），非 ASCII 没问题；写进
+文件时会被转义，含引号、反斜杠、空格都可以。
+
+口令是明文存在 `stream-config.toml` 里的，那份文件别提交到公开仓库。文档里
+还留着一个老名字 `auth-token.txt`：老机器升级上来时仍然认它，但**它的优先级
+低于配置** —— 用表单设过之后，那个文件就可以删了。
+
+细节见 `deploy-one-click.md` §7.26。
 
 **入站规则没加上怎么办**（UAC 被拒、或只提权了安装没提权规则）：补一次即可，
 不会碰任何文件：
@@ -274,10 +290,10 @@ Get-NetConnectionProfile | Select-Object InterfaceAlias, NetworkCategory
 
 | 时机 | 动作 | 结果写在哪 |
 |---|---|---|
-| `stream-server.exe --run` 跑起来（看门狗每分钟一次，但只在真的要起进程时执行） | 查 `cloud-stream 8080` / `ICMPv4` 两条规则，缺了就补（提权才有权限；没权限只记一行）；有 `auth-token.txt` 就把口令传给 exe | `logs\watchdog.log` 的 `PREFLIGHT` 行 |
+| `stream-server.exe --run` 跑起来（看门狗每分钟一次，但只在真的要起进程时执行） | 查 `cloud-stream 8080` / `ICMPv4` 两条规则，缺了就补（提权才有权限；没权限只记一行） | `logs\watchdog.log` 的 `PREFLIGHT` 行 |
 | exe 启动后 | 自己另起 `--probe` 子进程，每 2.5 秒探一次 loopback，最多 30 秒 | 同上：`PREFLIGHT listening on 8080 after N probe(s)` 或 `PREFLIGHT NOT listening ...` + 三条最可能原因 + 下一步 |
 | 安装器跑完（`stream-setting.exe --install`） | 建任务（交互式令牌，无密码）→ 立刻启动 → 最多等 60 秒 → 结论贴回窗口日志面板，同时写 `%ProgramData%\cloud-stream\last-install.txt` | 窗口面板 + 那个文件 |
-| `collect-launch-facts.cmd` | 第 9 节专门列入站：网络配置文件、本机 IPv4、两条规则的实际参数、最近 12 条 `PREFLIGHT` 行 | `cloud-stream-facts.txt` |
+| `stream-server.exe --diagnose` | 九节现场取证：OS/会话、账户策略、包完整性、VC 运行库、端口与任务、两份日志尾部、任务计划事件、Defender、入站可达性（含最近 12 条 `PREFLIGHT`） | `cloud-stream-facts.txt`（运行根 + 桌面各一份） |
 
 所以"启动后发现没效果"必然留下痕迹：先看 `logs\watchdog.log` 里最后一条
 `PREFLIGHT`，它要么说 `listening on 8080`（那就是网络/防火墙），要么直接给出
@@ -303,10 +319,11 @@ preflight，所以窗口里看不到异常时，日志里也有判决。适合�
 建任务。把它放进 `shell:startup` 也能开机自起，但同样只在登录后发生、且没有
 自愈——这就是为什么要建任务。
 
-**起不来先双击 `collect-launch-facts.cmd`**：它生成 `cloud-stream-facts.txt`
+**起不来先跑 `stream-server.exe --diagnose`**：它生成 `cloud-stream-facts.txt`
 （桌面也放一份），把 OS/会话/账户策略/包完整性/VC 运行库/端口/任务状态/
 `LastTaskResult`/两份日志尾部/任务计划事件/Defender/入站规则一次收全。它不启动
-exe，只给你一行手工复现的命令。
+exe，只给你一行手工复现的命令。工具箱里也能转调它（`stream-setting.exe
+--diagnose`），敲哪个名字都行 —— 两个 exe 躺在同一个目录里。
 
 **跑起来之后核这三条**：
 
@@ -408,7 +425,7 @@ ssh <别名> "powershell -c \"(Get-Process stream-server).SessionId\""     # 1�
 | 页面打不开但 ssh 正常 | 新机器防火墙是开的，8080 没放行 | 管理员跑 `stream-setting.exe --inbound`（22 也要放行） |
 | **服务在跑、日志也写了 `starting`，但外部完全连不上** | 入站被整档丢弃：Public 配置文件默认丢全部入站（含 ICMP），VMware NAT / host-only 网卡常被判成 Public。表现是 `ping` 无响应、8080 **TIMEOUT**（不是 REFUSED） | 先看 `logs\watchdog.log` 最后一条 `PREFLIGHT`：若是 `listening on 8080`，问题就在网络层 —— 管理员跑 `stream-setting.exe --inbound`；`Get-NetConnectionProfile` 确认不是被 `Private` 规则挡在 Public 上 |
 | 日志里只有 `启动：<目录>`，没有 `PREFLIGHT` 行 | 跑的是旧包（新版的 `--run` 会自己 spawn `--probe`） | 用当前整包覆盖运行根；新版每次启动都会写 `PREFLIGHT` 判决 |
-| 安装器的结论是 `[fail] nothing listening ... after 60 s` | 8080 被占用 / exe panic / 缺 VC++，三者之一 | `last-install.txt` 里已列出要看的两份日志；或跑 `collect-launch-facts.cmd` |
+| 安装器的结论是 `[fail] nothing listening ... after 60 s` | 8080 被占用 / exe panic / 缺 VC++，三者之一 | `last-install.txt` 里已列出要看的两份日志；或跑 `stream-server.exe --diagnose`（九节事实清单） |
 | 证书报警、剪贴板失灵 | SAN 还是旧 IP；或根本没配证书（退回明文 http） | 按 §1.1 重签；剪贴板 API 要求安全上下文 |
 | 信令连上、视频不出 | 跨网段/跨 NAT，`ice_servers=[]` 只有 host candidate | 同网段部署，或后续接 STUN/TURN |
 | 指针灵敏度/界面缩放改了没反应还报错 | 服务用**非游戏账号**跑，改的是另一个 HKCU | `/RU` 必须是游戏所在的交互用户（现网 `Administrator`） |

@@ -78,6 +78,10 @@ windows-sys = { version = "0.52", features = [
     "Win32_System_Console",
     "Win32_Storage_FileSystem",
     "Win32_Media",
+    # `--diagnose`：控制台程序的输出是**系统 ANSI 代码页**的字节（中文机器上
+    # 是 936），按 UTF-8 硬读会得到一串问号。`MultiByteToWideChar` 是那个回退，
+    # 而问号恰好是诊断文件里最没用的东西。
+    "Win32_Globalization",
 ] }
 flate2 = "1.0"
 # #55: clipboard uplink chunks arrive base64-encoded (clipboard-worker-bridge).

@@ -112,7 +112,7 @@
 | 30 | 默认灵敏度三层固化（游戏 0.5 / 关加速 / gain 1.0） | ✅ | `mouse-sensitivity-default.md`、`start-mc.ps1` |
 | 31 | 会话互斥（同页签重连驱逐旧 socket，跨页签共存） | ✅ | `websession.rs` `SessionRegistry::publish`：按 `client_tab_id` 比对，只踢同一页签的僵尸连接。多页面共享一条采集管线，首个为 `controller`，其余 `viewer` 只读。见 `pipeline/shared.rs` 与 `roadmap-multi-display-multi-input.md §5.1` |
 | 32 | 服务自恢复 | ✅ | #81 `0159076`：`MCStreamSrv` 改 `/SC MINUTE /MO 1` + `run-hidden.vbs` 隐藏宿主 + 单实例检查。实测 `taskkill` PID 1904 → 一分钟后 PID 7612 自起，当前跑的正是它 |
-| 33 | 鉴权 | ✅* | **已闭环（#88 骨架 → #101 口令 → #110 身份）**：22 个监听面全部插桩、五处裁决点都在副作用之前（HTTP / 信令 / 控制通道 / 指针通道 / 麦克风）；`--auth-token <pw>`（等价 `default:host`）+ 可重复的 `--auth-grant tenant:role:token`（`host` / `operator` / `viewer`）；五种载体 Bearer / `?token=` / cookie / WS 子协议 / URL 片段，常量时间比较；`Static` 与 `Status` 豁免。裁决在 `http/server.rs:254`：**先口令（401 + `WWW-Authenticate`）、再策略（403）**，信令与媒体复用同一个 `grant`。**\*线上未开**：`C:\dev\stream\auth-token.txt` 不存在 → 启动日志 `cred=none`，局域网内任何人打开 8080 仍能直接操作。开只需在被控机跑一次 `set-password.cmd` 再重启任务。见 `listener-surface.md` |
+| 33 | 鉴权 | ✅* | **已闭环（#88 骨架 → #101 口令 → #110 身份）**：22 个监听面全部插桩、五处裁决点都在副作用之前（HTTP / 信令 / 控制通道 / 指针通道 / 麦克风）；`--auth-token <pw>`（等价 `default:host`）+ 可重复的 `--auth-grant tenant:role:token`（`host` / `operator` / `viewer`）；五种载体 Bearer / `?token=` / cookie / WS 子协议 / URL 片段，常量时间比较；`Static` 与 `Status` 豁免。裁决在 `http/server.rs:254`：**先口令（401 + `WWW-Authenticate`）、再策略（403）**，信令与媒体复用同一个 `grant`。**\*线上未开**：`C:\dev\stream\auth-token.txt` 不存在、配置里也没有 `auth_token` → 启动日志 `cred=none`，局域网内任何人打开 8080 仍能直接操作。开只需在被控机用工具箱设一次口令（配置表单的"访问口令"）再重启任务。见 `listener-surface.md` |
 | 34 | 一键部署 | ✅ | #34 `toolchain/deploy.ps1` + `deploy-remote.ps1`：构建 → 上传 → 两端 MD5 → 停任务/禁用 → 备份 → 换文件 → 起任务 → 三重体检（HTTP 200 + 进程启动时间 + 日志 `listening on`）→ 失败自动回滚。实测两次全量部署各 48 s、一次 `-Rollback` 通过；`-Bootstrap` 顺带把 sshd 钉成自动启动。见 `deploy-one-click.md` |
 
 ---
@@ -254,7 +254,8 @@
 **开启方式**（无需改代码、无需重新部署）：
 ```powershell
 # 在被控机（192.168.59.148）上
-C:\dev\stream\set-password.cmd            # 写入 auth-token.txt（ASCII）
+# 双击 stream-setting.exe →「改配置」→ "访问口令"一格填一个、保存
+# （写进 stream-config.toml 的 auth_token；老机器上的 auth-token.txt 仍认，但优先级更低）
 schtasks /End /TN MCStreamSrv; schtasks /Run /TN MCStreamSrv
 ```
 
@@ -482,12 +483,12 @@ audio 5.0s: cap=0 enc=0 bytes=0 sil=0 => 0.0 fps, 0.0 kbps (no frames: endpoint 
 | ~~P2~~ | ~~2.9 残余：关键帧秒级可配~~ | — | **已实现 #86**，`--keyframe-secs` 默认 10 s，墙钟为准、帧数是兜底 |
 | ~~P2~~ | ~~2.11 一键部署~~ | — | **已实现 #34**，`deploy.ps1` + `deploy-remote.ps1`，两次全量 + 一次回滚实测 |
 | **P1** | **2.12 音频观测（收尾）** | — | 5 s 摘要日志已补（`audio 5.0s: cap=… => N fps`），health 的 `stream.audio.*` 已在用；**只剩** `StreamStats` 的 `audio_*` 三字段（HUD 才看得到） |
-| ~~P1~~ | ~~2.5 鉴权~~ | — | **已实现 #88→#101→#110**（口令表 / 五载体 / 租户+角色 / 五处裁决）。剩下的不是代码，是**在被控机跑一次 `set-password.cmd`** |
+| ~~P1~~ | ~~2.5 鉴权~~ | — | **已实现 #88→#101→#110**（口令表 / 五载体 / 租户+角色 / 五处裁决）。剩下的不是代码，是**在被控机用工具箱设一次口令**（配置表单的"访问口令"，写 `stream-config.toml` 的 `auth_token`） |
 | ~~P2~~ | ~~2.2 手柄~~ | — | **已实现 #17**，`dispatch/gamepad.rs` + vendored `ViGEmClient.dll`；硬件回环在被控机通过，浏览器侧待人工验收 |
 | ~~P3~~ | ~~2.10 截图~~ | — | **已实现 #28**：`GET /api/screenshot`，1920×1080 请求 93 ms（编码 42–51 ms）。录屏拆出另议 |
 
 **剩 1 项收尾 + 1 条配置债**：2.12 的 `StreamStats` 三字段（HUD 才看得到音频），
-以及 2.5 的口令（`set-password.cmd` + 重启任务，两步，不需要构建）。
+以及 2.5 的口令（工具箱里设一次 + 重启任务，两步，不需要构建）。
 2.11 落地之后，剩下的每一项验收都只要一条命令，摩擦不再是理由。
 
 ---

@@ -177,6 +177,16 @@ Type: files; Name: "{app}\cloud-setup.exe"
 ; （见 DefaultGroupName），旧 .iss 就是这么写的。
 Type: files; Name: "{group}\{#AppName} 控制台.lnk"
 
+; 2026-11 起这两个脚本没了，各自被一个命令取代（同一个理由：升级只覆盖新清单，
+; 旧文件会一直留着）：
+;   set-password.cmd          -> 配置表单里的"访问口令"一格（写 TOML 的 auth_token）
+;   collect-launch-facts.cmd  -> stream-server.exe --diagnose（九节现场取证）
+; 留着它们的后果不是"多两个文件"，而是**两个入口指向两个已经不存在的行为**：
+; 一个去改 auth-token.txt，而那个文件现在的优先级低于配置 —— 改了不生效；
+; 一个收集的是旧版的事实清单。
+Type: files; Name: "{app}\set-password.cmd"
+Type: files; Name: "{app}\collect-launch-facts.cmd"
+
 [Dirs]
 ; 提权安装有个副作用：写进 {app} 的文件默认属主是管理员，普通用户改不了。
 ; 而 stream-config.toml 是文档里明确说"直接编辑它"的东西，logs 也要能写。

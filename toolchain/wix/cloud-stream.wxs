@@ -182,9 +182,22 @@
       <File Id="KeyPem" Source="$(var.BundleDir)\key.pem" KeyPath="yes" />
     </Component>
 
-    <Component Id="Scripts" Guid="{F770EB0F-56D4-4D70-A01A-C242882F470F}" Directory="INSTALLDIR" Win64="yes">
-      <File Id="SetPasswordCmd" Source="$(var.BundleDir)\set-password.cmd" KeyPath="yes" />
-      <File Id="CollectFactsCmd" Source="$(var.BundleDir)\collect-launch-facts.cmd" />
+    <!--
+      VC++ 运行时（app-local）。
+
+      Rust 的 msvc 目标默认**动态**链接 CRT（产物里有 `VCRUNTIME140.dll`
+      这个导入名），而安装器不装运行库。放进 {app} 之后加载器优先找到这一份
+      （它不是 KnownDLL），于是"这台机器没装 VC++"不再是"双击毫无反应"。
+
+      2026-11 之前这里放的是 set-password.cmd / collect-launch-facts.cmd。
+      它们分别被配置表单的"访问口令"一格和 `stream-server.exe` 的 diagnose
+      子命令取代了。两条 `RemoveFile` 是给"Inno 装了旧版、现在装 MSI"的交叉
+      情形：留着它们等于留着两个已经没人维护的入口。
+    -->
+    <Component Id="Crt" Guid="{A2C7B4E1-1F3D-4B62-9C58-6D0F2A9E7B31}" Directory="INSTALLDIR" Win64="yes">
+      <File Id="CrtDll" Source="$(var.BundleDir)\vcruntime140.dll" KeyPath="yes" />
+      <RemoveFile Id="OldSetPasswordCmd" Name="set-password.cmd" On="install" />
+      <RemoveFile Id="OldCollectFactsCmd" Name="collect-launch-facts.cmd" On="install" />
     </Component>
 
     <Component Id="Readme" Guid="{7FD34C03-4191-4DCB-A4F8-EF18E453286E}" Directory="INSTALLDIR" Win64="yes">
@@ -251,7 +264,7 @@
       <ComponentRef Id="Config" />
       <ComponentRef Id="Cert" />
       <ComponentRef Id="Key" />
-      <ComponentRef Id="Scripts" />
+      <ComponentRef Id="Crt" />
       <ComponentRef Id="Readme" />
       <ComponentRef Id="Manifest" />
       <ComponentRef Id="LogsCleanup" />

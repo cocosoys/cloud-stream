@@ -78,15 +78,23 @@ upload_quota_mb = 512
 
 # ---------- ICE ----------
 # WebRTC 的 UDP 端口区间。改了这里就要同步防火墙规则
-# （toolchain/open-inbound.cmd 里的 `cloud-stream webrtc UDP`）。
+# （`stream-setting.exe --inbound` 建的那条 `cloud-stream webrtc UDP`）。
 # 走 websockets 时这段用不上，但留着不影响。
 webrtc_udp_port_min = 40000
 webrtc_udp_port_max = 40049
 
 # ---------- 安全 ----------
-# auto = 有没有令牌决定 allow-all / role-based。口令本身在 auth-token.txt，
-# 由 --run 用 --auth-token 传入，不写在这里（这份文件可能进版本库）。
+# auto = 有没有令牌决定 allow-all / role-based。
 policy = 'auto'
+# 访问口令。不写这一行（或写成空串）= 同网段谁都能开，/api/* 不鉴权。
+#
+# 2026-11 之前它只能放在 exe 旁边的 auth-token.txt（由 set-password.cmd 写）。
+# 现在的唯一位置就是这里；那个 txt 还认，但优先级低于本文件 —— 老机器升级
+# 上来不用重设，而一旦用工具箱设过就以这里为准。
+#
+# 明文存放：这份文件别提交到公开仓库。改完要重启任务才生效。
+# 工具箱（stream-setting.exe）的配置表单里有一格，那里改更不容易写错。
+# auth_token = 'x'
 # 多租户才需要，格式 "租户:角色:令牌"，整体替换而不是追加。
 auth_grants = []
 

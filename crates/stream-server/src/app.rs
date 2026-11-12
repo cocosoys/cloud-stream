@@ -90,6 +90,12 @@ pub async fn run() -> anyhow::Result<()> {
     if let Some(code) = crate::update::try_run(&argv) {
         std::process::exit(code);
     }
+    // `--diagnose`：九节现场取证。放在这里而不是更早，是因为它要读配置
+    // （端口从 `stream-config.toml` 来）—— 但它**不**经过 `Config::parse`：
+    // 配置坏了的时候正是最需要诊断的时候，让诊断死在配置解析上等于白写。
+    if let Some(code) = crate::diagnose::try_run(&argv) {
+        std::process::exit(code);
+    }
     // `--probe` 必须排在 `--run` 前面：展开 `--run` 时会 spawn 一个探测进程，
     // 而那个进程进来的参数就是 `--probe ...`。两者不会同时出现在一条命令行上，
     // 但这个顺序让“探测进程自己再去展开一次 --run”这种事不可能发生。

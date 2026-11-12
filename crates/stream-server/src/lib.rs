@@ -43,6 +43,7 @@ pub mod boot;
 pub mod config;
 pub mod configedit;
 pub mod configfile;
+pub mod diagnose;
 pub mod dispatch;
 pub mod http;
 pub mod ops;

@@ -120,6 +120,14 @@ pwsh toolchain/deploy.ps1
 
 ## 1 部署内容清单
 
+> **这一节记的是 2026-11 之前的脚本布局。** 现在除了 `stream-server.exe` /
+> `ViGEmClient.dll` / `vcruntime140.dll` / `selkies-web\` / `logs\` /
+> `stream-config.toml` 之外，目录里只有一个 `stream-setting.exe`：建任务、
+> 放行端口、卸载、改配置、诊断都是它的子命令。上手指南以
+> [`deploy-new-host.md`](deploy-new-host.md) 为准，本文保留下来是因为它逐条
+> 记了"为什么当初要有那些脚本"，那个推理链至今是判断"该不该再加一个脚本"
+> 的依据。
+
 ### 1.0 一个目录：`target\output\cloud-stream`
 
 脚本在构建完之后，把「被控端需要的全部东西」汇总到
@@ -145,11 +153,9 @@ target\output\cloud-stream\
                            `/restore` 先把上次卸载留下的配置/证书/录音设备原值放回来）
   uninstall.cmd          一键卸载：停任务 → 杀进程 → 还默认录音设备 → 删规则 → 存身份 → 删目录
                          （`/keep` 只卸服务留文件，`/whatif` 只列清单）
-  collect-launch-facts.cmd  起不来时双击它，生成一份事实清单（只读，不启动 exe）
   setup-inbound.cmd     管理员身份运行：放行 8080、ping 与 WebRTC 的 UDP 段（新机器必须做一次）
   open-inbound.cmd      上面那条规则的执行者，被启动脚本自动调用（幂等、静默）
   probe-listen.cmd      启动后 30 秒内把"到底有没有监听"写进 watchdog.log
-  set-password.cmd      设 / 改 / 清访问口令，写 auth-token.txt（重启任务生效）
   README.txt             上机三步 + 目录说明（给拿到包的人看）
   manifest.json          构建指纹：提交、时间、MD5、前端文件数
 target\output\cloud-stream.zip   整包，拷到新机器用
@@ -183,10 +189,9 @@ UAC，然后检查包、放行入站、建任务、立刻起一次并打印 `[ok
 | `…\selkies-web\`（打包 1,214,640 B） | `C:\dev\stream\selkies-web\` | 前端整页（2008 个文件） | 不要 |
 | `…\stream-config.toml` | `C:\dev\stream\stream-config.toml` | **参数本体**；路径由 `--run` 从自身目录推导 | 下次启动生效 |
 | `…\setup-watchdog.bat` | `C:\dev\stream\setup-watchdog.bat` | 建/重建看门狗任务，任务动作按自身位置生成 | 不要 |
-| `…\collect-launch-facts.cmd` | `C:\dev\stream\collect-launch-facts.cmd` | 起不来时的第一个动作：双击生成事实清单（只读） | 不要 |
 | `…\setup-inbound.cmd` | `C:\dev\stream\setup-inbound.cmd` | 管理员运行一次：放行 TCP 8080、ICMP、UDP 40000-40049 与 `stream-server.exe` 程序规则，否则外部一概连不上、WebRTC 切不过去 | 不要 |
 | `…\open-inbound.cmd` | `C:\dev\stream\open-inbound.cmd` | 上面那条规则的幂等实现，`--run` 每次真启动时调用；无输出，只回退出码 | 下次启动生效 |
-| `…\set-password.cmd` | `C:\dev\stream\set-password.cmd` | 设 / 改 / 清访问口令，结果写入 `auth-token.txt` | 下次启动生效 |
+| ~~`…\set-password.cmd`~~ | — | 已删（2026-11）：口令改在配置表单的"访问口令"一格，写 `stream-config.toml` 的 `auth_token` | — |
 | `…\cert.pem` / `key.pem` | `C:\dev\stream\cert.pem` / `key.pem` | 仅当被控机**没有**证书时安装（SAN 是那台机器的 IP，不能拿构建端覆盖） | 要（`--tls-*` 在启动参数里） |
 | `toolchain\deploy-remote.ps1` | `C:\dev\deploy\deploy-remote.ps1` | 被控端执行体（`deploy\` 里唯一的常驻文件） | 不要 |
 
@@ -828,7 +833,7 @@ web 目录副本（§7.22）。
 | `build-ws.cmd` | 写死 `vcvars64.bat` 与 `C:\dev\*` 的 PATH；现在由 `toolchain\build.ps1` / `deploy.ps1` 的 `Initialize-BuildEnv` 负责。CONTRIBUTING.md 里"别去改脚本里写死的路径"说的就是它 |
 | `build-shell.cmd` | 同上，且只为编一个阶段 0 的冒烟 crate。那个 crate（`crates/shell`）留着，`cargo build --manifest-path crates/shell/Cargo.toml` 仍然能用 |
 | `distcheck.ps1` | 查的是已经不存在的 `C:\dev\selkies-web`。前端现在在仓库里，指纹走 `manifest.json` 与 `--task-xml` 那一类诊断 |
-| `logtriage.ps1` | 过滤的是 `C:\dev\stream\logs\stream-server.log`，而运行根现在在 `%LOCALAPPDATA%\cloud-stream`；同一件事 `collect-launch-facts.cmd` 已经做了（两个日志各拖尾 40 行） |
+| `logtriage.ps1` | 过滤的是 `C:\dev\stream\logs\stream-server.log`，而运行根现在在 `%LOCALAPPDATA%\cloud-stream`；同一件事 `stream-server.exe --diagnose` 已经做了（两个日志各拖尾 40 行） |
 
 `start-mc.ps1` **留下了**：它不是 cloud-stream 的构建件，是游戏主机上手动排障用
 的脚本。`.148` 现在 ssh 超时、`.150` 上既没有 `C:\dev\mc` 也没有 jdk8，所以这份
@@ -969,6 +974,8 @@ rem ... dies on "/I" — the guard ...
   任务详情与 `LastTaskResult`、两份日志尾部、任务计划事件、Defender 状态。
   它**不启动 exe** —— 会抢屏和 8080，也可能和已在工作的实例打架；只给出一行
   "手工复现"的命令。
+  **2026-11 并入 `stream-server.exe --diagnose`**：九节照旧，只是不再需要"不依赖
+  VC++ 的脚本"这个前提（`vcruntime140.dll` 已随包走）。
 - 这个脚本自己的两个坑与 `find.exe` 同源：`powershell` 要写**全路径**
   （PATH 里若有 pwsh 7，裸名字会跑到别的版本上），并把 `PSModulePath` 收窄到
   5.1 的模块目录（否则 5.1 去加载 pwsh 的模块，弹"不受信任的发布者"交互提示，
@@ -1013,7 +1020,7 @@ rem ... dies on "/I" — the guard ...
 | 启动前 | `start-stream.cmd` 每次**真启动**前 `call open-inbound.cmd`（幂等：查询四条规则，缺了才加）。提权才加得动；UAC 过滤令牌下加不上就记一行 | `PREFLIGHT inbound 8080/ICMP/WebRTC still blocked -- run setup-inbound.cmd as administrator once` |
 | 启动后 | `start "" /b probe-listen.cmd`：每 5 秒探一次 loopback（先 https 再 http），最多 6 轮 | `PREFLIGHT listening on 8080 after N probe(s): local status 200` 或 `PREFLIGHT NOT listening on 8080 ...` + 8080 被占用 / panic / 加载器失败三选一 + 下一步 |
 | 建任务时 | `setup-watchdog.bat` 结尾改成：`schtasks /Run` → 最多等 60 秒 → 打印 `[ok]` / `[fail]`，失败时直接给出要看哪两个日志；最后 `pause`，窗口停在结论上 | 屏幕上的 `[fail]`，不会随窗口消失 |
-| 收证据时 | `collect-launch-facts.cmd` 第 9 节：网络配置文件、本机 IPv4、四条规则（含 UDP 区间与程序路径）的实际参数、最近 12 条 `PREFLIGHT` 行 | `cloud-stream-facts.txt` 直接可回传 |
+| 收证据时 | `stream-server.exe --diagnose` 第 9 节：网络配置文件、本机 IPv4、四条规则（含 UDP 区间与程序路径）的实际参数、最近 12 条 `PREFLIGHT` 行 | `cloud-stream-facts.txt`（运行根 + 桌面）直接可回传 |
 
 **探针自己的四个坑**（都实测踩过）：
 
@@ -1051,13 +1058,18 @@ rem ... dies on "/I" — the guard ...
 在 7.25 之前，这套东西的默认状态是**同网段任何人打开地址就能操作键鼠**。口令是
 一条真实欠账，不是可选项。
 
-**怎么开**：运行根里双击 `set-password.cmd`，输一个口令（只限 ASCII），它会写
-`auth-token.txt`；`start-stream.cmd` 每次启动读这个文件并传 `--auth-token`。删掉
-文件（或在脚本里留空）就恢复开放。
+**怎么开**：双击运行根里的 `stream-setting.exe` →「改配置」→ 找到"访问口令"
+那一格，填一个、保存，然后重启任务（改配置只写文件）。它写进
+`stream-config.toml` 的 `auth_token`；把那一格清空并保存就恢复开放。
 
-**为什么要一个文件而不是写进 `.cmd`**：`.cmd` 按 OEM 代码页逐字节解析，口令里
-只要有一个中文字符，到 exe 手上就变了（和 §7.23 那个破折号同一类问题）。文件
-还可以在不改脚本的前提下替换 —— 而脚本可能正被看门狗执行着。
+**最早的做法是一个单独的文本文件 `auth-token.txt`**（由 `set-password.cmd` 写，
+`start-stream.cmd` 每次启动读它并传 `--auth-token`）。那个文件现在仍然认，但
+**优先级低于配置** —— 老机器升级上来不用重设，而一旦用表单设过就以配置为准。
+
+**为什么当初要一个文件而不是写进 `.cmd`**：`.cmd` 按 OEM 代码页逐字节解析，
+口令里只要有一个中文字符，到 exe 手上就变了（和 §7.23 那个破折号同一类问题）。
+搬进 TOML 之后这层限制消失：文件是 UTF-8，写回时做转义，口令可以带中文、引号、
+反斜杠。那个 `.cmd` 也因此没有存在的理由了。
 
 **前端不需要任何改动**，因为 `lib/session-token.js` 已经把五种载体都实现了，
 服务端按同样的五种读：
@@ -1127,11 +1139,12 @@ Cookie: selkies_token=test123 -> 200
 - [ ] 故意失败一次能回滚：`-SkipFrontend` 上传一个坏 zip，或直接跑 `-Rollback`
 - [ ] 被控机上只有正式产物：`C:\dev\stream` 里没有 `*.prev` / `*.new.*`，
       `C:\dev\deploy` 只剩 `deploy-remote.ps1` 与九个上机脚本（zip 解压完即删）
-- [ ] 运行根里五个上机脚本都在：`setup-watchdog.bat` / `setup-task.ps1` /
-      `collect-launch-facts.cmd` / `setup-inbound.cmd` / `open-inbound.cmd` /
-      `set-password.cmd`
-      （少一个就是有人改了 `$LauncherNames` 而没改 `$Launchers`，打包与安装用的是
-      两份列表）
+- [ ] 运行根里**没有**任何 `.cmd` / `.vbs` / `.ps1` 启动器，只有一个
+      `stream-setting.exe`（2026-11 之后建任务、放行端口、卸载、改配置、诊断
+      全是它的子命令）。目录里出现脚本 = 有人在拿旧包覆盖。
+      这条也是 `deploy.ps1` 打包清单的验收：`$LauncherNames` 现在只有
+      `stream-config.toml`，`deploy-remote.ps1` 的 `$Launchers` 只有
+      `stream-setting.exe`，两份列表一起改才不会有残留。
 - [ ] `logs\watchdog.log` 的尾部有一次启动的**完整三行**：`starting ...`、
       `PREFLIGHT listening on 8080 after N probe(s)`、`loopback works. ...`
       （缺第二行 = 包里少了 `probe-listen.cmd`，或 `start-stream.cmd` 是旧版；
@@ -1162,10 +1175,8 @@ cd C:\Users\user\Desktop\cloud-stream
 scp target\output\cloud-stream\stream-server.exe mc-admin:C:/dev/stream/stream-server.new.exe
 scp target\deploy-selkies-web.zip mc-admin:C:/dev/deploy/selkies-web.zip
 scp toolchain\deploy-remote.ps1 mc-admin:C:/dev/deploy/deploy-remote.ps1
-scp toolchain\start-stream.cmd toolchain\start-stream.60fps.cmd toolchain\run-hidden.vbs `
-    toolchain\setup-watchdog.bat toolchain\collect-launch-facts.cmd `
-    toolchain\setup-inbound.cmd toolchain\open-inbound.cmd toolchain\probe-listen.cmd `
-    mc-admin:C:/dev/deploy/
+# 上机侧只剩一个 exe：系统集成、配置、诊断都挂在它下面
+scp target\output\stream-setting.exe mc-admin:C:/dev/deploy/
 
 # 切换（唯一需要记住的一条；-Root 默认就是 <base>\stream，可不传）
 ssh mc-admin 'powershell -NoProfile -ExecutionPolicy Bypass -File C:\dev\deploy\deploy-remote.ps1'

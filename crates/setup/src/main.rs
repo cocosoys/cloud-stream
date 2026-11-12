@@ -96,7 +96,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetWindowTextW, LoadIconW,
     LoadCursorW, MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassW,
     SendMessageW, SetForegroundWindow, SetWindowTextW, SetWindowPos, ShowWindow, TranslateMessage,
-    BS_PUSHBUTTON, CW_USEDEFAULT, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY,
+    BS_PUSHBUTTON, CW_USEDEFAULT, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_PASSWORD,
+    ES_READONLY,
     MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO, MSG, SWP_NOACTIVATE, SWP_NOZORDER,
     SW_SHOWNORMAL, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_SETFONT,
     WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_MINIMIZEBOX, WS_SYSMENU, WS_VISIBLE, WS_VSCROLL,
@@ -489,6 +490,8 @@ struct Field {
     original: Option<String>,
     /// 下拉框的选项。空 = 用文本框。
     options: Vec<String>,
+    /// 文本框要不要打码（`ES_PASSWORD`）。只有口令那一项是 true。
+    secret: bool,
     /// 输入控件（文本框或下拉框）。
     hwnd: HWND,
     /// 上面那行名字。也要跟着 DPI 重排，所以句柄得留着。
@@ -518,20 +521,48 @@ static CONFIG_HWND: Mutex<isize> = Mutex::new(0);
 /// "我是谁打开的"。存一份比 `GetWindow(hwnd, GW_OWNER)` 稳妥。
 static MAIN_HWND: Mutex<isize> = Mutex::new(0);
 
-/// 去掉一层外层引号：`'vp9'` → `vp9`，`'D:\logs\x.log'` → `D:\logs\x.log`。
+/// 去掉一层外层引号，并把双引号字符串里的转义还原：
+/// `'vp9'` → `vp9`，`'D:\logs\x.log'` → 原样，`"p\"ss\\w"` → `p"ss\w`。
 ///
 /// 表单里显示的是"值"，不是"TOML 语法"。引号由 `configedit::format_value`
-/// 在写回时按类型重新加，所以这里剥掉不会丢信息，也不怕路径里的反斜杠。
-fn plain(raw: &str) -> &str {
+/// 在写回时按类型重新加，所以这里剥掉不会丢信息。
+///
+/// 两种引号的处理**必须不同**：单引号字符串（literal）在 TOML 里没有转义，
+/// 里面的反斜杠是字面量（路径就靠这个）；双引号字符串（basic）有转义，
+/// 不还原的话口令里一个 `\` 会变成两个，而界面上看不出来 —— 现象是"我明明
+/// 设的是这个口令，怎么进不去"。这两条规则与 `quote_basic` 对称。
+fn plain(raw: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
     let text = raw.trim();
     if text.len() >= 2 {
         let bytes = text.as_bytes();
         let (first, last) = (bytes[0], bytes[bytes.len() - 1]);
-        if (first == b'\'' && last == b'\'') || (first == b'"' && last == b'"') {
-            return &text[1..text.len() - 1];
+        if first == b'\'' && last == b'\'' {
+            return Cow::Borrowed(&text[1..text.len() - 1]);
+        }
+        if first == b'"' && last == b'"' {
+            let inner = &text[1..text.len() - 1];
+            if !inner.contains('\\') {
+                return Cow::Borrowed(inner);
+            }
+            let mut out = String::with_capacity(inner.len());
+            let mut chars = inner.chars();
+            while let Some(ch) = chars.next() {
+                if ch != '\\' {
+                    out.push(ch);
+                    continue;
+                }
+                match chars.next() {
+                    Some('n') => out.push('\n'),
+                    Some('t') => out.push('\t'),
+                    Some(other) => out.push(other),
+                    None => out.push('\\'),
+                }
+            }
+            return Cow::Owned(out);
         }
     }
-    text
+    Cow::Borrowed(text)
 }
 
 /// 读一个控件的文本。下拉框的选中项也走这一条 —— 取值方式只有一种，
@@ -589,6 +620,9 @@ fn read_config_fields(exe: &std::path::Path) -> Result<Vec<Field>, String> {
             brief,
             original: key["raw"].as_str().map(|v| v.to_owned()),
             options,
+            // 打码由服务端的类型表决定，界面自己判断"哪个键是口令"就会变成
+            // 第二套判断 —— 而它一定会和 `configedit` 分叉。
+            secret: key["kind"].as_str() == Some("secret"),
             hwnd: 0,
             label: 0,
         });
@@ -641,7 +675,11 @@ unsafe fn build_config_controls(parent: HWND) -> i32 {
         // 控件：枚举/布尔是下拉框，其余是文本框
         let (class, style) = if field.options.is_empty() {
             // ES_* 在 windows-sys 里是 i32，style 是 u32（WINDOW_STYLE）。
-            ("EDIT", WS_BORDER | ES_AUTOHSCROLL as u32)
+            // 口令那一格加 ES_PASSWORD：不是为了防谁，而是因为这块屏幕
+            // 常常正被远程看着（这软件本身就是干这个的），明文口令出现在
+            // 别人的画面上是实打实的泄露。
+            let extra = if field.secret { ES_PASSWORD as u32 } else { 0 };
+            ("EDIT", WS_BORDER | ES_AUTOHSCROLL as u32 | extra)
         } else {
             // 下拉列表（只能选不能打）：值域由类型表定，手打没有意义。
             ("COMBOBOX", CBS_DROPDOWNLIST | WS_VSCROLL)
@@ -664,11 +702,11 @@ unsafe fn build_config_controls(parent: HWND) -> i32 {
         );
         let selected = field.original.as_deref().map(plain);
         if field.options.is_empty() {
-            let w = wide(selected.unwrap_or(""));
+            let w = wide(selected.as_deref().unwrap_or(""));
             SetWindowTextW(input, w.as_ptr());
         } else {
             // 下拉框的"高度"是展开列表的高度，得给足；重排时会换成按 DPI 算的。
-            fill_combo(input, &field.options, selected);
+            fill_combo(input, &field.options, selected.as_deref());
         }
         field.hwnd = input;
         field.label = label;
@@ -727,11 +765,12 @@ fn fill_fields() {
         let selected = field.original.as_deref().map(plain);
         unsafe {
             if field.options.is_empty() {
-                let w = wide(selected.unwrap_or(""));
+                let w = wide(selected.as_deref().unwrap_or(""));
                 SetWindowTextW(field.hwnd, w.as_ptr());
             } else {
                 // 重新填一遍选项会把已有的删掉重来，这里只挪选中项就够了。
                 let index = selected
+                    .as_deref()
                     .and_then(|value| {
                         field
                             .options
@@ -765,8 +804,8 @@ fn submit_config() -> (bool, Vec<String>) {
             }
             let now = control_text(field.hwnd);
             let now = now.trim();
-            let was = field.original.as_deref().map(plain).unwrap_or("");
-            if now == was {
+            let was = field.original.as_deref().map(plain).unwrap_or_default();
+            if now == was.as_ref() {
                 continue;
             }
             if now.is_empty() {
@@ -1323,6 +1362,26 @@ fn main() {
     if args.iter().any(|a| a == "--program-info") {
         print!("{}", program_info(&run_root()));
         std::process::exit(0);
+    }
+    // 「诊断」在这个 exe 上也接：用户不一定记得九节取证在服务端那一份 exe 上，
+    // 而两个 exe 躺在同一个目录里，敲错是常态。转调过去，stdio 直接继承 ——
+    // 九节正文不该被我们截一遍再原样打出来。
+    //
+    // 位置和 `--program-info` 一样在角色判断之前：诊断不需要提权、不需要包，
+    // 落进 `classify` 就会被当成控制台开一个窗口（`--uninstall-step` 那次
+    // 死锁就是这么来的）。
+    if args.iter().any(|a| a == "--diagnose") {
+        let server = run_root().join("stream-server.exe");
+        let code = match std::process::Command::new(&server).arg("--diagnose").status() {
+            Ok(status) => status.code().unwrap_or(1),
+            // 拿不到那份 exe 时唯一有意义的说法是"它不在这儿"，
+            // 而不是一句"诊断失败"。
+            Err(err) => {
+                eprintln!("--diagnose：跑不起来 {}（{err}）", server.display());
+                1
+            }
+        };
+        std::process::exit(code);
     }
     // 替身（`--purge`）必须在角色判断**之前**截住：它跑在 `%TEMP%` 里，那儿
     // 没有 `stream-server.exe`，而它自带有内置包 —— 按下面的判据会被认成

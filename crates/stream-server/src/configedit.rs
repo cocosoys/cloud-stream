@@ -33,6 +33,17 @@ pub enum Kind {
     Enum(&'static [&'static str]),
     /// 自由字符串（路径、设备名）。写回时用单引号包住。
     Text,
+    /// 口令。写回时用**双引号**字符串，并且做转义。
+    ///
+    /// 为什么不复用 `Text` 的单引号：TOML 的单引号字符串（literal string）
+    /// 里没有任何转义手段，口令里出现一个 `'` 就没法表示 —— 而 `'` 比 `"`
+    /// 更常出现在口令里。双引号字符串能装下任意可打印字符，代价是读回来
+    /// 要反转义（界面侧 `unquote`，服务端侧 toml 自己会做）。
+    ///
+    /// 语义上也与 `Text` 不同：**空输入是错的**（去掉这一项请用 unset），
+    /// 因为"空口令"在这个系统里的意思是"关闭鉴权"，那是一个需要明说的
+    /// 动作，不该由"把输入框擦干净再点保存"顺手造成。
+    Secret,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -165,6 +176,19 @@ pub const KEYS: &[Key] = &[
         kind: Kind::Text,
         label: "指定录音设备名（空 = 系统默认）",
         brief: "录音设备名",
+    },
+    // 口令。放在最后：它属于"设一次就不再动"的那一类，而不是调参。
+    //
+    // 它在 2026-11 之前是 `set-password.cmd` 写 `auth-token.txt`，服务由
+    // `--run` 读出来转成 `--auth-token`。现在它是配置里的一项：能进表单、
+    // 能进 `--ops` 的备份与回滚、能写非 ASCII（cmd 的代码页限制消失了）。
+    // 那个 txt 还留着，但优先级低于这里 —— 老机器升级上来时继续生效，
+    // 一旦用表单设过就以配置为准。
+    Key {
+        name: "auth_token",
+        kind: Kind::Secret,
+        label: "访问口令（留空 = 局域网不鉴权；改完要重启任务）",
+        brief: "访问口令",
     },
 ];
 
@@ -320,7 +344,36 @@ pub fn format_value(key: &Key, input: &str) -> Result<String, String> {
             }
             Ok(format!("'{input}'"))
         }
+        // 口令必须能装下任意可打印字符，所以走双引号 + 转义。控制字符单独
+        // 拦掉：TOML 的 basic string 允许 `\n` 这种写法，而一个真的换行会
+        // 让配置后半段变成语法错误 —— 报"不能有换行"比报"第 41 行语法错"
+        // 有用得多。
+        Kind::Secret => {
+            if input.chars().any(char::is_control) {
+                return Err(format!("{} 里不能有换行或控制字符", key.name));
+            }
+            Ok(quote_basic(input))
+        }
     }
+}
+
+/// 把一段文本写成 TOML 的 basic string（双引号，转义 `\` 与 `"`）。
+///
+/// 与界面侧 `plain()` 的规则是**对称的**：那边读的时候要把这两条反转回来。
+/// 两处分别写、只能靠测试守着 —— 所以 `configedit` 的测试里有一条专门
+/// 做"写进去再读出来还是原来那个口令"的往返。
+fn quote_basic(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 2);
+    out.push('"');
+    for ch in input.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            _ => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// 把 `key` 设成已经格式化好的 `value`。返回新的全文。
@@ -548,6 +601,35 @@ no_hdr = true
         let value = format_value(&key, "we#brtc").unwrap();
         let out = set(TEMPLATE, "app", &value);
         assert_eq!(raw_value(&out, "app").as_deref(), Some("'we#brtc'"));
+    }
+
+    /// 口令里的 `"` 与 `\` 必须原样往返。
+    ///
+    /// 三处规则必须对称：这里写（`quote_basic` 转义）、toml 解析（反转义）、
+    /// 界面读回（`plain` 反转义）。任何一处不对称，现象都是"口令怎么都不
+    /// 对"，而三处都不报错 —— 所以只能靠这条测试守着。
+    #[test]
+    fn a_password_survives_the_round_trip() {
+        let key = find("auth_token").expect("键表里应当有 auth_token");
+        // 单引号也在里面：这正是不能复用 `Kind::Text` 的原因。
+        let password = r#"p@ss"w\ord'"#;
+        let formatted = format_value(key, password).expect("双引号字符串装得下它");
+        let text = set("port = 8080\n", "auth_token", &formatted);
+        assert!(
+            text.contains(r#"auth_token = "p@ss\"w\\ord'""#),
+            "文件里应当是转义后的形态：{text}"
+        );
+        let parsed = validate(&text).expect("转义后的口令要能解析");
+        assert_eq!(parsed.auth_token.as_deref(), Some(password));
+    }
+
+    /// 口令里不能有真的换行：它会把配置后半段变成语法错误，而报"不能有
+    /// 换行"比报"第 41 行语法错"有用。
+    #[test]
+    fn a_password_with_a_newline_is_rejected() {
+        let key = find("auth_token").expect("键表里应当有 auth_token");
+        let err = format_value(key, "a\nb").expect_err("换行应当被拒");
+        assert!(err.contains("换行"), "{err}");
     }
 
     /// 改一行不能顺手把整份文件的换行风格改掉：Windows 上这份配置本来是

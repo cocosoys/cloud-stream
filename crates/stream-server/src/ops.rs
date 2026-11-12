@@ -1039,6 +1039,8 @@ fn key_json(key: &crate::configedit::Key, text: &str) -> serde_json::Value {
         Kind::Bool => serde_json::json!({ "kind": "bool" }),
         Kind::Enum(options) => serde_json::json!({ "kind": "enum", "options": options }),
         Kind::Text => serde_json::json!({ "kind": "text" }),
+        // 界面据此把它做成密码框（`ES_PASSWORD`），并在文本输出里打码。
+        Kind::Secret => serde_json::json!({ "kind": "secret" }),
     };
     let raw = crate::configedit::raw_value(text, key.name);
     let object = doc.as_object_mut().expect("上面构造的一定是对象");
@@ -1358,7 +1360,13 @@ pub fn execute(request: &Request) -> i32 {
                 }
                 for key in crate::configedit::KEYS {
                     let written = crate::configedit::raw_value(&text, key.name);
-                    let value = written.clone().unwrap_or_else(|| "(默认)".to_owned());
+                    // 口令不打原文：这条命令的输出会进日志、进粘贴板、进聊天
+                    // 记录。"有没有设"才是要看的那件事。
+                    let value = match (&written, key.kind) {
+                        (Some(_), crate::configedit::Kind::Secret) => "(已设置)".to_owned(),
+                        (Some(v), _) => v.clone(),
+                        (None, _) => "(默认)".to_owned(),
+                    };
                     // 没写着的用空格代替 "="，一眼能看出哪些是自己设过的。
                     let marker = if written.is_some() { '=' } else { ' ' };
                     println!(

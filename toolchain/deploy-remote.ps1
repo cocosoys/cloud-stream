@@ -21,11 +21,10 @@
 
     Runtime layout - identical to the build machine's target\output\cloud-stream:
 
-        <root>\stream-server.exe  ViGEmClient.dll
+        <root>\stream-server.exe  ViGEmClient.dll  vcruntime140.dll
         <root>\cert.pem  key.pem
         <root>\selkies-web\  logs\
         <root>\stream-setting.exe
-        <root>\collect-launch-facts.cmd  set-password.cmd
 
     No .cmd / .ps1 / .vbs launcher exists any more: the task action is
     `<root>\stream-server.exe --run`, and install / uninstall / firewall are
@@ -121,10 +120,12 @@ $NewDll = Join-Path $Root 'ViGEmClient.new.dll'
 # (docs/operations-install.md). The firewall rules and the task are created by
 # that exe, not by anything shipped here.
 #
-# collect-launch-facts.cmd is the "it will not start" first responder; it ships
-# so the person at the machine does not need the repo to answer the question.
-# set-password.cmd only writes a text file; a real UI for it would be a second
-# window for one line of input.
+# Two scripts used to ride along here. Both are gone (2026-11):
+#   collect-launch-facts.cmd -> `stream-server.exe --diagnose` (nine sections)
+#   set-password.cmd         -> the "access password" field of the config form
+# Their only reason to exist was "who collects the scene when the exe will not
+# start", and that premise died with the app-local `vcruntime140.dll`: a missing
+# VC++ runtime is no longer a failure mode.
 #
 # stream-setting.exe rides along so the box keeps a *current* console: it is what
 # that person double-clicks for install / repair / uninstall / config, and an
@@ -132,7 +133,7 @@ $NewDll = Join-Path $Root 'ViGEmClient.new.dll'
 # install.cmd). It arrived in <deploy>\ like everything else and is copied into
 # the run root here. If someone has the window open, the copy fails on a sharing
 # violation and stays a NOTE -- the new one applies next time.
-$Launchers = @('collect-launch-facts.cmd', 'set-password.cmd', 'stream-setting.exe')
+$Launchers = @('stream-setting.exe')
 
 function Say([string]$Text) { Write-Output $Text }
 function Fail([string]$Text) { Write-Output "FAIL $Text"; exit 1 }
