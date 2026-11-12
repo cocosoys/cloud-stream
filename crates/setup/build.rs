@@ -6,7 +6,7 @@
 //! 2. **payload** —— `--features embed` 时把 `target/output/cloud-stream` 打成
 //!    一个 gzip 归档，用 `include_bytes!` 嵌进 exe，于是分发物是**一个文件**。
 //!
-//! # 为什么归档里没有 cloud-setup.exe 自己
+//! # 为什么归档里没有 stream-setting.exe 自己
 //!
 //! 那是个循环：exe 里嵌着包含自己的包，包又嵌在 exe 里。解法是安装器解压完
 //! 之后把 `current_exe()` 复制到目标目录 —— 于是安装好的那份就是控制台，而
@@ -31,13 +31,13 @@ fn main() {
 /// `/MANIFEST:EMBED` + `/MANIFESTINPUT:` 是 MSVC 链接器自带的路，不额外引入
 /// 构建依赖（比如往 PE 里塞资源的 crate）。
 fn embed_manifest() {
-    println!("cargo:rerun-if-changed=cloud-setup.manifest");
+    println!("cargo:rerun-if-changed=stream-setting.manifest");
     // 用 `current_dir` 而不是 `canonicalize`：后者在 Windows 上返回
     // `\\?\C:\...` 这种扩展长度路径，而 link.exe 打不开它（LNK1104，看起来
     // 像"文件不存在"，其实只是前缀不一样）。cargo 跑构建脚本时当前目录就是
     // 包根，拼一下就是绝对路径。
     let dir = std::env::current_dir().expect("拿不到当前目录");
-    let manifest = dir.join("cloud-setup.manifest");
+    let manifest = dir.join("stream-setting.manifest");
     if !manifest.exists() {
         panic!("找不到 {}", manifest.display());
     }
@@ -76,21 +76,21 @@ fn embed_icon() {
     };
     let dir = std::env::current_dir().expect("拿不到当前目录");
     let icon = dir.join("..").join("..").join("res").join("app.ico");
-    let name = "cloud-setup.ico";
+    let name = "stream-setting.ico";
     if let Err(err) = std::fs::copy(&icon, out_dir.join(name)) {
         println!(
-            "cargo:warning=读不到 {}（{err}），cloud-setup.exe 将不带图标",
+            "cargo:warning=读不到 {}（{err}），stream-setting.exe 将不带图标",
             icon.display()
         );
         return;
     }
     let Some(rc) = find_rc() else {
-        println!("cargo:warning=rc.exe 没找到，cloud-setup.exe 将不带图标");
+        println!("cargo:warning=rc.exe 没找到，stream-setting.exe 将不带图标");
         return;
     };
 
-    let rc_path = out_dir.join("cloud-setup.rc");
-    let res_path = out_dir.join("cloud-setup.res");
+    let rc_path = out_dir.join("stream-setting.rc");
+    let res_path = out_dir.join("stream-setting.res");
     // 图标先抄进 OUT_DIR，.rc 里只写相对文件名。绝对路径要转义反斜杠、要加
     // 引号，而 rc 按系统 ANSI 代码页读 .rc —— 仓库哪天落到带中文的路径下，
     // 那种写法会在别人机器上变成"找不到文件"。
@@ -158,7 +158,7 @@ fn embed_payload() {
     // `cargo build` 就是这样），不是编译错误。
     if std::env::var_os("CARGO_FEATURE_EMBED").is_none() {
         write_empty(&target);
-        println!("cargo:warning=cloud-setup: 未开 embed，exe 里没有安装包");
+        println!("cargo:warning=stream-setting: 未开 embed，exe 里没有安装包");
         return;
     }
 
@@ -180,7 +180,7 @@ fn embed_payload() {
     let gz = enc.finish().expect("压缩失败");
     std::fs::write(&target, &gz).expect("写 payload.gz 失败");
     println!(
-        "cargo:warning=cloud-setup: 内嵌 {} 个文件，{:.1} MB 压缩后 {:.1} MB",
+        "cargo:warning=stream-setting: 内嵌 {} 个文件，{:.1} MB 压缩后 {:.1} MB",
         files.len(),
         bytes.len() as f64 / 1e6,
         gz.len() as f64 / 1e6
@@ -228,7 +228,7 @@ fn collect(root: &Path) -> Vec<(String, Vec<u8>)> {
             let name = rel.to_string_lossy().replace('\\', "/");
             // 安装器解压完会把自己复制进去，归档里放它只会造成"解压时覆盖正在
             // 运行的 exe"（Windows 允许改名不允许删除/覆盖运行中的 exe）。
-            if name.eq_ignore_ascii_case("cloud-setup.exe") {
+            if name.eq_ignore_ascii_case("stream-setting.exe") {
                 continue;
             }
             // 日志不打包：那是上一台机器的现场，带到新机器上只会误导。

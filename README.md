@@ -112,18 +112,20 @@ stream-server.exe --config stream-config.toml --print-config
 整包（含前端、证书）还有一个同名 zip，拷到新设备解压即可跑，见
 `docs/deploy-one-click.md` §1.1。
 
-**装一台新设备**是双击 `cloud-setup.exe`（就是控制台那个 exe，构建时用
+**装一台新设备**是双击 `stream-setting.exe`（stream-server 的工具箱，构建时用
 `--features embed` 把整包嵌了进去，约 9 MB）：它自己提权，然后一次做完解包、
 放行入站、建看门狗任务、立刻启动并验证（打印 `[ok]` 和本机访问地址），细节见
-`docs/deploy-new-host.md` §3.0。要撤掉一台机器就还双击它，点「卸载」——五步
-（停任务/杀进程/还录音设备/删规则/删目录）走完，删不掉的文件会点名告诉你。
+`docs/deploy-new-host.md` §3.0。要撤掉一台机器就双击向导版留下的
+`unins000.exe`（或「应用和功能」里那条）—— 卸载器按顺序调五条单步命令
+（停任务/杀进程/还录音设备/删规则/备份身份），再由它删文件；便携包直接解出来
+的那种没有卸载器，删掉整个目录即可。
 整包目录里**没有任何 .cmd / .ps1 / .vbs 启动脚本**，见
 [`docs/operations-install.md`](docs/operations-install.md)。
 
 发给别人装时用同一批产物里的 `cloud-stream-setup.exe`（约 7.8 MB）：外面套了
 一层 Inno 向导，可以自己选装到哪个盘，装完在「应用和功能」里能卸。它是外壳不是
-另一套实现 —— 建任务、防火墙、录音设备仍然由 `cloud-setup.exe --finish` /
-`--uninstall --keep` 做，两条命令和上面那个双击流程完全一样。
+另一套实现 —— 装机时建任务、防火墙、录音设备仍然由 `stream-setting.exe --finish`
+做；卸载时由卸载器逐条调 `--uninstall-step`，落到的还是同一批函数。
 
 需要组策略 / SCCM 推的时候用 `cloud-stream.msi`（约 7.7 MB，`msiexec /i ... /qn`，
 `INSTALLDIR=` 可改目录）：它是**第三个外壳**，系统集成还是那两条命令 —— 连
@@ -172,7 +174,7 @@ cd target\output\cloud-stream
 | `--display` | `0` | 默认采集哪块屏（索引 0 = 主屏，其余按枚举顺序）。页面的 `display_id`（`primary` / `display2`）会覆盖它；指定的屏不存在时采集如实失败，不会回落成主屏 |
 | `--mode` | `websockets` | 新浏览器（本地还没有选择记录）默认用哪种传输：`websockets` / `webrtc`。页面从 `/api/status` 读它，面板切换的模式选择优先于它 |
 | `--video-codec` | `vp9` | 视频编码：`vp9` / `vp8` / `h264`。`h264` 是硬编与 Safari/WebCodecs 兼容的通道，软编下也能跑 |
-| `--webrtc-udp-port-min` / `--webrtc-udp-port-max` | `40000` / `40049` | ICE 只会绑这一段 UDP（含两端），让防火墙规则写得出来。改了要让规则跟上：管理员跑一次 `cloud-setup.exe --inbound`；程序规则 `cloud-stream app` 仍覆盖任意端口 |
+| `--webrtc-udp-port-min` / `--webrtc-udp-port-max` | `40000` / `40049` | ICE 只会绑这一段 UDP（含两端），让防火墙规则写得出来。改了要让规则跟上：管理员跑一次 `stream-setting.exe --inbound`；程序规则 `cloud-stream app` 仍覆盖任意端口 |
 | `--tune` | `tuned` | 软编实时参数组；`legacy` 复现 #95 之前的参数，仅用于同机 A/B |
 | `--log` | `logs\stream-server.log` | 日志落盘路径 |
 | `--no-hdr` | — | 关闭 HDR 采集路径 |
@@ -196,7 +198,7 @@ cd target\output\cloud-stream
 | [`docs/operations-update.md`](docs/operations-update.md) | **更新：`--update check/apply`，三种验版本口径、自动回滚、更新包放哪** |
 | [`docs/operations-run.md`](docs/operations-run.md) | **服务怎么被拉起来：`--run`、GUI 子系统与 stdio 的三种处境、单实例、退出码** |
 | [`docs/operations-install.md`](docs/operations-install.md) | **安装：一个 exe 装出整台机器 —— 两段提权、任务 XML 里三个改了就毁的设置、结论文件契约** |
-| [`docs/console.md`](docs/console.md) | **可视化控制台 `cloud-setup.exe`：四个动作的按钮版，七个按钮各落到哪条命令** |
+| [`docs/console.md`](docs/console.md) | **工具箱 `stream-setting.exe`：看状态/改配置/换版本/卸掉，四个按钮各落到哪条命令** |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | **参与开发：环境、构建、测试、提交规范、硬规矩** |
 | [`docs/roadmap-l2-l3-gaps.md`](docs/roadmap-l2-l3-gaps.md) | 全量盘点：已完成 / 部分 / 未做，逐项拆解 |
 | [`docs/stage1-signaling-session.md`](docs/stage1-signaling-session.md) | 信令契约与会话状态机 |

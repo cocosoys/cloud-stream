@@ -11,7 +11,7 @@
       2. 构建后端 release
       3. 构建前端（core → dashboard 两级，顺序不能反）
       4. 汇总产物到 target\output\cloud-stream（+ 同名 zip）
-      5. 用 --features embed 把上面那个目录打进 target\output\cloud-setup.exe
+      5. 用 --features embed 把上面那个目录打进 target\output\stream-setting.exe
          —— 一个自带整包的单文件安装器（顺序不能反，见 New-Installer）
       6. scp 上传（exe / DLL / zip / 三个上机脚本 / 证书 / 安装器，内容一样就跳过）
       7. MD5 双向核对
@@ -62,8 +62,8 @@
     产物有两个，落在 target\output\：
       cloud-stream\        运行根目录，可直接拷走（给调试、手工摆位用）
       cloud-stream.zip     同上的压缩版
-      cloud-setup.exe      自带整包的单文件安装器，装新机器只需要它
-    这一步跑完就可以把 cloud-setup.exe 交给别人去装。
+      stream-setting.exe      自带整包的单文件安装器，装新机器只需要它
+    这一步跑完就可以把 stream-setting.exe 交给别人去装。
     用途是把"要一个能装到新机器上的包"和"部署到 .148"这两件事分开 ——
     前者不需要目标机开机，也不该因为 ssh 连不上而整条命令失败。
 
@@ -88,7 +88,7 @@
 
 .EXAMPLE
     pwsh toolchain/deploy.ps1 -PackageOnly
-    只产出能装到新机器的东西（target\output\cloud-stream + zip + cloud-setup.exe），不连被控机。
+    只产出能装到新机器的东西（target\output\cloud-stream + zip + stream-setting.exe），不连被控机。
 #>
 [CmdletBinding()]
 param(
@@ -154,7 +154,7 @@ $RemoteLog = "$RemoteRoot\logs\stream-server.log"
 #       —— 启动后 30 秒探活。`--probe` 干同一件事，输出同一行 PREFLIGHT。
 #   install.cmd / uninstall.cmd / setup-watchdog.bat / setup-task.ps1 /
 #   open-inbound.cmd / setup-inbound.cmd
-#       —— 装与卸的四层命令。现在是一个 exe：`cloud-setup.exe --install` /
+#       —— 装与卸的四层命令。现在是一个 exe：`stream-setting.exe --install` /
 #       `--uninstall`，任务 XML、防火墙、端口全都由它自己算
 #       （docs/operations-install.md）。
 #
@@ -176,14 +176,14 @@ $LocalExe = Join-Path $RepoRoot 'target\release\stream-server.exe'
 # （377 KB，秒开），所以是独立产物。
 #
 # **它不再进整包目录**：打包那一步会用 `--features embed` 把它重新编一遍，让
-# 它自带整个运行包，成品落在 `target\output\cloud-setup.exe` —— 一个文件就是
+# 它自带整个运行包，成品落在 `target\output\stream-setting.exe` —— 一个文件就是
 # 一台能装的机器。理由有两个：
 #   * 包内再放一份 9 MB 的"自带同一份包"的 exe，是把自己复制了一遍；
 #   * 分发形式变成"拷一个 exe 过去双击"，而不是"解开一个目录再找里面的脚本"。
 # 装完之后 `place_self` 会把它复制进运行根，所以在被控机上它仍然是控制台。
-$LocalSetup = Join-Path $RepoRoot 'target\release\cloud-setup.exe'
+$LocalSetup = Join-Path $RepoRoot 'target\release\stream-setting.exe'
 # 安装器成品：单个 exe，自带整包。
-$InstallerExe = Join-Path $RepoRoot 'target\output\cloud-setup.exe'
+$InstallerExe = Join-Path $RepoRoot 'target\output\stream-setting.exe'
 # #17: 虚拟手柄的 DLL。必须和 exe 同目录（LoadLibraryW 先查应用目录），并且
 # 必须在进程停下之后才能覆盖 —— 已加载的 DLL 被持有，运行中覆盖是共享冲突。
 $LocalVigem = Join-Path $RepoRoot 'vendor\vigem\ViGEmClient.dll'
@@ -464,32 +464,32 @@ cloud-stream 被控端整包
   最省事的一条：把 cloud-stream-setup.exe 拷过去双击。向导里能自己选装到
   哪个盘（会在你选的位置下建一个 cloud-stream 子目录），装完在 Windows 的
   「应用和功能」里能正常卸载，不用知道下面这些命令。
-  它和下面那个 cloud-setup.exe 都**不在**这个目录里 —— 这个目录正是它们
+  它和下面那个 stream-setting.exe 都**不在**这个目录里 —— 这个目录正是它们
   要铺下去的内容。
 
   不要向导的那条路（也适合写进脚本批量装）：
-  1) 只拷**一个文件**过去：cloud-setup.exe（自带这整个包，约 9 MB）。
+  1) 只拷**一个文件**过去：stream-setting.exe（自带这整个包，约 9 MB）。
   2) 双击它。弹一次 UAC，然后它依次：把内置包解到
      %LOCALAPPDATA%\cloud-stream -> 放行 TCP 端口 / ping / WebRTC 的 UDP 段 ->
      建看门狗计划任务（不需要任何账户密码）-> 启动一次 -> 等端口应答 ->
      告诉你这台机器的访问地址。失败时它按最可能的原因给下一步。
   3) 浏览器打开 ${scheme}://<本机IP>:8080/
-  4) 以后不要了：同一台机器上双击运行根里的 cloud-setup.exe -> 「卸载」。
+  4) 以后不要了：同一台机器上双击运行根里的 stream-setting.exe -> 「卸载」。
      它停任务、杀进程、把默认录音设备还回去、删防火墙规则，最后删掉整个目录。
      删不掉的文件会点名告诉你（多半是有程序还开着里面的东西）。
 
   只想看它会做什么、不改动任何东西（命令行，输出直接打在屏幕上）：
-     cloud-setup.exe --uninstall --plan     在某台机器上卸载会做什么
-     cloud-setup.exe --task-xml             要注册的那个任务长什么样
+     stream-setting.exe --uninstall --plan     在某台机器上卸载会做什么
+     stream-setting.exe --task-xml             要注册的那个任务长什么样
                                             （默认按它会装的目录算；换台机器看，
                                               加 --dir D:\stream）
-     cloud-setup.exe --inbound              只补那四条防火墙规则（要管理员）
+     stream-setting.exe --inbound              只补那四条防火墙规则（要管理员）
 
 已经有任务在跑、只想换文件（deploy.ps1 的部署路径）
   把同目录的 zip 解到这台机器的运行根（比如 C:\dev\stream），然后重启任务：
      schtasks /End /TN MCStreamSrv
      schtasks /Run /TN MCStreamSrv
-  也可以双击运行根里的 cloud-setup.exe，点「安装 / 修复」（会顺带把任务与规则
+  也可以双击运行根里的 stream-setting.exe，点「安装 / 修复」（会顺带把任务与规则
   重新做一遍）。
 
 目录说明
@@ -524,7 +524,7 @@ cloud-stream 被控端整包
     账户会抓到一张空桌面 —— 采集和 SendInput 都是按会话隔离的。
   * 换机器要重签证书（SAN 里是 IP），否则浏览器报警、剪贴板不工作。
   * 外部机器连不上、本机 loopback 正常，多半是入站规则或网络配置文件
-    （VMware 的网卡常被判成"公用"）：管理员身份跑一次 cloud-setup.exe --inbound。
+    （VMware 的网卡常被判成"公用"）：管理员身份跑一次 stream-setting.exe --inbound。
   * 换分辨率 / 码率改 stream-config.toml（或控制台的「改配置」按钮），不要改计划任务。
   * 计划任务的动作就是 stream-server.exe --run，没有脚本中转；它自己从所在目录
     推导配置、前端、日志、证书、令牌的位置，所以整包搬到哪都能跑。
@@ -561,7 +561,7 @@ function New-DeployBundle {
     }
     # 控制台不在这里拷进包里 —— 它是**产物目录的兄弟**，不是包里的一员。
     # 打包的最后一步会用 `--features embed` 把它编成"自带这个包"的单文件
-    # 安装器，落在 `target\output\cloud-setup.exe`。放进包里有两个坏处：
+    # 安装器，落在 `target\output\stream-setting.exe`。放进包里有两个坏处：
     # 体积翻一倍（包里含一份自带这个包的 9 MB exe），以及"我该双击哪个"
     # 这个问题本来就不该存在。
 
@@ -642,15 +642,15 @@ function New-DeployBundle {
 }
 
 <#
-    把刚打好的整包编进 cloud-setup.exe，成品是一个文件。
+    把刚打好的整包编进 stream-setting.exe，成品是一个文件。
 
     顺序不能反：payload **就是** `target\output\cloud-stream` 这个目录，所以
-    必须先有它、再编安装器。`build.rs` 里刻意跳过 `cloud-setup.exe` 自己 ——
+    必须先有它、再编安装器。`build.rs` 里刻意跳过 `stream-setting.exe` 自己 ——
     否则就是"exe 里嵌着包含自己的包"。装的时候 `pack::place_self` 把它复制进
     运行根，从那以后它就是控制台。
 
     这里用 `-Exe` 而不是别的路径，是因为 `build.ps1` 走的是 workspace 的
-    `target\`：`-Package cloud-setup` 和这里编出来的是同一个文件，只是特征不同。
+    `target\`：`-Package stream-setting` 和这里编出来的是同一个文件，只是特征不同。
 #>
 function New-Installer {
     param([string]$PayloadDir)
@@ -667,7 +667,7 @@ function New-Installer {
     $env:CS_PAYLOAD_DIR = $PayloadDir
     try {
         Invoke-Native -Exe 'cargo' -Arguments @(
-            'build', '--release', '-p', 'cloud-setup', '--features', 'embed',
+            'build', '--release', '-p', 'stream-setting', '--features', 'embed',
             '--manifest-path', (Join-Path $RepoRoot 'Cargo.toml')
         ) -Quiet
     } finally {
@@ -706,11 +706,11 @@ function Get-ConsoleExe {
     $consoleDir = Join-Path $RepoRoot 'target\inno-console'
     Write-Info '编运行根里的控制台（不带 embed）'
     Invoke-Native -Exe 'cargo' -Arguments @(
-        'build', '--release', '-p', 'cloud-setup',
+        'build', '--release', '-p', 'stream-setting',
         '--target-dir', $consoleDir,
         '--manifest-path', (Join-Path $RepoRoot 'Cargo.toml')
     ) -Quiet
-    $consoleExe = Join-Path $consoleDir 'release\cloud-setup.exe'
+    $consoleExe = Join-Path $consoleDir 'release\stream-setting.exe'
     if (-not (Test-Path $consoleExe)) { throw "编完却找不到 $consoleExe" }
     return $consoleExe
 }
@@ -722,11 +722,11 @@ function Get-ConsoleExe {
 .DESCRIPTION
     两个安装器是同一份东西的两个外壳，不是两套实现：
 
-    * `cloud-setup.exe`（embed）—— 拷一个文件走天下，自带整包；
+    * `stream-setting.exe`（embed）—— 拷一个文件走天下，自带整包；
     * `cloud-stream-setup.exe`（Inno）—— 正式分发，有向导、目录选择、
       控制面板卸载项、跟随系统明暗。
 
-    区别只在外壳：系统集成仍然是 `cloud-setup.exe --finish` / `--uninstall --keep`。
+    区别只在外壳：系统集成仍然是 `stream-setting.exe --finish` / `--uninstall --keep`。
     所以这里要做的事很少 —— 编一份**不带 embed** 的控制台放进运行根，
     然后把 payload 交给 ISCC。
 
@@ -817,13 +817,13 @@ function New-InnoInstaller {
     三个外壳，同一份 payload，同一对系统集成命令 —— 区别只在"谁铺文件、
     谁记录卸载项"：
 
-      cloud-setup.exe        自己解压自己，控制台在运行根里
+      stream-setting.exe        自己解压自己，控制台在运行根里
       cloud-stream-setup.exe Inno：向导、自选目录、控制面板卸载项
       cloud-stream.msi       Windows Installer：/qn 静默、INSTALLDIR= 指定目录、
                               升级/修复/卸载都归 msiexec 管
 
     这里**不做**任何新的系统集成。建任务、防火墙、录音设备仍然由 MSI 里的
-    两个 deferred CustomAction 调 cloud-setup.exe 那两条命令完成，见
+    两个 deferred CustomAction 调 stream-setting.exe 那两条命令完成，见
     toolchain/wix/cloud-stream.wxs 的头部说明。
 
     没有 WiX 时只警告、不 throw：三个安装器里缺一个不是"构建坏了"。
@@ -963,7 +963,7 @@ function Save-DeployArchive {
         Copy-Item (Join-Path $PSScriptRoot $name) (Join-Path $ArchiveDir $name) -Force
     }
     if (Test-Path $LocalSetup) {
-        Copy-Item $LocalSetup (Join-Path $ArchiveDir 'cloud-setup.exe') -Force
+        Copy-Item $LocalSetup (Join-Path $ArchiveDir 'stream-setting.exe') -Force
     }
     $dllMd5 = $(if (Test-Path $ArchiveDll) { Get-Md5 $ArchiveDll } else { $null })
     $zipMd5 = $(if (Test-Path $ArchiveZip) { Get-Md5 $ArchiveZip } else { $null })
@@ -1308,7 +1308,7 @@ try {
             Write-Note '这一轮没有 MSI（本机没有 WiX 工具链，见上面的提示）'
         }
         Write-Note ('发给别人装：拷 cloud-stream-setup.exe —— 向导、可以自己选目录、' +
-            '装完在"应用和功能"里能卸。只想要一个文件、不想看向导：拷 cloud-setup.exe，' +
+            '装完在"应用和功能"里能卸。只想要一个文件、不想看向导：拷 stream-setting.exe，' +
             '它自带整包，双击就是控制台。要批量推/让它归 msiexec 管：用 cloud-stream.msi。' +
             '整包目录与 zip 是给"已经有任务在跑、只换文件"的部署路径用的。')
         return
@@ -1338,8 +1338,8 @@ try {
     if ($packaged -and (Test-Path $InstallerExe)) {
         # 安装器不再在包里，所以路径从产物目录取。被控机上它是控制台：放在
         # 运行根里，双击就是那四个按钮。
-        Send-File $InstallerExe "$RemoteDeploy/cloud-setup.exe"
-        Write-Ok 'cloud-setup.exe（自带整包的安装器）'
+        Send-File $InstallerExe "$RemoteDeploy/stream-setting.exe"
+        Write-Ok 'stream-setting.exe（自带整包的安装器）'
     }
     # 证书只传到暂存区：被控端已有证书时不覆盖（SAN 里是那台机器的 IP），没有才装。
     foreach ($name in @('cert.pem', 'key.pem')) {
@@ -1497,9 +1497,9 @@ try {
         Write-Ok ("看门狗动作 {0}" -f ($actLine -replace '^act=', ''))
     } elseif ($actLine) {
         Write-Note ("看门狗动作指向别处：{0}" -f ($actLine -replace '^act=', ''))
-        Write-Note "  期望是 \"$expectExe --run\"；整包搬过位置后要在被控机重跑一次 cloud-setup.exe --install"
+        Write-Note "  期望是 \"$expectExe --run\"；整包搬过位置后要在被控机重跑一次 stream-setting.exe --install"
     } else {
-        Write-Note "查不到计划任务 $RemoteTask 的动作 —— 先在被控机跑一次 cloud-setup.exe --install"
+        Write-Note "查不到计划任务 $RemoteTask 的动作 —— 先在被控机跑一次 stream-setting.exe --install"
     }
 
     # ---- 10 归档（构建端唯一的备份）

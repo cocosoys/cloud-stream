@@ -20,16 +20,16 @@
 >
 > 第二批（2026-11-12）删的是**安装那一层**：`install.cmd` / `uninstall.cmd` /
 > `setup-task.ps1` / `setup-watchdog.bat` / `open-inbound.cmd` / `setup-inbound.cmd`。
-> 全都并进了 `cloud-setup.exe` —— 同一个窗口既能看状态，也能装、能修、能卸：
+> 全都并进了 `stream-setting.exe` —— 同一个窗口既能看状态，也能装、能修、能卸：
 >
 > | 原来 | 现在 |
 > |---|---|
-> | `install.cmd` | `cloud-setup.exe --install`（双击窗口里的「安装 / 修复」） |
-> | `install.cmd /check` | `cloud-setup.exe --plan` |
-> | `uninstall.cmd` | `cloud-setup.exe --uninstall` |
-> | `uninstall.cmd /whatif` | `cloud-setup.exe --uninstall --plan` |
+> | `install.cmd` | `stream-setting.exe --install`（双击窗口里的「安装 / 修复」） |
+> | `install.cmd /check` | `stream-setting.exe --plan` |
+> | `uninstall.cmd` | `stream-setting.exe --uninstall` |
+> | `uninstall.cmd /whatif` | `stream-setting.exe --uninstall --plan` |
 > | `setup-task.ps1` + `setup-watchdog.bat` | `--install` 内部建任务（交互式令牌，无密码） |
-> | `open-inbound.cmd` / `setup-inbound.cmd` | `cloud-setup.exe --inbound` |
+> | `open-inbound.cmd` / `setup-inbound.cmd` | `stream-setting.exe --inbound` |
 >
 > 所以本文里凡是出现这些文件名的地方，读起来都该替换成上表右列。**没有**逐行
 > 重写的原因：这个文件的价值一半在“当时为什么这样”的推理链条里，把名词换掉会

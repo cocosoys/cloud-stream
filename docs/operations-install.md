@@ -5,13 +5,13 @@
 失败方式分别来自 cmd 的引号、`-Command` 的第二层引号、`schtasks /RP` 存密码、
 `netsh` 重复建规则 —— 全都不是"逻辑写错了"，而是"命令行长到会出错"。
 
-现在这三个动作都在 `cloud-setup.exe` 里，**没有命令行可拼**：
+现在这三个动作都在 `stream-setting.exe` 里，**没有命令行可拼**：
 
 | 动作 | 命令 | 需要管理员 | 实现在 |
 |---|---|---|---|
-| 安装 | `cloud-setup.exe --install` | 第二段才要 | `install.rs` |
-| 卸载 | `cloud-setup.exe --uninstall` | 整段要 | `uninstall.rs` |
-| 只补防火墙 | `cloud-setup.exe --inbound` | 是 | `install.rs` |
+| 安装 | `stream-setting.exe --install` | 第二段才要 | `install.rs` |
+| 卸载 | `stream-setting.exe --uninstall` | 整段要 | `uninstall.rs` |
+| 只补防火墙 | `stream-setting.exe --inbound` | 是 | `install.rs` |
 
 发给别人装的那一份外面还套了一层向导（`cloud-stream-setup.exe`，见下节
 「第三个外壳」）。那一层只管铺文件与注册卸载项，上面三个动作仍然是同一个 exe。
@@ -22,16 +22,16 @@
 target\output\
   cloud-stream\          ← 运行根：exe / dll / 前端 / 证书 / 配置 / README
   cloud-stream.zip       ← 上面那个目录的压缩快照（部署上传用）
-  cloud-setup.exe        ← 单文件安装器：自带整包（约 9 MB）
+  stream-setting.exe        ← 单文件安装器：自带整包（约 9 MB）
   cloud-stream-setup.exe ← 向导版安装器：Inno 外壳（约 7.8 MB，见下节）
 ```
 
-`cloud-setup.exe` **不在** `cloud-stream\` 里面，这是刻意的：归档里放进
-`cloud-setup.exe` 就是"exe 里嵌着包含自己的包"。装完之后 `pack::place_self`
+`stream-setting.exe` **不在** `cloud-stream\` 里面，这是刻意的：归档里放进
+`stream-setting.exe` 就是"exe 里嵌着包含自己的包"。装完之后 `pack::place_self`
 把它复制进运行根，从那以后它就是控制台。所以：
 
-* 装一台新机器 = 拷 `cloud-setup.exe` 过去双击，不拷目录；
-* 已经装好的机器 = 运行根里那个 `cloud-setup.exe` 就是控制台。
+* 装一台新机器 = 拷 `stream-setting.exe` 过去双击，不拷目录；
+* 已经装好的机器 = 运行根里那个 `stream-setting.exe` 就是控制台。
 
 体积上有个反直觉的点：运行根 24.0 MB（exe 自己 20.2 MB），装进 exe 之后只有
 8.7 MB（9,144,832 B）。因为它不是"把文件原样拼在后面"，而是过了一遍 flate2
@@ -40,20 +40,20 @@ target\output\
 
 构建顺序因此是**先整包、后安装器**：`deploy.ps1` 先装满
 `target\output\cloud-stream`，再带 `--features embed` 和
-`CS_PAYLOAD_DIR=那个目录` 编一次，产物拷到 `target\output\cloud-setup.exe`。
+`CS_PAYLOAD_DIR=那个目录` 编一次，产物拷到 `target\output\stream-setting.exe`。
 反过来的话，exe 里嵌的是一个还不存在的包。
 
 ## 第三个外壳：`cloud-stream-setup.exe`（Inno 向导版）
 
-`cloud-setup.exe` 双击起来"没有界面"—— 只有一串自检输出和一个控制台窗口。发给
+`stream-setting.exe` 双击起来"没有界面"—— 只有一串自检输出和一个控制台窗口。发给
 不熟这套东西的人时缺三样很具体的能力：自己选装到哪个盘、看得到进度、装完之后
 能在「应用和功能」里找到它。所以 `deploy.ps1` 还编第三个产物：
 
-| | `cloud-setup.exe` | `cloud-stream-setup.exe` |
+| | `stream-setting.exe` | `cloud-stream-setup.exe` |
 |---|---|---|
-| 界面 | 控制台（四个按钮） | 向导：欢迎 → 目录 → 进度 → 完成 |
+| 界面 | 工具箱（四个按钮） | 向导：欢迎 → 目录 → 进度 → 完成 |
 | 装到哪 | `%LOCALAPPDATA%\cloud-stream` 固定 | 用户选的目录 + `\cloud-stream` |
-| 卸载入口 | 运行根里的控制台，点「卸载」 | 控制面板「应用和功能」 |
+| 卸载入口 | 运行根里的工具箱点「卸载」（它调起 `unins000.exe`） | 控制面板「应用和功能」 |
 | 提权 | 自己弹 UAC | `PrivilegesRequired=admin` |
 | 体积 | 8.7 MB | 7.84 MB |
 | 适合 | 自己的机器、脚本批量装 | 发给别人 |
@@ -64,28 +64,46 @@ target\output\
 
 ```text
 PrepareToInstall  自己做幂等停机：schtasks /End → taskkill /F /IM → 等 600 ms
-ssPostInstall     cloud-setup.exe --finish      --quiet --dir "<用户选的目录>"
-UninstallRun      cloud-setup.exe --uninstall --keep --yes --quiet --dir "<同上>"
+ssPostInstall     stream-setting.exe --finish --quiet --dir "<用户选的目录>"
+usUninstall       逐条调 --uninstall-step <步骤> --quiet --dir "<同上>"
+                  （task → procs → mic → firewall → identity，五条）
 ```
 
-`--keep` 说"别删文件"（文件归 Inno 删），`--quiet` 说"别弹框"（向导在负责告诉
-用户发生了什么）。两件事经常一起出现，但不是一回事。
+**卸载那一步为什么不写成 `[UninstallRun]`。** 那个段只能跑一条命令行，退出码也
+收不到；而"回收系统集成"本来就是五件不相干的事，用户还应该看得见"现在卡在
+哪一步"。所以卸载改由 `[Code]` 里的 `CurUninstallStepChanged(usUninstall)` 逐条
+调，每条一行日志、一句进度。
+
+这条线是这样划的：
+
+| | 归谁 | 为什么 |
+|---|---|---|
+| 先停什么、哪步失败还继续 | 卸载器（Pascal Script） | 它本来就知道卸载分几步；也只有它能把进度写到卸载页上 |
+| 任务怎么删、规则叫什么、端口从哪读、身份存哪 | `stream-setting.exe` | 换个安装器也要一样（MSI 走的是同一个 exe 的 `--uninstall --keep`，落到同一批 `step_*` 函数） |
+| 删文件 | 卸载器（按安装日志） | 只有它知道这次到底写了哪些文件 |
+
+也就是说，"并入 unins000"搬过去的是**顺序**，不是**判断** —— 所以它没有变成
+第二套实现。
+
+`--keep` 仍然在（MSI 的卸载动作在用）：说"别删文件"，文件归外面那层删。
+`--quiet` 说"别弹框" —— 两件事经常一起出现，但不是一回事。
 
 `--quiet` 是进程级开关（`sys::set_quiet`），不是给每个函数加参数：`dialog` 有
 二十多个调用点，逐个传参会把"静默"扩散进所有签名，而它本来只是"这一次运行"的
 一个属性。静默下 `dialog` 改写到 stderr、`confirm` 直接返回 true —— 静默和
-`--yes` 是同一件事的两面，外面那层已经问过了。
+`--yes` 是同一件事的两面，外面那层已经问过了。`--uninstall-step` 在解析参数时
+就把 `quiet` 打开：单步命令永远不弹框，不指望调用方记得传。
 
 ### 为什么 `PrepareToInstall` 不干脆调旧版的 `--uninstall`
 
-被升级的那份 `cloud-setup.exe` 是**旧版本**，它不认识 `--quiet`。参数解析对不
+被升级的那份 `stream-setting.exe` 是**旧版本**，它不认识 `--quiet`。参数解析对不
 认识的开关是"忽略"（这是对的，否则加个新开关就会让老机器装不上），于是它会按
 老规矩弹一个「卸载完成」的框 —— 无人值守安装里向导背后没有人点确定，两个进程
 就那样互相等着。自己在向导里做幂等停机没有这个问题，也不需要旧版本配合。
 
 ### 运行根里那份控制台不带整包
 
-payload 里**没有** `cloud-setup.exe`（`build.rs` 刻意跳过它，否则就是 exe 里
+payload 里**没有** `stream-setting.exe`（`build.rs` 刻意跳过它，否则就是 exe 里
 嵌着包含自己的包）。Inno 需要往运行根补一份，所以构建时另外编一个
 `--target-dir target\inno-console` 的**不带 embed** 版本：748,032 B，对比 embed
 版的 8.7 MB。用独立 target 目录而不是反复切 features —— 同一个 target 目录下
@@ -236,7 +254,7 @@ Property(S): ACCOUNT = [%USERDOMAIN]\[%USERNAME]
 **不做开始菜单快捷方式。** per-machine 装到 Program Files 时，
 `ProgramMenuFolder` 在链接期被 ICE38/43/57 判成"往用户配置里装东西"，而那三条
 说的问题是真实的。取舍：MSI 是给管理员批量推的，控制台在已知路径下
-（`Program Files\cloud-stream\cloud-setup.exe`）；要快捷方式的人用向导版。
+（`Program Files\cloud-stream\stream-setting.exe`）；要快捷方式的人用向导版。
 
 其它几条小的：`Language="2052"` 必须配 `Codepage="936"`（否则 light 按 1252
 处理，中文串报 `LGHT0311`）；`NeverOverwrite` 放在 `Component` 上（v3 的 `File`
@@ -292,7 +310,7 @@ Property(S): ACCOUNT = [%USERDOMAIN]\[%USERNAME]
 
 ### 第 5 步为什么要一个"替身"
 
-删不掉自己：`cloud-setup.exe` 正在跑，Windows 不会让任何人删掉一个正在执行的
+删不掉自己：`stream-setting.exe` 正在跑，Windows 不会让任何人删掉一个正在执行的
 exe（可以重命名，不能删除）。也没有"退出前把自己删了"这种操作。
 
 所以：把自己复制到 `%TEMP%`，以 `--purge --dir <目标> --wait <pid>` 拉起，

@@ -11,7 +11,7 @@ stream-server.exe --update check    只看，不动
 stream-server.exe --update apply    覆盖 + 验证，失败自动回滚
 ```
 
-`cloud-setup.exe` 上的【更新】按钮就是这两条命令：先 `check`，有新版就问一句，
+`stream-setting.exe` 上的【更新】按钮就是这两条命令：先 `check`，有新版就问一句，
 然后 `apply`。
 
 ---

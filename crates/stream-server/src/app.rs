@@ -222,7 +222,7 @@ pub async fn run() -> anyhow::Result<()> {
 
     // #122: ICE 的 UDP 区间必须让外部知道 —— 它是唯一一个"防火墙写错时
     // 服务端一切正常、只有浏览器说媒体路径失败"的参数。日志里有一行，至少
-    // 能让人对着它核 `cloud-setup.exe --inbound` 放行的是不是同一段。
+    // 能让人对着它核 `stream-setting.exe --inbound` 放行的是不是同一段。
     match cfg.webrtc_udp_ports() {
         Some((min, max)) => log::info!(
             "webrtc ICE will bind UDP {min}-{max} (open this range inbound for WebRTC; WebSockets needs only TCP {})",

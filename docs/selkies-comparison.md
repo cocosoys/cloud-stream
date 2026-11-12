@@ -107,7 +107,7 @@ Windows 没有「用户态造一个输入设备」的接口——这就是本项
 
 不是所有差异都是欠账，这几项是上游没有的：
 
-- [x] **单机一键部署**：`deploy.ps1` 上传-切换-体检-回滚，`cloud-setup.exe` 一次做完
+- [x] **单机一键部署**：`deploy.ps1` 上传-切换-体检-回滚，`stream-setting.exe` 一次做完
       放行入站、建任务、自检。上游的等价物是「写 Dockerfile / 起容器」。
 - [x] **进程内多观众 fanout**：一块屏一次采集、一次编码，N 个 sink
       （`VideoFanout` / `AudioFanout`），观众数不线性放大 CPU。上游是每会话一套。

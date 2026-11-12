@@ -75,8 +75,8 @@
 | 7 | OpenSSH Server | 装 → `Set-Service sshd -StartupType Automatic` → `Start-Service sshd` → 放行 TCP 22 | 部署脚本第一步就超时（脚本会把这三行打出来） |
 | 8 | 目录 | `C:\dev\stream\logs`、`C:\dev\deploy`、`C:\dev\stream\selkies-web` | `-Bootstrap` 会建，但 exe/前端仍要落位 |
 | 9 | TLS 证书 | `C:\dev\stream\cert.pem` + `C:\dev\key.pem`，**SAN 里要有这台机器的新 IP** | 浏览器证书不匹配；剪贴板 API 直接不可用（非安全上下文） |
-| 10 | 计划任务 `MCStreamSrv` | 在运行根里**以管理员身份**跑一次 `cloud-setup.exe --install`（不需要账户密码）：它会顺手放行入站、建任务、立刻启动并打印 `[ok]` / `[fail]` | `task MISSING`，切换阶段失败 |
-| 11 | **入站放行** | 管理员跑一次 `cloud-setup.exe --inbound`，或让第 10 项代劳；判据是从别的机器 `ping <IP>` 有回、`curl -k https://<IP>:8080` 不是 TIMEOUT | 服务跑得好好的，但外部一律连不上：ping 无响应、8080 TIMEOUT（连 RST 都不回）。`stream-server.exe --run` 每次启动会尝试补，但提权失败时只能记一行日志 |
+| 10 | 计划任务 `MCStreamSrv` | 在运行根里**以管理员身份**跑一次 `stream-setting.exe --install`（不需要账户密码）：它会顺手放行入站、建任务、立刻启动并打印 `[ok]` / `[fail]` | `task MISSING`，切换阶段失败 |
+| 11 | **入站放行** | 管理员跑一次 `stream-setting.exe --inbound`，或让第 10 项代劳；判据是从别的机器 `ping <IP>` 有回、`curl -k https://<IP>:8080` 不是 TIMEOUT | 服务跑得好好的，但外部一律连不上：ping 无响应、8080 TIMEOUT（连 RST 都不回）。`stream-server.exe --run` 每次启动会尝试补，但提权失败时只能记一行日志 |
 
 额外两条只跟游戏有关，不属于推流链：
 
@@ -102,7 +102,7 @@ IP，拿构建端的覆盖等于把 HTTPS 换成浏览器报警）。
 
 | 端口 | 用途 | 现状 |
 |---|---|---|
-| TCP 8080 | HTTPS 页面 + WS 信令 + 文件传输 | `cloud-setup.exe --inbound` 建 `cloud-stream 8080`（profile=any） |
+| TCP 8080 | HTTPS 页面 + WS 信令 + 文件传输 | `stream-setting.exe --inbound` 建 `cloud-stream 8080`（profile=any） |
 | UDP 40000-40049 | WebRTC 媒体，ICE **host** 候选 | `cloud-stream webrtc UDP`；区间由 `--webrtc-udp-port-min/max` 定（#122） |
 | 任意 TCP/UDP | `stream-server.exe` 本体 | `cloud-stream app` 程序规则，按路径匹配，覆盖改区间/换端口 |
 | TCP 22 | 部署（ssh/scp） | **不随包放行**；要远程部署才手动开 |
@@ -168,7 +168,7 @@ Host mc-admin-2
 
 构建端跑一次部署（或只跑到「汇总产物」）会得到两样东西：
 
-* `target\output\cloud-setup.exe` —— **约 9 MB 的单文件**，整个运行包嵌在里面。
+* `target\output\stream-setting.exe` —— **约 9 MB 的单文件**，整个运行包嵌在里面。
   装一台新机器只需要把它拷过去双击。
 * `target\output\cloud-stream\` —— 解开后的运行根（目录）与 `cloud-stream.zip`，
   那是给"手工摆位 / 现场调试"用的，不是安装路径。
@@ -182,17 +182,17 @@ Host mc-admin-2
 | **交互式已登录会话** | `quser` 看到 `console 1 运行中` | 任务建得出来但不会跑；从服务/session 0 起进程抓到空桌面 |
 | ~~账户有密码~~ | `net user %USERNAME%` 看 `Password required` | **不再是前提**（2026-11 改）：任务改用交互式令牌注册，不存凭据、不做批处理登录，空密码账户同样可用 |
 | 真实显示输出 | VMware SVGA 3D 或物理显示器，分辨率设成要推的尺寸 | 黑屏，或退化成 1024×768 |
-| **入站已放行** | 从别的机器 `ping <IP>`、`curl -k https://<IP>:8080` | 全部 TIMEOUT（连 RST 都不返回）就是整档被丢：服务跑得再好也连不上。管理员跑一次 `cloud-setup.exe --inbound` |
+| **入站已放行** | 从别的机器 `ping <IP>`、`curl -k https://<IP>:8080` | 全部 TIMEOUT（连 RST 都不返回）就是整档被丢：服务跑得再好也连不上。管理员跑一次 `stream-setting.exe --inbound` |
 
 **三步**（0 取文件，1 在新机器上点一下，2 开浏览器）：
 
 ```powershell
-# 0. 只拷 target\output\cloud-setup.exe 这一个文件（约 9 MB）
+# 0. 只拷 target\output\stream-setting.exe 这一个文件（约 9 MB）
 #    从网上 / IM 拿到的先解锁，否则 SmartScreen 会拦：
-Unblock-File .\cloud-setup.exe
-#    想先看它打算做什么、一个文件都不动：cloud-setup.exe --plan（不需要管理员）
+Unblock-File .\stream-setting.exe
+#    想先看它打算做什么、一个文件都不动：stream-setting.exe --plan（不需要管理员）
 
-# 1. 双击 cloud-setup.exe
+# 1. 双击 stream-setting.exe
 #    窗口先显示这台机器当前的状态，点「安装 / 修复」。它会自己弹 UAC，然后：
 #      a) 把内嵌的包解压到 %LOCALAPPDATA%\cloud-stream（--dir 可改）
 #      b) 把自己复制到那个目录 —— 之后那儿也有一份控制台
@@ -207,7 +207,7 @@ Unblock-File .\cloud-setup.exe
 #    临时提权的那个身份 —— 因为桌面属于前者。
 #
 #    没有窗口的机器（纯 ssh）走同一条命令：
-#      cloud-setup.exe --install --yes --dir D:\stream
+#      stream-setting.exe --install --yes --dir D:\stream
 
 # 2. 浏览器打开 https://<本机IP>:8080/
 #    窗口里已经说了 [ok]；要复核的，见下面的三条命令
@@ -248,7 +248,7 @@ https://<本机IP>:8080/?token=<口令>
 
 ```powershell
 # 管理员 PowerShell，或右键"以管理员身份运行"
-D:\stream\cloud-setup.exe --inbound --dir D:\stream
+D:\stream\stream-setting.exe --inbound --dir D:\stream
 ```
 
 等价的单行命令（管理员）：
@@ -276,7 +276,7 @@ Get-NetConnectionProfile | Select-Object InterfaceAlias, NetworkCategory
 |---|---|---|
 | `stream-server.exe --run` 跑起来（看门狗每分钟一次，但只在真的要起进程时执行） | 查 `cloud-stream 8080` / `ICMPv4` 两条规则，缺了就补（提权才有权限；没权限只记一行）；有 `auth-token.txt` 就把口令传给 exe | `logs\watchdog.log` 的 `PREFLIGHT` 行 |
 | exe 启动后 | 自己另起 `--probe` 子进程，每 2.5 秒探一次 loopback，最多 30 秒 | 同上：`PREFLIGHT listening on 8080 after N probe(s)` 或 `PREFLIGHT NOT listening ...` + 三条最可能原因 + 下一步 |
-| 安装器跑完（`cloud-setup.exe --install`） | 建任务（交互式令牌，无密码）→ 立刻启动 → 最多等 60 秒 → 结论贴回窗口日志面板，同时写 `%ProgramData%\cloud-stream\last-install.txt` | 窗口面板 + 那个文件 |
+| 安装器跑完（`stream-setting.exe --install`） | 建任务（交互式令牌，无密码）→ 立刻启动 → 最多等 60 秒 → 结论贴回窗口日志面板，同时写 `%ProgramData%\cloud-stream\last-install.txt` | 窗口面板 + 那个文件 |
 | `collect-launch-facts.cmd` | 第 9 节专门列入站：网络配置文件、本机 IPv4、两条规则的实际参数、最近 12 条 `PREFLIGHT` 行 | `cloud-stream-facts.txt` |
 
 所以"启动后发现没效果"必然留下痕迹：先看 `logs\watchdog.log` 里最后一条
@@ -317,21 +317,21 @@ Get-Content D:\stream\logs\stream-server.log | Select-String 'listening on' # ht
 ```
 
 页面 404 → `selkies-web\` 没解压全（`selkies-web\index.html` 必须在）；
-页面能开但黑屏 → 进程在 session 0，重跑一次 `cloud-setup.exe --install`；
-任务"运行过"但端口不通 → 任务动作指向别的目录，重跑一次 `cloud-setup.exe --install`；
+页面能开但黑屏 → 进程在 session 0，重跑一次 `stream-setting.exe --install`；
+任务"运行过"但端口不通 → 任务动作指向别的目录，重跑一次 `stream-setting.exe --install`；
 本机 `PREFLIGHT listening` 但别的机器打不开 → 入站规则或网络配置文件，
-`cloud-setup.exe --inbound`。
+`stream-setting.exe --inbound`。
 
 要改分辨率 / 帧率 / 码率：编辑运行根里的 `stream-config.toml`，或用
-`cloud-setup.exe` 的「改配置」按钮（默认
+`stream-setting.exe` 的「改配置」按钮（默认
 1920×1080 / 60 fps / 2500 kbps），然后重启任务。改完别动计划任务本身。
 
 这一路不需要构建机、不需要 ssh、不需要工具链。包里的 `README.txt` 就是三步版
 （拷 exe → 双击 → 浏览器）。
 
-### 3.0.2 把一台机器退回去：`cloud-setup.exe --uninstall`
+### 3.0.2 把一台机器退回去：`stream-setting.exe --uninstall`
 
-同一个目录里的 `cloud-setup.exe`，双击后点「卸载」即可（它会自己提权，然后
+同一个目录里的 `stream-setting.exe`，双击后点「卸载」即可（它会自己提权，然后
 **把窗口关掉** —— 那个窗口占着目录里的 exe，不退出谁都删不掉）。顺序是排过的，
 不是想起哪个做哪个：
 
@@ -350,9 +350,9 @@ Get-Content D:\stream\logs\stream-server.log | Select-String 'listening on' # ht
 告诉你那个目录在哪（要强删加 `--force`）。另外三个模式：
 
 ```cmd
-cloud-setup.exe --uninstall --plan     :: 只列清单，什么都不改、不弹框（不需要管理员）
-cloud-setup.exe --uninstall --whatif   :: 同一份清单，弹框显示
-cloud-setup.exe --uninstall --keep     :: 卸服务、留文件（换新版本重装时用）
+stream-setting.exe --uninstall --plan     :: 只列清单，什么都不改、不弹框（不需要管理员）
+stream-setting.exe --uninstall --whatif   :: 同一份清单，弹框显示
+stream-setting.exe --uninstall --keep     :: 卸服务、留文件（换新版本重装时用）
 ```
 
 卸载前会把"这台机器的身份"（配置、证书、录音设备原值，几 KB）备份到
@@ -403,16 +403,16 @@ ssh <别名> "powershell -c \"(Get-Process stream-server).SessionId\""     # 1�
 
 | 现象 | 原因 | 处置 |
 |---|---|---|
-| 页面能开、画面全黑 | 进程跑在 session 0（注册成服务、或任务没用交互式令牌），抓的是空桌面 | 部署体检打印 `session=0` 就是这条；重跑 `cloud-setup.exe --install` 建任务 |
+| 页面能开、画面全黑 | 进程跑在 session 0（注册成服务、或任务没用交互式令牌），抓的是空桌面 | 部署体检打印 `session=0` 就是这条；重跑 `stream-setting.exe --install` 建任务 |
 | 重启之后 8080 不通 | 没人登录 → 交互式任务不触发；或 `sshd` 是「手动」 | 开自动登录；`Set-Service sshd -StartupType Automatic` |
-| 页面打不开但 ssh 正常 | 新机器防火墙是开的，8080 没放行 | 管理员跑 `cloud-setup.exe --inbound`（22 也要放行） |
-| **服务在跑、日志也写了 `starting`，但外部完全连不上** | 入站被整档丢弃：Public 配置文件默认丢全部入站（含 ICMP），VMware NAT / host-only 网卡常被判成 Public。表现是 `ping` 无响应、8080 **TIMEOUT**（不是 REFUSED） | 先看 `logs\watchdog.log` 最后一条 `PREFLIGHT`：若是 `listening on 8080`，问题就在网络层 —— 管理员跑 `cloud-setup.exe --inbound`；`Get-NetConnectionProfile` 确认不是被 `Private` 规则挡在 Public 上 |
+| 页面打不开但 ssh 正常 | 新机器防火墙是开的，8080 没放行 | 管理员跑 `stream-setting.exe --inbound`（22 也要放行） |
+| **服务在跑、日志也写了 `starting`，但外部完全连不上** | 入站被整档丢弃：Public 配置文件默认丢全部入站（含 ICMP），VMware NAT / host-only 网卡常被判成 Public。表现是 `ping` 无响应、8080 **TIMEOUT**（不是 REFUSED） | 先看 `logs\watchdog.log` 最后一条 `PREFLIGHT`：若是 `listening on 8080`，问题就在网络层 —— 管理员跑 `stream-setting.exe --inbound`；`Get-NetConnectionProfile` 确认不是被 `Private` 规则挡在 Public 上 |
 | 日志里只有 `启动：<目录>`，没有 `PREFLIGHT` 行 | 跑的是旧包（新版的 `--run` 会自己 spawn `--probe`） | 用当前整包覆盖运行根；新版每次启动都会写 `PREFLIGHT` 判决 |
 | 安装器的结论是 `[fail] nothing listening ... after 60 s` | 8080 被占用 / exe panic / 缺 VC++，三者之一 | `last-install.txt` 里已列出要看的两份日志；或跑 `collect-launch-facts.cmd` |
 | 证书报警、剪贴板失灵 | SAN 还是旧 IP；或根本没配证书（退回明文 http） | 按 §1.1 重签；剪贴板 API 要求安全上下文 |
 | 信令连上、视频不出 | 跨网段/跨 NAT，`ice_servers=[]` 只有 host candidate | 同网段部署，或后续接 STUN/TURN |
 | 指针灵敏度/界面缩放改了没反应还报错 | 服务用**非游戏账号**跑，改的是另一个 HKCU | `/RU` 必须是游戏所在的交互用户（现网 `Administrator`） |
-| 任务显示"运行过"，但页面 404 / 日志空 | 整包被搬到了别的目录，计划任务里还存着旧路径 | 在新目录重跑一次 `cloud-setup.exe --install`；部署体检会把动作路径打出来 |
+| 任务显示"运行过"，但页面 404 / 日志空 | 整包被搬到了别的目录，计划任务里还存着旧路径 | 在新目录重跑一次 `stream-setting.exe --install`；部署体检会把动作路径打出来 |
 
 ---
 

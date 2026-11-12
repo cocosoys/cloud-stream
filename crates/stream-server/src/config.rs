@@ -198,7 +198,7 @@ pub struct Config {
     /// 地址**各绑一个 socket（IPv4 多网卡、非 link-local 的 IPv6 都算），一个
     /// 会话通常占 2–4 个。50 个端口对 `max_sessions=8` 留了足够余量。
     ///
-    /// 改了这里就要让防火墙规则跟上：管理员跑一次 `cloud-setup.exe --inbound`，
+    /// 改了这里就要让防火墙规则跟上：管理员跑一次 `stream-setting.exe --inbound`，
     /// 它按这个区间重建 `cloud-stream webrtc UDP`（程序规则 `cloud-stream app`
     /// 仍然覆盖任意端口，但它绑绝对路径，换个目录解压就失效）。
     pub webrtc_udp_port_min: u16,

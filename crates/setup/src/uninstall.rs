@@ -1,6 +1,6 @@
-//! 原生卸载：把这台机器还原成"什么都没装"。
+//! 卸载的后端：把这台机器还原成"什么都没装"。
 //!
-//! # 五步，次序不是装饰
+//! # 六步，次序不是装饰
 //!
 //! ```text
 //! 1. 计划任务 MCStreamSrv   先停、再删 —— 看门狗每分钟一次，先杀进程
@@ -8,12 +8,23 @@
 //! 2. stream-server.exe      只杀 exe 路径在这个目录下的
 //! 3. 默认录音设备           服务启动时把它抢走了，且从不自己还回来
 //! 4. 四条入站规则           名字是机器级的，删掉顺手清干净
-//! 5. 目录本身               交给替身进程（见下）
+//! 5. 机器身份               配置/证书/录音原值存到 %ProgramData%
+//! 6. 目录本身               交给替身进程（见下）
 //! ```
 //!
-//! # 为什么第 5 步要一个"替身"
+//! # 谁在调它
 //!
-//! 删不掉自己：`cloud-setup.exe` 正在跑，Windows 不会让任何人删掉一个正在执行
+//! 两个入口，共用同一批 `step_*` 函数：
+//!
+//! * `--uninstall` —— 完整一条链（便携版、MSI 的 `--keep`）；
+//! * `--uninstall-step <名字>` —— 只做一步，给 Inno 的卸载器逐条调用。
+//!
+//! 换言之：**编排可以在外面，知识只在这里**。Inno 那边写的是"先 task 再
+//! procs"，这里写的是"task 到底怎么删"。
+//!
+//! # 为什么第 6 步要一个"替身"
+//!
+//! 删不掉自己：`stream-setting.exe` 正在跑，Windows 不会让任何人删掉一个正在执行
 //! 的 exe（可以重命名，不能删除/覆盖）。也没有"退出前把自己删了"这种操作 ——
 //! 进程退出时那条路径已经没人持有了，但也没有代码在跑了。
 //!
@@ -101,6 +112,13 @@ struct Opts {
     /// （文件归外面那层删），`--quiet` 说"别弹框"（外面那层的卸载页在负责
     /// 告诉用户发生了什么）。静默卸载里一个 MessageBox 会让进程一直等。
     quiet: bool,
+    /// `--uninstall-step <名字>`：只做五步里的一步（`task` / `procs` / `mic` /
+    /// `firewall` / `identity`）。
+    ///
+    /// 给 Inno 的卸载器用：它在 `[Code]` 里按顺序逐条调，于是卸载进度页能一条
+    /// 一条报出来，而不是"停在那里十几秒"。**编排在卸载器，知识在这里** ——
+    /// 这是刻意划的那条线（见 `step_*` 上面那段注释）。
+    step: Option<String>,
 }
 
 fn parse(args: &[String]) -> Result<Opts, String> {
@@ -115,6 +133,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         plan: false,
         wait: Vec::new(),
         quiet: false,
+        step: None,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -145,6 +164,12 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "--whatif" => opts.whatif = true,
             "--plan" => opts.plan = true,
             "--quiet" | "--silent" => opts.quiet = true,
+            "--uninstall-step" => {
+                let value = it.next().ok_or("--uninstall-step 后面要跟一个步骤名")?;
+                opts.step = Some(value.clone());
+                // 单步永远不弹框：调用方是卸载器，它背后没有人点"确定"。
+                opts.quiet = true;
+            }
             // 其余忽略：窗口会把"我们这个 exe 的参数"整串传下来。
             _ => {}
         }
@@ -167,9 +192,76 @@ pub fn run(args: &[String]) -> i32 {
         }
     };
     sys::set_quiet(opts.quiet);
+    if let Some(step) = opts.step.clone() {
+        return run_step(&opts, &step);
+    }
     match opts.stage {
         Stage::Main => main_stage(&opts),
         Stage::Purge => purge_stage(&opts),
+    }
+}
+
+/// 只做一步。给外面那层卸载器用（见 `Opts::step`）。
+///
+/// 三条约定，都是为了让"卸载器编排"这件事可预测：
+///
+/// * **不弹框、不等确认**：解析参数时就把 `quiet` 打开了；
+/// * **不删文件**：删文件是卸载器的活（它按自己的安装日志删），这里只回收
+///   系统集成；
+/// * **退出码只说明这一步**：0 = 做完了（哪怕本来是"没有这个任务"），非 0 =
+///   没做成。`task` 那一步"删不掉也禁不掉"仍然是失败 —— 看门狗会把服务拉起来，
+///   而卸载器马上就要删它指向的 exe。
+fn run_step(opts: &Opts, name: &str) -> i32 {
+    let dir = opts.dir.clone().unwrap_or_else(crate::run_root);
+    let report = Report::new();
+    report.start(&dir, &format!("uninstall-step {name}"));
+    report.note(&format!("elevated: {}", sys::elevated()));
+    report.note(&format!("dir: {}", dir.display()));
+
+    // 单步命令同样删任务、杀进程，所以照样过一遍"绝对不该碰的目录"。
+    // 正常永远过（外面传的是它自己装的 {app}）；防的是手抖的 `--dir C:\`。
+    if let Some(why) = absolutely_not(&dir) {
+        report.note(&format!("  [skip] {why}"));
+        report.end("SKIP");
+        println!("skip: {why}");
+        return 0;
+    }
+
+    let ok = match name {
+        "task" => {
+            let (ok, line) = task_outcome(&step_task(&dir, &opts.task, opts.force, &report));
+            report.note(&line);
+            ok
+        }
+        "procs" => {
+            step_procs(&dir, &report);
+            true
+        }
+        "mic" => {
+            step_mic(&dir, &report);
+            true
+        }
+        "firewall" => {
+            step_firewall(&dir, &report);
+            true
+        }
+        "identity" => {
+            step_identity(&dir, &report);
+            true
+        }
+        other => {
+            report.note(&format!("  [fail] 不认识的步骤 {other}"));
+            report.end("FAIL (unknown step)");
+            eprintln!("不认识的步骤：{other}（可选 task/procs/mic/firewall/identity）");
+            return 2;
+        }
+    };
+
+    report.end(if ok { "OK" } else { "FAIL" });
+    if ok {
+        0
+    } else {
+        1
     }
 }
 
@@ -269,6 +361,85 @@ fn main_stage(opts: &Opts) -> i32 {
 }
 
 /// 提权之后的五步。返回进程退出码。
+// ---------------------------------------------------------------------------
+// 五步：每一步一个函数
+// ---------------------------------------------------------------------------
+//
+// 拆成函数而不是一段流水账，是因为每一步有**两个**调用方：
+//
+// * `steps()` —— 完整卸载（便携版、MSI 走这条：`--uninstall`）；
+// * `run_step()` —— 只做一步（`--uninstall-step <名字>`），给 Inno 的卸载器用。
+//   它自己在 `[Code]` 里按顺序调这五条，于是卸载进度页能逐条报出来。
+//
+// 这是"回收器并入卸载器"和"不要第二套实现"能同时成立的地方：卸载器拿走的是
+// **编排**（先停什么、什么算致命），不是**知识**（任务怎么删、规则叫什么名字、
+// 录音设备原值存在哪）。知识仍然只有这一份，而且还能被单测。
+
+/// 第 1 步：停并删看门狗任务。返回的 `TaskEnd` 由调用方决定"算不算失败" ——
+/// `steps()` 把 `Stuck` 当致命（看门狗会把服务拉起来），单步调用也一样。
+fn step_task(dir: &Path, task: &str, force: bool, report: &Report) -> TaskEnd {
+    stop_task(task, dir, force, report)
+}
+
+/// 第 2 步：停掉这个目录下的 `stream-server.exe`。
+fn step_procs(dir: &Path, report: &Report) {
+    let killed = kill_servers_under(dir, Some(report));
+    if killed == 0 {
+        report.note("  [ok] 这个目录下没有在跑的实例");
+    }
+    // 给了时间还不退，就别假装删得动。
+    if !wait_no_server(dir, 30) {
+        report.note("  [warn] 还有进程没退干净，后面删目录可能会失败");
+    }
+}
+
+/// 第 3 步：把默认录音设备还回安装前的那个。
+fn step_mic(dir: &Path, report: &Report) {
+    restore_mic(dir, report);
+}
+
+/// 第 4 步：删四条入站规则。返回还剩几条（不致命，策略可能持有它们）。
+fn step_firewall(dir: &Path, report: &Report) -> usize {
+    let left = close_inbound(dir, report);
+    if left == 0 {
+        report.note("  [ok] 四条规则都清掉了");
+    } else {
+        // 不是致命错误：策略或第三方防火墙可能管着这些规则，而机器还是要卸。
+        report.note(&format!(
+            "  [warn] {left} 条规则还在（域策略或第三方防火墙持有），按名字在 Windows 防火墙里删"
+        ));
+    }
+    left
+}
+
+/// 第 5 步：把这台机器的身份存到目录外面。
+///
+/// 文件马上就要被删（自己删，或者 Inno 按安装日志删），而"配置/证书/录音
+/// 设备原值"是重装时唯一想留下来的东西 —— 重装后 `--ops rollback` 会放回去。
+///
+/// 放在 `--keep` 分支之前是有意的：`--keep` 说的是"文件归别人删"，不该顺手
+/// 把身份也丢掉。
+fn step_identity(dir: &Path, report: &Report) {
+    save_identity(dir, report);
+}
+
+/// `TaskEnd` → "继续不继续 + 一句人话"。`steps()` 与 `run_step()` 共用，
+/// 免得两处对"任务指向别的目录算不算失败"给出不同答案。
+fn task_outcome(end: &TaskEnd) -> (bool, String) {
+    match end {
+        TaskEnd::Absent => (true, "  [ok] 没有这个任务".to_owned()),
+        TaskEnd::Removed => (true, "  [ok] 任务已删除".to_owned()),
+        TaskEnd::Disabled(note) => (true, format!("  [warn] {note}")),
+        TaskEnd::Foreign(what) => (
+            true,
+            format!(
+                "  [skip] 任务指向另一个目录，留着不动：\n         {what}\n         在那边再卸载一次才能删掉它"
+            ),
+        ),
+        TaskEnd::Stuck(msg) => (false, format!("  [fail] {msg}")),
+    }
+}
+
 fn steps(opts: &Opts, dir: &Path) -> i32 {
     let report = Report::new();
     report.start(
@@ -282,68 +453,53 @@ fn steps(opts: &Opts, dir: &Path) -> i32 {
     report.note(&format!("elevated: {}", sys::elevated()));
 
     // ---- 1. 计划任务 -------------------------------------------------------
-    report.note(&format!("[1/5] 看门狗任务 {}", opts.task));
-    match stop_task(&opts.task, dir, opts.force, &report) {
-        TaskEnd::Absent => report.note("  [ok] 没有这个任务"),
-        TaskEnd::Removed => report.note("  [ok] 任务已删除"),
-        TaskEnd::Disabled(note) => report.note(&format!("  [warn] {note}")),
-        TaskEnd::Foreign(what) => report.note(&format!(
-            "  [skip] 任务指向另一个目录，留着不动：\n         {what}\n         在那边再卸载一次才能删掉它"
-        )),
-        TaskEnd::Stuck(msg) => {
-            report.note(&format!("  [fail] {msg}"));
-            report.end("FAIL (task)");
-            // 到这儿就停：看门狗会每分钟把服务拉起来，而它指向的 exe 正在被删。
-            dialog(
-                &format!(
-                    "{msg}\n\n\
-                     它的看门狗每分钟拉起一次服务，所以后面的目录删不干净。\n\
-                     这一步之前什么都没动。\n\n\
-                     请在「任务计划程序」(taskschd.msc) 里删掉 {} 再试一次。",
-                    opts.task
-                ),
-                "卸载",
-                MB_ICONERROR,
-            );
-            return 1;
-        }
+    report.note(&format!("[1/6] 看门狗任务 {}", opts.task));
+    let (ok, line) = task_outcome(&step_task(dir, &opts.task, opts.force, &report));
+    report.note(&line);
+    if !ok {
+        report.end("FAIL (task)");
+        // 到这儿就停：看门狗会每分钟把服务拉起来，而它指向的 exe 正在被删。
+        dialog(
+            &format!(
+                "{line}\n\n\
+                 它的看门狗每分钟拉起一次服务，所以后面的目录删不干净。\n\
+                 这一步之前什么都没动。\n\n\
+                 请在「任务计划程序」(taskschd.msc) 里删掉 {} 再试一次。",
+                opts.task
+            ),
+            "卸载",
+            MB_ICONERROR,
+        );
+        return 1;
     }
 
     // ---- 2. 进程 -----------------------------------------------------------
-    report.note("[2/5] 停 stream-server.exe");
-    let killed = kill_servers_under(dir, Some(&report));
-    if killed == 0 {
-        report.note("  [ok] 这个目录下没有在跑的实例");
-    }
-    // 给了时间还不退，就别假装删得动。
-    if !wait_no_server(dir, 30) {
-        report.note("  [warn] 还有进程没退干净，后面删目录可能会失败");
-    }
+    report.note("[2/6] 停 stream-server.exe");
+    step_procs(dir, &report);
 
     // ---- 3. 默认录音设备 ---------------------------------------------------
-    report.note("[3/5] 还回默认录音设备");
-    restore_mic(dir, &report);
+    report.note("[3/6] 还回默认录音设备");
+    step_mic(dir, &report);
 
     // ---- 4. 入站规则 -------------------------------------------------------
-    report.note("[4/5] 删入站防火墙规则");
-    let left = close_inbound(dir, &report);
-    if left == 0 {
-        report.note("  [ok] 四条规则都清掉了");
-    } else {
-        // 不是致命错误：策略或第三方防火墙可能管着这些规则，而机器还是要卸。
-        report.note(&format!(
-            "  [warn] {left} 条规则还在（域策略或第三方防火墙持有），按名字在 Windows 防火墙里删"
-        ));
-    }
+    report.note("[4/6] 删入站防火墙规则");
+    step_firewall(dir, &report);
 
-    // ---- 5. 目录 -----------------------------------------------------------
+    // ---- 5. 身份 -----------------------------------------------------------
+    // 放在 keep 分支**之前**：`--keep` 是"文件归别人删"，而身份是重装时唯一
+    // 想留住的东西 —— 谁删文件都不该顺手把它删掉。MSI 的卸载也走 --keep，
+    // 所以这一步对它同样生效（此前那条路是漏的）。
+    report.note("[5/6] 备份机器身份");
+    step_identity(dir, &report);
+
+    // ---- 6. 目录 -----------------------------------------------------------
     if opts.keep_files {
-        report.note("[5/5] 保留文件（--keep）");
+        report.note("[6/6] 保留文件（--keep）");
         report.end("OK (files kept)");
         dialog(
             &format!(
                 "服务、任务、规则都处理完了，文件保留在：\n{}\n\n\
-                 在这个目录里运行 cloud-setup.exe 可以重新安装或修好它。",
+                 文件由安装器删（`--keep` 的语义就是这个）。",
                 dir.display()
             ),
             "卸载完成（保留文件）",
@@ -352,9 +508,7 @@ fn steps(opts: &Opts, dir: &Path) -> i32 {
         return 0;
     }
 
-    report.note(&format!("[5/5] 删目录 {}", dir.display()));
-    // 顺序：先备份身份，再交棒。备份读的就是即将消失的那棵树。
-    save_identity(dir, &report);
+    report.note(&format!("[6/6] 删目录 {}", dir.display()));
 
     // 这一段必须写在**交棒之前**：交棒之后本进程只能退出，没有地方再弹框。
     let mut text = format!(
@@ -540,8 +694,35 @@ impl TaskLookup {
     }
 }
 
-fn lookup_task(task: &str) -> TaskLookup {
-    if let Some(file) = task_file(task) {
+/// 看门狗任务现在是什么状态。给「程序信息」面板用（`main.rs`）。
+///
+/// 和 `stop_task` 里那套判断同源（都是 `lookup_task` + `settings_disabled`），
+/// 所以"面板说已禁用"和"卸载时走 `Disabled` 分支"一定是同一件事。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TaskState {
+    /// 没有这个任务。
+    Absent,
+    /// 在，正常启用。
+    Enabled,
+    /// 在，但被 `schtasks /Change /DISABLE` 关过 —— 删不掉任务时的兜底，
+    /// 看门狗已经拉不起服务。
+    Disabled,
+    /// 文件在，但内容读不出来（权限，或者哪天格式变了）。
+    Unknown,
+}
+
+pub(crate) fn task_state(task: &str) -> TaskState {
+    match lookup_task(task) {
+        TaskLookup::Absent => TaskState::Absent,
+        TaskLookup::Present(found) => match &found.xml {
+            Some(xml) if settings_disabled(xml) => TaskState::Disabled,
+            Some(_) => TaskState::Enabled,
+            None => TaskState::Unknown,
+        },
+    }
+}
+
+fn lookup_task(task: &str) -> TaskLookup {    if let Some(file) = task_file(task) {
         if !file.exists() {
             return TaskLookup::Absent;
         }
@@ -663,7 +844,7 @@ fn settings_disabled(xml: &str) -> bool {
 ///
 /// 按**完整路径**过滤是全部要点：同一台机器上另一个目录里的安装不该被这一个
 /// 卸载掉。任务管理器里两个同名 exe 长得一模一样，只有路径能分开。
-fn server_pids_under(dir: &Path) -> Vec<u32> {
+pub(crate) fn server_pids_under(dir: &Path) -> Vec<u32> {
     let mut out = Vec::new();
     unsafe {
         let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -1181,6 +1362,34 @@ fn path_under(path: &Path, dir: &Path) -> bool {
 /// 每一条都是廉价的，而且没有一条能被"我是管理员"说服 —— 一次误删一个盘根或
 /// 用户主目录，代价和"卸载失败"不是一个量级。
 fn refuse_reason(dir: &Path, force: bool) -> Option<String> {
+    // 前两条是绝对的，`--force` 也越不过去（见 `absolutely_not`）。
+    if let Some(why) = absolutely_not(dir) {
+        return Some(why);
+    }
+    // 目录里连一个"我装过东西"的痕迹都没有：多半是打错了路径。
+    //
+    // `--force` 能越过这一条（"我知道我在干什么"）：一个人可能手工删掉了
+    // 服务端，只剩下一堆前端文件，那时他仍然需要一个能清干净的任务和规则。
+    if force {
+        return None;
+    }
+    let looks_installed = dir.join("stream-server.exe").exists() || dir.join("manifest.json").exists();
+    if !looks_installed {
+        return Some(
+            "这个目录里没有 stream-server.exe / manifest.json / stream-setting.exe，\
+             看起来不是一个 cloud-stream 目录。"
+                .to_owned(),
+        );
+    }
+    None
+}
+
+/// 无论谁、带什么开关都不该碰的目录：盘根，和那几个系统目录。
+///
+/// 从 `refuse_reason` 里拆出来的，因为 `--uninstall-step` 那五条单步命令也要
+/// 这道护栏 —— 它们同样会删任务、杀进程，而调用方（卸载器）传的路径一旦有
+/// 毛病，后果和完整卸载一样重。
+fn absolutely_not(dir: &Path) -> Option<String> {
     // 盘根（`C:\` 的 parent 是 None；`C:\x` 的 parent 是 `C:\`）。
     if dir.parent().is_none() {
         return Some("这是一个盘根。".to_owned());
@@ -1196,25 +1405,11 @@ fn refuse_reason(dir: &Path, force: bool) -> Option<String> {
         let Some(value) = std::env::var_os(var) else {
             continue;
         };
-        if !value.is_empty() && norm_path(dir.to_string_lossy().as_ref()) == norm_path(value.to_string_lossy().as_ref())
+        if !value.is_empty()
+            && norm_path(dir.to_string_lossy().as_ref()) == norm_path(value.to_string_lossy().as_ref())
         {
             return Some(format!("这是 %{var}%。"));
         }
-    }
-    // 目录里连一个"我装过东西"的痕迹都没有：多半是打错了路径。
-    //
-    // `--force` 能越过这一条（"我知道我在干什么"）：一个人可能手工删掉了
-    // 服务端，只剩下一堆前端文件，那时他仍然需要一个能清干净的任务和规则。
-    if force {
-        return None;
-    }
-    let looks_installed = dir.join("stream-server.exe").exists() || dir.join("manifest.json").exists();
-    if !looks_installed {
-        return Some(
-            "这个目录里没有 stream-server.exe / manifest.json / cloud-setup.exe，\
-             看起来不是一个 cloud-stream 目录。"
-                .to_owned(),
-        );
     }
     None
 }
@@ -1258,6 +1453,22 @@ mod tests {
     fn purge_is_its_own_stage() {
         let opts = parse(&args(&["--purge", "--dir", "C:\\x"])).unwrap();
         assert_eq!(opts.stage, Stage::Purge);
+    }
+
+    #[test]
+    fn uninstall_step_is_single_and_silent() {
+        // 单步命令由卸载器拉起，背后没有人点"确定" —— 解析参数时就必须把
+        // quiet 打开，不能指望调用方记得传 --quiet。
+        let opts = parse(&args(&[
+            "--uninstall-step",
+            "firewall",
+            "--dir",
+            "C:\\Program Files\\cloud-stream",
+        ]))
+        .unwrap();
+        assert_eq!(opts.step.as_deref(), Some("firewall"));
+        assert!(opts.quiet, "单步必须是静默的");
+        assert_eq!(opts.task, TASK_NAME, "没给 --task 时必须用默认任务名");
     }
 
     #[test]

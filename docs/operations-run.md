@@ -69,7 +69,7 @@ GUI 子系统的进程不会。
 把那条管道顶掉，更新器就永远读不到版本 —— 而它的失败方式是"报 0.0.0"，看起来
 像版本号坏了。
 
-`cloud-setup.exe` 同样是 GUI 子系统：它没有一行 `println!`，挂 console 的代价
+`stream-setting.exe` 同样是 GUI 子系统：它没有一行 `println!`，挂 console 的代价
 却是双击后一个黑框陪到最后。
 
 ## 4. 单实例
@@ -137,7 +137,7 @@ GUI 子系统的进程不会。
 | 有 `auth-token.txt` | `--auth-token` 生效 | ✅（日志显示 token REQUIRED） |
 | 第二次 `--run` | 退出码 0，`watchdog.log` 记"已有一个实例在跑" | ✅ |
 | 配置里拼错键 | 退出码 2，`watchdog.log` 有 TOML 行号与可接受键名 | ✅ |
-| 双击 `cloud-setup.exe` | 只有窗口，没有黑框 | ✅（子系统 = 2） |
+| 双击 `stream-setting.exe` | 只有窗口，没有黑框 | ✅（子系统 = 2） |
 
 **未验证**：真的从计划任务拉起（需要注册任务，那是 `--install` 那一步的事）；
 `.150` 全天离线，实机验收未做。

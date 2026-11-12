@@ -784,15 +784,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1d728cc89cf3aee9ff92b05e62b19ee65a02b5702cff7d5a377e32c6ae29d8d"
 
 [[package]]
-name = "cloud-setup"
-version = "0.1.0"
-dependencies = [
- "flate2",
- "serde_json 1.0.118",
- "windows-sys 0.52.0",
-]
-
-[[package]]
 name = "cloudabi"
 version = "0.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4028,6 +4019,15 @@ dependencies = [
  "toml 0.7.8",
  "webrtc",
  "windows 0.52.0",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "stream-setting"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "serde_json 1.0.118",
  "windows-sys 0.52.0",
 ]
 

@@ -29,7 +29,7 @@ static PAYLOAD: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/payload.gz"));
 
 /// 这个 exe 有没有可安装的内容。
 ///
-/// 开发机构建的 `cloud-setup.exe` 是空的（2 秒构建、377 KB），点「安装」时应当
+/// 开发机构建的 `stream-setting.exe` 是空的（2 秒构建、377 KB），点「安装」时应当
 /// 说清"我这个 exe 里没有包"，而不是装出一个空目录再报成功。
 ///
 /// **只解前九个字节**：这个函数在每次启动时都被问一次（`main` 要用它决定这次
@@ -330,7 +330,7 @@ pub fn default_target() -> Option<PathBuf> {
 /// 该当控制台还是当安装器。
 pub fn place_self(dest: &Path) -> Result<(), String> {
     let me = std::env::current_exe().map_err(|e| format!("拿不到自己的路径：{e}"))?;
-    let dst = dest.join("cloud-setup.exe");
+    let dst = dest.join("stream-setting.exe");
     if me == dst {
         return Ok(()); // 从安装目录里重装（修复），不用复制自己
     }
@@ -376,7 +376,7 @@ mod tests {
     ///
     /// ```text
     /// $env:CS_PAYLOAD_DIR = "$env:TEMP\cs-payload-probe"
-    /// .\toolchain\build.ps1 -Task test -Package cloud-setup -CargoArgs '--features embed'
+    /// .\toolchain\build.ps1 -Task test -Package stream-setting -CargoArgs '--features embed'
     /// ```
     ///
     /// 这是"单 exe 装出完整运行根"能被信任的前提 —— 它不碰任务、不碰防火墙、

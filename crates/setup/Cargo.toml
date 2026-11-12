@@ -1,5 +1,5 @@
 [package]
-name = "cloud-setup"
+name = "stream-setting"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
@@ -63,7 +63,7 @@ flate2 = "1.0"
 [features]
 # `--features embed` 时把 `target/output/cloud-stream` 打进 exe（见 build.rs）。
 #
-# 默认**不开**：`cargo build -p cloud-setup` 应该还是 2 秒、377 KB，方便改界面
+# 默认**不开**：`cargo build -p stream-setting` 应该还是 2 秒、377 KB，方便改界面
 # 时快速迭代；只有 `deploy.ps1` 在打发布包时才需要那个 9 MB 的版本。
 embed = []
 

@@ -1,38 +1,38 @@
-//! 可视化控制台：四个动作的按钮版。
+//! stream-server 的工具箱：看状态、改配置、换版本、卸掉。
 //!
 //! 四动作差距矩阵里，「可视化界面」这一列原本四格全红 —— 安装和卸载只有 cmd
-//! 黑框、更新要开发机、修改是文本编辑器。这个 exe 就是那一列。
+//! 黑框、更新要开发机、修改是文本编辑器。这个 exe 是那一列的残余部分：装和卸
+//! 已经归安装器（Inno / MSI），剩下的"看、改、换、卸的入口"归它。
 //!
 //! # 它是什么，不是什么
 //!
 //! 它**不是**第二个实现。窗口上的每个按钮最后都落到同一条命令上：
 //!
 //! ```text
-//! 刷新状态 / 拍快照 / 回滚   ->  stream-server.exe --ops state|snapshot|rollback
-//! 更新                      ->  stream-server.exe --update check|apply
-//! 安装                      ->  本 exe 自己：--install（解压）→ --finish（管理员）
-//! 卸载                      ->  本 exe 自己：--uninstall（提权整段）→ --purge（替身删目录）
-//! 改配置                    ->  stream-server.exe --ops config-get|config-set
+//! 刷新状态   ->  自己查进程/端口/任务 + stream-server.exe --ops state
+//! 更新       ->  stream-server.exe --update check|apply
+//! 卸载       ->  运行根里的 unins000.exe（卸载流程在卸载器里，不在这儿）
+//! 改配置     ->  stream-server.exe --ops config-get|config-set
 //! ```
 //!
 //! 所以窗口只是这些命令的一个消费者，同一套动作在命令行里也能做，反之亦然 ——
 //! 不存在"界面上能点、命令行里做不到"这种只能靠人记住的差别。
 //!
-//! # 同一个 exe 的两个角色
+//! # 为什么卸不下来时补一句"和它放同一目录"
 //!
-//! 装上之后，这个 exe 就是控制台；而分发出去的那一份（带 `--features embed`
-//! 构建的）里还嵌着整个运行包，双击就要能装。判断依据不是"我是不是被双击了"
-//! ——那个问题没有答案，而是**我旁边有没有 `stream-server.exe`**：
+//! 分发出去的那一份（带 `--features embed` 构建的）里嵌着整个运行包，双击就该
+//! 能装。判断依据不是"我是不是被双击了" —— 那个问题没有答案，而是**我旁边有
+//! 没有 `stream-server.exe`**：
 //!
-//! * 旁边有 → 装上之后的那一份（或者开发机上的整包目录），当控制台；
+//! * 旁边有 → 装上之后的那一份（或者开发机上的整包目录），当工具箱；
 //! * 旁边没有但有内置包 → 分发出去的那一份，当安装器。
 //!
 //! 归档里刻意没有这个 exe 自己（否则就成了"exe 里嵌着包含自己的包"）：安装器
-//! 解压完把自己复制进目标目录，从那以后它就是控制台。见 `pack::place_self`。
+//! 解压完把自己复制进目标目录，从那以后它就是工具箱。见 `pack::place_self`。
 //!
 //! # 为什么不用 Tauri / egui
 //!
-//! Tauri 会拖进一个运行时和四百个 crate，而这个窗口要画的东西是六个按钮和两块
+//! Tauri 会拖进一个运行时和四百个 crate，而这个窗口要画的东西是四个按钮和两块
 //! 文本。`windows-sys` 已经在依赖树里（服务端用它做采集与输入），所以这里的
 //! 增量成本是零个新依赖、几秒构建。代价是界面语言是 Win32 而不是 CSS —— 对这
 //! 个尺寸的界面，这笔账划算。
@@ -83,6 +83,7 @@ mod sys;
 mod uninstall;
 
 use std::os::windows::process::CommandExt;
+use std::path::Path;
 use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -107,9 +108,6 @@ const ID_LOG: i32 = 1101;
 const ID_LABEL_STATE: i32 = 1102;
 const ID_LABEL_LOG: i32 = 1103;
 const BTN_REFRESH: i32 = 1001;
-const BTN_SNAPSHOT: i32 = 1002;
-const BTN_ROLLBACK: i32 = 1003;
-const BTN_INSTALL: i32 = 1004;
 const BTN_UNINSTALL: i32 = 1005;
 const BTN_CONFIG: i32 = 1006;
 const BTN_UPDATE: i32 = 1007;
@@ -149,7 +147,7 @@ unsafe fn wide(s: &str) -> Vec<u16> {
 //
 // 150% 的屏上看到的不该是"被拉大的位图"。三步，缺一不可：
 //
-// 1. 清单里声明 PerMonitorV2（`cloud-setup.manifest` + `build.rs`）—— 不声明
+// 1. 清单里声明 PerMonitorV2（`stream-setting.manifest` + `build.rs`）—— 不声明
 //    的话系统在进程启动那一刻就把窗口当位图放大，代码里做什么都晚了。
 // 2. 所有尺寸从 96 DPI 的基准值按窗口当前 DPI 换算，字体也按 DPI 重建。
 // 3. 窗口被拖到另一块不同缩放的屏上时系统会发 `WM_DPICHANGED`：按它给的矩形
@@ -162,23 +160,22 @@ unsafe fn wide(s: &str) -> Vec<u16> {
 /// 一遍；散着写就得写两份，而两份坐标一定会分叉。
 const MAIN_LAYOUT: &[(i32, i32, i32, i32, i32)] = &[
     (ID_LABEL_STATE, 16, 12, 200, 20),
-    (ID_STATE, 16, 34, 748, 130),
-    // 七个按钮等宽排一行：中文字宽差不多的前提下，等宽比"按字数伸缩"更好看，
-    // 也不会因为某个标签多了两个字就挤歪整排。顺序即操作顺序：看状态 →
-    // 留底 → 退回 → 更新 → 装 / 卸 / 改。
-    (BTN_REFRESH, 16, 176, 100, 30),
-    (BTN_SNAPSHOT, 124, 176, 100, 30),
-    (BTN_ROLLBACK, 232, 176, 100, 30),
-    (BTN_UPDATE, 340, 176, 100, 30),
-    (BTN_INSTALL, 448, 176, 100, 30),
-    (BTN_UNINSTALL, 556, 176, 100, 30),
-    (BTN_CONFIG, 664, 176, 100, 30),
-    (ID_LABEL_LOG, 16, 220, 200, 20),
-    (ID_LOG, 16, 242, 748, 210),
+    // 170 高：顶上那几行是运行状态（服务/端口/看门狗），下面接 `--ops state`
+    // 的原文。只留 130 时状态区会把原文挤没，人还是得滚。
+    (ID_STATE, 16, 34, 748, 168),
+    // 四个按钮等宽排一行，铺满状态框的宽度：中文标签字数接近，等宽比"按字数
+    // 伸缩"耐看，也不会因为某个标签多两个字就挤歪整排。顺序即使用频次：
+    // 看 → 换版本 → 卸掉 → 改。
+    (BTN_REFRESH, 16, 214, 178, 30),
+    (BTN_UPDATE, 206, 214, 178, 30),
+    (BTN_UNINSTALL, 396, 214, 178, 30),
+    (BTN_CONFIG, 586, 214, 178, 30),
+    (ID_LABEL_LOG, 16, 258, 200, 20),
+    (ID_LOG, 16, 280, 748, 210),
 ];
 
 /// 主窗口的基准尺寸（96 DPI，含边框）。窗口按当前 DPI 等比放大。
-const MAIN_WINDOW: (i32, i32) = (796, 484);
+const MAIN_WINDOW: (i32, i32) = (796, 522);
 
 /// 一个 96 DPI 下的长度换成像素。
 ///
@@ -386,73 +383,59 @@ where
     });
 }
 
-/// `%ProgramData%\cloud-stream\last-install.txt`。
+/// 「程序信息」面板最上面那几行：**这台机器现在跑没跑**。
 ///
-/// 和 `report.rs` 里选的落点是同一个路径，**两边必须一致**。
-/// 刻意不是 `%TEMP%`：提权可能切换账户，那时提权进程的 `%TEMP%` 是本窗口
-/// 读不到的地方；`ProgramData` 对两侧是同一个字符串，也不用在
-/// cmd → PowerShell → CreateProcess 这条链上给路径加引号（引号就是在这条
-/// 链上死的）。
-fn install_result_path() -> Option<std::path::PathBuf> {
-    let program_data = std::env::var_os("ProgramData")?;
-    Some(
-        std::path::PathBuf::from(program_data)
-            .join("cloud-stream")
-            .join("last-install.txt"),
-    )
-}
+/// 为什么不用 `--ops state` 一次问完：那份输出回答的是"配置和快照是什么样"，
+/// 而"服务在不在跑"是窗口自己就能查的三件事（进程、端口、计划任务）。让面板
+/// 先显示这三件，下面再附 `--ops state` 的原文 —— 人打开窗口第一眼要的通常是
+/// 前者，而它是**不需要**服务端配合就能给出来的（服务没起来的时候，
+/// `--ops state` 也可能因为配置坏了而失败）。
+fn program_info(root: &Path) -> String {
+    let exe = root.join("stream-server.exe");
+    let mut out = String::new();
 
-/// 盯着结论文件，出现终局标记就把整段读回日志面板。
-///
-/// 为什么是"盯文件"而不是抓子进程输出：`runas` 拉起来的是另一个进程（往往
-/// 还是另一个账户），它的控制台本窗口看不到。文件是两边都能看见的唯一通道。
-///
-/// 三条防错：只认 `started` 之后写出来的那份（上一次的 OK 不能冒充这一次）、
-/// 只认带 `=== RESULT:` 的（半截文件读下去只会看到一半）、等不到就说清楚
-/// 去哪儿找 —— 沉默的等待比报错更让人不知所措。
-fn watch_install_result(hwnd: HWND, path: std::path::PathBuf, started: std::time::SystemTime) {
-    let target = hwnd as isize;
-    std::thread::spawn(move || {
-        let hwnd = target as HWND;
-        let grace = started
-            .checked_sub(std::time::Duration::from_secs(3))
-            .unwrap_or(started);
-        // 240 秒：安装自己最多等 60 秒探活，加上提权、防火墙、任务注册，
-        // 留足余量。超时就明说，而不是永远转下去。
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
-        loop {
-            if std::time::Instant::now() > deadline {
-                log(
-                    &format!(
-                        "[warn] 240 秒内没等到结论文件 {}",
-                        path.display()
-                    ),
-                    hwnd,
-                );
-                log("     安装是另一个进程，它不往本窗口输出；结论只在那份文件里", hwnd);
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(700));
-            let Ok(meta) = std::fs::metadata(&path) else {
-                continue;
-            };
-            let fresh = meta.modified().map(|m| m >= grace).unwrap_or(true);
-            if !fresh {
-                continue;
-            }
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            if !text.contains("=== RESULT:") {
-                continue;
-            }
-            log("-- 提权进程的结论（读自 last-install.txt）--", hwnd);
-            for line in text.lines() {
-                log(line, hwnd);
-            }
-            return;
-        }
+    // 进程按**完整路径**数，不能按映像名：同一台机器上可能还有另一个目录的安装，
+    // 任务管理器里两个 stream-server.exe 长得一模一样。
+    let pids = uninstall::server_pids_under(root);
+    out.push_str(&match pids.len() {
+        0 => "服务      未运行\n".to_owned(),
+        1 => format!("服务      运行中（pid {}）\n", pids[0]),
+        n => format!(
+            "服务      运行中（{n} 个：{}）\n",
+            pids.iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     });
+
+    // 端口读配置，不假设 8080 —— `cloud-stream 9000` 那种改过端口的机器上，
+    // 写死 8080 会显示"没有应答"，而服务其实好好的。
+    let port = if exe.exists() {
+        install::effective_config(&exe).port
+    } else {
+        8080
+    };
+    let listening = std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        std::time::Duration::from_millis(400),
+    )
+    .is_ok();
+    out.push_str(&format!(
+        "端口      {port} · {}\n",
+        if listening { "正在监听" } else { "没有应答" }
+    ));
+
+    let task = match uninstall::task_state(install::TASK_NAME) {
+        uninstall::TaskState::Absent => "未注册",
+        uninstall::TaskState::Enabled => "已注册",
+        uninstall::TaskState::Disabled => "已注册，但被禁用（看门狗不会拉起服务）",
+        uninstall::TaskState::Unknown => "在，但读不出内容",
+    };
+    out.push_str(&format!("看门狗    {} · {task}\n", install::TASK_NAME));
+
+    out.push_str(&format!("目录      {}\n", root.display()));
+    out
 }
 
 /// 确认框。返回 true = 继续。
@@ -1034,43 +1017,17 @@ fn on_command(hwnd: HWND, id: i32) {
     let exe = root.join("stream-server.exe");
     match id {
         BTN_REFRESH => {
-            if !exe.exists() {
-                set_state("找不到 stream-server.exe（本窗口要和它放在同一目录）", hwnd);
-                return;
+            let root = run_root();
+            let mut out = program_info(&root);
+            if exe.exists() {
+                let (_, text) = run_capture(&exe, &["--ops", "state"]);
+                out.push_str("\n-- 服务端自述（--ops state）--\n");
+                out.push_str(text.trim_end());
+            } else {
+                out.push_str("\n找不到 stream-server.exe（本窗口要和它放在同一目录）");
             }
-            let (_, text) = run_capture(&exe, &["--ops", "state"]);
-            set_state(&text, hwnd);
+            set_state(&out, hwnd);
             log("-- 状态已刷新", hwnd);
-        }
-        BTN_SNAPSHOT => {
-            if !exe.exists() {
-                log("[fail] 找不到 stream-server.exe", hwnd);
-                return;
-            }
-            spawn_job(hwnd, move || {
-                let (code, text) = run_capture(&exe, &["--ops", "snapshot", "--ops-label", "manual"]);
-                vec![format!("[exit {code}] 拍快照"), text.trim_end().to_owned()]
-            });
-        }
-        BTN_ROLLBACK => {
-            if !exe.exists() {
-                log("[fail] 找不到 stream-server.exe", hwnd);
-                return;
-            }
-            // 回滚会替换文件，必须问一句。文案里带"回滚本身也能退回去"是因为
-            // 这决定了人敢不敢点。
-            if !confirm(
-                hwnd,
-                "把程序文件退回到最近一次快照？\n\n当前状态会先自动留底，随时可以再退回来。",
-                "回滚",
-            ) {
-                log("-- 已取消回滚", hwnd);
-                return;
-            }
-            spawn_job(hwnd, move || {
-                let (code, text) = run_capture(&exe, &["--ops", "rollback"]);
-                vec![format!("[exit {code}] 回滚"), text.trim_end().to_owned()]
-            });
         }
         BTN_UPDATE => {
             if !exe.exists() {
@@ -1128,82 +1085,62 @@ fn on_command(hwnd: HWND, id: i32) {
                 lines.push(format!("[exit {code}] 更新"));
                 lines.push(text.trim_end().to_owned());
                 lines.push(if code == 0 {
-                    "更新完成：重启服务（安装 / 修复）后生效".to_owned()
+                    // 原来写的是"重启服务（安装 / 修复）后生效" —— 那个入口已经
+                    // 没了。现在重启服务的正路是看门狗：停掉进程，一分钟内它自己
+                    // 会用新版本拉起来。
+                    "更新完成：重启服务后生效（结束 stream-server.exe，看门狗一分钟内会用新版拉起来）".to_owned()
                 } else {
                     "更新没有完成；失败时会自动回滚，情况见上面的记录".to_owned()
                 });
                 lines
             });
         }
-        BTN_INSTALL => {
-            // 走自己的 `--install`，不再调 `install.cmd`：那 525 行 cmd 现在
-            // 只剩"同一个 exe 的另一条启动路径"这一件事，而这条路径正是要删掉
-            // 的东西（见 docs/operations-install.md）。
-            //
-            // **不提权**：安装的第一段（解压 + 复制自己）必须在用户令牌下做，
-            // 否则 `runas` 换账户时 `%LOCALAPPDATA%` 会指到别人的家。提权发生在
-            // 第二段，由那个 child 自己发起 —— 也就是一次 UAC，而不是两次。
-            let started = std::time::SystemTime::now();
-            let path = install_result_path();
-            if let Some(p) = &path {
-                // 能删就删（提权写的文件普通用户删不掉，所以上面那个时间戳是
-                // 真正的保险，这一行只是让文件干净一点）。
-                let _ = std::fs::remove_file(p);
-            }
-            let root = run_root();
-            let exe = root.join("cloud-setup.exe");
-            let dir_arg = root.to_string_lossy().into_owned();
-            match std::process::Command::new(&exe)
-                .args(["--install", "--yes", "--dir", &dir_arg])
-                .current_dir(&root)
-                .creation_flags(sys::CREATE_NO_WINDOW)
-                .spawn()
-            {
-                Ok(child) => log(
-                    &format!(
-                        "[i] 安装器已启动（pid {}）；它会在需要时自己请求管理员权限",
-                        child.id()
-                    ),
-                    hwnd,
-                ),
-                Err(err) => log(&format!("[fail] 起不了安装器：{err}"), hwnd),
-            }
-            if let Some(p) = path {
-                watch_install_result(hwnd, p, started);
-            }
-        }
         BTN_UNINSTALL => {
-            if confirm(
+            // 卸载归安装器。Inno 把整套卸载逻辑编进了运行根里的 `unins000.exe`
+            // （`[Code]` 里逐条调后端能力，见 toolchain\inno\cloud-stream.iss），
+            // 本窗口只负责把它叫起来。
+            //
+            // 这里**刻意不自己调 `--uninstall`**：那样一来"卸载要做哪几步"就有
+            // 两份定义 —— 一份在 uninstaller，一份在这里，而两份迟早分叉
+            // （最先分叉的会是"配置要不要先备份"这种判断）。
+            let unins = run_root().join("unins000.exe");
+            if !unins.exists() {
+                notice(
+                    hwnd,
+                    "这个目录里没有 unins000.exe —— 说明它不是用向导版/MSI 装的（多半是\
+                     便携包直接解出来的）。\n\n那种安装没有卸载器，删掉整个目录即可；\
+                     服务和防火墙规则会由卸载前那一步静默处理。",
+                    "卸载",
+                );
+                return;
+            }
+            if !confirm(
                 hwnd,
                 "卸载会停服务、删防火墙规则、删整个目录。\n\n\
                  机器身份（配置/证书/录音设备原值）会先备份到\n\
                  %ProgramData%\\cloud-stream\\uninstall-backup\n\n继续？",
                 "卸载",
             ) {
-                let root = run_root();
-                // 把本进程的 pid 交出去：删目录时本窗口还占着这个目录里的
-                // `cloud-setup.exe`，负责删的替身要等我们退出才动手。
-                let params = format!(
-                    "--uninstall --yes --dir \"{}\" --wait {}",
-                    root.display(),
-                    std::process::id()
-                );
-                match sys::elevate_raw(&params, &root) {
-                    Ok(()) => {
-                        log("-- 卸载已交给提权进程，本窗口即将关闭（它要等本窗口退出才删得掉这个 exe）", hwnd);
-                        // 必须真的退出：目录里有正在执行的 exe，谁都删不掉它。
-                        unsafe {
-                            DestroyWindow(hwnd);
-                        }
-                    }
-                    Err(sys::ElevateError::Denied) => log("[warn] UAC 被拒绝，什么都没动", hwnd),
-                    Err(sys::ElevateError::Failed(code)) => log(
-                        &format!("[fail] 起不了提权进程（ShellExecute={code}）"),
-                        hwnd,
-                    ),
-                }
-            } else {
                 log("-- 已取消卸载", hwnd);
+                return;
+            }
+            // 交给 unins000：它是 requireAdministrator 的，`runas` 会弹一次 UAC。
+            // 不能用 `Command::spawn` —— 从非提权进程直接 CreateProcess 一个
+            // 要求管理员的 exe，拿到的是 ERROR_ELEVATION_REQUIRED（740），
+            // 而那个错误长得像"文件不存在"。
+            match sys::launch_elevated(&unins, "", &run_root()) {
+                Ok(()) => {
+                    log("-- 已交给卸载器；本窗口这就关闭（它要删的就是这个 exe）", hwnd);
+                    // 必须真的退出：目录里有正在执行的 exe，谁都删不掉它。
+                    unsafe {
+                        DestroyWindow(hwnd);
+                    }
+                }
+                Err(sys::ElevateError::Denied) => log("[warn] UAC 被拒绝，什么都没动", hwnd),
+                Err(sys::ElevateError::Failed(code)) => log(
+                    &format!("[fail] 起不了卸载器（ShellExecute={code}）"),
+                    hwnd,
+                ),
             }
         }
         BTN_CONFIG => {
@@ -1247,15 +1184,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 )
             };
 
-            make("STATIC", "程序文件", 0, ID_LABEL_STATE);
+            make("STATIC", "程序信息", 0, ID_LABEL_STATE);
             make("EDIT", "", READONLY_EDIT, ID_STATE);
 
-            let buttons: [(&str, i32); 7] = [
+            let buttons: [(&str, i32); 4] = [
                 ("刷新状态", BTN_REFRESH),
-                ("拍快照", BTN_SNAPSHOT),
-                ("回滚", BTN_ROLLBACK),
                 ("更新", BTN_UPDATE),
-                ("安装 / 修复", BTN_INSTALL),
                 ("卸载", BTN_UNINSTALL),
                 ("改配置", BTN_CONFIG),
             ];
@@ -1267,7 +1201,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             make("EDIT", "", READONLY_EDIT, ID_LOG);
 
             apply_main_layout(hwnd);
-            SetWindowTextW(hwnd, wide("cloud-stream 控制台").as_ptr());
+            SetWindowTextW(hwnd, wide("stream-setting · stream-server 的工具箱").as_ptr());
             0
         }
         WM_COMMAND => {
@@ -1370,6 +1304,14 @@ fn main() {
     if args.iter().any(|a| a == "--task-xml") {
         std::process::exit(install::print_task_xml(&args));
     }
+    // 「程序信息」面板那几行也能从命令行问。加这个开关不是"顺手"，而是让
+    // 面板上那句话（服务/端口/看门狗）**可验证** —— 窗口在 session 0 里
+    // 没有可截图的桌面，远端只能靠这条命令确认它到底算出什么。
+    // 和 `--task-xml` 一样属于"结果本身就是答案"的那一类。
+    if args.iter().any(|a| a == "--program-info") {
+        print!("{}", program_info(&run_root()));
+        std::process::exit(0);
+    }
     // 替身（`--purge`）必须在角色判断**之前**截住：它跑在 `%TEMP%` 里，那儿
     // 没有 `stream-server.exe`，而它自带有内置包 —— 按下面的判据会被认成
     // "安装器"，于是它去解压一个包，而不是去删目录。
@@ -1392,7 +1334,7 @@ fn main() {
     }
     unsafe {
         let instance = GetModuleHandleW(std::ptr::null());
-        let class_name = wide("CloudStreamSetup");
+        let class_name = wide("StreamSetting");
         // 窗口标题栏、Alt+Tab、任务栏读的是"窗口类的图标"，而不是 exe 的。
         // 不填（`hIcon: 0`）时系统给一个通用图标 —— 右键属性里明明有图标，
         // 运行时却是白纸，这种不一致最容易被当成"图标没生效"。
@@ -1443,7 +1385,7 @@ fn main() {
                 d
             }
         };
-        let title = wide("cloud-stream 控制台");
+        let title = wide("stream-setting · stream-server 的工具箱");
         let hwnd = CreateWindowExW(
             0,
             class_name.as_ptr(),

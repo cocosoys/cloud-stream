@@ -5,7 +5,7 @@
   和前两个外壳的分工完全一样，别在这里重新发明：
 
       谁铺文件      这个文件（WiX）／Inno／那个自带整包的 exe，三选一
-      谁做系统集成  cloud-setup.exe。永远只有两条命令：
+      谁做系统集成  stream-setting.exe。永远只有两条命令：
                       装完 ：完成系统集成（建任务、防火墙、启动并等应答）
                       卸前 ：停服务并保留文件
 
@@ -15,7 +15,7 @@
 
   也就是说 MSI 只做"把一个目录铺到 Program Files、并把卸载项交给 Windows
   Installer"，提权建计划任务、四条防火墙规则、接管/还原默认录音设备仍然由
-  cloud-setup.exe 干。三个外壳共用同一套判断，第二套实现迟早和第一套分叉
+  stream-setting.exe 干。三个外壳共用同一套判断，第二套实现迟早和第一套分叉
   （见 crates/setup/src/install.rs 的模块头）。
 
   为什么是 WiX 3 而不是 4/5：v4 起 WiX 是 dotnet 工具，要先装 .NET SDK；这里
@@ -47,7 +47,7 @@
              InstallScope="perMachine"
              Platform="x64"
              Description="cloud-stream 被控端"
-             Comments="装完由运行根里的 cloud-setup.exe 完成系统集成（建任务、放行防火墙）"
+             Comments="装完由运行根里的 stream-setting.exe 完成系统集成（建任务、放行防火墙）"
              InstallPrivileges="elevated" />
 
     <!--
@@ -93,7 +93,7 @@
 
       所以改成分工：MSI 只负责**转达**（有人显式给了 ACCOUNT 就传下去，供
       SCCM/组策略那种以 SYSTEM 推送、机器上又没人的场景用），没人给就让
-      cloud-setup.exe 自己去问活动控制台会话的主人（见 sys::install_account）。
+      stream-setting.exe 自己去问活动控制台会话的主人（见 sys::install_account）。
       那本来就是系统集成那一步该知道的事，顺带把"装和修走同一套"这条守住了。
     -->
     <Property Id="ACCOUNT" Secure="yes" />
@@ -206,7 +206,7 @@
       拿 HKLM 当 keypath 又不该往用户配置里写快捷方式。
 
       取舍：MSI 是给管理员批量推的，控制台在已知路径下
-      （Program Files\cloud-stream\cloud-setup.exe）；要快捷方式的人用向导版，
+      （Program Files\cloud-stream\stream-setting.exe）；要快捷方式的人用向导版，
       那边 Inno 的 {group} 天然就是"所有用户"。
     -->
 

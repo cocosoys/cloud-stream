@@ -24,12 +24,12 @@
         <root>\stream-server.exe  ViGEmClient.dll
         <root>\cert.pem  key.pem
         <root>\selkies-web\  logs\
-        <root>\cloud-setup.exe
+        <root>\stream-setting.exe
         <root>\collect-launch-facts.cmd  set-password.cmd
 
     No .cmd / .ps1 / .vbs launcher exists any more: the task action is
     `<root>\stream-server.exe --run`, and install / uninstall / firewall are
-    subcommands of cloud-setup.exe (docs/operations-run.md,
+    subcommands of stream-setting.exe (docs/operations-run.md,
     docs/operations-install.md).
 
     Steps: install launchers -> stop task (and disable its 1-minute trigger) ->
@@ -116,7 +116,7 @@ $NewDll = Join-Path $Root 'ViGEmClient.new.dll'
 # open-inbound.cmd / setup-inbound.cmd used to be here too. They were the four
 # layers of "put this machine into service": batch quoting, a second round of
 # quoting through -Command, schtasks storing a password, netsh building the
-# same rule twice. All of it is `cloud-setup.exe --install` / `--uninstall` /
+# same rule twice. All of it is `stream-setting.exe --install` / `--uninstall` /
 # `--inbound` now, in one process, with no command line to assemble
 # (docs/operations-install.md). The firewall rules and the task are created by
 # that exe, not by anything shipped here.
@@ -126,13 +126,13 @@ $NewDll = Join-Path $Root 'ViGEmClient.new.dll'
 # set-password.cmd only writes a text file; a real UI for it would be a second
 # window for one line of input.
 #
-# cloud-setup.exe rides along so the box keeps a *current* console: it is what
+# stream-setting.exe rides along so the box keeps a *current* console: it is what
 # that person double-clicks for install / repair / uninstall / config, and an
 # old copy would answer with old rules (e.g. a version that still expects
 # install.cmd). It arrived in <deploy>\ like everything else and is copied into
 # the run root here. If someone has the window open, the copy fails on a sharing
 # violation and stays a NOTE -- the new one applies next time.
-$Launchers = @('collect-launch-facts.cmd', 'set-password.cmd', 'cloud-setup.exe')
+$Launchers = @('collect-launch-facts.cmd', 'set-password.cmd', 'stream-setting.exe')
 
 function Say([string]$Text) { Write-Output $Text }
 function Fail([string]$Text) { Write-Output "FAIL $Text"; exit 1 }
@@ -233,7 +233,7 @@ function Stop-Server {
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if (-not $task) {
         Fail ("scheduled task $TaskName not found. On that machine run: " +
-            "cloud-setup.exe --install --yes  (it creates the task, the firewall rules " +
+            "stream-setting.exe --install --yes  (it creates the task, the firewall rules " +
             "and starts the service in one go)")
     }
 

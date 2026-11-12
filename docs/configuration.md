@@ -149,7 +149,7 @@ stream-server.exe --ops config-get
 stream-server.exe --ops config-set --ops-set fps=30 --ops-set video_codec=vp9
 stream-server.exe --ops config-set --ops-unset bitrate
 
-:: 图形界面：控制台窗口的「改配置」，或 cloud-setup.exe --config
+:: 图形界面：控制台窗口的「改配置」，或 stream-setting.exe --config
 ```
 
 `config-set` 保证的四件事：

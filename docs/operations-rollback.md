@@ -8,7 +8,7 @@
 stream-server.exe --ops <verb> [选项]
 ```
 
-同一个 exe、同一份实现，被 `cloud-setup.exe --install` / `--uninstall`、更新器、配置界面共同调用。目标机上只有 exe 是确定存在的，所以动作层放在这里，而不是再发一个 `backup.ps1`。
+同一个 exe、同一份实现，被 `stream-setting.exe --install` / `--uninstall`、更新器、配置界面共同调用。目标机上只有 exe 是确定存在的，所以动作层放在这里，而不是再发一个 `backup.ps1`。
 
 ## 1. 为什么不放在配置层后面
 
@@ -88,8 +88,8 @@ stream-server.exe              ->  stream-server.exe.rollback-old
 
 | 动作 | 调用点 | 做法 |
 |---|---|---|
-| 安装 | `cloud-setup.exe --install`（`restore_identity`） | 装完之后发现上次卸载留下的备份，就用 `--ops rollback` 放回去（备份坏了只 warn，不挡安装） |
-| 卸载 | `cloud-setup.exe --uninstall` 第 5 步之前 | `--ops snapshot --ops-dir %ProgramData%\cloud-stream\uninstall-backup --ops-paths "stream-config.toml;config.toml;cert.pem;cert.key;logs\mic-default.json"` |
+| 安装 | `stream-setting.exe --install`（`restore_identity`） | 装完之后发现上次卸载留下的备份，就用 `--ops rollback` 放回去（备份坏了只 warn，不挡安装） |
+| 卸载 | `stream-setting.exe --uninstall` 第 5 步之前 | `--ops snapshot --ops-dir %ProgramData%\cloud-stream\uninstall-backup --ops-paths "stream-config.toml;config.toml;cert.pem;cert.key;logs\mic-default.json"` |
 | 更新 | 更新器（后续） | 覆盖 exe/DLL/前端之前 `snapshot`，验证 `/api/v1/version` 不对就 `rollback` |
 | 修改 | 配置界面（后续） | 写 `stream-config.toml` 之前 `snapshot`；"撤销上次修改"就是 `rollback` |
 

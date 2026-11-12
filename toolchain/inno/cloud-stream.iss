@@ -3,20 +3,29 @@
 ;
 ; 这一层**只做外壳**：向导、目录选择、铺文件、注册控制面板卸载项。
 ;
-; 真正的系统集成仍然在 cloud-setup.exe 里，两条命令：
-;   --finish  --dir <目录>                         装完后注册防火墙/任务并启动
-;   --uninstall --keep --yes --quiet --dir <目录>   升级或卸载前先收走服务和规则
+; 真正的知识仍然在 stream-setting.exe 里，但卸载不再由它"整段承包" ——
+; 卸载器按顺序调五条单步命令：
+;   --finish --dir <目录>                              装完后注册防火墙/任务并启动
+;   --uninstall-step <步骤> --quiet --dir <目录>        卸载前逐条回收系统集成
+;       步骤：task（注销看门狗）/ procs（停进程）/ mic（还录音设备）
+;             / firewall（删规则）/ identity（备份机器身份）
 ;
-; 所以 Inno、将来的 WiX、以及那个便携的单文件 exe，三个外壳共用同一套判断。
-; 把"防火墙要放行哪个端口""任务用哪个登录类型"搬进这里，就会变成第二套实现 ——
-; 而第二套实现迟早和第一套分叉（这条教训写在 install.rs 的模块头里）。
+; 为什么是"卸载器编排、exe 提供能力"：
 ;
-; 构建时由 toolchain\deploy.ps1 设置三个环境变量，见下面的 #define。
+;   * 编排归卸载器 —— 它本来就知道卸载分几步、哪一步失败了还该继续（删文件
+;     比"还回录音设备"重要），也只有它能把进度写到卸载页上；
+;   * 知识归 stream-setting.exe —— 任务怎么删、规则叫什么名字、录音设备原值
+;     存在哪、端口从哪读，这些换个安装器也要一样（MSI 那边调的是同一个 exe
+;     的 --uninstall --keep，落到同一批函数）。
+;
+; 所以"并入 unins000"没有变成第二套实现：搬过去的是**顺序**，不是**判断**。
+;
+; 构建时由 toolchain\deploy.ps1 设置几个环境变量，见下面的 #define。
 ; ===========================================================================
 
 #define AppName "cloud-stream"
 #define AppExeName "stream-server.exe"
-#define ConsoleExe "cloud-setup.exe"
+#define ConsoleExe "stream-setting.exe"
 #define TaskName "MCStreamSrv"
 #define AppPublisher "SOYS"
 
@@ -59,7 +68,7 @@
   #define ConsoleExePath GetEnv("CS_INNO_CONSOLE")
 #endif
 #if ConsoleExePath == ""
-  #error 缺少 CS_INNO_CONSOLE（指向不带 embed 的 cloud-setup.exe）。
+  #error 缺少 CS_INNO_CONSOLE（指向不带 embed 的 stream-setting.exe）。
 #endif
 
 #ifndef OutDir
@@ -146,7 +155,7 @@ chinesesimp.FinishedLabel=cloud-stream 已经装好并在运行。%n%n浏览器�
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-; payload 就是运行根本身：2018 个文件，里面没有 cloud-setup.exe（构建时刻意
+; payload 就是运行根本身：2018 个文件，里面没有 stream-setting.exe（构建时刻意
 ; 排除，否则会出现"exe 里嵌着包含自己的包"）。控制台那一份在下一行补进来。
 Source: "{#PayloadDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#ConsoleExePath}"; DestDir: "{app}"; Flags: ignoreversion
@@ -159,21 +168,17 @@ Name: "{app}"; Permissions: users-modify
 Name: "{app}\logs"; Permissions: users-modify
 
 [Icons]
-Name: "{group}\{#AppName} 控制台"; Filename: "{app}\{#ConsoleExe}"
+Name: "{group}\{#AppName} 工具箱"; Filename: "{app}\{#ConsoleExe}"
 Name: "{group}\卸载 {#AppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#ConsoleExe}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#ConsoleExe}"; Description: "打开 {#AppName} 控制台"; Flags: postinstall nowait skipifsilent
+Filename: "{app}\{#ConsoleExe}"; Description: "打开 {#AppName} 工具箱"; Flags: postinstall nowait skipifsilent
 
-[UninstallRun]
-; 先让 cloud-setup.exe 把服务收走（停任务、杀本目录进程、还录音设备、
-; 删四条防火墙规则），再交给 Inno 删文件。
-;
-; `--keep` 是关键：这一步只卸"系统里的东西"，文件归 Inno 删 —— 两边都删
-; 会互相踩（Inno 删到一半发现文件没了，或者我们删掉了 Inno 还要用的东西）。
-; `--quiet` 同样关键：卸载页已经在告诉用户进度，这里再弹一个框就是两次。
-Filename: "{app}\{#ConsoleExe}"; Parameters: "--uninstall --keep --yes --quiet --dir ""{app}"""; Flags: runhidden waituntilterminated; RunOnceId: "CSStopService"
+; 这里**没有 [UninstallRun]**：卸载那五步改由下面的 CurUninstallStepChanged
+; 逐条调用（见 [Code]）。写在 .iss 里而不是一个外部命令行，是为了让每条都能
+; 进日志、都能在卸载页上报一句；也因为 [UninstallRun] 只能给"一条命令"，
+; 而"回收系统集成"本来就是五件不相干的事。
 
 [UninstallDelete]
 ; 运行时生成的东西不在安装清单里，Inno 卸载时不会碰它们。不列出来的话，
@@ -214,7 +219,7 @@ var
 begin
   Result := '';
 
-  // 旧版本（那个自带 payload 的 cloud-setup.exe）默认装在 %LOCALAPPDATA%。
+  // 旧版本（那个自带 payload 的 stream-setting.exe）默认装在 %LOCALAPPDATA%。
   // 这里默认装到 Program Files，两份会抢同一个 8080，而计划任务是同一个
   // 名字 —— 后装的那份会把任务的动作路径改成自己，先装的那份从此没人管，
   // 但进程还活着。这种情况只能留一份，先问清楚。
@@ -227,7 +232,7 @@ begin
     begin
       if MsgBox('这台机器的 ' + OldDir + ' 里还有一份 cloud-stream。' + #13#10 + #13#10 +
                 '两份会抢同一个端口（8080），计划任务也是同一个名字，只能留一份。' + #13#10 + #13#10 +
-                '建议：先到那个目录双击 cloud-setup.exe 点"卸载"（会删掉那边的配置），' +
+                '建议：先把那边的整个目录删掉（便携版没有卸载器），' +
                 '再把那边的 stream-config.toml 抄过来。' + #13#10 + #13#10 +
                 '现在继续安装吗？', mbConfirmation, MB_YESNO) <> IDYES then
       begin
@@ -243,7 +248,7 @@ begin
 
   // 升级：先把服务停掉，让 Inno 能覆盖 stream-server.exe。
   //
-  // 这里**刻意不调** cloud-setup.exe --uninstall。目标目录里那一份可能是
+  // 这里**刻意不调** stream-setting.exe --uninstall。目标目录里那一份可能是
   // 旧版本，而旧版本的参数表里没有 --quiet —— 它会把不认识的开关忽略掉，
   // 然后按老规矩弹一个"卸载完成"框。向导背后（尤其静默安装）没有人去点
   // 那个确定，安装就永远停在这一步。**"用被升级的旧程序来完成升级"这件事
@@ -268,7 +273,7 @@ begin
   Sleep(600);
 end;
 
-/// 文件铺完之后，让 cloud-setup.exe 去做它那四步。
+/// 文件铺完之后，让 stream-setting.exe 去做它那四步。
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   Code: Integer;
@@ -283,7 +288,7 @@ begin
     if not WizardSilent then
       MsgBox('文件都装好了，但"注册计划任务、放行端口、启动服务"这一步没能执行。' + #13#10 + #13#10 +
              '原因：' + ExpandConstant('{app}\' + ConsoleName) + ' 起不来。' + #13#10 +
-             '到那个目录里双击它，点"安装 / 修复"可以补上。', mbError, MB_OK);
+             '到那个目录里双击它，看"程序信息"里怎么说；修的话重跑一次本安装器即可。', mbError, MB_OK);
     Exit;
   end;
   if Code <> 0 then
@@ -294,9 +299,60 @@ begin
              '最常见的原因是这台机器缺 VC++ 运行库（vcruntime140.dll），' + #13#10 +
              '那会让 stream-server.exe 在写第一条日志之前就退出。' + #13#10 + #13#10 +
              '细节在 %ProgramData%\cloud-stream\last-install.txt，' + #13#10 +
-             '补装一次运行库后，到程序目录双击控制台点"安装 / 修复"即可。', mbError, MB_OK);
+             '补装一次运行库后，重跑一次本安装器即可（它会覆盖安装并重新做系统集成）。', mbError, MB_OK);
     Exit;
   end;
 
   Log('系统集成完成');
+end;
+
+// ---------------------------------------------------------------------------
+// 卸载：五步系统集成回收
+// ---------------------------------------------------------------------------
+//
+// 每一条都是 `stream-setting.exe --uninstall-step <名字>`，跑完就退。顺序不能
+// 换：先收看门狗（否则它每分钟把服务拉起来）、再杀进程，之后才是设备/规则/
+// 身份 —— 最后两项读的就是正在被删的那棵树，必须在 Inno 动手之前。
+//
+// 失败不中止：删文件比"还回录音设备"重要，而且 Inno 走到这一步时，用户点的
+// 是"卸载"，不是"修好它"。每条都进 Setup 日志（/LOG 里能查到退出码）。
+
+/// 跑一步并把结论写进日志 / 卸载页。
+///
+/// `Caption` 是给人看的（"注销看门狗任务…"）。进度页上那句只是"更好看的等待"，
+/// 真正的记录在日志里 —— 所以取不到进度页（静默卸载）时不必做任何补救。
+procedure RunStep(const Step, Caption: String);
+var
+  Exe: String;
+  Code: Integer;
+begin
+  Exe := ExpandConstant('{app}\' + ConsoleName);
+  if not FileExists(Exe) then
+  begin
+    // 文件被手工删过：这一步做不了，但 Inno 自己的删除照样能收尾。说清楚，
+    // 别让日志里只剩一片空白。
+    Log('缺少 ' + Exe + '，跳过 ' + Step + '（任务/规则可能需要手工清）');
+    Exit;
+  end;
+  if UninstallProgressForm <> nil then
+    UninstallProgressForm.StatusLabel.Caption := Caption + '…';
+  if not Exec(Exe, '--uninstall-step ' + Step + ' --quiet --dir "' + ExpandConstant('{app}') + '"',
+              ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, Code) then
+    Log('起不来：' + Step)
+  else
+    Log(Format('卸载步骤 %s 退出码 %d', [Step, Code]));
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep <> usUninstall then
+    Exit;
+  // usUninstall 是"文件还没被删"的那一刻 —— 五个步骤都要在这一刻做。
+  Log('开始回收系统集成（看门狗 / 进程 / 录音设备 / 防火墙 / 身份）');
+  RunStep('task', '注销看门狗任务');
+  RunStep('procs', '停止服务进程');
+  RunStep('mic', '还回默认录音设备');
+  RunStep('firewall', '删除防火墙规则');
+  RunStep('identity', '备份机器身份');
+  Log('系统集成回收完成，接下来由 Inno 删文件');
 end;

@@ -90,7 +90,7 @@ net user <account> *
 
 * 在 ssh 里直接跑 `GetCursorPos`，拿到的是 session 0 那个空桌面的坐标，永远 (0,0)；
 * 想抓真实数据，必须**从 ssh 发起、在交互会话里执行** —— 也就是项目里已经在用的
-  那招：`InteractiveToken` 计划任务（现在由 `cloud-setup.exe --install` 注册）。探针脚本由任务在 session 1
+  那招：`InteractiveToken` 计划任务（现在由 `stream-setting.exe --install` 注册）。探针脚本由任务在 session 1
   里跑，把 JSON 写到 `C:\dev\stream\logs\`，再从 ssh 取走。
 
 不要为了"能远程跑命令"去开 3389：RDP 的暴露面比 ssh 大得多，而且同样要现场

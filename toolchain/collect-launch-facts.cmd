@@ -11,7 +11,7 @@ rem Why a script: on a fresh Windows install the three usual causes all fail
 rem *silently*, and each one looks exactly like "the program will not start".
 rem   * task not registered -> nothing ever starts the server, and there is no
 rem                           window to show why: the task is created by
-rem                           `cloud-setup.exe --install` (it uses InteractiveToken,
+rem                           `stream-setting.exe --install` (it uses InteractiveToken,
 rem                           so no password is involved).
 rem   * missing VC++       -> the exe dies in the loader, before it can write a
 rem                           single line to its own log.
@@ -68,7 +68,7 @@ chcp 65001 >nul 2>&1
 >> "%OUT%" dir /a "%ROOT%" 2>&1
 >> "%OUT%" echo.
 >> "%OUT%" echo -- files that must exist --
-for %%F in (stream-server.exe ViGEmClient.dll cloud-setup.exe stream-config.toml collect-launch-facts.cmd set-password.cmd) do (
+for %%F in (stream-server.exe ViGEmClient.dll stream-setting.exe stream-config.toml collect-launch-facts.cmd set-password.cmd) do (
     if exist "%ROOT%\%%F" (
         >> "%OUT%" echo OK      %%F
     ) else (
@@ -158,7 +158,7 @@ if exist "%ROOT%\logs\stream-server.log" (
 >> "%OUT%" "%PS%" -NoProfile -Command "try { Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -ne '127.0.0.1' } | ForEach-Object { $_.InterfaceAlias + '  ' + $_.IPAddress } } catch { 'Get-NetIPAddress failed: ' + $_.Exception.Message }" 2>&1
 >> "%OUT%" echo.
 >> "%OUT%" echo -- rule "cloud-stream 8080" --
->> "%OUT%" "%PS%" -NoProfile -Command "try { $r = Get-NetFirewallRule -DisplayName 'cloud-stream 8080' -ErrorAction Stop; $r | ForEach-Object { 'enabled=' + $_.Enabled + '  direction=' + $_.Direction + '  action=' + $_.Action + '  profile=' + $_.Profile }; $r | Get-NetFirewallPortFilter | ForEach-Object { 'protocol=' + $_.Protocol + '  localport=' + $_.LocalPort } } catch { 'NOT FOUND -- run: cloud-setup.exe --inbound (as administrator)' }" 2>&1
+>> "%OUT%" "%PS%" -NoProfile -Command "try { $r = Get-NetFirewallRule -DisplayName 'cloud-stream 8080' -ErrorAction Stop; $r | ForEach-Object { 'enabled=' + $_.Enabled + '  direction=' + $_.Direction + '  action=' + $_.Action + '  profile=' + $_.Profile }; $r | Get-NetFirewallPortFilter | ForEach-Object { 'protocol=' + $_.Protocol + '  localport=' + $_.LocalPort } } catch { 'NOT FOUND -- run: stream-setting.exe --inbound (as administrator)' }" 2>&1
 >> "%OUT%" echo.
 >> "%OUT%" echo -- rule "cloud-stream ICMPv4" --
 >> "%OUT%" "%PS%" -NoProfile -Command "try { $r = Get-NetFirewallRule -DisplayName 'cloud-stream ICMPv4' -ErrorAction Stop; $r | ForEach-Object { 'enabled=' + $_.Enabled + '  direction=' + $_.Direction + '  action=' + $_.Action + '  profile=' + $_.Profile } } catch { 'NOT FOUND -- ping will time out even when the server is fine' }" 2>&1
@@ -167,7 +167,7 @@ if exist "%ROOT%\logs\stream-server.log" (
 >> "%OUT%" "%PS%" -NoProfile -Command "try { $r = Get-NetFirewallRule -DisplayName 'cloud-stream webrtc UDP' -ErrorAction Stop; $r | ForEach-Object { 'enabled=' + $_.Enabled + '  direction=' + $_.Direction + '  action=' + $_.Action + '  profile=' + $_.Profile }; $r | Get-NetFirewallPortFilter | ForEach-Object { 'protocol=' + $_.Protocol + '  localport=' + $_.LocalPort } } catch { 'NOT FOUND -- WebRTC will report a failed media path while WebSockets keeps working' }" 2>&1
 >> "%OUT%" echo.
 >> "%OUT%" echo -- rule "cloud-stream app" (program rule; covers any port) --
->> "%OUT%" "%PS%" -NoProfile -Command "try { $r = Get-NetFirewallRule -DisplayName 'cloud-stream app' -ErrorAction Stop; $r | ForEach-Object { 'enabled=' + $_.Enabled + '  direction=' + $_.Direction + '  action=' + $_.Action + '  profile=' + $_.Profile }; $r | Get-NetFirewallApplicationFilter | ForEach-Object { 'program=' + $_.Program } } catch { 'NOT FOUND -- run: cloud-setup.exe --inbound (as administrator)' }" 2>&1
+>> "%OUT%" "%PS%" -NoProfile -Command "try { $r = Get-NetFirewallRule -DisplayName 'cloud-stream app' -ErrorAction Stop; $r | ForEach-Object { 'enabled=' + $_.Enabled + '  direction=' + $_.Direction + '  action=' + $_.Action + '  profile=' + $_.Profile }; $r | Get-NetFirewallApplicationFilter | ForEach-Object { 'program=' + $_.Program } } catch { 'NOT FOUND -- run: stream-setting.exe --inbound (as administrator)' }" 2>&1
 >> "%OUT%" echo.
 >> "%OUT%" echo -- startup verdicts from the launcher (PREFLIGHT lines) --
 >> "%OUT%" "%PS%" -NoProfile -Command "if (Test-Path -LiteralPath '%ROOT%\logs\watchdog.log') { $l = Select-String -LiteralPath '%ROOT%\logs\watchdog.log' -Pattern 'PREFLIGHT' | Select-Object -Last 12; if ($l) { $l | ForEach-Object { $_.Line } } else { 'no PREFLIGHT lines -- this bundle predates the startup check' } } else { 'no watchdog.log -- start-stream.cmd never ran from this folder' }" 2>&1

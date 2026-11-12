@@ -341,8 +341,20 @@ pub enum ElevateError {
 /// 传它只是为了让日志和相对路径有个合理起点。
 pub fn elevate_raw(params: &str, dir: &Path) -> Result<(), ElevateError> {
     let me = std::env::current_exe().map_err(|_| ElevateError::Failed(0))?;
+    launch_elevated(&me, params, dir)
+}
+
+/// 以管理员身份启动**指定的** exe（`runas` verb）。
+///
+/// 和 `Command::spawn` 的区别不是"要不要弹 UAC"，而是**会不会弹**：直接从
+/// 非提权进程 `CreateProcess` 一个 `requireAdministrator` 的 exe，拿到的是
+/// `ERROR_ELEVATION_REQUIRED`（740），而那个错误在 Rust 里长得像"文件不存在"。
+/// 走 `ShellExecute` + `runas` 才会由外壳去做提权，被拒绝时给的是 5 / 1223。
+///
+/// 现在唯一的调用方是「卸载」按钮：它要拉起运行根里的 `unins000.exe`。
+pub fn launch_elevated(exe: &Path, params: &str, dir: &Path) -> Result<(), ElevateError> {
     let verb = wide("runas");
-    let file = wide(&me.to_string_lossy());
+    let file = wide(&exe.to_string_lossy());
     let args = wide(params);
     let cwd = wide(&dir.display().to_string());
     let rc = unsafe {
