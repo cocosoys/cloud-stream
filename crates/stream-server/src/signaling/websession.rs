@@ -2322,6 +2322,12 @@ async fn arm_connected_notices(
                 // tracking whether it ever sent `ma,1`.
                 Action::SetPointerDirect(on) => {
                     log::info!("client sets pointer direct -> {on}");
+                    // #124: tell the sink first. It may have pinned 1:1 on its
+                    // own when the first `m2` arrived, and `ma,0` has to stop it
+                    // from doing that again — otherwise the client's explicit
+                    // "no" is undone by the next delta, one frame later, with
+                    // nothing in the log to explain why the setting came back.
+                    input.pointer_direct(on);
                     let outcome = tokio::task::spawn_blocking(move || {
                         if on {
                             hostui::pin_pointer().map(|applied| {

@@ -368,8 +368,20 @@ impl PipelineHandle {
     }
 
     /// Whether the pipeline should composite the OS cursor this beat.
+    ///
+    /// #124/D: a pointer-locked page that drives by relative motion draws its
+    /// own crosshair, and its ghost pointer lives in the browser — a composited
+    /// OS cursor is then a *second* pointer, parked at whatever `m` position it
+    /// had last, i.e. visibly not where the player is aiming. It also costs
+    /// 3–4 ms per frame (BGRA→I420 plus encode, ~20 % of a 60 fps budget, see
+    /// `docs/ghost-cursor.md`), which is the last thing a locked session wants.
+    ///
+    /// The client's own `SET_NATIVE_CURSOR_RENDERING` still decides for every
+    /// other case — including drag mode, where the pointer-lock request failed
+    /// and the page has no cursor of its own to draw.
     pub fn cursor_inject_on(&self) -> bool {
         self.cursor_inject.load(Ordering::SeqCst)
+            && !crate::dispatch::win_input::pointer_is_relative()
     }
 
     /// #111: 被控机当前的指针形状，给刚连上的会话补发一次。
@@ -917,6 +929,10 @@ fn run_inner_beat(
     // injector is not being reached; `pm=` flat means the channel delivers
     // nothing and motion is still riding (or falling back to) `control`.
     let mut prev_pointer_msgs: u64 = 0;
+    // #124: baselines for the three pointer-health numbers (`ms=`, `clip=`).
+    // `dmax` needs none — the reader swaps the window to zero.
+    let mut prev_abs_suppressed: u64 = 0;
+    let mut prev_clip: u64 = 0;
     let mut last_stats_log = Instant::now();
     // #118: baseline for the audio summary line below. `audio::totals()` was
     // written for #77/#80 and then never called by anything, so "how many audio
@@ -1043,6 +1059,23 @@ fn run_inner_beat(
             let (rel_events, rel_pixels) = crate::dispatch::win_input::mouse_rel_totals();
             let abs_events = crate::dispatch::win_input::mouse_abs_total();
             let pointer_msgs = crate::dispatch::win_input::pointer_channel_total();
+            // #124 diagnostics. Three numbers that were previously unknowable:
+            //   `pin=1`   the host pointer is on the 1:1 pin (acceleration off).
+            //             `m2` climbing while `pin=0` means the client never sent
+            //             `m2` *or* the pin was refused — the log says which.
+            //   `ms=`     absolute moves held back because the page is locked and
+            //             driving by deltas (`m= + ms=` is what arrived).
+            //   `clip=`   pointer warps off a screen edge. Without it,
+            //             `--pointer-recenter` is unverifiable: "it feels better"
+            //             and "it never fired" look the same.
+            //   `dmax=`   the worst single delta of the window. The reference
+            //             client drops any component over 400 px, so a legit fast
+            //             flick can vanish client-side; `dmax` approaching 400 is
+            //             the only server-side evidence of that.
+            let abs_suppressed = crate::dispatch::win_input::mouse_abs_suppressed_total();
+            let clipped = crate::dispatch::win_input::recenter_total();
+            let dmax = crate::dispatch::win_input::rel_window_max();
+            let pinned = crate::dispatch::hostui::pointer_pinned();
             // #83: A/V offset as `signal`, the way the panel shows it. `-` means
             // audio has not started (no baseline yet). #118: `idle=` says the
             // audio track has gone silent — without it a frozen clock reads as
@@ -1058,7 +1091,8 @@ fn run_inner_beat(
             log::info!(
                 "pipeline {:.1}s: loop={:.1}Hz new={} repeat={} skip={} wb={} inv={} cap_err={} \
                  enc_ok={} enc_no_out={} enc_err={} ws_err={} cap_wait={:.2}ms poll={:.2}ms conv={:.2}ms \
-                 enc_avg={:.1}ms pipe_avg={:.1}ms scale={} carry={} paint={} on={} m={} m2={} dm={} pm={} av={} kf={}",
+                 enc_avg={:.1}ms pipe_avg={:.1}ms scale={} carry={} paint={} on={} m={} m2={} dm={} pm={} \
+                 ms={} pin={} clip={} dmax={} av={} kf={}",
                 since_log.as_secs_f64(),
                 beats as f64 / since_log.as_secs_f64(),
                 d(c.new_frames, prev_counters.new_frames),
@@ -1084,6 +1118,10 @@ fn run_inner_beat(
                 rel_events.saturating_sub(prev_rel_events),
                 rel_pixels.saturating_sub(prev_rel_pixels),
                 pointer_msgs.saturating_sub(prev_pointer_msgs),
+                abs_suppressed.saturating_sub(prev_abs_suppressed),
+                pinned as u8,
+                clipped.saturating_sub(prev_clip),
+                dmax,
                 av,
                 d(c.key_frames, prev_counters.key_frames)
             );
@@ -1092,6 +1130,8 @@ fn run_inner_beat(
             prev_rel_events = rel_events;
             prev_rel_pixels = rel_pixels;
             prev_pointer_msgs = pointer_msgs;
+            prev_abs_suppressed = abs_suppressed;
+            prev_clip = clipped;
             // #118: the audio twin of the line above. `cap=` is the only number
             // that answers "is the loopback producing frames at all"; on an idle
             // desktop (nothing playing) WASAPI delivers nothing, `cap` stays 0

@@ -16,7 +16,10 @@
 //! * `kd,<keysym>` / `ku,<keysym>`      key down / up (X11 keysym decimal)
 //! * `kh,<k1>,<k2>,...`                 held-key heartbeat (ensure pressed)
 //! * `kr`                               release all keys
-//! * `p,0|1`                            pointer-lock state (informational)
+//! * `p,0|1`                            pointer-lock state. #124: no longer a
+//!   no-op — it decides whether an absolute `m` is applied or held back
+//!   ([`should_suppress_abs`]), whether the pipeline composites the OS cursor,
+//!   and when a self-taken 1:1 pin is released.
 //! * `SET_NATIVE_CURSOR_RENDERING,0|1`  cursor mode switch (informational)
 //! * `sf,<dx>,<dy>` / `sfe`             smooth-wheel fallback
 //! * `js,...`                           joystick; forwarded to `dispatch::gamepad`
@@ -29,8 +32,10 @@
 use std::os::raw::c_int;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
+use std::time::Instant;
 
+use windows_sys::Win32::Foundation::POINT;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC,
     MapVirtualKeyW,
@@ -40,8 +45,8 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, VkKeyScanW, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    GetCursorPos, GetSystemMetrics, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SetCursorPos,
 };
 
 use crate::pipeline::StreamSettings;
@@ -80,6 +85,13 @@ static MOUSE_REL_PIXELS: AtomicI64 = AtomicI64::new(0);
 /// the proof that the `pointer` channel hook works: without it the server
 /// received nothing from the unordered channel and this stayed flat too.
 static MOUSE_ABS_EVENTS: AtomicU64 = AtomicU64::new(0);
+/// #124/C: absolute `m` messages dropped because the page was locked and
+/// driving by deltas.
+///
+/// Without this counter `m=` climbing next to a motionless pointer reads as
+/// "injection is broken" — the exact conclusion #70/#72 taught everyone to draw.
+/// `ms=` says the messages arrived and were deliberately not applied.
+static MOUSE_ABS_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
 
 /// #70: `(m2 messages injected, |dx| + |dy| summed)` since process start.
 pub fn mouse_rel_totals() -> (u64, i64) {
@@ -92,6 +104,11 @@ pub fn mouse_rel_totals() -> (u64, i64) {
 /// #72: `m` messages applied since process start.
 pub fn mouse_abs_total() -> u64 {
     MOUSE_ABS_EVENTS.load(Ordering::Relaxed)
+}
+
+/// #124/C: `m` messages withheld because the page was driving by deltas.
+pub fn mouse_abs_suppressed_total() -> u64 {
+    MOUSE_ABS_SUPPRESSED.load(Ordering::Relaxed)
 }
 
 /// #73: messages actually handed to the `pointer` channel hook since process
@@ -134,6 +151,144 @@ pub fn note_pointer_channel_msg(line: &str) {
 /// Latin-1 (`input.js:965-971`), which is exactly the set a keyboard layout
 /// cannot produce directly: `中`, `日本語`, `Привет`, emoji.
 const XK_UNICODE_BASE: u32 = 0x0100_0000;
+
+// #124: the three things a relative-motion client needs from us that #74 left
+// open. A game (this repo's reference is a pointer-locked FPS, `temp/几猫…`) does
+// not want "a mouse driving a desktop"; it wants raw counts, injected 1:1, with
+// the pointer never running out of screen to move on.
+//
+// Process-wide for the same reason the counters above are: the pipeline's stats
+// line reads them from the beat, which holds no sink. `p` and `m2` also describe
+// the *host* pointer, which is a single thing — two tabs cannot each have their
+// own, and `PipelineHandle::cursor_inject` (the other half of #124/D) is already
+// shared per program rather than per tab.
+/// `p,1|0` as last reported by a page: the browser cursor is captured.
+static POINTER_LOCKED: AtomicBool = AtomicBool::new(false);
+/// A relative delta has arrived since the current lock was taken.
+///
+/// Deliberately not just `m2 ever`: this is the answer to "is the client driving
+/// by relative motion right now", and it gates two behaviours that are wrong for
+/// an absolute pointer — suppressing `m` (#124/C) and not compositing the OS
+/// cursor (#124/D). A page that sends `m2` without ever locking keeps the old,
+/// conservative behaviour.
+static POINTER_RELATIVE: AtomicBool = AtomicBool::new(false);
+/// #124/B: `SetCursorPos` warps back to the middle of the target monitor.
+static RECENTER_EVENTS: AtomicU64 = AtomicU64::new(0);
+/// #124/E: largest single `|dx| + |dy|` of the current stats window.
+///
+/// The reference client drops any single delta with a component over 400 px
+/// (its own anti-jump guard), so a legitimately fast flick can be thrown away
+/// while the server has no idea it happened. `dmax` is the only number that
+/// shows the cap being approached; the window is swapped to 0 by
+/// [`rel_window_max`] so the line reports a maximum, not a running one.
+static REL_WINDOW_MAX: AtomicI64 = AtomicI64::new(0);
+/// #124/B: `--pointer-recenter`, off by default — it moves the host pointer.
+static RECENTER_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// #124/B: how close to an edge the pointer has to get before it is warped back.
+///
+/// Two pixels, not a percentage: the point is to catch "the pointer is against
+/// the wall and every further count is discarded", which happens at 0–1 px.
+/// A larger margin would fire early and lose real motion on a display whose
+/// edges the user legitimately works in.
+const RECENTER_MARGIN: i32 = 2;
+
+/// #124/A: how long a self-taken 1:1 pin survives without a single `m2`.
+///
+/// The pin changes the host's pointer settings, so it may not outlive its
+/// reason. Two paths already release it (`p,0` and session teardown); this one
+/// covers the page that keeps the lock but stops sending — a tab suspended by
+/// the browser is the usual case. Checked on every line the session feeds the
+/// sink, so it costs nothing while input is flowing and cannot fire while the
+/// user is actually playing.
+const PIN_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// #124: `ma,` has not spoken — the heuristics may pin and release on their own.
+const DIRECT_AUTO: u8 = 0;
+/// #124: `ma,1` — the client wants 1:1 and owns the release.
+const DIRECT_ON: u8 = 1;
+/// #124: `ma,0` — the client explicitly does not want 1:1. Never auto-pin again
+/// in this session, otherwise the next `m2` would undo the client's choice
+/// within one frame and the host would be left in a state the user cannot see.
+const DIRECT_OFF: u8 = 2;
+
+/// #124/A: whether the host pointer is pinned to 1:1 right now.
+pub fn pointer_locked() -> bool {
+    POINTER_LOCKED.load(Ordering::Relaxed)
+}
+
+/// #124/C+D: the client is locked *and* has sent a delta since locking.
+pub fn pointer_is_relative() -> bool {
+    POINTER_LOCKED.load(Ordering::Relaxed) && POINTER_RELATIVE.load(Ordering::Relaxed)
+}
+
+/// #124/B: enable edge recentering (`--pointer-recenter`). Process-wide, like
+/// `dispatch::ghost::set_idle_secs` — set once at startup.
+pub fn set_recenter(on: bool) {
+    RECENTER_ENABLED.store(on, Ordering::Relaxed);
+}
+
+/// #124/B: whether edge recentering is enabled.
+pub fn recenter_enabled() -> bool {
+    RECENTER_ENABLED.load(Ordering::Relaxed)
+}
+
+/// #124/B: warps performed since process start.
+pub fn recenter_total() -> u64 {
+    RECENTER_EVENTS.load(Ordering::Relaxed)
+}
+
+/// #124/E: the largest single delta of the window that just ended, and reset.
+pub fn rel_window_max() -> i64 {
+    REL_WINDOW_MAX.swap(0, Ordering::Relaxed)
+}
+
+/// #124/B: where to put the pointer before the next delta, if it is boxed in.
+///
+/// `space` is `(x, y, w, h)` of the monitor being streamed, in virtual-desktop
+/// coordinates. Returns the centre of that monitor when the pointer sits within
+/// `margin` of any of its four edges — **or outside it entirely**, which on a
+/// multi-monitor host means the pointer has wandered onto a screen nobody is
+/// watching and every delta is now invisible to the player. `None` otherwise.
+///
+/// This is a pure function on purpose: the decision is the part that is easy to
+/// get wrong (an off-by-one on the far edge means "the pointer stops 1 px early
+/// and nothing says why"), and it is the only part testable without a desktop.
+fn recenter_target(
+    cursor: (i32, i32),
+    space: (i32, i32, i32, i32),
+    margin: i32,
+) -> Option<(i32, i32)> {
+    let (x, y, w, h) = space;
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    // Far edges are inclusive-minus-one: pixel `x + w - 1` is the last one that
+    // exists, and that is where `SendInput` stops moving the pointer.
+    let (first_x, last_x) = (x, x + w - 1);
+    let (first_y, last_y) = (y, y + h - 1);
+    let margin = margin.max(0);
+    let boxed = cursor.0 - first_x <= margin
+        || last_x - cursor.0 <= margin
+        || cursor.1 - first_y <= margin
+        || last_y - cursor.1 <= margin;
+    if boxed {
+        Some((x + w / 2, y + h / 2))
+    } else {
+        None
+    }
+}
+
+/// #124/C: whether an absolute `m` must be dropped rather than injected.
+///
+/// While a page is locked the browser keeps sending both: `m` from its
+/// (clipped, meaningless) cursor position and `m2` from `movementX/Y`. Applying
+/// `m` drags the host pointer to a coordinate that has nothing to do with the
+/// view the player is turning — every one of them undoes the accumulated
+/// offsets from the deltas, which reads as "the mouse stutters back".
+fn should_suppress_abs(locked: bool, relative: bool) -> bool {
+    locked && relative
+}
 
 /// Resolve a keysym to a Unicode scalar that must be injected as text.
 ///
@@ -256,6 +411,18 @@ struct InputState {
     buttons_held: u32,
     scroll_bits_prev: u32,
     held_keys: Vec<u32>,
+    /// #124: `p,1` — the page says its cursor is captured.
+    locked: bool,
+    /// #124: a relative delta arrived in this lock epoch. Reset when a new lock
+    /// starts, so "locked but idle" never suppresses the absolute stream of a
+    /// page that turns out to be absolute after all.
+    relative: bool,
+    /// #124/C: the last `m` position seen while suppressed, applied once on
+    /// `p,0` so the pointer lands where the page's cursor is rather than
+    /// wherever the deltas left it.
+    pending_abs: Option<(i32, i32)>,
+    /// #124/A: when the last relative delta was injected (idle un-pin).
+    last_rel: Option<Instant>,
 }
 
 /// The real injection sink. All methods are `&self` and cheap: heavy work is a
@@ -307,6 +474,14 @@ pub struct WinInputSink {
     /// monitor; a session watching display N sets this after it attaches, and
     /// every absolute move is then expressed in that monitor's corner.
     target: Mutex<TargetSpace>,
+    /// #124/A: this sink took the 1:1 pin itself, so it is the one that has to
+    /// give it back. Ownership rather than a refcount: `hostui::pin_pointer` is
+    /// idempotent and keeps a single restore point, so a sink that pinned only
+    /// because it was the first to ask must not release someone else's pin
+    /// (#101 made the same distinction for whole sessions).
+    auto_pinned: AtomicBool,
+    /// #124: what `ma,` said — [`DIRECT_AUTO`], [`DIRECT_ON`], [`DIRECT_OFF`].
+    direct: AtomicU8,
 }
 
 /// The monitor the injected pointer lives on, in virtual-desktop coordinates.
@@ -364,6 +539,8 @@ impl WinInputSink {
             last_abs_seq: std::sync::atomic::AtomicU64::new(0),
             gamepad,
             target: Mutex::new(TargetSpace::default()),
+            auto_pinned: AtomicBool::new(false),
+            direct: AtomicU8::new(DIRECT_AUTO),
         }
     }
 
@@ -391,6 +568,177 @@ impl WinInputSink {
                 },
             },
         }]);
+    }
+
+    /// #124/A: take the host pointer to 1:1 the first time a page shows it is
+    /// driving by relative motion, instead of waiting for the client to send
+    /// `ma,1`.
+    ///
+    /// #74 measured why this has to happen at all: `SendInput`'s relative
+    /// displacement runs through Windows' "enhance pointer precision" curve,
+    /// which is a *non-linear* function of hand speed (`dm/m2` landed at 9.55
+    /// px/msg, inside the Threshold1/Threshold2 doubled band). A player cannot
+    /// compensate for that with a sensitivity slider, because the curve is still
+    /// there at every speed — the only fix is turning the curve off. That is
+    /// exactly what `hostui::pin_pointer` does, and it restores the previous
+    /// values on release.
+    ///
+    /// Inline rather than on a worker: it is two registry reads and at most two
+    /// writes without a broadcast, it happens once per session (the flag below
+    /// short-circuits every later delta), and the alternative — a thread hop in
+    /// the middle of the input path — would put 100 µs of scheduling jitter on
+    /// the frame where the player first moves the mouse.
+    fn auto_pin(&self) {
+        if self.direct.load(Ordering::Relaxed) == DIRECT_OFF {
+            return;
+        }
+        if self.auto_pinned.load(Ordering::Relaxed) {
+            return;
+        }
+        // Someone else (a second tab's `ma,1`, or an operator) already holds it:
+        // record nothing, so we never release a pin we did not take.
+        if super::hostui::pointer_pinned() {
+            return;
+        }
+        // Claimed before the call so two deltas racing on the same session
+        // cannot both decide to pin; `pin_pointer` is idempotent anyway, but the
+        // flag is what decides who releases.
+        self.auto_pinned.store(true, Ordering::Relaxed);
+        match super::hostui::pin_pointer() {
+            Ok(applied) => log::info!(
+                "host pointer auto-pinned to 1:1 for relative input \
+                 (speed={}, accel_off={}, strategy={})",
+                applied.speed,
+                applied.accel,
+                applied.strategy
+            ),
+            Err(reason) => {
+                self.auto_pinned.store(false, Ordering::Relaxed);
+                log::warn!(
+                    "relative input could not pin the host pointer to 1:1: {reason} \
+                     — deltas still pass through, but the OS acceleration curve \
+                     multiplies them"
+                );
+            }
+        }
+    }
+
+    /// #124/A: give back a pin this sink took. Idempotent, and a no-op for a
+    /// sink that never pinned.
+    fn auto_unpin(&self, why: &str) {
+        if !self.auto_pinned.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        match super::hostui::unpin_pointer() {
+            Ok(()) => log::info!("host pointer released ({why})"),
+            Err(reason) => log::warn!("host pointer not restored ({why}): {reason}"),
+        }
+    }
+
+    /// #124/A: drop the pin when the page holds the lock but stopped sending.
+    ///
+    /// Called at the top of every line. A silent session is covered by teardown
+    /// and by `p,0`; this covers the tab the browser suspended with the lock
+    /// still nominally held — the host would otherwise keep acceleration off
+    /// until someone closed it.
+    fn reap_idle_pin(&self) {
+        if !self.auto_pinned.load(Ordering::Relaxed) {
+            return;
+        }
+        let idle = match self.state.lock() {
+            Ok(st) => st.last_rel.map(|t| t.elapsed()),
+            Err(p) => p.into_inner().last_rel.map(|t| t.elapsed()),
+        };
+        if idle.map(|d| d >= PIN_IDLE).unwrap_or(false) {
+            self.auto_unpin("no relative motion for 30s");
+        }
+    }
+
+    /// #124/B: put the pointer back in the middle of the monitor when it has
+    /// been pushed against an edge.
+    ///
+    /// This is the actual "转不动" mechanism, and it is the same in both modes:
+    /// `m2` is applied to the *real* cursor, so once the cursor is on the last
+    /// pixel of the desktop every further relative move is discarded by the OS
+    /// and the client's `movementX` becomes 0 as well. A 180° turn costs ~1500
+    /// counts on the reference client, so a 1920-wide screen runs out before the
+    /// second flick unless the page has taken a pointer lock (Chrome clips the
+    /// cursor to the window, which is why this is invisible in a browser and
+    /// only shows up through a remote one).
+    ///
+    /// `SetCursorPos` and not `SendInput`-with-absolute: the latter synthesises
+    /// a move *event*, which the host app would read as a large real movement —
+    /// in a game that is a flick. The former only relocates the pointer.
+    fn recenter_if_needed(&self) {
+        if !recenter_enabled() {
+            return;
+        }
+        let t = *self.target.lock().unwrap_or_else(|p| p.into_inner());
+        let mut at = POINT { x: 0, y: 0 };
+        if unsafe { GetCursorPos(&mut at) } == 0 {
+            return;
+        }
+        let Some((cx, cy)) = recenter_target((at.x, at.y), (t.x, t.y, t.w, t.h), RECENTER_MARGIN)
+        else {
+            return;
+        };
+        if unsafe { SetCursorPos(cx, cy) } == 0 {
+            log::debug!("recenter refused by the host (SetCursorPos failed)");
+            return;
+        }
+        RECENTER_EVENTS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// #124: `p,<0|1>` from the page.
+    ///
+    /// Two things happen on the transition, and both matter:
+    /// * `1` starts a new lock epoch. `relative` is cleared so a page that
+    ///   locks but never sends a delta keeps the conservative absolute path.
+    /// * `0` ends it. An absolute position that arrived while suppressed is
+    ///   applied here, once, so the pointer ends up where the page's own cursor
+    ///   is instead of wherever the deltas left it — the "unlock jumps to a
+    ///   random corner" complaint.
+    fn set_locked(&self, on: bool) {
+        let pending = {
+            let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            st.locked = on;
+            st.relative = false;
+            if on {
+                None
+            } else {
+                st.pending_abs.take()
+            }
+        };
+        POINTER_LOCKED.store(on, Ordering::Relaxed);
+        POINTER_RELATIVE.store(false, Ordering::Relaxed);
+        log::info!(
+            "pointer lock -> {} (relative motion will {}absolute `m`)",
+            if on { "on" } else { "off" },
+            if on { "suppress " } else { "no longer suppress " }
+        );
+        if !on {
+            if let Some((x, y)) = pending {
+                let (sx, sy) = self.frame_to_screen(x, y);
+                self.move_abs(sx, sy);
+            }
+            self.auto_unpin("pointer lock released");
+        }
+    }
+
+    /// #124: a delta arrived — remember it, and pin if nobody has yet.
+    fn note_relative(&self, dx: i32, dy: i32) {
+        {
+            let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            st.last_rel = Some(Instant::now());
+            if st.locked {
+                st.relative = true;
+            }
+        }
+        if POINTER_LOCKED.load(Ordering::Relaxed) {
+            POINTER_RELATIVE.store(true, Ordering::Relaxed);
+        }
+        REL_WINDOW_MAX.fetch_max(i64::from(dx.abs() + dy.abs()), Ordering::Relaxed);
+        self.auto_pin();
     }
 
     /// #68: one INFO line per session showing both sides of the pointer mapping.
@@ -797,6 +1145,9 @@ impl WinInputSink {
     /// Full wire-message parser. Called by the session for every C-group
     /// line; unrecognized shapes are debug-logged and dropped.
     fn handle(&self, line: &str) {
+        // #124/A: a page that holds the lock and stopped sending must not keep
+        // the host's pointer settings hostage. Cheap when nothing is pinned.
+        self.reap_idle_pin();
         let (head, rest) = match line.split_once(',') {
             Some((h, r)) => (h, r),
             None => (line, ""),
@@ -820,6 +1171,28 @@ impl WinInputSink {
                     }
                     self.last_abs_seq.store(seq, Ordering::Relaxed);
                 }
+                // #124/C: while the page is locked and has sent deltas, its `m`
+                // is the position of a cursor the browser has already clipped to
+                // the window — not a host coordinate. Injecting it drags the
+                // pointer back on every frame, and the player sees the view
+                // stutter. Remember it instead; `set_locked(false)` applies the
+                // last one so the pointer ends up under the page's cursor.
+                let suppress = {
+                    let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                    let suppress = should_suppress_abs(st.locked, st.relative);
+                    if suppress {
+                        st.pending_abs = Some((x, y));
+                    }
+                    sync_buttons(&mut st, mask);
+                    let _ = mag;
+                    suppress
+                };
+                if suppress {
+                    MOUSE_ABS_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                // #72: `m=` counts *applied* absolute moves; `ms=` counts the ones
+                // #124/C held back, so their sum is what arrived.
                 MOUSE_ABS_EVENTS.fetch_add(1, Ordering::Relaxed);
                 // #62: `m` carries stream-frame pixels; map them onto the
                 // physical screen before injecting (a 1:1 pass-through left the
@@ -829,10 +1202,6 @@ impl WinInputSink {
                 // `transmitted_frame`), never the client's requested resolution.
                 let (sx, sy) = self.frame_to_screen(x, y);
                 self.move_abs(sx, sy);
-                if let Ok(mut st) = self.state.lock() {
-                    sync_buttons(&mut st, mask);
-                    let _ = mag;
-                }
             }
             "m2" => {
                 let f: Vec<&str> = rest.splitn(5, ',').collect();
@@ -847,6 +1216,12 @@ impl WinInputSink {
                 // #62: relative deltas are frame-space too; scale them so a
                 // locked pointer keeps a 1:1 feel on a scaled-down stream.
                 let (sdx, sdy) = self.frame_to_screen_delta(dx, dy);
+                // #124: this is the message that says "the client is a camera".
+                // It arms the 1:1 pin (A), records the window's worst delta (E),
+                // and — with `--pointer-recenter` — pulls the pointer off the
+                // edge it is about to get stuck on (B).
+                self.note_relative(sdx, sdy);
+                self.recenter_if_needed();
                 // #70: count what is actually injected, not what arrived — a
                 // scaled-to-zero delta is exactly the failure being looked for.
                 MOUSE_REL_EVENTS.fetch_add(1, Ordering::Relaxed);
@@ -900,8 +1275,17 @@ impl WinInputSink {
                 Some(hub) => hub.handle_js(rest),
                 None => log::debug!("[input] gamepad line dropped (no ViGEmBus): {line}"),
             },
+            // #124: `p,<0|1>` stopped being informational. It decides whether
+            // an absolute `m` is injected (see `should_suppress_abs`), whether
+            // the server composites the OS cursor (`pipeline::cursor_inject_on`),
+            // and when the 1:1 pin taken in `auto_pin` is given back.
+            "p" => match rest.trim() {
+                "1" => self.set_locked(true),
+                "0" => self.set_locked(false),
+                other => log::debug!("malformed p: {line} ({other:?})"),
+            },
             // Informational / no-op on the injection side.
-            "p" | "SET_NATIVE_CURSOR_RENDERING" | "sf" | "sfe" | "pointer" => {
+            "SET_NATIVE_CURSOR_RENDERING" | "sf" | "sfe" | "pointer" => {
                 log::debug!("[input] informational line: {line}");
             }
             _ => {
@@ -987,6 +1371,20 @@ impl InputSink for WinInputSink {
         // app keeps receiving a "pressed" state after the tab goes away.
         sync_buttons(&mut st, 0);
         st.scroll_bits_prev = 0;
+        // #124: drop the lock epoch too — a reconnect starts from nothing, and a
+        // stale `relative` would suppress the absolute stream of a page that
+        // comes back unlocked.
+        st.locked = false;
+        st.relative = false;
+        st.pending_abs = None;
+        st.last_rel = None;
+        drop(st);
+        POINTER_LOCKED.store(false, Ordering::Relaxed);
+        POINTER_RELATIVE.store(false, Ordering::Relaxed);
+        // #124/A: a 1:1 pin changes the *host's* settings, so it may not
+        // outlive the session that took it. Only our own: a viewer leaving must
+        // not revert what the controller in the other tab is still using (#101).
+        self.auto_unpin("session ended");
         log::info!("input state reset: held keys / buttons released");
     }
 
@@ -1015,6 +1413,25 @@ impl InputSink for WinInputSink {
             size.1,
             origin.0,
             origin.1
+        );
+    }
+
+    /// #124: `ma,` — the client said what it wants, so the automatic pin must
+    /// stop guessing in the opposite direction.
+    ///
+    /// The pin itself is still taken and released by the session (it needs the
+    /// `AppliedPin` report to answer the client), so this only records intent.
+    /// Both values clear `auto_pinned`: `ma,1` because the client now owns the
+    /// release, `ma,0` because it just performed one.
+    fn pointer_direct(&self, on: bool) {
+        self.direct.store(
+            if on { DIRECT_ON } else { DIRECT_OFF },
+            Ordering::Relaxed,
+        );
+        self.auto_pinned.store(false, Ordering::Relaxed);
+        log::info!(
+            "pointer direct set by the client -> {on} (automatic 1:1 pin {} )",
+            if on { "stays out of the way" } else { "disabled for this session" }
         );
     }
 
@@ -1230,5 +1647,56 @@ mod tests {
         assert!(needs_virtual_desk((-1920, 0), (1920, 1080), (1920, 1080)));
         // Same origin, different size: a rotated or non-native primary.
         assert!(needs_virtual_desk((0, 0), (1080, 1920), (1920, 1080)));
+    }
+
+    /// #124/C: the rule only fires when *both* halves hold. A locked page that
+    /// never sent a delta is still driven by `m`, and dropping those would leave
+    /// it unable to move the pointer at all.
+    #[test]
+    fn absolutes_are_suppressed_only_while_locked_and_relative() {
+        assert!(!should_suppress_abs(false, false));
+        assert!(!should_suppress_abs(true, false), "locked but absolute: `m` is the only motion");
+        assert!(!should_suppress_abs(false, true), "deltas without a lock: keep the old path");
+        assert!(should_suppress_abs(true, true));
+    }
+
+    /// #124/B: nothing to do in the middle of the display, and the far edge is
+    /// `x + w - 1` — an off-by-one there means the pointer stops 1 px short and
+    /// no further deltas are applied while the code believes it still has room.
+    #[test]
+    fn recentering_only_fires_within_the_margin_of_an_edge() {
+        let screen = (0, 0, 1920, 1080);
+        assert_eq!(recenter_target((960, 540), screen, 2), None);
+        assert_eq!(recenter_target((500, 500), screen, 2), None);
+        assert_eq!(recenter_target((0, 540), screen, 2), Some((960, 540)));
+        assert_eq!(recenter_target((1, 540), screen, 2), Some((960, 540)));
+        assert_eq!(recenter_target((1919, 540), screen, 2), Some((960, 540)));
+        assert_eq!(recenter_target((1918, 540), screen, 2), Some((960, 540)), "last pixel - margin");
+        assert_eq!(recenter_target((960, 0), screen, 2), Some((960, 540)));
+        assert_eq!(recenter_target((960, 1079), screen, 2), Some((960, 540)));
+        assert_eq!(recenter_target((960, 1076), screen, 2), None, "three pixels in is enough room");
+    }
+
+    /// #124/B: the target is the *monitor*, not the desktop. A session watching
+    /// the right-hand screen must be recentred inside that screen: the centre of
+    /// a 3840-wide desktop is the boundary between the two, i.e. an edge of the
+    /// streamed one — recentring there would fire again on the next delta.
+    #[test]
+    fn recentering_uses_the_streamed_monitors_corner() {
+        let second = (1920, 0, 1920, 1080);
+        assert_eq!(recenter_target((1920, 0), second, 2), Some((2880, 540)));
+        assert_eq!(
+            recenter_target((1919, 0), second, 2),
+            Some((2880, 540)),
+            "a pointer that wandered onto the other screen is brought back to the watched one"
+        );
+    }
+
+    /// #124/B: a zero-sized target (no capture yet) must not produce `(0, 0)` —
+    /// that would teleport the pointer to the desktop origin on the first delta.
+    #[test]
+    fn recentering_refuses_a_degenerate_target() {
+        assert_eq!(recenter_target((0, 0), (0, 0, 0, 0), 2), None);
+        assert_eq!(recenter_target((0, 0), (0, 0, 1, 1080), 2), Some((0, 540)));
     }
 }

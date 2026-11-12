@@ -75,6 +75,7 @@
 | `input_policy` | `exclusive` | `--input-policy` | `exclusive`（只有持锁会话能操作）/ `shared` |
 | `max_sessions` | `8` | `--max-sessions` | 并发信令会话上限 |
 | `ghost_cursor_idle` | `5` | `--ghost-cursor-idle` | 幽灵指针静止多少秒淡出 |
+| `pointer_recenter` | `false` | `--pointer-recenter` | 指针贴到屏幕边缘时拉回中间，给相对位移腾地方（会动被控机真光标，见 `pointer-1to1.md`） |
 | `mic_device` | `auto` | `--mic-device` | 下行音频写哪 |
 | `mic_default_device` | `auto` | `--mic-default-device` | `auto` / `off` |
 | `upload_dir` | 空 | `--upload-dir` | 空串 = 关闭文件传输 |

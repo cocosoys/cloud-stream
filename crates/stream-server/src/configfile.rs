@@ -84,6 +84,8 @@ pub struct FileConfig {
     pub input_policy: Option<String>,
     pub max_sessions: Option<usize>,
     pub ghost_cursor_idle: Option<u64>,
+    /// #124/B: 把贴到边缘的指针拉回中间。会动真光标，默认 false。
+    pub pointer_recenter: Option<bool>,
 
     // ---- 音频 ----
     pub mic_device: Option<String>,
@@ -181,6 +183,9 @@ impl FileConfig {
         if let Some(v) = self.ghost_cursor_idle {
             cfg.ghost_cursor_idle_secs = v;
         }
+        if let Some(v) = self.pointer_recenter {
+            cfg.pointer_recenter = v;
+        }
         if let Some(v) = self.mic_device {
             cfg.mic_device = v;
         }
@@ -253,6 +258,7 @@ impl FileConfig {
             input_policy: Some(cfg.input_policy.as_str().to_owned()),
             max_sessions: Some(cfg.max_sessions),
             ghost_cursor_idle: Some(cfg.ghost_cursor_idle_secs),
+            pointer_recenter: Some(cfg.pointer_recenter),
             mic_device: Some(cfg.mic_device.clone()),
             mic_default_device: Some(cfg.mic_default_device.clone()),
             upload_dir: Some(path_or_empty(cfg.upload_dir.as_deref())),
@@ -458,6 +464,9 @@ pub fn render_toml(cfg: &Config) -> String {
     out.push_str(&kv_num("max_sessions", cfg.max_sessions as u64));
     out.push_str("# ghost_cursor_idle: 游戏模式的幽灵指针静止多少秒后淡出。\n");
     out.push_str(&kv_num("ghost_cursor_idle", cfg.ghost_cursor_idle_secs));
+    out.push_str("# pointer_recenter: 指针贴到屏幕边缘时拉回中间，给相对位移腾地方。\n");
+    out.push_str("# 会移动被控机的真光标；只有远端玩第一人称时才值得开。\n");
+    out.push_str(&kv_bool("pointer_recenter", cfg.pointer_recenter));
     out.push('\n');
 
     out.push_str("# ---------- 音频 ----------\n");
@@ -618,6 +627,7 @@ mod tests {
         cfg.upload_dir = Some(PathBuf::from(r"D:\共享 目录"));
         cfg.no_hdr = true;
         cfg.input_policy = InputPolicy::Shared;
+        cfg.pointer_recenter = true;
 
         let text = render_toml(&cfg);
         let file = parse_file(&text).expect("render_toml 的输出必须是合法 TOML");
@@ -641,6 +651,7 @@ mod tests {
         assert_eq!(back.auth_grants[1].tenant.as_str(), "beta");
         assert_eq!(back.default_mode, cfg.default_mode);
         assert_eq!(back.ghost_cursor_idle_secs, cfg.ghost_cursor_idle_secs);
+        assert_eq!(back.pointer_recenter, cfg.pointer_recenter);
         assert_eq!(back.max_sessions, cfg.max_sessions);
     }
 

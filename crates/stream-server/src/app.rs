@@ -263,6 +263,21 @@ pub async fn run() -> anyhow::Result<()> {
         dispatch::ghost::idle_secs()
     );
 
+    // #124/B: 相对位移是往真光标上累加的，光标贴边之后位移就被系统吞掉。开关
+    // 打开后，每次注入 `m2` 之前都会检查光标是否已经贴边，是则先把它拉回中间。
+    // 默认关闭，因为它动的是**被控机的真光标**：本机有人坐着用时，那个指针会
+    // 被远端拽走。装在这里而不是 sink 里，是因为它是一条运维决定，不是每会话
+    // 的状态。
+    dispatch::win_input::set_recenter(cfg.pointer_recenter);
+    log::info!(
+        "pointer edge recentering: {} (relative input only)",
+        if dispatch::win_input::recenter_enabled() {
+            "on"
+        } else {
+            "off"
+        }
+    );
+
     // #88/#110: 监听面鉴权骨架。策略必须在 bind 之前装好 —— 第一个可能被裁决的
     // 事件是 `serve` 收到的 HTTP 请求，装晚了就会出现"前几个请求按默认放行"
     // 的窗口。策略名拼错时退回 allow-all 而不是退出：本项目的默认本来就是

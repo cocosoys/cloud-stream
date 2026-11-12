@@ -36,6 +36,11 @@ pub trait InputSink: Send + Sync {
     /// secondary's position in the virtual desktop.
     fn set_target_display(&self, _origin: (i32, i32), _size: (u32, u32)) {}
 
+    /// #124: `ma,<0|1>` — the client explicitly asked for (or refused) a 1:1
+    /// host pointer. The sink records the refusal so its own automatic pin
+    /// cannot undo the client's choice one frame later.
+    fn pointer_direct(&self, _on: bool) {}
+
     /// Tally an unparsed input line in stage1; stage2 parses each C-group line
     /// and dispatches it to the matching concrete method above instead.
     fn note_stub(&self, line: &str);

@@ -213,6 +213,17 @@ pub struct Config {
     /// top of the action and lies about where the pointer is; one that
     /// disappears too early is gone before the hand starts moving again.
     pub ghost_cursor_idle_secs: u64,
+    /// #124/B: 把指针从屏幕边缘拉回中间。**默认关闭**。
+    ///
+    /// 相对位移是往**真光标**上累加的，光标一贴到桌面边界，后续 `SendInput`
+    /// 的位移就被系统丢掉，远端看到的 `movementX` 同时变成 0 —— 表现是"视角
+    /// 转不动了"，而且越用力甩越转不动。一次 180° 反手在参考客户端上是 ~1500
+    /// counts，1920 宽的屏两枪就顶到边。
+    ///
+    /// 关着的原因不是"没用"，是它会**动真光标**：开着的机器上，本机用户会和
+    /// 远端抢同一个指针，而且 `SetCursorPos` 在没被 `ClipCursor` 夹住的桌面上
+    /// 是可见的跳动。默认行为保持插桩前的样子，谁需要谁开，翻车面留在一个开关里。
+    pub pointer_recenter: bool,
     /// #88: 监听面鉴权策略名（`auto` / `allow-all` / `role-based` / `deny-all`）。
     ///
     /// 默认 `auto`，由 `main` 决定成哪一个：**没有令牌表时是 `allow-all`**
@@ -361,6 +372,7 @@ impl Default for Config {
             webrtc_udp_port_min: 40000,
             webrtc_udp_port_max: 40049,
             ghost_cursor_idle_secs: crate::dispatch::ghost::DEFAULT_IDLE_SECS,
+            pointer_recenter: false,
             policy: "auto".to_owned(),
             auth_token: None,
             auth_grants: Vec::new(),
@@ -610,6 +622,9 @@ impl Config {
                         }
                     }
                 }
+                // #124/B: 只在需要时才动真光标，所以是"出现即开"的开关，没有
+                // `--pointer-recenter 0` 这种写法 —— 配置文件里才有显式的 false。
+                "--pointer-recenter" => cfg.pointer_recenter = true,
                 "--policy" => {
                     if let Some(v) = iter.next() {
                         // 未知名保留默认并在 main 里告警，不在这里吞掉 ——
@@ -929,6 +944,19 @@ mod tests {
             parse(&["--ghost-cursor-idle", "soon"]).ghost_cursor_idle_secs,
             5,
             "a value that is not a number keeps the default"
+        );
+    }
+
+    /// #124/B: 默认关闭，出现即开。它动的是被控机的真光标，所以"不说就是不动"
+    /// 是唯一能接受的默认 —— 关掉的人不需要一个 `--no-pointer-recenter`，因为
+    /// 不写这个参数就是关着的。
+    #[test]
+    fn pointer_recentering_is_off_unless_asked_for() {
+        assert!(!parse(&[]).pointer_recenter);
+        assert!(parse(&["--pointer-recenter"]).pointer_recenter);
+        // 位置无关：它是个开关，不该因为写在别的参数前后而失效。
+        assert!(
+            parse(&["--port", "9000", "--pointer-recenter", "--fps", "60"]).pointer_recenter
         );
     }
 }
