@@ -101,6 +101,24 @@ usUninstall       逐条调 --uninstall-step <步骤> --quiet --dir "<同上>"
 老规矩弹一个「卸载完成」的框 —— 无人值守安装里向导背后没有人点确定，两个进程
 就那样互相等着。自己在向导里做幂等停机没有这个问题，也不需要旧版本配合。
 
+### 改名那一版怎么升级上来
+
+2026-11 把 `cloud-setup.exe` 改名成 `stream-setting.exe`，这件事在升级路径上
+留下两个洞，都补在 `.iss` 里：
+
+| 洞 | 症状 | 补法 |
+|---|---|---|
+| `PrepareToInstall` 用新名字判断"是不是已经有安装" | 从老版本升级被判成**全新安装**，停机段整个跳过 → Inno 复制 `stream-server.exe` 时撞上文件占用，装到一半失败 | 判据认两个名字：`stream-setting.exe` **或** `cloud-setup.exe` |
+| Inno 的升级只按新清单覆盖，不比对旧清单 | 老名字那个 exe 永远留在 `{app}` 里 —— 用户双击到的是**旧工具箱**（还带"拍快照 / 回滚"），遂以为"升级没生效" | `[InstallDelete]` 删 `{app}\cloud-setup.exe` 与开始菜单里那条 `cloud-stream 控制台.lnk` |
+
+两条都只针对"从改名前的版本装上来"这一个过渡期，等确认没有机器还停在这条路上
+可以整段删掉；留着不影响全新安装（文件本来就不存在，`[InstallDelete]` 对
+不存在的文件是静默跳过）。
+
+MSI 那边对应的是 `Console` 组件上的一条 `<RemoveFile Name="cloud-setup.exe"
+On="install" />`。它自己的升级用不上（`MajorUpgrade` 先卸旧产品，旧包清单里有
+那个文件），写它是给交叉情形：机器上原来是 Inno 装的老名字，现在装 MSI。
+
 ### 运行根里那份控制台不带整包
 
 payload 里**没有** `stream-setting.exe`（`build.rs` 刻意跳过它，否则就是 exe 里

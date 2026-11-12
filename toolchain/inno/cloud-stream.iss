@@ -160,6 +160,23 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "{#PayloadDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#ConsoleExePath}"; DestDir: "{app}"; Flags: ignoreversion
 
+[InstallDelete]
+; 改名遗留（2026-11）：`cloud-setup.exe` 是 `stream-setting.exe` 之前的名字，
+; 从老版本装机升级上来的机器上还留着这一份。
+;
+; 为什么要写出来：Inno 的升级只按**新清单覆盖**，它不比对旧清单，所以"旧版本
+; 有、新版本没有"的文件会永远留在 {app} 里。留着的东西不是一份死文件 —— 它是
+; 一个还能双击的旧工具箱，按钮是"拍快照 / 回滚 / 安装修复"，而那些能力这一版
+; 已经删掉了。用户看到的会是"我升级了，可界面怎么还是旧的"。
+;
+; 只删这一个文件名：它是我们自己的产物，改名之后不可能再被写出来。
+; 等确认没有机器还停在这条升级路径上，整段可以去掉。
+Type: files; Name: "{app}\cloud-setup.exe"
+; 老版本开始菜单里那一条叫"cloud-stream 控制台"，指向上面那个 exe。不删的话，
+; 文件一删它就成了一条点了没反应的死快捷方式。{group} = {autoprograms}\cloud-stream
+; （见 DefaultGroupName），旧 .iss 就是这么写的。
+Type: files; Name: "{group}\{#AppName} 控制台.lnk"
+
 [Dirs]
 ; 提权安装有个副作用：写进 {app} 的文件默认属主是管理员，普通用户改不了。
 ; 而 stream-config.toml 是文档里明确说"直接编辑它"的东西，logs 也要能写。
@@ -243,7 +260,14 @@ begin
   end;
 
   // 全新安装：目标目录里没有控制台，就没有什么要收的。
-  if not FileExists(ExpandConstant('{app}\' + ConsoleName)) then
+  //
+  // **认两个名字**。`cloud-setup.exe` 是 2026-11 改名之前的那一份，而"改名"
+  // 恰恰是最容易把升级路径弄断的地方：只看新名字，从老版本升级上来的机器会被
+  // 判成"全新安装"，于是下面这段停机被整个跳过 —— 旧版本的服务还跑着，
+  // Inno 复制 stream-server.exe 时撞上文件占用，装到一半失败。删掉 InstallDelete
+  // 那段也不会恢复这个判断：两件事各管一头，都必须在。
+  if not (FileExists(ExpandConstant('{app}\' + ConsoleName)) or
+          FileExists(ExpandConstant('{app}\cloud-setup.exe'))) then
     Exit;
 
   // 升级：先把服务停掉，让 Inno 能覆盖 stream-server.exe。

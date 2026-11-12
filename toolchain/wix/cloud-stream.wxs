@@ -152,6 +152,17 @@
     <!-- 运行根里的控制台。来源是"不带 embed"那份（748 KB），不是分发用的 8.7 MB。 -->
     <Component Id="Console" Guid="{F3B285C9-10DF-49E0-AD20-CC402B9B87C9}" Directory="INSTALLDIR" Win64="yes">
       <File Id="ConsoleExe" Source="$(var.ConsoleExe)" KeyPath="yes" Vital="yes" />
+      <!--
+        改名遗留：`cloud-setup.exe` 是 `stream-setting.exe` 之前的名字。
+
+        MSI 自己的升级用不上这条 —— MajorUpgrade 默认先卸旧产品，旧包的清单里
+        有那个文件，RemoveExistingProducts 会带走它。写在这儿是给**交叉**情形：
+        这台机器上是 Inno 版装的老名字，现在装 MSI。那时没有任何 MSI 记录知道
+        那个文件，它就会一直躺在那儿，还能双击起来。
+
+        On="install" 而不是 "uninstall"：它要在装的时候就消失，而不是等下次卸载。
+      -->
+      <RemoveFile Id="OldConsoleName" Name="cloud-setup.exe" On="install" />
     </Component>
 
     <!--
