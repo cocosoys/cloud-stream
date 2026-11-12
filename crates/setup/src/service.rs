@@ -188,6 +188,8 @@ pub(crate) fn start(root: &Path) -> Done {
     let port = install::effective_config(&exe).port;
     let before = pids(root);
     let already = !before.is_empty();
+    // 这一轮真的发过 `/Run`（用来决定要不要补第二枪，见循环之后那段）。
+    let mut asked = false;
     let mut lines = Vec::new();
     // 启用 / 禁用失败意味着"这次能起来，但看门狗不接手"，那是要说的，
     // 不该被后面那句"[ok] 已启动"盖过去。
@@ -217,6 +219,7 @@ pub(crate) fn start(root: &Path) -> Done {
                 if already {
                     lines.push(format!("-- 已经在跑（pid {}），没有再起一个", join(&before)));
                 } else {
+                    asked = true;
                     match schtasks(&["/Run", "/TN", TASK_NAME]) {
                         Ok((0, _)) => lines.push("[ok] 已让看门狗拉起来".to_owned()),
                         Ok((code, text)) => lines.push(format!(
@@ -262,6 +265,21 @@ pub(crate) fn start(root: &Path) -> Done {
         }
     }
 
+    // 补一枪：`/End` 之后任务计划程序有时还会认为上一个实例在跑，这时 `/Run`
+    // 被 `IgnoreNew` 挡掉，而它给的话是「任务正在运行」—— 听起来像成功，实际
+    // 什么都没起。等三秒再要一次，比让点按钮的人去猜"为什么没起来"便宜得多。
+    if asked && !wait_process(root, 3) {
+        lines.push("-- 三秒还没见到进程，再要一次（上一次可能撞上「任务正在运行」）".to_owned());
+        match schtasks(&["/Run", "/TN", TASK_NAME]) {
+            Ok((0, _)) => {}
+            Ok((code, text)) => lines.push(format!(
+                "[warn] 第二次 schtasks /Run 退出码 {code}：{}",
+                text.trim()
+            )),
+            Err(err) => lines.push(format!("[fail] 起不了 schtasks：{err}")),
+        }
+    }
+
     let ready = wait_ready(root, port);
     // 计时要在**等完之后**取：把 15 秒的等待排除在外，会写出"用时 0.4 秒"
     // 这种和服务实际起来的时间无关的数。
@@ -280,8 +298,8 @@ pub(crate) fn start(root: &Path) -> Done {
         }
         Ready::NoProcess => {
             lines.push(format!(
-                "[fail] 进程没起来（{GHOST_SECONDS} 秒内一次都没见到）。\n\
-                 这是一次性的失败，不用重试：先看 stream-server.exe --diagnose 的结论"
+                "[fail] 进程没起来（{GHOST_SECONDS} 秒内一次都没见到）。\
+                 这不是「等一会儿就好」的那种失败：先看 stream-server.exe --diagnose 的结论"
             ));
             Done::bad(lines)
         }
@@ -493,6 +511,17 @@ fn wait_ready(root: &Path, port: u16) -> Ready {
     } else {
         Ready::NoAnswer(live)
     }
+}
+
+/// 等目录里出现 `stream-server.exe`（只要进程，不管端口）。
+fn wait_process(root: &Path, seconds: u32) -> bool {
+    for _ in 0..seconds * 4 {
+        if !pids(root).is_empty() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    !pids(root).is_empty()
 }
 
 fn wait_gone(root: &Path) -> bool {
