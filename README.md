@@ -198,7 +198,7 @@ cd target\output\cloud-stream
 | [`docs/operations-update.md`](docs/operations-update.md) | **更新：`--update check/apply`，三种验版本口径、自动回滚、更新包放哪** |
 | [`docs/operations-run.md`](docs/operations-run.md) | **服务怎么被拉起来：`--run`、GUI 子系统与 stdio 的三种处境、单实例、退出码** |
 | [`docs/operations-install.md`](docs/operations-install.md) | **安装：一个 exe 装出整台机器 —— 两段提权、任务 XML 里三个改了就毁的设置、结论文件契约** |
-| [`docs/console.md`](docs/console.md) | **工具箱 `stream-setting.exe`：看状态/改配置/换版本/卸掉，四个按钮各落到哪条命令** |
+| [`docs/console.md`](docs/console.md) | **工具箱 `stream-setting.exe`：看状态/开停服务/改配置/换版本/卸掉，五个按钮各落到哪条命令** |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | **参与开发：环境、构建、测试、提交规范、硬规矩** |
 | [`docs/roadmap-l2-l3-gaps.md`](docs/roadmap-l2-l3-gaps.md) | 全量盘点：已完成 / 部分 / 未做，逐项拆解 |
 | [`docs/stage1-signaling-session.md`](docs/stage1-signaling-session.md) | 信令契约与会话状态机 |

@@ -923,7 +923,12 @@ unsafe fn image_path(pid: u32) -> Option<PathBuf> {
 /// 那个窗口没关"。
 const CONSOLE_EXES: &[&str] = &["stream-setting.exe", "cloud-setup.exe"];
 
-fn kill_servers_under(dir: &Path, report: Option<&Report>) -> usize {
+/// 收掉这个目录下的 `stream-server.exe`，返回真正结束掉的个数。
+///
+/// `pub(crate)`：卸载的第 2 步和「停止服务」用的是同一段代码（`service::stop`）。
+/// 两处各写一遍"按路径枚举再 TerminateProcess"没有意义 —— 早晚有一处忘了
+/// 跳过自己的 pid。
+pub(crate) fn kill_servers_under(dir: &Path, report: Option<&Report>) -> usize {
     kill_pids_under(dir, &["stream-server.exe"], report)
 }
 

@@ -58,7 +58,7 @@ exe 同目录是 app-local 部署 —— 加载器优先找同目录，它不是
 
 | | `stream-setting.exe` | `cloud-stream-setup.exe` |
 |---|---|---|
-| 界面 | 工具箱（四个按钮） | 向导：欢迎 → 目录 → 进度 → 完成 |
+| 界面 | 工具箱（五个按钮） | 向导：欢迎 → 目录 → 进度 → 完成 |
 | 装到哪 | `%LOCALAPPDATA%\cloud-stream` 固定 | 用户选的目录 + `\cloud-stream` |
 | 卸载入口 | 运行根里的工具箱点「卸载」（它调起 `unins000.exe`） | 控制面板「应用和功能」 |
 | 提权 | 自己弹 UAC | `PrivilegesRequired=admin` |

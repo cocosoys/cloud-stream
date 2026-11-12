@@ -1414,7 +1414,7 @@ try {
     Write-Ok ($LauncherNames -join ' / ')
     if ($packaged -and (Test-Path $InstallerExe)) {
         # 安装器不再在包里，所以路径从产物目录取。被控机上它是控制台：放在
-        # 运行根里，双击就是那四个按钮。
+        # 运行根里，双击就是那五个按钮。
         Send-File $InstallerExe "$RemoteDeploy/stream-setting.exe"
         Write-Ok 'stream-setting.exe（自带整包的安装器）'
     }

@@ -241,6 +241,10 @@ schtasks /End /TN MCStreamSrv
 schtasks /Run /TN MCStreamSrv
 ```
 
+（窗口上那两个按钮做的是同一件事，只是多做两步：**先禁用看门狗**再结束进程
+—— 不然最多一分钟它就把旧进程拉回来了 —— 结束后再把默认录音设备还回去。
+命令行形态：`stream-setting.exe --service stop` / `--service start`。）
+
 之后浏览器必须带 token 打开一次：
 
 ```

@@ -10,6 +10,7 @@
 //!
 //! ```text
 //! 刷新状态   ->  自己查进程/端口/任务 + stream-server.exe --ops state
+//! 开始/停止  ->  schtasks /Change|/Run|/End（见 service.rs）
 //! 更新       ->  stream-server.exe --update check|apply
 //! 卸载       ->  运行根里的 unins000.exe（卸载流程在卸载器里，不在这儿）
 //! 改配置     ->  stream-server.exe --ops config-get|config-set
@@ -79,6 +80,7 @@
 mod install;
 mod pack;
 mod report;
+mod service;
 mod sys;
 mod uninstall;
 
@@ -112,6 +114,9 @@ const BTN_REFRESH: i32 = 1001;
 const BTN_UNINSTALL: i32 = 1005;
 const BTN_CONFIG: i32 = 1006;
 const BTN_UPDATE: i32 = 1007;
+/// 开 / 停。文字跟着状态翻（见 `service::power_label`），所以它是唯一一个
+/// 标签在运行期会变的按钮。
+const BTN_POWER: i32 = 1008;
 
 // 配置表单（另一个窗口）的控件 id。
 const BTN_CFG_SAVE: i32 = 1200;
@@ -164,13 +169,17 @@ const MAIN_LAYOUT: &[(i32, i32, i32, i32, i32)] = &[
     // 170 高：顶上那几行是运行状态（服务/端口/看门狗），下面接 `--ops state`
     // 的原文。只留 130 时状态区会把原文挤没，人还是得滚。
     (ID_STATE, 16, 34, 748, 168),
-    // 四个按钮等宽排一行，铺满状态框的宽度：中文标签字数接近，等宽比"按字数
-    // 伸缩"耐看，也不会因为某个标签多两个字就挤歪整排。顺序即使用频次：
-    // 看 → 换版本 → 卸掉 → 改。
-    (BTN_REFRESH, 16, 214, 178, 30),
-    (BTN_UPDATE, 206, 214, 178, 30),
-    (BTN_UNINSTALL, 396, 214, 178, 30),
-    (BTN_CONFIG, 586, 214, 178, 30),
+    // 五个按钮等宽排一行，铺满状态框的宽度（5×140 + 4×12 = 748）：中文标签
+    // 字数接近，等宽比"按字数伸缩"耐看，也不会因为某个标签多两个字就挤歪整排。
+    // 顺序即使用频次：看 → 开停 → 换版本 → 卸掉 → 改。
+    //
+    // 「开始/停止」排在第二格而不是紧挨着「卸载」：它和「刷新」同属"看这台
+    // 机器现在怎么样"，而和卸载放在一起迟早有人点错。
+    (BTN_REFRESH, 16, 214, 140, 30),
+    (BTN_POWER, 168, 214, 140, 30),
+    (BTN_UPDATE, 320, 214, 140, 30),
+    (BTN_UNINSTALL, 472, 214, 140, 30),
+    (BTN_CONFIG, 624, 214, 140, 30),
     (ID_LABEL_LOG, 16, 258, 200, 20),
     (ID_LOG, 16, 280, 748, 210),
 ];
@@ -258,7 +267,7 @@ fn apply_main_layout(hwnd: HWND) {
 
 /// 运行根：本 exe 所在目录。和 `ops::run_root` 同一口径 —— 不取当前工作目录，
 /// 计划任务拉起进程时那是 `System32`。
-fn run_root() -> std::path::PathBuf {
+pub(crate) fn run_root() -> std::path::PathBuf {
     std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
@@ -290,6 +299,8 @@ const CLI_SWITCHES: &[&str] = &[
     "--uninstall",
     "--purge",
     "--uninstall-step",
+    "--inbound",
+    "--service",
 ];
 
 /// 这一轮启动该做什么。
@@ -350,6 +361,17 @@ fn set_state(text: &str, hwnd: HWND) {
     }
 }
 
+/// 按钮文字跟着状态翻：在跑写"停止服务"，没跑写"开始服务"。
+///
+/// 文案只有一处来源（`service::power_label`），判断也只有一个（`running`）——
+/// 于是"标签说停止、点下去却是启动"这种自相矛盾不可能出现。
+fn update_power_label(hwnd: HWND, running: bool) {
+    unsafe {
+        let text = wide(service::power_label(running));
+        SetWindowTextW(GetDlgItem(hwnd, BTN_POWER), text.as_ptr());
+    }
+}
+
 /// 跑一个子进程并把它说的话原样拿回来（stdout + stderr）。
 ///
 /// `CREATE_NO_WINDOW`（0x08000000）是必需的：不带它，每次刷新状态都会闪一下
@@ -403,13 +425,16 @@ where
 /// 先显示这三件，下面再附 `--ops state` 的原文 —— 人打开窗口第一眼要的通常是
 /// 前者，而它是**不需要**服务端配合就能给出来的（服务没起来的时候，
 /// `--ops state` 也可能因为配置坏了而失败）。
-fn program_info(root: &Path) -> String {
+///
+/// 进程表由调用方传进来（`service::pids`）：同一个刷新里，「服务在不在跑」
+/// 还要用来决定那个按钮写"开始"还是"停止"，两处各查一遍就成了两次进程快照，
+/// 而它们之间还有那么一小会儿可以说出互相矛盾的话。
+fn program_info(root: &Path, pids: &[u32]) -> String {
     let exe = root.join("stream-server.exe");
     let mut out = String::new();
 
     // 进程按**完整路径**数，不能按映像名：同一台机器上可能还有另一个目录的安装，
     // 任务管理器里两个 stream-server.exe 长得一模一样。
-    let pids = uninstall::server_pids_under(root);
     out.push_str(&match pids.len() {
         0 => "服务      未运行\n".to_owned(),
         1 => format!("服务      运行中（pid {}）\n", pids[0]),
@@ -1069,7 +1094,9 @@ fn on_command(hwnd: HWND, id: i32) {
     match id {
         BTN_REFRESH => {
             let root = run_root();
-            let mut out = program_info(&root);
+            // 一次进程快照，两处用：面板上的"服务"那行，和那个按钮该写什么。
+            let pids = service::pids(&root);
+            let mut out = program_info(&root, &pids);
             if exe.exists() {
                 let (_, text) = run_capture(&exe, &["--ops", "state"]);
                 out.push_str("\n-- 服务端自述（--ops state）--\n");
@@ -1078,7 +1105,36 @@ fn on_command(hwnd: HWND, id: i32) {
                 out.push_str("\n找不到 stream-server.exe（本窗口要和它放在同一目录）");
             }
             set_state(&out, hwnd);
+            update_power_label(hwnd, !pids.is_empty());
             log("-- 状态已刷新", hwnd);
+        }
+        BTN_POWER => {
+            // 按钮写的是"点下去会发生什么"，动作也照那个走 —— 判断只有一处。
+            let stopping = service::running(&root);
+            // 只有"停"要问：它会把所有已连上的远端断掉（这软件本身就是干这个
+            // 的），顺便把默认录音设备还回去，而且连看门狗一起禁用。
+            if stopping
+                && !confirm(
+                    hwnd,
+                    "停止服务会断开所有已连上的远端，并把默认录音设备还回去。\n\n\
+                     看门狗也会一起禁用 —— 不点「开始服务」，重启后它也不会自己起来。\n\n\
+                     继续？",
+                    "停止服务",
+                )
+            {
+                log("-- 已取消停止", hwnd);
+                return;
+            }
+            // 两条路都要等（停止等进程退、启动等端口应答），所以走后台线程：
+            // 同步跑会让窗口"未响应"，而一个未响应的窗口看起来就是崩了。
+            let root = root.clone();
+            spawn_job(hwnd, move || {
+                if stopping {
+                    service::stop(&root).lines
+                } else {
+                    service::start(&root).lines
+                }
+            });
         }
         BTN_UPDATE => {
             if !exe.exists() {
@@ -1137,9 +1193,9 @@ fn on_command(hwnd: HWND, id: i32) {
                 lines.push(text.trim_end().to_owned());
                 lines.push(if code == 0 {
                     // 原来写的是"重启服务（安装 / 修复）后生效" —— 那个入口已经
-                    // 没了。现在重启服务的正路是看门狗：停掉进程，一分钟内它自己
-                    // 会用新版本拉起来。
-                    "更新完成：重启服务后生效（结束 stream-server.exe，看门狗一分钟内会用新版拉起来）".to_owned()
+                    // 没了。现在重启服务的正路是旁边那个按钮：停止 → 开始
+                    // （走看门狗，`/Run` 用的就是刚覆盖上去的那个 exe）。
+                    "更新完成：点「停止服务」再「开始服务」即可用上新版本".to_owned()
                 } else {
                     "更新没有完成；失败时会自动回滚，情况见上面的记录".to_owned()
                 });
@@ -1238,8 +1294,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             make("STATIC", "程序信息", 0, ID_LABEL_STATE);
             make("EDIT", "", READONLY_EDIT, ID_STATE);
 
-            let buttons: [(&str, i32); 4] = [
+            let buttons: [(&str, i32); 5] = [
                 ("刷新状态", BTN_REFRESH),
+                // 初始文字按此刻的真实状态定：窗口一出现，按钮和下面面板说的
+                // 就得是同一件事，不该先写"开始"再等刷新改回来。
+                (service::power_label(service::running(&run_root())), BTN_POWER),
                 ("更新", BTN_UPDATE),
                 ("卸载", BTN_UNINSTALL),
                 ("改配置", BTN_CONFIG),
@@ -1360,7 +1419,8 @@ fn main() {
     // 没有可截图的桌面，远端只能靠这条命令确认它到底算出什么。
     // 和 `--task-xml` 一样属于"结果本身就是答案"的那一类。
     if args.iter().any(|a| a == "--program-info") {
-        print!("{}", program_info(&run_root()));
+        let root = run_root();
+        print!("{}", program_info(&root, &service::pids(&root)));
         std::process::exit(0);
     }
     // 「诊断」在这个 exe 上也接：用户不一定记得九节取证在服务端那一份 exe 上，
@@ -1382,6 +1442,14 @@ fn main() {
             }
         };
         std::process::exit(code);
+    }
+    // 开关服务（`--service start|stop`）：窗口上那个按钮的命令行形态。
+    //
+    // 和 `--purge` / `--uninstall-step` 一样必须在角色判断**之前**截住：装好
+    // 之后的 exe 旁边就有 `stream-server.exe`，落进 `classify` 会被当成控制台，
+    // 于是开一个窗口进消息循环 —— 而敲命令的人等的是一个退出码。
+    if args.iter().any(|a| a == "--service") {
+        std::process::exit(service::run(&args));
     }
     // 替身（`--purge`）必须在角色判断**之前**截住：它跑在 `%TEMP%` 里，那儿
     // 没有 `stream-server.exe`，而它自带有内置包 —— 按下面的判据会被认成
@@ -1548,6 +1616,45 @@ mod tests {
                 MAIN_WINDOW.1
             );
         }
+    }
+
+    /// 按钮行：等宽、等距、正好铺满状态框。
+    ///
+    /// 加那个「开始/停止」按钮时把 4×178 改成了 5×140，这组数字之间是有关系的
+    /// （5×140 + 4×12 = 748 = 状态框宽度）。少算一个间隔、或者只改宽度不改 x，
+    /// 得到的是"最右边那个按钮压在边框上"这种只有实机才看得出来的错，所以在这里
+    /// 把关系写死。
+    #[test]
+    fn the_button_row_is_evenly_spaced() {
+        const BUTTONS: [i32; 5] = [
+            BTN_REFRESH,
+            BTN_POWER,
+            BTN_UPDATE,
+            BTN_UNINSTALL,
+            BTN_CONFIG,
+        ];
+        let mut prev: Option<(i32, i32, i32)> = None; // (x, y, w)
+        for id in BUTTONS {
+            let &(_, x, y, w, _) = MAIN_LAYOUT
+                .iter()
+                .find(|(control, ..)| *control == id)
+                .unwrap_or_else(|| panic!("按钮 {id} 不在 MAIN_LAYOUT 里"));
+            match prev {
+                None => assert_eq!(x, 16, "第一个按钮的左边距不是 16"),
+                Some((px, py, pw)) => {
+                    assert_eq!(y, py, "按钮 {id} 换行了");
+                    assert_eq!(w, pw, "按钮 {id} 和左边那个不一样宽");
+                    assert_eq!(x - px, pw + 12, "按钮 {id} 的间距不是 12");
+                }
+            }
+            prev = Some((x, y, w));
+        }
+        let (last_x, _, last_w) = prev.unwrap();
+        assert_eq!(
+            last_x + last_w,
+            16 + 748,
+            "按钮行没有铺满状态框（右边会留一条缝，或者压出框）"
+        );
     }
 
     /// 表单是两列，第二列必须从第一列右边之外开始，否则两列叠在一起。
