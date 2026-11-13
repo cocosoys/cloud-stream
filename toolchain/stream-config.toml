@@ -63,6 +63,10 @@ input_policy = 'exclusive'
 max_sessions = 8
 # 游戏模式下客户端幽灵指针静止多少秒后淡出。
 ghost_cursor_idle = 5
+# pointer_recenter: 指针贴到屏幕边缘时拉回中间，给相对位移腾地方。
+# 会移动被控机的真光标（服务端 SetCursorPos），所以只在该机被封着打第一人称时
+# 才值得开；平时用鼠标操作桌面，它会把光标时不时拽走。默认关。
+pointer_recenter = false
 
 # ---------- 音频 ----------
 # auto = 挑一台虚拟线缆（Steam Streaming Microphone / VB-CABLE / VoiceMeeter）。
