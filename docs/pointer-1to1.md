@@ -35,9 +35,11 @@
 `hostui::pin_pointer()`：关掉"提高指针精确度"、把速度档钉到 10。三条释放路径
 都是幂等的——`p,0`、会话 `reset()`、以及"30 秒没有 `m2`"。
 
-**为什么必须**：#74 实测 `dm/m2 = 9.55 px/msg`，正落在 Windows 的
-`Threshold1=6 / Threshold2=10` 加倍档里。加速是**非线性**的，玩家无法用灵敏度
-抵消它：慢移还在 1 倍档、快甩已到 2 倍档。唯一解就是把曲线关掉。
+**为什么必须**：#74 实测注入侧 `dm/m2 = 9.55 counts/msg`，正落在 Windows 的
+`Threshold1=6 / Threshold2=10` 加倍档里（这个比值是"每条消息的 counts"，
+也就是 OS 判档的输入；它随手指快慢变，**不能**反过来当 1:1 的判据）。
+加速是**非线性**的，玩家无法用灵敏度抵消它：慢移还在 1 倍档、快甩已到 2 倍档。
+唯一解就是把曲线关掉。
 
 **边界**：
 
@@ -147,11 +149,17 @@ OS 光标就是屏幕上**第二个**指针，而且它停在"上一次绝对位
 | --- | --- | --- |
 | `pin=` | 1 = 被控机指针当前在 1:1 钉上 | `m2` 在涨而 `pin=0`：钉被拒了（日志有原因）或客户端在 `ma,0` 之后 |
 | `ms=` | 因为"锁定 + 相对"被扣下的绝对位移条数 | `m=0` 且 `ms` 在涨 = 正常；两者都涨 = 页面在混发 |
-| `clip=` | 边缘重定位次数（窗口内） | 0 说明 `--pointer-recenter` 没生效或没到边缘；> 0 才算证明它有用 |
-| `dmax=` | 窗口内单条 `|dx|+|dy|` 的最大值 | 逼近 400 说明客户端的 400 px 上限随时会吞掉合法甩枪 |
+| `clip=` | 边缘重定位次数（窗口内） | 0 说明没到边缘或没开；**host 侧 pointer lock 生效时光标被 `ClipCursor` 关在窗口里，永远到不了边缘 —— 这种会话 `clip=0` 是正确结果，不是故障** |
+| `dmax=` | 窗口内单条 `|dx|+|dy|` 的最大值，取的是**客户端到达值**（`sdx` 之前） | 逼近 400 说明客户端的 400 px 上限随时会吞掉合法甩枪 |
 
 `dmax` 是唯一能在服务端看到"客户端把那一下扔了"的证据 —— 它扔的时候服务端
-什么都收不到，只剩"玩家说甩不动"。
+什么都收不到，只剩"玩家说甩不动"。它必须取到达值：取注入值就只能证明自己发了多少。
+
+`dm/m2` **不是** 1:1 的判据。`dm` 累加的是注入意图（`|sdx|+|sdy|`），`m2` 是消息数，
+所以这个比值就是"每条消息的平均 counts"，正常落在手速量级（10~20）。加速发生在
+`SendInput` 之后、由 OS 施加到光标上，服务端没有任何计数器能看到那个乘数 ——
+要证明钉住了，只能看 `pin=1` + 日志里的 `accel_off=true`，以及事后 `--diagnose`
+第 10 节的 `runtime`。
 
 ---
 
@@ -237,14 +245,42 @@ pointer_recenter  off —— 边缘重定位没开
   `MouseSpeed=1 / t1=6 / t2=10 / MouseSensitivity=10` 前后一致）。
 - `--diagnose` 第 10 节在本机跑通，`profile` 与 `runtime` 判为同一份数据。
 
-**未做（要实机 + 真实客户端）**：
+### 2026-11-13 实测（VMware 主机 / 软件编码 / 1920×1080 → 1920×1080 恒等映射）
 
-1. 连一个真实 pointer-lock 客户端，连续转 10 圈不卡；日志出现
-   `host pointer auto-pinned to 1:1`、`pointer lock -> on`、结束时
-   `host pointer released` 三行。
-2. 开 `--pointer-recenter` 跑同一段，`clip=` 必须 > 0，且手感不是"每次贴边都顿一下"。
-3. `dmax` 的窗口最大值应 < 400；`dm/m2` 应趋近 1.0 —— 这一条在 accel 顺序修正之后
-   才有意义：之前 `pin` 名义上成功，实际把曲线加强了，`dm/m2` 只会更糟。
+一次真实的 pointer-lock 会话，约 25 s，四行日志齐全：
+
+```text
+pointer lock -> on (relative motion will suppress absolute `m`)
+host pointer auto-pinned to 1:1 for relative input (speed=10, accel_off=true, strategy=pinned)
+pointer lock -> off (relative motion will no longer suppress absolute `m`)
+host pointer released (pointer lock released)
+```
+
+对应五个 5 s 统计段：`m2=434→497→502→534→289`（约 100 msg/s）、
+`dm=8192→7813→8286→6802→2696`、`dmax=105→52→52→67→27`、`pin=1` 全程、`clip=0`。
+
+| 项 | 判定 | 依据 |
+| --- | --- | --- |
+| A 自动钉 1:1 | **通过** | `strategy=pinned` + `accel_off=true`，`pin=1` 五个段，`p,0` 后 `released` |
+| E `dmax` | **通过** | 峰值 105，距 400 上限还有 4 倍余量 —— 这一轮客户端没有合并发送 |
+| C 压制绝对 `m` | **未覆盖** | 客户端锁定后自己就不发 `m` 了（`m` 归 0、`ms` 恒 0），压制路径没被走过 |
+| D 锁定态不合成光标 | **无独立证据** | 页面自己先发了 `SET_NATIVE_CURSOR_RENDERING,0`（日志 `off (frontend native)`），D 只是同意它 |
+| B 边缘重定位 | **未触发** | 配置关；且 `dm` 每段稳定在 7000~8300 说明光标一直在有效移动，没被 OS 丢弃 |
+
+B 这一行值得单独记：**host 侧 pointer lock 生效时，光标被 `ClipCursor` 关在窗口内，
+永远到不了屏幕边缘，所以 B 永远不会触发**。本次 `dm` 持续为正就是证据 ——
+如果撞边，OS 会丢弃位移，`m2` 继续涨而 `dm` 归零。B 只在 host 侧没锁上
+（前端 `requestPointerLock` 失败、窗口失焦）而客户端仍在发 `m2` 时才是兜底。
+
+**仍未覆盖**：
+
+1. B 真的触发一次：需要一个 host 侧锁不上的环境（或临时把窗口切到非全屏），
+   看 `clip=` > 0，并确认贴边时视角不跳（`SetCursorPos` 不该合成移动事件）。
+2. C：需要一个锁定态仍发 `m` 的客户端；`ms=` 应该开始涨而 `m` 不动。
+3. D：需要前端不发 `SET_NATIVE_CURSOR_RENDERING,0` 的会话（当前没有 CLI 能强制
+   `cursor_inject`，只能改前端）。
+4. 退出后的系统设置复原：日志的 `released` 只证明调用了 `unpin_pointer`，
+   真实复原要查注册表（`--diagnose` 第 10 节的 `profile` 与 `runtime` 一致）。
 
 ---
 
