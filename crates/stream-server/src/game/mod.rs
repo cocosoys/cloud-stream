@@ -167,14 +167,8 @@ fn d_schema() -> u32 {
 fn d_heap_mb() -> u32 {
     2048
 }
-fn d_main_class() -> String {
-    "net.minecraft.launchwrapper.Launch".to_owned()
-}
 fn d_player() -> String {
     "CloudPlayer".to_owned()
-}
-fn d_tweak() -> Option<String> {
-    None
 }
 fn d_stop_timeout() -> u64 {
     10
@@ -190,11 +184,31 @@ pub struct JavaSpec {
     /// 追加的 JVM 参数，排在默认参数之后。
     #[serde(default)]
     pub jvm_args: Vec<String>,
+    /// 启动前真的去 classpath 里找一遍主类与 tweaker。
+    ///
+    /// 默认开：改错一个类名时，`javaw` 只会打一行 `Could not find or load main
+    /// class` 然后秒退，跟"哪个字段写错了"没有关联。这里先扫一遍 jar 的中央目录
+    /// （不解压），找不到就拒绝启动并说清扫过几个 jar。
+    ///
+    /// 留了一个关掉的口子，因为校验本身也会出错：jar 是 zip64、包在别的容器里、
+    /// 或者类由自定义 ClassLoader 从非 jar 来源加载时，扫描会漏。那时把这里设成
+    /// false，回到"java 自己报错"的老路。
+    #[serde(default = "d_true")]
+    pub verify_classes: bool,
+}
+
+fn d_true() -> bool {
+    true
 }
 
 impl Default for JavaSpec {
     fn default() -> Self {
-        Self { path: String::new(), heap_mb: d_heap_mb(), jvm_args: Vec::new() }
+        Self {
+            path: String::new(),
+            heap_mb: d_heap_mb(),
+            jvm_args: Vec::new(),
+            verify_classes: true,
+        }
     }
 }
 
@@ -203,10 +217,19 @@ pub struct GameSpec {
     /// 版本目录名，例如 `1.12.2-Forge_14.23.5.2864`。必须与 `versions\<name>\`
     /// 同名 —— 因为 classpath 是从那一层的 json 推导出来的。
     pub version: String,
-    #[serde(default = "d_main_class")]
-    pub main_class: String,
-    /// Forge 的 tweaker。为空表示原版（不带 mod 加载）。
-    #[serde(default = "d_tweak")]
+    /// 主类覆盖。**留空是常态**：留空时从版本 json 的 `mainClass` 读。
+    ///
+    /// 以前这里是必填并且默认写死 `net.minecraft.launchwrapper.Launch`，
+    /// 于是同一件事在版本 json 和实例文件里各存一份 —— 换一个不是 Forge 的
+    /// 客户端（原版、Fabric、Quilt）时，忘了改这里就是一句
+    /// `Could not find or load main class`，而 json 里明明写着对的。
+    /// 现在只在"确实要偏离 json"时（自定义 jar、包装启动器）才写。
+    #[serde(default)]
+    pub main_class: Option<String>,
+    /// tweaker 覆盖。留空是常态：留空时从版本 json 的参数模板里取
+    /// `--tweakClass` 的值（Forge 的 `FMLTweaker`、OptiFine 的 tweaker 都在
+    /// 那里，本来就不用抄）。
+    #[serde(default)]
     pub tweak_class: Option<String>,
     #[serde(default = "d_player")]
     pub player: String,
@@ -219,8 +242,8 @@ impl Default for GameSpec {
     fn default() -> Self {
         Self {
             version: String::new(),
-            main_class: d_main_class(),
-            tweak_class: d_tweak(),
+            main_class: None,
+            tweak_class: None,
             player: d_player(),
             game_args: Vec::new(),
         }
@@ -377,6 +400,48 @@ impl InstanceSpec {
 
 // ---------------------------------------------------------------- 启动计划
 
+/// 一个参数是从哪来的。
+///
+/// 存在的理由只有一个：`--print-game` 要能回答"这个参数是谁写的"。改坏一次启动
+/// 之后，对着三四十个 token 猜是哪一层出的错，比改起来还费时间。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgOrigin {
+    /// 代码里写死的形状或值（`-Xmx`、`-cp`、`--username` 这些键，离线 uuid 之类）。
+    Builtin,
+    /// 来自版本 json（classpath 的内容、`assetIndex`、`mainClass`、模板里的 tweaker）。
+    Json,
+    /// 来自实例文件（存档目录、玩家名、追加参数、显式覆盖值）。
+    Instance,
+}
+
+impl ArgOrigin {
+    pub fn label(self) -> &'static str {
+        match self {
+            ArgOrigin::Builtin => "builtin",
+            ArgOrigin::Json => "json",
+            ArgOrigin::Instance => "instance",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ArgToken {
+    pub text: String,
+    pub origin: ArgOrigin,
+}
+
+impl ArgToken {
+    fn builtin(text: impl Into<String>) -> Self {
+        Self { text: text.into(), origin: ArgOrigin::Builtin }
+    }
+    fn json(text: impl Into<String>) -> Self {
+        Self { text: text.into(), origin: ArgOrigin::Json }
+    }
+    fn instance(text: impl Into<String>) -> Self {
+        Self { text: text.into(), origin: ArgOrigin::Instance }
+    }
+}
+
 /// 一次启动需要的全部输入，已经展开成可直接交给 `Command` 的形态。
 ///
 /// 单独一层是为了"打印"和"执行"走同一份数据：`--print-game` 打出来的命令行
@@ -385,32 +450,69 @@ impl InstanceSpec {
 pub struct LaunchPlan {
     pub java: PathBuf,
     pub cwd: PathBuf,
-    /// 逐个参数，不拼成一整串。
+    /// JVM 段，含 `-cp` 与 classpath。
     ///
     /// `toolchain\start-mc.ps1` 里必须手拼字符串（PowerShell 的 `Start-Process
     /// -ArgumentList` 传数组会按空格拆断含空格的路径）。Rust 的 `Command` 自己
     /// 负责引号，所以这里保留参数数组这一层 —— 拼好的字符串只用于显示。
-    pub args: Vec<String>,
+    pub jvm: Vec<ArgToken>,
+    /// 主类。单拎出来不是因为顺序（它就在两段之间），而是因为它是唯一一个
+    /// "写错了就必然起不来、而且报错完全指不到源头"的参数。
+    pub main_class: ArgToken,
+    /// 游戏段。
+    pub game: Vec<ArgToken>,
     /// 目标窗口尺寸（写 options.txt 用）。
     pub size: (u32, u32),
     pub model: DisplayModel,
     /// classpath 里缺的 jar（相对 libraries 的路径）。非空不算失败：natives-only
     /// 的两个包本来就不在磁盘上，MC 也不需要它们进 classpath。
     pub missing: Vec<String>,
+    /// 启动前跑过的校验结论（一行一条，给 `--print-game` 与启动日志）。
+    pub checks: Vec<String>,
 }
 
 impl LaunchPlan {
-    /// 给人看的命令行（`--print-game` 与日志）。含空格的参数加双引号。
+    /// 交给 `Command` 的顺序：jvm → mainClass → game。
+    pub fn args(&self) -> Vec<String> {
+        let mut out = Vec::with_capacity(self.jvm.len() + 1 + self.game.len());
+        out.extend(self.jvm.iter().map(|t| t.text.clone()));
+        out.push(self.main_class.text.clone());
+        out.extend(self.game.iter().map(|t| t.text.clone()));
+        out
+    }
+
+    /// 给人看的命令行（`cmdline.txt` 与日志）。含空格的参数加双引号。
     pub fn render(&self) -> String {
         let mut out = String::new();
         out.push_str(&quote(&self.java.to_string_lossy()));
-        for a in &self.args {
+        for a in self.args() {
             out.push(' ');
-            out.push_str(&quote(a));
+            out.push_str(&quote(&a));
         }
         out
     }
+
+    /// 带来源标注的分段视图（`--print-game`）。
+    pub fn render_annotated(&self) -> String {
+        let mut out = String::new();
+        let mut section = |title: &str, tokens: &[ArgToken], out: &mut String| {
+            out.push_str(&format!("{title} ({} token)\n", tokens.len()));
+            for t in tokens {
+                out.push_str(&format!("  {:<8} {}\n", t.origin.label(), t.text));
+            }
+        };
+        section("jvm", &self.jvm, &mut out);
+        out.push_str("main\n");
+        out.push_str(&format!(
+            "  {:<8} {}\n",
+            self.main_class.origin.label(),
+            self.main_class.text
+        ));
+        section("game", &self.game, &mut out);
+        out
+    }
 }
+
 
 fn quote(s: &str) -> String {
     if s.contains(' ') || s.contains('\t') {
@@ -420,6 +522,279 @@ fn quote(s: &str) -> String {
     }
 }
 
+// ------------------------------------------------------ 参数来源与启动前校验
+
+/// 主类：实例覆盖优先，否则版本 json 的 `mainClass`。
+///
+/// 这个函数存在的全部意义是把"同一个事实只存一份"落到代码里：以前实例里默认
+/// 写死 `net.minecraft.launchwrapper.Launch`，而 json 里也有一个 `mainClass`，
+/// 两者不同步时的报错完全指不到源头。
+fn resolve_main_class(
+    spec: &InstanceSpec,
+    json: &serde_json::Value,
+) -> Result<(String, ArgOrigin), String> {
+    if let Some(v) = spec.game.main_class.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        return Ok((v.to_owned(), ArgOrigin::Instance));
+    }
+    if let Some(v) =
+        json.get("mainClass").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty())
+    {
+        return Ok((v.to_owned(), ArgOrigin::Json));
+    }
+    Err("版本 json 里没有 mainClass，实例里也没写 game.main_class —— 两者至少要有一个"
+        .to_owned())
+}
+
+/// tweaker：实例覆盖优先，否则从版本 json 的参数模板里取 `--tweakClass`。
+///
+/// 旧式模板（1.12 及以前）是 `minecraftArguments` 一整串；新式（1.13+）是
+/// `arguments.game` 数组。两种都读，因为 Forge 的安装器到现在仍在生成旧式的。
+fn resolve_tweak_class(
+    spec: &InstanceSpec,
+    json: &serde_json::Value,
+) -> Result<Option<(String, ArgOrigin)>, String> {
+    if let Some(v) = spec.game.tweak_class.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        return Ok(Some((v.to_owned(), ArgOrigin::Instance)));
+    }
+    if let Some(raw) = json.get("minecraftArguments").and_then(|v| v.as_str()) {
+        if let Some(v) = find_flag_value(&split_arguments(raw), "--tweakClass") {
+            return Ok(Some((v, ArgOrigin::Json)));
+        }
+    }
+    if let Some(arr) = json.pointer("/arguments/game").and_then(|v| v.as_array()) {
+        // 新式里参数元素可能是 `{rules, value}` 对象，这里只取纯字符串元素 ——
+        // 带 rules 的 tweaker 至今没出现过，真出现时交给 B 阶段的模板引擎。
+        let flat: Vec<String> =
+            arr.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect();
+        if let Some(v) = find_flag_value(&flat, "--tweakClass") {
+            return Ok(Some((v, ArgOrigin::Json)));
+        }
+    }
+    Ok(None)
+}
+
+/// 按空白切分参数串，**尊重双引号**。
+///
+/// 版本 json 的 `minecraftArguments` 是一整串文本：`split_whitespace` 会把
+/// `--gameDir "C:\Program Files\x"` 切成三段。PCL 为此写了 `SplitJavaArguments`
+/// 状态机，这里只做它最小的一件事 —— 引号内外切换、引号内的 `\"` 还原。
+fn split_arguments(raw: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut touched = false;
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if in_quotes && chars.peek() == Some(&'"') => {
+                cur.push('"');
+                chars.next();
+                touched = true;
+            }
+            '"' => {
+                in_quotes = !in_quotes;
+                touched = true;
+            }
+            c if c.is_whitespace() && !in_quotes => {
+                if touched {
+                    out.push(std::mem::take(&mut cur));
+                    touched = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                touched = true;
+            }
+        }
+    }
+    if touched {
+        out.push(cur);
+    }
+    out
+}
+
+/// `["--tweakClass", "x.Foo", ...]` 里取 `x.Foo`。
+fn find_flag_value(tokens: &[String], flag: &str) -> Option<String> {
+    tokens
+        .iter()
+        .position(|t| t.eq_ignore_ascii_case(flag))
+        .and_then(|i| tokens.get(i + 1))
+        .cloned()
+}
+
+/// 游戏段里重复出现的 `--flag`。
+///
+/// 只查 `--` 开头的：`-Dfoo=1` 这类 JVM 属性重复是合法的（后者覆盖前者），
+/// 而 `--width`、`--uuid` 重复时 MC 通常只认第一个 —— 那正好是"改了却没生效"
+/// 的经典来源。PCL 的做法是拼接后统一去重（新值覆盖旧值），我们现阶段还没引入
+/// 模板拼接，所以先把"重复"这件事变成一条报错，等人决定以哪个为准。
+fn duplicate_flags(tokens: &[ArgToken]) -> Vec<String> {
+    let mut seen: Vec<&str> = Vec::new();
+    let mut dup: Vec<String> = Vec::new();
+    for t in tokens {
+        let s = t.text.as_str();
+        if !s.starts_with("--") {
+            continue;
+        }
+        if seen.iter().any(|x| x.eq_ignore_ascii_case(s)) {
+            if !dup.iter().any(|d| d.eq_ignore_ascii_case(s)) {
+                dup.push(s.to_owned());
+            }
+        } else {
+            seen.push(s);
+        }
+    }
+    dup
+}
+
+/// 类名 → jar 条目名：`a.b.C` → `a/b/C.class`。
+fn class_entry(class: &str) -> String {
+    let mut s = class.replace('.', "/");
+    s.push_str(".class");
+    s
+}
+
+struct ClassScan {
+    /// 扫遍 classpath 也没找到的类（原始类名）。
+    missing: Vec<String>,
+    /// 中央目录读不开的 jar（文件名）。它们不计入 missing —— 扫不到不等于不存在。
+    unreadable: Vec<String>,
+    /// 实际扫过的 jar 数。类在前几个 jar 就找到时会少于 classpath 长度，
+    /// 所以报"扫了 N 个"比报"classpath 有 N 项"诚实。
+    scanned: usize,
+}
+
+/// 在 classpath 的 jar 中央目录里找这些类，**不解压任何数据**。
+///
+/// 只读文件尾的 EOCD 和中央目录段，对 20 MB 的客户端 jar 也是几毫秒的事。
+fn locate_classes(classpath: &[PathBuf], wanted: &[&str]) -> ClassScan {
+    let mut pending: Vec<(String, String)> =
+        wanted.iter().map(|c| ((*c).to_owned(), class_entry(c))).collect();
+    let mut unreadable: Vec<String> = Vec::new();
+    let mut scanned = 0usize;
+    for jar in classpath {
+        if pending.is_empty() {
+            break;
+        }
+        scanned += 1;
+        match jar_entry_names(jar) {
+            Ok(names) => {
+                let set: std::collections::HashSet<&str> =
+                    names.iter().map(|s| s.as_str()).collect();
+                pending.retain(|(_, entry)| !set.contains(entry.as_str()));
+            }
+            Err(_) => unreadable.push(
+                jar.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| jar.display().to_string()),
+            ),
+        }
+    }
+    ClassScan { missing: pending.into_iter().map(|(c, _)| c).collect(), unreadable, scanned }
+}
+
+/// 前三个名字 + "等 N 个"。列表长了以后，报错信息本身会变得没人读。
+fn short_list(items: &[String]) -> String {
+    let head: Vec<&str> = items.iter().take(3).map(|s| s.as_str()).collect();
+    if items.len() > 3 {
+        format!("{} 等 {} 个", head.join("、"), items.len())
+    } else {
+        head.join("、")
+    }
+}
+
+const EOCD_SIG: u32 = 0x0605_4b50;
+const CENTRAL_SIG: u32 = 0x0201_4b50;
+
+/// jar（zip）中央目录里的文件名列表。
+fn jar_entry_names(path: &Path) -> Result<Vec<String>, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let len = f.metadata().map_err(|e| e.to_string())?.len();
+    if len < 22 {
+        return Err("文件短于 EOCD".to_owned());
+    }
+    let tail_len = len.min(66_000) as usize; // EOCD + 最长 65535 字节注释
+    let tail_start = len - tail_len as u64;
+    let mut tail = vec![0u8; tail_len];
+    f.seek(SeekFrom::Start(tail_start)).map_err(|e| e.to_string())?;
+    f.read_exact(&mut tail).map_err(|e| e.to_string())?;
+
+    let mut eocd: Option<usize> = None;
+    for i in (0..=tail_len - 22).rev() {
+        let sig = u32::from_le_bytes([tail[i], tail[i + 1], tail[i + 2], tail[i + 3]]);
+        if sig != EOCD_SIG {
+            continue;
+        }
+        let comment = u16::from_le_bytes([tail[i + 20], tail[i + 21]]) as usize;
+        if i + 22 + comment == tail_len {
+            eocd = Some(i);
+            break;
+        }
+    }
+    let Some(i) = eocd else { return Err("找不到中央目录结尾（不是 zip？）".to_owned()) };
+
+    let cd_size = u32::from_le_bytes([tail[i + 12], tail[i + 13], tail[i + 14], tail[i + 15]]) as u64;
+    let cd_off = u32::from_le_bytes([tail[i + 16], tail[i + 17], tail[i + 18], tail[i + 19]]) as u64;
+    if cd_off == u32::MAX as u64 || cd_size == u32::MAX as u64 {
+        return Err("zip64 暂不支持".to_owned());
+    }
+    if cd_off + cd_size > len {
+        return Err("中央目录越界".to_owned());
+    }
+
+    let cd: Vec<u8> = if cd_off >= tail_start {
+        let s = (cd_off - tail_start) as usize;
+        let e = (s + cd_size as usize).min(tail_len);
+        tail[s..e].to_vec()
+    } else {
+        let mut buf = vec![0u8; cd_size as usize];
+        f.seek(SeekFrom::Start(cd_off)).map_err(|e| e.to_string())?;
+        f.read_exact(&mut buf).map_err(|e| e.to_string())?;
+        buf
+    };
+    Ok(central_dir_names(&cd))
+}
+
+/// 解析中央目录段，取出每个条目的文件名。格式见 PKWARE APPNOTE 4.3.12。
+fn central_dir_names(cd: &[u8]) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut p = 0usize;
+    while p + 46 <= cd.len() {
+        let sig = u32::from_le_bytes([cd[p], cd[p + 1], cd[p + 2], cd[p + 3]]);
+        if sig != CENTRAL_SIG {
+            break;
+        }
+        let name_len = u16::from_le_bytes([cd[p + 28], cd[p + 29]]) as usize;
+        let extra_len = u16::from_le_bytes([cd[p + 30], cd[p + 31]]) as usize;
+        let comment_len = u16::from_le_bytes([cd[p + 32], cd[p + 33]]) as usize;
+        let start = p + 46;
+        let end = start + name_len;
+        if end > cd.len() {
+            break;
+        }
+        names.push(String::from_utf8_lossy(&cd[start..end]).replace('\\', "/"));
+        p = end + extra_len + comment_len;
+    }
+    names
+}
+
+
+/// 读 `versions\<version>\<version>.json`。
+///
+/// 单独一个函数是因为这份 json 现在被三处要用（classpath、asssetIndex/type、
+/// 主类与 tweaker），而它的读取失败信息必须一致 —— 三份各自的 "读不到" 只会让
+/// 人以为是三个不同的问题。
+fn read_version_json(client: &Path, version: &str) -> Result<(PathBuf, serde_json::Value), String> {
+    let vjson = client.join("versions").join(version).join(format!("{version}.json"));
+    let raw = std::fs::read_to_string(&vjson)
+        .map_err(|e| format!("读不到版本 json {}：{e}", vjson.display()))?;
+    let json: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("版本 json {} 解析失败：{e}", vjson.display()))?;
+    Ok((vjson, json))
+}
+
 /// 从 `versions\<version>\<version>.json` 拼 classpath。
 ///
 /// 三条从脚本时代继承下来的规则，一条都不能省：
@@ -427,13 +802,12 @@ fn quote(s: &str) -> String {
 ///    客户端根）—— 首版少 55 个 jar 就是这么来的；
 /// 2. 没有该字段时按 `group:artifact:version` 推导；
 /// 3. `rules` 有匹配项时看最后一条 `action`，没有匹配项就不进 classpath。
-fn build_classpath(client: &Path, version: &str) -> Result<(Vec<PathBuf>, Vec<String>), String> {
+fn build_classpath(
+    client: &Path,
+    version: &str,
+    json: &serde_json::Value,
+) -> Result<(Vec<PathBuf>, Vec<String>), String> {
     let vdir = client.join("versions").join(version);
-    let vjson = vdir.join(format!("{version}.json"));
-    let raw = std::fs::read_to_string(&vjson)
-        .map_err(|e| format!("读不到版本 json {}：{e}", vjson.display()))?;
-    let json: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("版本 json {} 解析失败：{e}", vjson.display()))?;
 
     let lib_root = client.join("libraries");
     let mut cp: Vec<PathBuf> = Vec::new();
@@ -533,7 +907,8 @@ impl InstanceSpec {
         let size = self.target_size(cfg);
         let version = &self.game.version;
 
-        let (cp, missing) = build_classpath(&client, version)?;
+        let (_vjson_path, json) = read_version_json(&client, version)?;
+        let (cp, missing) = build_classpath(&client, version, &json)?;
         if cp.is_empty() {
             return Err(format!(
                 "classpath 是空的（客户端 {} 下没有 versions\\{}\\）",
@@ -541,11 +916,6 @@ impl InstanceSpec {
                 version
             ));
         }
-        let vjson = client.join("versions").join(version).join(format!("{version}.json"));
-        let raw = std::fs::read_to_string(&vjson)
-            .map_err(|e| format!("读不到版本 json {}：{e}", vjson.display()))?;
-        let json: serde_json::Value = serde_json::from_str(&raw)
-            .map_err(|e| format!("版本 json {} 解析失败：{e}", vjson.display()))?;
         let asset_index = json
             .pointer("/assetIndex/id")
             .and_then(|v| v.as_str())
@@ -557,61 +927,149 @@ impl InstanceSpec {
             .unwrap_or("release")
             .to_owned();
 
+        // 主类与 tweaker 一律"实例没写就从 json 取"。以前这两个都在实例里抄了一遍，
+        // 而 json 里本来就有 —— 一个字段改错，表现是 javaw 秒退 + 一行
+        // `Could not find or load main class`，与"哪里写错了"毫无线索关联。
+        let (main_text, main_origin) = resolve_main_class(self, &json)?;
+        let tweak = resolve_tweak_class(self, &json)?;
+
         let cp_joined = cp
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect::<Vec<_>>()
             .join(";");
 
-        let mut args: Vec<String> = vec![
-            format!("-Xmx{}M", self.java.heap_mb),
-            "-Xms512M".to_owned(),
-            "-XX:+UseG1GC".to_owned(),
-            format!("-Djava.library.path={}", natives_dir(&client, version).display()),
-            "-Dfml.ignoreInvalidMinecraftCertificates=true".to_owned(),
-            "-Dfml.ignorePatchDiscrepancies=true".to_owned(),
+        let mut jvm: Vec<ArgToken> = vec![
+            ArgToken::builtin(format!("-Xmx{}M", self.java.heap_mb)),
+            ArgToken::builtin("-Xms512M"),
+            ArgToken::builtin("-XX:+UseG1GC"),
+            ArgToken::builtin(format!(
+                "-Djava.library.path={}",
+                natives_dir(&client, version).display()
+            )),
+            ArgToken::builtin("-Dfml.ignoreInvalidMinecraftCertificates=true"),
+            ArgToken::builtin("-Dfml.ignorePatchDiscrepancies=true"),
             // JVM 自己的崩溃日志也进 runtime，与游戏的 crash-report 放在一起，
             // 否则一个在 %TEMP%、一个在存档里，没人能同时找到。
-            format!("-XX:ErrorFile={}", paths.runtime().join("hs_err_%p.log").display()),
+            ArgToken::builtin(format!(
+                "-XX:ErrorFile={}",
+                paths.runtime().join("hs_err_%p.log").display()
+            )),
         ];
-        args.extend(self.java.jvm_args.iter().cloned());
+        jvm.extend(self.java.jvm_args.iter().cloned().map(ArgToken::instance));
+        jvm.push(ArgToken::builtin("-cp"));
+        // classpath 的内容来自版本 json 的 libraries，形状（`-cp` 与 `;`）是我们定的。
+        jvm.push(ArgToken::json(cp_joined));
 
-        args.push("-cp".to_owned());
-        args.push(cp_joined);
-        args.push(self.game.main_class.clone());
-        args.push("--username".to_owned());
-        args.push(self.game.player.clone());
-        args.push("--version".to_owned());
-        args.push(version.clone());
-        args.push("--gameDir".to_owned());
-        args.push(saves.to_string_lossy().into_owned());
-        args.push("--assetsDir".to_owned());
-        args.push(client.join("assets").to_string_lossy().into_owned());
-        args.push("--assetIndex".to_owned());
-        args.push(asset_index);
-        args.push("--uuid".to_owned());
-        args.push("00000000-0000-0000-0000-000000000000".to_owned());
-        args.push("--accessToken".to_owned());
-        args.push("0".to_owned());
-        args.push("--userType".to_owned());
-        args.push("legacy".to_owned());
-        args.push("--versionType".to_owned());
-        args.push(version_type);
+        let mut game: Vec<ArgToken> = Vec::new();
+        game.push(ArgToken::builtin("--username"));
+        game.push(ArgToken::instance(self.game.player.clone()));
+        game.push(ArgToken::builtin("--version"));
+        game.push(ArgToken::json(version.clone()));
+        game.push(ArgToken::builtin("--gameDir"));
+        game.push(ArgToken::instance(saves.to_string_lossy().into_owned()));
+        game.push(ArgToken::builtin("--assetsDir"));
+        game.push(ArgToken::builtin(
+            client.join("assets").to_string_lossy().into_owned(),
+        ));
+        game.push(ArgToken::builtin("--assetIndex"));
+        game.push(ArgToken::json(asset_index));
+        game.push(ArgToken::builtin("--uuid"));
+        game.push(ArgToken::builtin("00000000-0000-0000-0000-000000000000"));
+        game.push(ArgToken::builtin("--accessToken"));
+        game.push(ArgToken::builtin("0"));
+        game.push(ArgToken::builtin("--userType"));
+        game.push(ArgToken::builtin("legacy"));
+        game.push(ArgToken::builtin("--versionType"));
+        game.push(ArgToken::json(version_type));
         // 窗口尺寸走 MC 自己的参数（1.12.2 的 Main 认 --width/--height），
         // 全屏则只能靠 options.txt，见 write_options。
-        args.push("--width".to_owned());
-        args.push(size.0.to_string());
-        args.push("--height".to_owned());
-        args.push(size.1.to_string());
-        if let Some(tweak) = self.game.tweak_class.as_deref() {
-            if !tweak.trim().is_empty() {
-                args.push("--tweakClass".to_owned());
-                args.push(tweak.to_owned());
+        game.push(ArgToken::builtin("--width"));
+        game.push(ArgToken::builtin(size.0.to_string()));
+        game.push(ArgToken::builtin("--height"));
+        game.push(ArgToken::builtin(size.1.to_string()));
+        if let Some((text, origin)) = tweak.clone() {
+            game.push(ArgToken::builtin("--tweakClass"));
+            game.push(ArgToken { text, origin });
+        }
+        game.extend(self.game.game_args.iter().cloned().map(ArgToken::instance));
+
+        // ---- 启动前的三条校验 -------------------------------------------
+        // 都是"几分钟就能查、但错过了要花半小时"的错，所以宁可在这里拒绝启动。
+        let mut checks: Vec<String> = Vec::new();
+
+        // 1) 占位符残留。我们没有模板引擎，参数里出现 `${...}` 说明有人把版本 json
+        //    的模板串直接写进了 game_args，或者将来模板化时漏了某一项。
+        for t in jvm.iter().chain(game.iter()) {
+            if t.text.contains("${") {
+                return Err(format!(
+                    "启动参数里残留未展开的占位符 {:?}（来源：{}）—— 这不是 java 能认的写法",
+                    t.text,
+                    t.origin.label()
+                ));
             }
         }
-        args.extend(self.game.game_args.iter().cloned());
 
-        Ok(LaunchPlan { java, cwd: client, args, size, model: self.display.model, missing })
+        // 2) 游戏段重复的 `--flag`。MC 的 main 通常取第一个出现的值，于是"改了
+        //    却没生效"是这里最典型的症状（PCL 在拼接后专门做一遍去重，就是为这个）。
+        let dups = duplicate_flags(&game);
+        if !dups.is_empty() {
+            return Err(format!(
+                "游戏参数里出现了重复的键：{}。MC 一般只认第一个，另一次会静默失效",
+                dups.join("、")
+            ));
+        }
+        checks.push(format!(
+            "args: {} 个 jvm / {} 个 game token，无重复键、无占位符残留",
+            jvm.len(),
+            game.len()
+        ));
+
+        // 3) 主类与 tweaker 必须真的在 classpath 里。
+        if self.java.verify_classes {
+            let mut wanted: Vec<&str> = vec![main_text.as_str()];
+            if let Some((text, _)) = tweak.as_ref() {
+                wanted.push(text.as_str());
+            }
+            let found = locate_classes(&cp, &wanted);
+            if !found.missing.is_empty() {
+                // 读不开的 jar 单独点出来：这类失败最常见的两种原因是"类名写错"
+                // 与"扫描器读不懂这个 jar"，而它们的处置完全相反。
+                let tail = if found.unreadable.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "；另有 {} 个 jar 读不开（{}），扫不到不等于不存在",
+                        found.unreadable.len(),
+                        short_list(&found.unreadable)
+                    )
+                };
+                return Err(format!(
+                    "classpath 里找不到 {}（扫了 {} 个 jar{tail}）。\
+                     确认 versions/{version}.json 的 mainClass 与实例里的 game.main_class 是否写错；\
+                     确实无法扫描时把实例里的 java.verify_classes 设为 false",
+                    found.missing.join("、"),
+                    found.scanned
+                ));
+            }
+            checks.push(format!(
+                "classes: {} 个类都在 classpath 里（扫了 {} 个 jar）",
+                wanted.len(),
+                found.scanned
+            ));
+        }
+
+        Ok(LaunchPlan {
+            java,
+            cwd: client,
+            jvm,
+            main_class: ArgToken { text: main_text, origin: main_origin },
+            game,
+            size,
+            model: self.display.model,
+            missing,
+            checks,
+        })
     }
 
     /// 把窗口形态与尺寸写进 `options.txt`。
@@ -700,11 +1158,12 @@ pub fn example_instance(id: &str) -> InstanceSpec {
     }
 }
 
-/// `--print-game` 的正文：生效实例 + 拼出来的那一条命令行。
+/// `--print-game` 的正文：生效实例 + 分段参数 + 那一条完整命令行。
 ///
-/// 为什么单独一个人读的格式而不是 JSON：这个输出最常见的用途是"贴到别处比对"
-/// —— 与 `toolchain\start-mc.ps1` 拼的那条、与上一次启动 `runtime\cmdline.txt`
-/// 里的那条。三行注释 + 一行命令，能一眼看出差在哪。
+/// 为什么不是 JSON：这个输出最常见的用途是"贴到别处比对"—— 与
+/// `toolchain\start-mc.ps1` 拼的那条、与上一次启动 `runtime\cmdline.txt` 里的那条、
+/// 以及与改坏之前的那一次。分段的 `builtin / json / instance` 三列回答的是
+/// "这个参数是谁写的"，比一整行命令少一半猜的时间。最后仍然给一整行，方便复制。
 pub fn report(cfg: &Config) -> Result<String, String> {
     let paths = Paths::resolve(cfg)?;
     let spec = InstanceSpec::load(&paths, &cfg.game_instance)?;
@@ -723,9 +1182,16 @@ pub fn report(cfg: &Config) -> Result<String, String> {
         "# display    : {}x{} {:?}\n",
         plan.size.0, plan.size.1, plan.model
     ));
+    out.push_str(&format!("# main       : {}\n", plan.main_class.text));
+    for c in &plan.checks {
+        out.push_str(&format!("# check      : {c}\n"));
+    }
     if !plan.missing.is_empty() {
         out.push_str(&format!("# missing    : {:?}\n", plan.missing));
     }
+    out.push('\n');
+    out.push_str(&plan.render_annotated());
+    out.push_str("\ncommand\n");
     out.push_str(&plan.render());
     out.push('\n');
     Ok(out)
@@ -807,5 +1273,130 @@ mod tests {
     fn quote_only_when_needed() {
         assert_eq!(quote("abc"), "abc");
         assert_eq!(quote(r"C:\Program Files\x"), r#""C:\Program Files\x""#);
+    }
+
+    #[test]
+    fn split_arguments_respects_quotes() {
+        let tokens = split_arguments(r#"--gameDir "C:\Program Files\x" --width 1280"#);
+        assert_eq!(
+            tokens,
+            vec!["--gameDir", r"C:\Program Files\x", "--width", "1280"],
+            "引号内的空格不能拆开"
+        );
+        // 空串参数（`""`）必须留下一个空 token，否则位置参数会整体左移。
+        assert_eq!(split_arguments(r#"--opt "" --x"#), vec!["--opt", "", "--x"]);
+        // 引号内的 \" 还原成 "
+        assert_eq!(split_arguments(r#""a\"b""#), vec![r#"a"b"#]);
+        assert!(split_arguments("   ").is_empty());
+    }
+
+    #[test]
+    fn find_flag_value_takes_the_next_token() {
+        let toks: Vec<String> =
+            ["--a", "1", "--tweakClass", "x.Y"].iter().map(|s| (*s).to_owned()).collect();
+        assert_eq!(find_flag_value(&toks, "--tweakClass").as_deref(), Some("x.Y"));
+        assert_eq!(find_flag_value(&toks, "--missing"), None);
+        // flag 在末尾时没有值可取，必须是 None 而不是越界 panic。
+        assert_eq!(find_flag_value(&toks[3..], "--tweakClass"), None);
+    }
+
+    #[test]
+    fn duplicate_flags_only_counts_double_dash() {
+        let toks = vec![
+            ArgToken::builtin("--width"),
+            ArgToken::builtin("1280"),
+            ArgToken::builtin("-Dfoo=1"),
+            ArgToken::builtin("-Dfoo=2"),
+            ArgToken::builtin("--width"),
+            ArgToken::builtin("1920"),
+        ];
+        assert_eq!(duplicate_flags(&toks), vec!["--width"]);
+        // 只有值、没有键时不该报。
+        let ok = vec![ArgToken::builtin("--a"), ArgToken::builtin("--b")];
+        assert!(duplicate_flags(&ok).is_empty());
+    }
+
+    #[test]
+    fn central_dir_reads_entry_names() {
+        fn entry(name: &str) -> Vec<u8> {
+            let mut v = vec![0u8; 46];
+            v[0..4].copy_from_slice(&CENTRAL_SIG.to_le_bytes());
+            v[28..30].copy_from_slice(&(name.len() as u16).to_le_bytes());
+            v.extend_from_slice(name.as_bytes());
+            v
+        }
+        let mut cd = entry("net/minecraft/launchwrapper/Launch.class");
+        cd.extend(entry("META-INF/MANIFEST.MF"));
+        assert_eq!(
+            central_dir_names(&cd),
+            vec![
+                "net/minecraft/launchwrapper/Launch.class".to_owned(),
+                "META-INF/MANIFEST.MF".to_owned()
+            ]
+        );
+        assert!(central_dir_names(&[]).is_empty());
+        assert!(central_dir_names(&[0u8; 46]).is_empty(), "签名不对时不能瞎读");
+    }
+
+    #[test]
+    fn main_class_prefers_the_instance_override() {
+        let mut spec = example_instance("x");
+        let json = serde_json::json!({ "mainClass": "net.minecraft.launchwrapper.Launch" });
+
+        let (text, origin) = resolve_main_class(&spec, &json).expect("json 里有");
+        assert_eq!(text, "net.minecraft.launchwrapper.Launch");
+        assert_eq!(origin, ArgOrigin::Json);
+
+        spec.game.main_class = Some("custom.Main".to_owned());
+        let (text, origin) = resolve_main_class(&spec, &json).expect("实例覆盖");
+        assert_eq!(text, "custom.Main");
+        assert_eq!(origin, ArgOrigin::Instance);
+
+        // 空白覆盖视为没写 —— 空的 `""` 是最容易在 JSON 里手滑出来的值。
+        spec.game.main_class = Some("   ".to_owned());
+        assert_eq!(resolve_main_class(&spec, &json).expect("回退 json").1, ArgOrigin::Json);
+
+        // 两边都没有：必须报错，而不是给一个猜的值。
+        spec.game.main_class = None;
+        assert!(resolve_main_class(&spec, &serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn tweak_class_comes_from_the_template() {
+        let mut spec = example_instance("x");
+        // 旧式：minecraftArguments 一整串
+        let old = serde_json::json!({
+            "minecraftArguments": "--username ${auth_player_name} --tweakClass net.minecraftforge.fml.common.launcher.FMLTweaker --versionType Forge"
+        });
+        assert_eq!(
+            resolve_tweak_class(&spec, &old).expect("应当能取到"),
+            Some((
+                "net.minecraftforge.fml.common.launcher.FMLTweaker".to_owned(),
+                ArgOrigin::Json
+            ))
+        );
+
+        // 新式：arguments.game 数组
+        let new = serde_json::json!({ "arguments": { "game": ["--tweakClass", "optifine.OptiFineTweaker"] } });
+        assert_eq!(
+            resolve_tweak_class(&spec, &new).expect("应当能取到"),
+            Some(("optifine.OptiFineTweaker".to_owned(), ArgOrigin::Json))
+        );
+
+        // 原版 json 没有 tweaker，应当返回 None 而不是报错。
+        assert_eq!(resolve_tweak_class(&spec, &serde_json::json!({})).expect("没有就是没有"), None);
+
+        // 实例覆盖优先
+        spec.game.tweak_class = Some("my.Tweaker".to_owned());
+        assert_eq!(
+            resolve_tweak_class(&spec, &old).expect("覆盖"),
+            Some(("my.Tweaker".to_owned(), ArgOrigin::Instance))
+        );
+    }
+
+    #[test]
+    fn class_entry_uses_slash_and_suffix() {
+        assert_eq!(class_entry("a.b.C"), "a/b/C.class");
+        assert_eq!(class_entry("Launch"), "Launch.class");
     }
 }

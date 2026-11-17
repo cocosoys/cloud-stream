@@ -39,16 +39,20 @@ classpath 走。** 第一次把 `gameDir` 挪到 `saves\default` 后，游戏只
   "name": "Minecraft 1.12.2 Forge",
   "client_dir": "C:\\Users\\Admin\\Desktop\\.minecraft",  // 绝对或相对 games 根
   "saves_dir": "saves\\default",
-  "java": { "path": "C:\\mc\\jre8\\bin\\javaw.exe", "heap_mb": 2048, "jvm_args": [] },
+  "java": { "path": "C:\\mc\\jre8\\bin\\javaw.exe", "heap_mb": 2048,
+            "jvm_args": [], "verify_classes": true },
   "game": { "version": "1.12.2-Forge_14.23.5.2864",
-            "main_class": "net.minecraft.launchwrapper.Launch",
-            "tweak_class": "net.minecraftforge.fml.common.launcher.FMLTweaker",
             "player": "CloudPlayer", "game_args": [] },
   "display": { "model": "windowed", "width": 0, "height": 0, "x": 0, "y": 0 },
   "lifecycle": { "stop_timeout_sec": 15, "restart_max": 0, "restart_backoff_sec": 5 }
 }
 ```
 
+* `game.main_class` / `game.tweak_class` **不写是常态**：留空时分别从版本 json 的
+  `mainClass` 与参数模板里的 `--tweakClass` 取。只在"确实要偏离 json"时才写（自定义
+  包装启动器）。见 §十。
+* `java.verify_classes`（默认 `true`）：启动前扫一遍 classpath 的 jar 中央目录，确认
+  主类与 tweaker 真的在里面。关掉它回到"java 自己报错"的老路。
 * `display.width/height = 0` 表示**跟随串流分辨率**（`config.width/height`）。采集和
   游戏用同一对数，编码前不会多一次缩放。
 * `display.model`：`exclusive`（写 `options.txt: fullscreen:true`）或 `windowed`。
@@ -211,4 +215,104 @@ ssh mc-150 'cd /d "C:\Program Files\cloud-stream" && ren selkies-web.bak selkies
    `<base>\stream`，与安装器实际的 `C:\Program Files\cloud-stream` 不一致。这一轮的部署
    是手工做的，这个脚本该修，否则下次还会绕开它。
 4. 客户端从桌面迁到 `games\clients\`（1.5 GB，动 `Desktop\.minecraft`，等用户确认）。
+
+## 十、参数来源与启动前校验（E + A）
+
+### 起因：改一个参数就起不来
+
+老的 `plan()` 把 1.12.2 的那串参数一条条 `push` 进 `Vec<String>`，同时实例文件里也写着
+`main_class` 与 `tweak_class`。而版本 json 里这两样**本来就有**：
+
+```
+1.12.2-Forge_14.23.5.2864.json
+  mainClass          = net.minecraft.launchwrapper.Launch
+  minecraftArguments = --username ${auth_player_name} … --versionType ${version_type}
+                       --tweakClass net.minecraftforge.fml.common.launcher.FMLTweaker
+```
+
+同一件事存两处，任一处抄错一个字母，`javaw` 只会回一句
+`Could not find or load main class`，与"哪个字段写错了"毫无关联。这就是"改一个参数
+就启动失败"的具体形态。
+
+### 参考 PCL2（`ModLaunch.vb`）
+
+| 机制 | PCL2 的做法 | 我们原来的做法 |
+|---|---|---|
+| 参数来源 | 旧版读 `minecraftArguments`，1.13+ 读 `arguments.game` / `arguments.jvm` | 全硬编码 |
+| 占位符 | 二十余个 `${…}`，`${classpath}`、`${natives_directory}`、`${resolution_width}`… | 无 |
+| 继承 | `InheritName` 向上逐级追加参数与库 | 只看单层 json |
+| 规则 | `McJsonRuleCheck` 统一过滤（含 `features`） | 只认 `os.name` / `os.arch` |
+| 去重 | 拼接后统一去重：游戏参数**新值覆盖旧值**，JVM 与 `--tweakClass` 保留旧值 | 无 |
+| natives | 遍历 `IsNatives` 的库，只解 `.dll`，被占用则中止 | 不解压，靠预先铺好的目录 |
+
+最值得抄的是**去重**：PCL 敢把 `--height/--width` 直接追加到模板后面，正是因为后出现的
+重复键会覆盖前面的 —— "改窗口尺寸"这件事永远不需要动模板。
+
+### 这一轮做了什么（E + A）
+
+**A. 消除双写。** `main_class` / `tweak_class` 变成可选覆盖：
+
+- 留空 → 主类取 json 的 `mainClass`；
+- 留空 → tweaker 从 json 的参数模板里取 `--tweakClass` 的值（旧式 `minecraftArguments`
+  按引号感知的规则切分后取，新式 `arguments.game` 数组也认）；
+- 写了 → 以实例为准，来源标 `instance`。
+
+**E. 让"改坏了"在启动前就能看见。**
+
+`--print-game` 现在分三段输出，每个 token 标来源（`builtin` / `json` / `instance`）：
+
+```
+# check      : args: 9 个 jvm / 24 个 game token，无重复键、无占位符残留
+# check      : classes: 2 个类都在 classpath 里（扫了 55 个 jar）
+
+jvm (9 token)
+  builtin  -Xmx2048M
+  …
+  json     C:\Users\Admin\Desktop\.minecraft\libraries\…
+main
+  json     net.minecraft.launchwrapper.Launch
+game (24 token)
+  builtin  --username
+  instance CloudPlayer
+  …
+  builtin  --tweakClass
+  json     net.minecraftforge.fml.common.launcher.FMLTweaker
+
+command
+<一整行，可直接复制比对>
+```
+
+三条校验，任一不过就拒绝启动而不是等 `javaw` 秒退：
+
+1. **占位符残留** —— 参数里出现 `${…}` 说明有人把模板串写进了 `game_args`。
+2. **重复的 `--flag`** —— MC 一般只认第一个，重复是"改了却没生效"的经典来源。
+3. **主类 / tweaker 真的在 classpath 里** —— 读 jar 的中央目录（不解压），
+   扫不到就报错并点出"扫了几个 jar、哪些 jar 读不开"。可用
+   `java.verify_classes: false` 关掉。
+
+### 实测（`.128`，2026-11-17 16:20）
+
+| 场景 | 结果 |
+|---|---|
+| 实例写着 `main_class` / `tweak_class` | `--print-game` 标 `instance`，起停正常（1.4 s） |
+| 删掉这两个字段后 | 来源变 `json`，`# main` 与 `command` 行**逐字不变** |
+| 真实启动（去双写） | 202，pid 3696，11 s 后窗口 `LWJGL 1936×1100 @0,0` |
+| 把主类改成 `…LaunchTypo` | 启动前报错：`classpath 里找不到 …LaunchTypo（扫了 55 个 jar；另有 5 个 jar 读不开（scala-continuations-library…、… 等 5 个））` |
+| 单测 | 480 通过（新增 7：切分 / 取值 / 重复键 / 中央目录 / 主类与 tweaker 解析） |
+
+**顺手查出一个真实隐患**：那 5 个"读不开"的 jar 是 `scala-continuations-*`、
+`scala-parser-combinators-*`、`scala-xml-*` 等，**每个只有 689 字节** —— 内容是下载失败
+留下的错误页，不是 zip。1.12.2 跑 Forge 时并不加载它们，所以游戏一直能起；但它们确实是
+坏文件，将来若某个 mod 用到 Scala 才会以"类找不到"的形式暴露。来源是整合包自带的
+`libraries`，本服务不做资源下载，所以这里只记录、不自动修。
+
+### 还没做（B / C / D）
+
+- **B. 游戏参数模板化**：`minecraftArguments` / `arguments.game` 整体接管，加占位符
+  替换与 PCL 那套去重。做完之后 `--width` 就变成"追加进去让去重覆盖"。
+- **C. `arguments.jvm` 与 `inheritsFrom`**：官方 installer 生成的 Forge json 是
+  `inheritsFrom` 形式，`build_classpath` 只看单层会缺库。这台的实例是合并式 json
+  （61 库、无 `inheritsFrom`）才没炸 —— 是埋着的雷。
+- **D. natives 自动解压**：现在是"目录存在就用"，靠预先铺好的 `natives-tmp`。
+
 

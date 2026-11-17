@@ -154,12 +154,16 @@ impl GameHost {
             plan.size.1,
             plan.model
         );
+        for line in &plan.checks {
+            log::info!("game: {line}");
+        }
         if !plan.missing.is_empty() {
             log::warn!("game: classpath 缺 {} 项：{:?}", plan.missing.len(), plan.missing);
         }
 
+        let args = plan.args();
         let child = Command::new(&plan.java)
-            .args(&plan.args)
+            .args(&args)
             .current_dir(&plan.cwd)
             // 子进程的 stdio 全部指向 NUL：游戏自己写 logs\latest.log，而父进程
             // 是 GUI 子系统，把句柄传下去只会多一条没人读的管道。
