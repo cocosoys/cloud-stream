@@ -775,6 +775,7 @@ pub async fn handle_health<S>(
     pipelines: &crate::pipeline::PipelineRegistry,
     probe: &HealthProbe,
     principal: &crate::security::Principal,
+    game: Option<&std::sync::Arc<crate::game::GameHost>>,
 ) -> std::io::Result<()>
 where
     S: AsyncWrite + Unpin,
@@ -787,6 +788,18 @@ where
     let sessions = visible_sessions(all, principal);
     let programs = pipelines.all().await;
     let (healthy, mut payload) = build(cfg, probe, &sample, &sessions, &programs);
+    // 游戏托管的状态。没启用时给 `{"enabled": false}` 而不是省略这个键：
+    // "这台机器没配游戏"与"这个版本还不知道游戏"是两件事，页面上要能区分。
+    let game_payload = match game {
+        Some(host) => {
+            let mut v = json!(host.status().await);
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("enabled".to_owned(), json!(true));
+            }
+            v
+        }
+        None => json!({ "enabled": false }),
+    };
     // #102: admission is injected here rather than threaded into `build`, for
     // two reasons. It describes "will this host take another viewer", not "how
     // is the stream doing" — a different question that belongs next to `ok`
@@ -808,6 +821,7 @@ where
                 "hidden_clients": total.saturating_sub(sessions.len()),
             }),
         );
+        object.insert("game".to_owned(), game_payload);
     }
     let body = payload.to_string();
     let (status, text) = if healthy { (200u16, "OK") } else { (503u16, "Service Unavailable") };
@@ -830,11 +844,98 @@ pub async fn handle_control<S>(
     action: &str,
     registry: &crate::signaling::SessionRegistry,
     pipelines: &crate::pipeline::PipelineRegistry,
-    _cfg: &Config,
+    cfg: &Config,
+    game: Option<&std::sync::Arc<crate::game::GameHost>>,
 ) -> std::io::Result<()>
 where
     S: AsyncWrite + Unpin,
 {
+    // 游戏托管：三个动作。
+    //
+    // 没启用时统一 404（而不是 200 + `state=stopped`）：一个不做游戏托管的部署
+    // 里，"启动成功"会让人以为游戏在起，而屏幕上什么都不会发生 —— 这个项目
+    // 最贵的一类故障就是"控制成功了，世界没变"。
+    if action.starts_with("game/") {
+        let Some(host) = game else {
+            return json_reply(stream, 404, "Not Found", json!({
+                "ok": false,
+                "action": action,
+                "error": "game hosting is disabled; enable it with --game (or game = true)",
+            }))
+            .await;
+        };
+        return match action {
+            "game/start" => match host.start(cfg).await {
+                Ok(status) => {
+                    json_reply(stream, 202, "Accepted", json!({
+                        "ok": true,
+                        "action": "game/start",
+                        "game": status,
+                    }))
+                    .await
+                }
+                // 409：已经在跑（或者上一次还没退干净）。这是"状态不对"，不是
+                // "服务器坏了"，客户端该读 `game.state` 而不是重试。
+                Err(err) => {
+                    json_reply(stream, 409, "Conflict", json!({
+                        "ok": false,
+                        "action": "game/start",
+                        "error": err,
+                        "game": host.status().await,
+                    }))
+                    .await
+                }
+            },
+            "game/stop" => match host.stop().await {
+                Ok(status) => {
+                    json_reply(stream, 200, "OK", json!({
+                        "ok": true,
+                        "action": "game/stop",
+                        "game": status,
+                    }))
+                    .await
+                }
+                Err(err) => {
+                    json_reply(stream, 409, "Conflict", json!({
+                        "ok": false,
+                        "action": "game/stop",
+                        "error": err,
+                        "game": host.status().await,
+                    }))
+                    .await
+                }
+            },
+            "game/restart" => match host.restart(cfg).await {
+                Ok(status) => {
+                    json_reply(stream, 202, "Accepted", json!({
+                        "ok": true,
+                        "action": "game/restart",
+                        "game": status,
+                    }))
+                    .await
+                }
+                Err(err) => {
+                    json_reply(stream, 409, "Conflict", json!({
+                        "ok": false,
+                        "action": "game/restart",
+                        "error": err,
+                        "game": host.status().await,
+                    }))
+                    .await
+                }
+            },
+            other => {
+                json_reply(stream, 404, "Not Found", json!({
+                    "ok": false,
+                    "error": "unknown game action",
+                    "action": other,
+                    "known": ["game/start", "game/stop", "game/restart"],
+                }))
+                .await
+            }
+        };
+    }
+
     match action {
         // #101: every program is restarted, not just "the" pipeline — the
         // operator asking for a capture restart wants the picture back on every
@@ -973,7 +1074,8 @@ where
                 "ok": false,
                 "error": "unknown control action",
                 "action": other,
-                "known": ["capture/restart", "session/kick", "session/kick/<id>", "session/take/<id>"],
+                "known": ["capture/restart", "session/kick", "session/kick/<id>", "session/take/<id>",
+                          "game/start", "game/stop", "game/restart"],
             }))
             .await
         }
@@ -1317,10 +1419,28 @@ mod tests {
             &crate::signaling::SessionRegistry::default(),
             &crate::pipeline::PipelineRegistry::default(),
             &cfg(),
+            None,
         )
         .await
         .expect("a Vec is an infallible writer");
         String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// 没启用游戏托管时，`game/*` 必须是 404。
+    ///
+    /// 为什么这条值得一个测试：这类端点的坏结局不是报错，而是**返回 200 然后
+    /// 什么都没发生**。页面上"启动游戏"按下去转一圈变回原样，运维会去查网络、
+    /// 查串流、查被控机 —— 而真正的原因是这台机器根本没配 `--game`。
+    #[tokio::test]
+    async fn game_control_is_404_when_hosting_disabled() {
+        for action in ["game/start", "game/stop", "game/restart"] {
+            let text = control(action).await;
+            assert!(text.contains("404"), "{action} 应当是 404：{text}");
+            assert!(text.contains("disabled"), "{action} 要说清原因：{text}");
+        }
+        // 拼错的子动作也必须 404，而不是被当成 `game/*` 里的合法动作。
+        let text = control("game/stat").await;
+        assert!(text.contains("404"), "got: {text}");
     }
 
     /// `session/kick/2x` 必须是 400，而不是"解析失败 → 踢掉所有人"。

@@ -209,11 +209,12 @@ async fn handle_connection<S>(
     chunks: file_transfer::ChunkStore,
     health: crate::http::HealthProbe,
     peer: std::net::IpAddr,
+    game: Option<Arc<crate::game::GameHost>>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     if let Err(err) = handle_inner(
-        stream, cfg, registry, admission, pipelines, chunks, health, peer,
+        stream, cfg, registry, admission, pipelines, chunks, health, peer, game,
     )
     .await
     {
@@ -230,6 +231,7 @@ async fn handle_inner<S>(
     chunks: file_transfer::ChunkStore,
     health: crate::http::HealthProbe,
     peer: std::net::IpAddr,
+    game: Option<Arc<crate::game::GameHost>>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -374,6 +376,7 @@ where
                 &registry,
                 &pipelines,
                 &cfg,
+                game.as_ref(),
             )
             .await;
             return Ok(());
@@ -459,6 +462,7 @@ where
                 &health,
                 // #110: 谁在问，决定报多少。
                 &principal,
+                game.as_ref(),
             )
             .await;
             return Ok(());
@@ -845,6 +849,40 @@ pub async fn serve(cfg: Arc<Config>) -> Result<()> {
     }
 
     let registry = SessionRegistry::default();
+
+    // 游戏托管：实例在服务起来时载入一次。
+    //
+    // 载入失败**不拖垮服务** —— 串流本身还能用，页面上还能看到 `/api/v1/health`
+    // 里那句话。把"实例 json 少了个字段"升级成"整个被控端不上线"，是让一个
+    // 配置错误变成一次停机。
+    let game = if cfg.game_enabled {
+        match crate::game::GameHost::new(&cfg) {
+            Ok(host) => {
+                log::info!("game: hosting instance {:?}", host.instance_id());
+                Some(host)
+            }
+            Err(err) => {
+                log::error!("game: 托管已启用，但实例载入失败：{err}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // autostart：后台起，不挡监听循环。游戏要几十秒才到主菜单，而端口现在就该
+    // 能应答 —— 部署脚本的健康检查不会等它。
+    if let Some(host) = game.clone() {
+        if cfg.game_autostart {
+            let cfg_for_game = cfg.clone();
+            tokio::spawn(async move {
+                match host.start(&cfg_for_game).await {
+                    Ok(status) => log::info!("game: autostart ok pid={:?}", status.pid),
+                    Err(err) => log::error!("game: autostart failed: {err}"),
+                }
+            });
+        }
+    }
     // #102: how many sessions may hold the stream at once. One shared encoder
     // means "one more viewer" is not free — it costs a packetizer pass and a
     // full copy of the bitrate — so the bound exists to protect the people
@@ -871,6 +909,7 @@ pub async fn serve(cfg: Arc<Config>) -> Result<()> {
                 let pipelines = pipelines.clone();
                 let chunks = chunks.clone();
                 let health = health.clone();
+                let game = game.clone();
                 match &acceptor {
                     Some(_) => {
                         // TlsAcceptor wraps an Arc<ServerConfig>; clone it into
@@ -882,7 +921,7 @@ pub async fn serve(cfg: Arc<Config>) -> Result<()> {
                                 Ok(tls) => {
                                     handle_connection(
                                         tls, cfg, registry, admission, pipelines, chunks, health,
-                                        peer.ip(),
+                                        peer.ip(), game,
                                     )
                                     .await
                                 }
@@ -896,7 +935,7 @@ pub async fn serve(cfg: Arc<Config>) -> Result<()> {
                         tokio::spawn(async move {
                             handle_connection(
                                 stream, cfg, registry, admission, pipelines, chunks, health,
-                                peer.ip(),
+                                peer.ip(), game,
                             )
                             .await;
                         });

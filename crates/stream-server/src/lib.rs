@@ -45,6 +45,7 @@ pub mod configedit;
 pub mod configfile;
 pub mod diagnose;
 pub mod dispatch;
+pub mod game;
 pub mod http;
 pub mod ops;
 pub mod pipeline;

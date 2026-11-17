@@ -317,6 +317,40 @@ pub struct Config {
     /// tuning helped" from "the machine was busier". Live encoders keep what
     /// they were opened with. See `pipeline::encoder::tuning`.
     pub tune: String,
+
+    /// 游戏托管：本进程要不要负责"把游戏客户端拉起来并看着它"。
+    ///
+    /// 关掉时所有游戏端点都答 404（不是 200 + 空状态）：一个没启用游戏托管的
+    /// 部署里，`POST /api/v1/control/game/start` 成功返回会让人以为游戏在起，
+    /// 而屏幕上什么都不会发生。见 [`crate::game`]。
+    pub game_enabled: bool,
+
+    /// 游戏托管：默认实例 id —— 对应 `<game_root>\instances\<id>.json`。
+    ///
+    /// 实例而不是路径：一台机器可以有多个客户端/多个存档，切换的动作应该是
+    /// "改一个字段"，不是"删了重配"。命令行 `--game-instance` 在单次启动里赢。
+    pub game_instance: String,
+
+    /// 游戏托管：`games` 根目录。
+    ///
+    /// **默认相对 exe 所在目录**（[`crate::run::root`]），不是相对工作目录 ——
+    /// 计划任务拉起时 cwd 由任务本身决定，谁也不能保证。`dist` 当初选相对
+    /// cwd 是因为它跟着包走；这里选了另一半：游戏目录里有存档，不能因为
+    /// 某人从别的目录敲了一次 exe 就"找不到世界了"。
+    pub game_root: Option<PathBuf>,
+
+    /// 游戏托管：服务起来时顺手把游戏也拉起来。
+    ///
+    /// 默认关。默认开会让"只想看串流、不想动桌面"的部署凭空多一个全屏窗口，
+    /// 而这个窗口正好盖住要串流的桌面 —— 那是一种很贵的惊喜。
+    pub game_autostart: bool,
+
+    /// 一次性动作：把生效的游戏实例与拼出来的启动命令行打到 stdout，然后退出。
+    ///
+    /// 与 `--print-config` 同一个理由：三十二个参数 + 一份实例 json 拼出来的
+    /// 那一条命令行，没人能凭记忆复述。运维要能"看一眼，然后复制到别处比对"。
+    /// 刻意不进 `--print-config` 的输出（那是配置本体），也不从文件读。
+    pub print_game: bool,
 }
 
 impl Default for Config {
@@ -383,6 +417,11 @@ impl Default for Config {
             max_sessions: 8,
             mic_device: "auto".to_owned(),
             mic_default_device: "auto".to_owned(),
+            game_enabled: false,
+            game_instance: "default".to_owned(),
+            game_root: None,
+            game_autostart: false,
+            print_game: false,
         }
     }
 }
@@ -753,6 +792,32 @@ impl Config {
                         }
                     }
                 }
+                // 游戏托管。四个开关都刻意做成"`--game` 开、`--no-game` 关"以外
+                // 的单值形式：游戏是一个**有状态**的对象（进程、窗口、存档），
+                // 拼错一个字母时"什么都没发生"比"起了一个不该起的窗口"好排查。
+                "--game" => cfg.game_enabled = true,
+                "--no-game" => cfg.game_enabled = false,
+                "--game-instance" => {
+                    if let Some(v) = iter.next() {
+                        if v.trim().is_empty() {
+                            log::warn!("--game-instance needs a non-empty id");
+                        } else {
+                            cfg.game_instance = v.trim().to_owned();
+                        }
+                    }
+                }
+                "--game-root" => {
+                    if let Some(v) = iter.next() {
+                        if v.is_empty() {
+                            cfg.game_root = None;
+                        } else {
+                            cfg.game_root = Some(PathBuf::from(v));
+                        }
+                    }
+                }
+                "--game-autostart" => cfg.game_autostart = true,
+                "--no-game-autostart" => cfg.game_autostart = false,
+                "--print-game" => cfg.print_game = true,
                 // 值已经在第一遍里读过并应用了，这里只是把它吞掉 —— 否则下面
                 // 的 `other` 分支会把 `--config` 报成未知参数，而它明明生效了。
                 "--config" => {

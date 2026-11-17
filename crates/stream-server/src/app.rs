@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use crate::{config, configfile, dispatch, http, pipeline, platform, security};
+use crate::{config, configfile, dispatch, game, http, pipeline, platform, security};
 
 /// Stage1 日志过滤器。压低嘈杂的传输内部，同时保留 webrtc ICE 的收集错误可见
 /// （hbb_common init_log:455 的写法）。
@@ -156,6 +156,19 @@ pub async fn run() -> anyhow::Result<()> {
             }
             Err(err) => {
                 eprintln!("config error: {err}");
+                std::process::exit(2);
+            }
+        }
+        return Ok(());
+    }
+
+    // 一次性动作：把游戏实例与启动命令行打出来就退出。与 `--print-config`
+    // 放在一起、同一个理由 —— 输出是给人和脚本读的，此时日志还没初始化。
+    if cfg.print_game {
+        match game::report(&cfg) {
+            Ok(text) => print!("{text}"),
+            Err(err) => {
+                eprintln!("game error: {err}");
                 std::process::exit(2);
             }
         }

@@ -106,6 +106,16 @@ pub struct FileConfig {
     /// 文件里的列表**整体替换**命令行之前累积的列表，不追加。
     pub auth_grants: Option<Vec<String>>,
 
+    // ---- 游戏托管 ----
+    /// 要不要由本进程拉起并看着游戏客户端。
+    pub game: Option<bool>,
+    /// 默认实例 id（`<game_root>\instances\<id>.json`）。
+    pub game_instance: Option<String>,
+    /// `games` 根目录。空串 = 回到默认（exe 旁边的 `games`）。
+    pub game_root: Option<String>,
+    /// 服务起来时顺手把游戏也拉起来。
+    pub game_autostart: Option<bool>,
+
     // ---- 诊断 ----
     pub no_hdr: Option<bool>,
     pub dump_frame: Option<String>,
@@ -228,6 +238,21 @@ impl FileConfig {
             cfg.no_hdr = v;
         }
         cfg.dump_frame = opt_path(self.dump_frame);
+
+        if let Some(v) = self.game {
+            cfg.game_enabled = v;
+        }
+        if let Some(v) = self.game_instance {
+            if v.trim().is_empty() {
+                warnings.push("game_instance 不能为空，保留原值".to_owned());
+            } else {
+                cfg.game_instance = v.trim().to_owned();
+            }
+        }
+        cfg.game_root = opt_path(self.game_root);
+        if let Some(v) = self.game_autostart {
+            cfg.game_autostart = v;
+        }
     }
 
     /// 反向：把生效配置摊成可序列化的形态，供 `--print-config` 使用。
@@ -275,6 +300,10 @@ impl FileConfig {
             ),
             no_hdr: Some(cfg.no_hdr),
             dump_frame: Some(path_or_empty(cfg.dump_frame.as_deref())),
+            game: Some(cfg.game_enabled),
+            game_instance: Some(cfg.game_instance.clone()),
+            game_root: Some(path_or_empty(cfg.game_root.as_deref())),
+            game_autostart: Some(cfg.game_autostart),
         }
     }
 }
@@ -507,6 +536,17 @@ pub fn render_toml(cfg: &Config) -> String {
         }
         out.push_str("]\n");
     }
+    out.push('\n');
+
+    out.push_str("# ---------- 游戏托管 ----------\n");
+    out.push_str("# game: 由本进程拉起并看着游戏客户端。关着时 /api/v1/control/game/* 一律 404。\n");
+    out.push_str(&kv_bool("game", cfg.game_enabled));
+    out.push_str("# game_instance: 默认实例 id，对应 <game_root>\\instances\\<id>.json。\n");
+    out.push_str(&kv_str("game_instance", &cfg.game_instance));
+    out.push_str("# game_root: games 根目录。空串 = exe 旁边的 games\\。\n");
+    out.push_str(&kv_opt_path("game_root", cfg.game_root.as_deref()));
+    out.push_str("# game_autostart: 服务起来时顺手拉起游戏（需要 game = true）。\n");
+    out.push_str(&kv_bool("game_autostart", cfg.game_autostart));
     out.push('\n');
 
     out.push_str("# ---------- 诊断 ----------\n");
