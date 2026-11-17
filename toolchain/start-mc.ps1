@@ -16,6 +16,17 @@
 #
 #        ssh mc-150 'powershell -NoProfile -ExecutionPolicy Bypass -File C:\mc\start-mc.ps1 -Deliver'
 #
+# 全屏：加 -Fullscreen（回到窗口用 -Windowed）。它在启动前把 options.txt 的
+#   fullscreen 改成 true/false —— 1.12.2 没有 --fullscreen 启动参数。已经在跑
+#   的实例会挡住这次修改（它退出时会把内存里的旧值写回去），脚本遇到就 exit 3。
+#
+#   **这是排障用的手工入口，不是正式路径。** 正式路径是 stream-server 托管
+#   （docs/game-hosting.md），全屏走游戏内的 F11 —— 实测 F11 的真全屏能被 DXGI
+#   桌面复制采到，所以不需要改窗口样式的无边框方案。全屏真正的敌人是**失焦**：
+#   独占全屏的 MC 一失去焦点就自己最小化到 -32000,-32000，而重试 SetWindowPos
+#   反复恢复会打崩 GL 上下文（No OpenGL context found in the current thread）。
+#   这件事由 kiosk（docs/kiosk.md）负责，不是这个脚本能解决的。
+#
 # 历史坑（前三条在 .148 上踩的，第四条在 .150 上踩的，别再踩一遍）：
 #   1. classpath 必须从 version json 的 downloads.artifact.path 拼，不能按 name
 #      猜；artifact.path 是相对 **libraries 根** 的。首版少 55 个 jar 直接失败。
@@ -34,7 +45,9 @@ param(
     [string]$HeapMB  = '2048',
     [string]$TaskName = 'MCGame',
     [switch]$Deliver,
-    [switch]$Delivered
+    [switch]$Delivered,
+    [switch]$Fullscreen,
+    [switch]$Windowed
 )
 
 $ErrorActionPreference = 'Stop'
@@ -70,7 +83,12 @@ if ($Deliver -and -not $Delivered) {
         Say 'deliver: already in the console session, starting here'
     } else {
         $self = $PSCommandPath
+        # 投递是"把这条指令重新念一遍给另一个会话听"，所以开关必须跟着走。漏掉
+        # 一个就会出现"命令里写了 -Fullscreen、桌上还是小窗"这种最难查的差别 ——
+        # 两条路径看起来一样，只是参数在转手时掉了。
         $act = 'powershell -NoProfile -ExecutionPolicy Bypass -File "' + $self + '" -Delivered'
+        if ($Fullscreen) { $act += ' -Fullscreen' }
+        if ($Windowed)   { $act += ' -Windowed' }
         if ($act.Length -gt 261) {
             Say ('deliver: command line is ' + $act.Length + ' chars, schtasks caps at 261')
             exit 2
@@ -178,6 +196,53 @@ if (-not (Test-Path $natives)) {
     $natives = $vdir
 }
 $assets = Join-Path $McDir 'assets'
+
+# ---- 全屏：只能改 options.txt --------------------------------------------
+# 1.12.2 的 Main 没有 --fullscreen 这个参数（那是 1.13 之后才有的），窗口模式由
+# GameSettings 从 options.txt 的 `fullscreen:true` 读出来。所以只能改文件。
+#
+# 两个前提条件，缺一个这次改就白改：
+#   * 游戏不能正在跑 —— MC 只在启动时读 options.txt，退出时把**内存里的状态**
+#     整份写回去。跑着的时候改，退出那一刻就被旧值盖掉，看起来像"改了没用"。
+#   * 得在**投递之后**改（也就是这个文件在被 -Deliver 拉起的那个进程里执行），
+#     因为真正开窗口的是它；在这里改也一样，因为启动动作就在下面几十行。
+if ($Fullscreen -or $Windowed) {
+    $want = if ($Fullscreen) { 'true' } else { 'false' }
+    # 用命令行匹配而不是映像名：同一台机器上可能有别人的 javaw（比如另一个版本），
+    # 或者上一次没退干净的实例。只有命令行里带着这个 .minecraft 的才算。
+    $alive = Get-CimInstance Win32_Process -Filter "Name='javaw.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -and $_.CommandLine.Contains($McDir) }
+    if ($alive) {
+        $ids = ($alive | ForEach-Object { $_.ProcessId }) -join ', '
+        Say ('fullscreen: a game under this .minecraft is already running (pid ' + $ids + ')')
+        Say 'fullscreen: stop it first -- it rewrites options.txt on exit and would undo this'
+        exit 3
+    }
+
+    $opt = Join-Path $McDir 'options.txt'
+    if (Test-Path $opt) {
+        # 按行改，保留顺序与其余设置（options.txt 有 100 多行，重排等于清掉用户的
+        # 键位、音量、资源包）。用 ReadAllLines 而不是 Get-Content：后者会给每行
+        # 套上 PSObject，写回去时字符串比较与拼接都容易出岔子。
+        $lines = [System.IO.File]::ReadAllLines($opt)
+        $hit = $false
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^fullscreen:') { $lines[$i] = 'fullscreen:' + $want; $hit = $true }
+        }
+        if (-not $hit) {
+            $lines = @($lines) + @('fullscreen:' + $want)
+        }
+        [System.IO.File]::WriteAllLines($opt, $lines, (New-Object System.Text.UTF8Encoding $false))
+        Say ('fullscreen=' + $want + ' -> ' + $opt + ' (' + $lines.Count + ' lines, ' +
+             $(if ($hit) { 'replaced' } else { 'appended' }) + ')')
+    } else {
+        # 没有 options.txt 说明这台机器上的 MC 一次都没正常退出过。不替它造一份：
+        # 缺文件的 MC 会用全套默认值，凭空写一行进去反而是最坏的那种"帮倒忙"。
+        Say ('fullscreen: no options.txt at ' + $opt + '; nothing changed')
+        Say 'fullscreen: run the game once so it writes one, then retry'
+        exit 4
+    }
+}
 
 # ---- 参数拼成一个字符串 ---------------------------------------------------
 # 数组会被 Start-Process 按分隔符重排，含空格的路径（比如 "C:\Program Files\..."）

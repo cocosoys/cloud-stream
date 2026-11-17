@@ -370,9 +370,36 @@ where
         // #93: the write surface is two POSTs; everything else on POST stays 405
         // so a stray form post cannot look like it did something.
         if let crate::http::Route::Control { action } = &route {
+            // 控制端点的 body 只有一种用途：`kiosk/unlock` 的口令。上限 4 KiB
+            // 与 `/api/switch` 同一个理由 —— 够宽松，也够挡住"往这里灌一百兆"。
+            let clen = header_value(&headers, "Content-Length")
+                .and_then(|v| std::str::from_utf8(v).ok())
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(0);
+            if clen > 4096 {
+                write_http(
+                    &mut stream,
+                    413,
+                    "Payload Too Large",
+                    "application/json; charset=utf-8",
+                    br#"{"status":"error","message":"control body too large"}"#,
+                )
+                .await?;
+                return Ok(());
+            }
+            let mut body = Vec::with_capacity(clen);
+            body.extend_from_slice(&extra);
+            extra.clear();
+            let need = clen.saturating_sub(body.len());
+            if need > 0 {
+                let mut rest = vec![0u8; need];
+                stream.read_exact(&mut rest).await?;
+                body.extend_from_slice(&rest);
+            }
             let _ = crate::http::health::handle_control(
                 &mut stream,
                 action,
+                &body,
                 &registry,
                 &pipelines,
                 &cfg,
@@ -877,7 +904,15 @@ pub async fn serve(cfg: Arc<Config>) -> Result<()> {
             let cfg_for_game = cfg.clone();
             tokio::spawn(async move {
                 match host.start(&cfg_for_game).await {
-                    Ok(status) => log::info!("game: autostart ok pid={:?}", status.pid),
+                    Ok(status) => {
+                        log::info!("game: autostart ok pid={:?}", status.pid);
+                        // 与 `POST control/game/start` 同一条规则：游戏起来了才锁。
+                        if crate::kiosk::autolock(&cfg_for_game) {
+                            if let Err(err) = crate::kiosk::engage("autolock") {
+                                log::warn!("kiosk: autolock 失败：{err}");
+                            }
+                        }
+                    }
                     Err(err) => log::error!("game: autostart failed: {err}"),
                 }
             });

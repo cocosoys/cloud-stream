@@ -18,7 +18,7 @@
 
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tokio::sync::Mutex;
@@ -343,10 +343,7 @@ impl GameHost {
 }
 
 fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    super::now_unix()
 }
 
 /// `crash-reports` 里有多少份报告。目录不存在 = 0（不是错误：新装的世界还没有）。

@@ -49,6 +49,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SetCursorPos,
 };
 
+use crate::kiosk::guard::KeyGuard;
+
 use crate::pipeline::StreamSettings;
 
 use super::input_stub::InputSink;
@@ -423,6 +425,15 @@ struct InputState {
     pending_abs: Option<(i32, i32)>,
     /// #124/A: when the last relative delta was injected (idle un-pin).
     last_rel: Option<Instant>,
+    /// kiosk：锁定期间把危险组合吃掉，别让它到系统那一层。
+    ///
+    /// 这里是四档锁定里最干净的一道 —— 键在**传输之后、注入之前**就没了，
+    /// 系统根本没机会反应。判据在 [`crate::kiosk::guard::judge`]，与键盘钩子
+    /// 共用同一份规则（两处各写一遍必然会走偏）。
+    ///
+    /// `armed` 每次按键都从全局原子量同步，不缓存：锁可以从网页上随时点，
+    /// 一个缓存了一百毫秒的布尔值会让"点了锁但这一下没拦住"变得像偶发 bug。
+    guard: KeyGuard,
 }
 
 /// The real injection sink. All methods are `&self` and cheap: heavy work is a
@@ -1331,22 +1342,34 @@ impl InputSink for WinInputSink {
 
     fn key_down(&self, keysym: u32) {
         let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        if !st.held_keys.contains(&keysym) {
-            inject_key(&st, keysym, true);
-            st.held_keys.push(keysym);
+        st.guard.set_armed(crate::kiosk::armed());
+        if st.held_keys.contains(&keysym) {
+            return;
         }
+        if !st.guard.on_down(keysym) {
+            log::debug!("kiosk: 吞掉 keysym 0x{keysym:x}（锁定中）");
+            return;
+        }
+        inject_key(&st, keysym, true);
+        st.held_keys.push(keysym);
     }
 
     fn key_up(&self, keysym: u32) {
         let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        inject_key(&st, keysym, false);
+        st.guard.set_armed(crate::kiosk::armed());
+        // 按下去时被吞的键，抬起来也不能注入 —— 否则游戏会收到一串"没按下过
+        // 就抬起"的事件。
+        if st.guard.on_up(keysym) {
+            inject_key(&st, keysym, false);
+        }
         st.held_keys.retain(|&k| k != keysym);
     }
 
     fn keys_sync(&self, held: Vec<u32>) {
         let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        st.guard.set_armed(crate::kiosk::armed());
         for ks in held {
-            if !st.held_keys.contains(&ks) {
+            if !st.held_keys.contains(&ks) && st.guard.on_down(ks) {
                 inject_key(&st, ks, true);
                 st.held_keys.push(ks);
             }
@@ -1359,6 +1382,7 @@ impl InputSink for WinInputSink {
             inject_key(&st, ks, false);
         }
         st.held_keys.clear();
+        st.guard.release_all();
     }
 
     fn reset(&self) {
@@ -1367,6 +1391,7 @@ impl InputSink for WinInputSink {
             inject_key(&st, ks, false);
         }
         st.held_keys.clear();
+        st.guard.release_all();
         // #62: a held mouse button must be released too, otherwise the host
         // app keeps receiving a "pressed" state after the tab goes away.
         sync_buttons(&mut st, 0);

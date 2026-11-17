@@ -822,6 +822,10 @@ where
             }),
         );
         object.insert("game".to_owned(), game_payload);
+        // 输入锁定：面板要能看见"现在锁没锁、为什么锁、能不能解开"。
+        // 尤其是 `password_set` —— 一个锁着又没配口令的部署，面板必须当场说清
+        // "这里只能用 --unlock 或 Ctrl+Alt+Del"，而不是等运维猜。
+        object.insert("kiosk".to_owned(), json!(crate::kiosk::status()));
     }
     let body = payload.to_string();
     let (status, text) = if healthy { (200u16, "OK") } else { (503u16, "Service Unavailable") };
@@ -839,9 +843,160 @@ where
 ///
 /// 白名单不是防君子，是为了让拼错的路径得到 404 而不是"执行了个寂寞"：一个
 /// 拼错的 `capture/restat` 静默 200，运维会以为重启过了。
+/// `POST /api/v1/control/kiosk/<action>`。
+///
+/// 三个动作：看状态、上锁、用口令解锁。上锁不校验口令（能点这个按钮的人已经在
+/// 页面里了，而页面本身是要令牌的）；解锁必须校验 —— 那是唯一一道把玩家关在
+/// 游戏里的门。
+async fn handle_kiosk<S>(
+    stream: &mut S,
+    action: &str,
+    body: &[u8],
+    cfg: &Config,
+) -> std::io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    if !cfg.kiosk {
+        return json_reply(
+            stream,
+            404,
+            "Not Found",
+            json!({
+                "ok": false,
+                "action": action,
+                "error": "kiosk is disabled; enable it with --kiosk (or kiosk = true)",
+            }),
+        )
+        .await;
+    }
+
+    match action {
+        "kiosk/status" => {
+            json_reply(
+                stream,
+                200,
+                "OK",
+                json!({ "ok": true, "kiosk": crate::kiosk::status() }),
+            )
+            .await
+        }
+        "kiosk/lock" => match crate::kiosk::engage("web") {
+            Ok(status) => {
+                json_reply(
+                    stream,
+                    200,
+                    "OK",
+                    json!({ "ok": true, "action": "kiosk/lock", "kiosk": status }),
+                )
+                .await
+            }
+            Err(err) => {
+                json_reply(
+                    stream,
+                    409,
+                    "Conflict",
+                    json!({
+                        "ok": false,
+                        "action": "kiosk/lock",
+                        "error": err,
+                        "kiosk": crate::kiosk::status(),
+                    }),
+                )
+                .await
+            }
+        },
+        "kiosk/unlock" => {
+            let password = hbb_common::serde_json::from_slice::<Value>(body)
+                .ok()
+                .and_then(|v| v.get("password").and_then(|p| p.as_str()).map(|s| s.to_owned()));
+
+            let Some(stored) = cfg.kiosk_password.as_deref() else {
+                // 没配口令 = 网页上不该有解锁这条路。说清楚替代方案，否则运维
+                // 会以为是"口令错了"而一遍遍重试。
+                return json_reply(
+                    stream,
+                    403,
+                    "Forbidden",
+                    json!({
+                        "ok": false,
+                        "action": action,
+                        "error": "kiosk_password is not configured; unlock on the host with `stream-server.exe --unlock` (or Ctrl+Alt+Del)",
+                    }),
+                )
+                .await;
+            };
+            let Some(password) = password else {
+                return json_reply(
+                    stream,
+                    400,
+                    "Bad Request",
+                    json!({
+                        "ok": false,
+                        "action": action,
+                        "error": "missing \"password\" in the JSON body",
+                    }),
+                )
+                .await;
+            };
+            if !crate::kiosk::verify_password(stored, &password) {
+                // 403 而不是 401：再试一次同样的口令也不会成功。前端据此清空
+                // 输入框，而不是弹一个"重新登录"的浏览器原生对话框。
+                return json_reply(
+                    stream,
+                    403,
+                    "Forbidden",
+                    json!({ "ok": false, "action": action, "error": "wrong password" }),
+                )
+                .await;
+            }
+            match crate::kiosk::disarm("web") {
+                Ok(status) => {
+                    json_reply(
+                        stream,
+                        200,
+                        "OK",
+                        json!({ "ok": true, "action": action, "kiosk": status }),
+                    )
+                    .await
+                }
+                Err(err) => {
+                    json_reply(
+                        stream,
+                        500,
+                        "Internal Server Error",
+                        json!({
+                            "ok": false,
+                            "action": action,
+                            "error": err,
+                            "kiosk": crate::kiosk::status(),
+                        }),
+                    )
+                    .await
+                }
+            }
+        }
+        other => {
+            json_reply(
+                stream,
+                404,
+                "Not Found",
+                json!({
+                    "ok": false,
+                    "error": "unknown kiosk action",
+                    "action": other,
+                    "known": ["kiosk/status", "kiosk/lock", "kiosk/unlock"],
+                }),
+            )
+            .await
+        }
+    }
+}
+
 pub async fn handle_control<S>(
     stream: &mut S,
     action: &str,
+    body: &[u8],
     registry: &crate::signaling::SessionRegistry,
     pipelines: &crate::pipeline::PipelineRegistry,
     cfg: &Config,
@@ -850,6 +1005,13 @@ pub async fn handle_control<S>(
 where
     S: AsyncWrite + Unpin,
 {
+    // 输入锁定：三个动作，全都走同一个"能力未启用就 404"的规则。
+    //
+    // 这里的 404 不是偷懒 —— 一个没装钩子、没写策略的服务答 200 说"已锁定"，
+    // 会让运维以为桌面被关住了，而实际上玩家按一下 `Win` 就出去了。
+    if action.starts_with("kiosk/") {
+        return handle_kiosk(stream, action, body, cfg).await;
+    }
     // 游戏托管：三个动作。
     //
     // 没启用时统一 404（而不是 200 + `state=stopped`）：一个不做游戏托管的部署
@@ -867,6 +1029,16 @@ where
         return match action {
             "game/start" => match host.start(cfg).await {
                 Ok(status) => {
+                    // autolock：**游戏起来之后**才锁。
+                    //
+                    // 顺序不能反 —— 先锁再启动，玩家会在"进程刚起来、窗口还没出"
+                    // 的那几十秒里面对一个锁住的桌面，而那时连游戏都还没有，
+                    // 唯一能做的就是解锁。锁的意义是"别切走"，不是"别动"。
+                    if crate::kiosk::autolock(cfg) {
+                        if let Err(err) = crate::kiosk::engage("autolock") {
+                            log::warn!("kiosk: autolock 失败：{err}");
+                        }
+                    }
                     json_reply(stream, 202, "Accepted", json!({
                         "ok": true,
                         "action": "game/start",
@@ -888,6 +1060,8 @@ where
             },
             "game/stop" => match host.stop().await {
                 Ok(status) => {
+                    // autolock 锁上的桌面，游戏停了就还回去（手工锁不动）。
+                    crate::kiosk::disarm_if_autolock("game stopped");
                     json_reply(stream, 200, "OK", json!({
                         "ok": true,
                         "action": "game/stop",
@@ -1113,6 +1287,24 @@ mod tests {
 
     fn probe() -> HealthProbe {
         HealthProbe::new()
+    }
+
+    /// 跑一次健康报告，把 JSON 报文当字符串拿回来。
+    async fn health_text() -> String {
+        let mut out: Vec<u8> = Vec::new();
+        handle_health(
+            &mut out,
+            &cfg(),
+            &crate::signaling::SessionRegistry::default(),
+            &crate::signaling::websession::Admission::new(8),
+            &crate::pipeline::PipelineRegistry::default(),
+            &probe(),
+            &crate::security::Principal::default(),
+            None,
+        )
+        .await
+        .expect("a Vec is an infallible writer");
+        String::from_utf8_lossy(&out).into_owned()
     }
 
     fn sample() -> ProbeSample {
@@ -1412,10 +1604,16 @@ mod tests {
     /// `Vec<u8>` 实现了 `AsyncWrite` 且永不失败，所以这里不需要 socket，
     /// 也就不需要为一个纯路由判断起监听。
     async fn control(action: &str) -> String {
+        control_with(action, b"").await
+    }
+
+    /// 带 body 的版本：`kiosk/unlock` 的口令从 body 里来。
+    async fn control_with(action: &str, body: &[u8]) -> String {
         let mut out: Vec<u8> = Vec::new();
         handle_control(
             &mut out,
             action,
+            body,
             &crate::signaling::SessionRegistry::default(),
             &crate::pipeline::PipelineRegistry::default(),
             &cfg(),
@@ -1468,6 +1666,30 @@ mod tests {
             assert!(text.starts_with("HTTP/1.1 409"), "{action} got: {text}");
             assert!(text.contains("no live session"), "{action} got: {text}");
         }
+    }
+
+    /// 没启用 kiosk 时，`kiosk/*` 必须 404。
+    ///
+    /// 与 `game/*` 同一个理由，而且后果更重：这里答 200 会让人以为"桌面被锁住
+    /// 了"，于是放心地把玩家关进全屏游戏 —— 而实际上一个钩子都没装。
+    #[tokio::test]
+    async fn kiosk_control_is_404_when_disabled() {
+        for action in ["kiosk/lock", "kiosk/unlock", "kiosk/status"] {
+            let text = control(action).await;
+            assert!(text.starts_with("HTTP/1.1 404"), "{action} 应当是 404：{text}");
+            assert!(text.contains("disabled"), "{action} 要说清原因：{text}");
+        }
+    }
+
+    /// 健康报告里必须有一个 `kiosk` 段，且未启用时 `enabled` 为假。
+    ///
+    /// 面板靠这一段决定"要不要画解锁按钮"。缺了它，前端只能猜 —— 而猜错的
+    /// 方向一定是"画出来，点了没反应"。
+    #[tokio::test]
+    async fn health_reports_a_kiosk_section() {
+        let text = health_text().await;
+        assert!(text.contains("\"kiosk\""), "got: {text}");
+        assert!(text.contains("\"password_set\""), "got: {text}");
     }
 
     /// 没有任何程序时重启采集器是 409：没东西可重建，不该回 202。

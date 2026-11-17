@@ -47,6 +47,18 @@ pub mod host;
 
 pub use host::{GameHost, Status};
 
+/// 当前 Unix 秒。
+///
+/// 实例、锁定、退出记录三处都要一个时间戳，而它们都需要"算不出来时返回 0 而不是
+/// 崩"—— 系统时钟被拨到 1970 之前这种事不会发生，但 `duration_since` 是会返回
+/// `Err` 的，`unwrap` 在这里没有任何好处。
+pub fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 
 /// `games` 根目录下的四个固定子目录。
 pub const DIR_CLIENTS: &str = "clients";

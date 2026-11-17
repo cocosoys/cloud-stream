@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use crate::{config, configfile, dispatch, game, http, pipeline, platform, security};
+use crate::{config, configfile, dispatch, game, http, kiosk, pipeline, platform, security};
 
 /// Stage1 日志过滤器。压低嘈杂的传输内部，同时保留 webrtc ICE 的收集错误可见
 /// （hbb_common init_log:455 的写法）。
@@ -175,6 +175,55 @@ pub async fn run() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // 一次性动作：从 stdin 读一行口令，打印哈希。
+    //
+    // 从 stdin 而不是参数，是这三处共同的考虑：shell 历史、进程列表（`ps`/
+    // 任务管理器）、计划任务的 XML —— 都不该出现口令原文。用法是
+    // `echo 我的口令 | stream-server.exe --kiosk-hash`。
+    if cfg.kiosk_hash {
+        use std::io::BufRead;
+        let plain = match cfg.kiosk_hash_plain.clone() {
+            Some(v) => v,
+            None => {
+                let mut line = String::new();
+                if let Err(err) = std::io::stdin().lock().read_line(&mut line) {
+                    eprintln!("kiosk error: 读标准输入失败：{err}");
+                    std::process::exit(2);
+                }
+                line.trim_end_matches(['\r', '\n']).to_owned()
+            }
+        };
+        if plain.is_empty() {
+            eprintln!(
+                "kiosk error: 口令是空的；用法 `--kiosk-hash <口令>` 或 `echo <口令> | stream-server.exe --kiosk-hash`"
+            );
+            std::process::exit(2);
+        }
+        // 纯 ASCII 输出：这一行会被复制粘贴进 `kiosk_password`。
+        println!("{}", kiosk::hash_password(&plain));
+        return Ok(());
+    }
+
+    // 救命通道：解除本机的输入锁定，然后立刻退出。
+    //
+    // 两条路一起走，因为"服务还在不在"决定了哪条才会生效：
+    //   * 服务在跑 → `SetEvent` 让它的钩子线程自己 disarm（钩子必须由装它的
+    //     那个进程卸载，外部动不了）；
+    //   * 服务不在 → 直接按还原记录把注册表还回去。
+    // 两边都是幂等的，同时做不会互相打架。
+    if cfg.unlock {
+        let signaled = kiosk::signal_disarm(&cfg);
+        let file = kiosk::state_path(&cfg);
+        let restored = kiosk::policy::restore(&file).unwrap_or_else(|err| {
+            eprintln!("kiosk: 还原注册表策略失败：{err}");
+            0
+        });
+        // 纯 ASCII：这条命令的典型用法是 `ssh host "stream-server.exe --unlock"`
+        // 再回显，中文在那里必然是乱码。
+        println!("UNLOCK signaled={signaled} restored={restored}");
+        return Ok(());
+    }
+
     // 一键卸载：把上次遗留的默认录音设备还回去，然后立刻退出。
     //
     // 必须放在所有启动动作之前：这个模式不该绑端口、不该开日志、不该碰采集，
@@ -238,6 +287,17 @@ pub async fn run() -> anyhow::Result<()> {
         Some(path) => log::info!("config: loaded {}", path.display()),
         None => log::info!("config: no config.toml found, using defaults + command line"),
     }
+
+    // 输入锁定：启动即接管。
+    //
+    // 这里做三件事，且顺序重要：
+    // 1. **无条件**检查上一轮的残留 —— 上一版进程可能是被 `taskkill /F` 结束的，
+    //    注册表里的 `NoWinKeys`/`DisableTaskMgr` 还在，而改它的进程已经不在了。
+    //    这一步在 `kiosk = false` 的部署里也必须跑，否则那台机器会一直带着
+    //    "任务管理器被禁用"运行；
+    // 2. 需要时装键盘钩子（装上但不 arm，等真正锁定时才拦）；
+    // 3. 起解锁事件的等待线程，让 `--unlock` 有地方可去。
+    kiosk::recover(&cfg);
 
     // #122: ICE 的 UDP 区间必须让外部知道 —— 它是唯一一个"防火墙写错时
     // 服务端一切正常、只有浏览器说媒体路径失败"的参数。日志里有一行，至少

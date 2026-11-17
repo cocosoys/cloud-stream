@@ -47,6 +47,7 @@ pub mod diagnose;
 pub mod dispatch;
 pub mod game;
 pub mod http;
+pub mod kiosk;
 pub mod ops;
 pub mod pipeline;
 pub mod platform;

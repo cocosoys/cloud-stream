@@ -90,6 +90,11 @@ windows-sys = { version = "0.52", features = [
 flate2 = "1.0"
 # #55: clipboard uplink chunks arrive base64-encoded (clipboard-worker-bridge).
 base64 = "0.22"
+# kiosk 解锁口令的哈希（`--kiosk-hash` / `kiosk_password`）。0.10.8 已经在
+# workspace lock 里（rustls 的传递依赖），所以这一行不新增任何下载。
+# 用它而不是 bcrypt/argon2：那两个要新 crate，而这里防的是"配置文件被看见"，
+# 不是"离线爆破"—— 后者需要的是权限管理，不是更慢的哈希。
+sha2 = "0.10"
 # #77 audio: Opus encoder for the game-sound downlink and decoder for the mic
 # uplink. Links the locally built static libopus (`C:\dev\opus-static`, built
 # from xiph/opus v1.5.2 because vcpkg refuses this machine's BuildTools-only
