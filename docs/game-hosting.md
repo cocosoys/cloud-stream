@@ -40,7 +40,7 @@ classpath 走。** 第一次把 `gameDir` 挪到 `saves\default` 后，游戏只
   "client_dir": "C:\\Users\\Admin\\Desktop\\.minecraft",  // 绝对或相对 games 根
   "saves_dir": "saves\\default",
   "java": { "path": "C:\\mc\\jre8\\bin\\javaw.exe", "heap_mb": 2048,
-            "jvm_args": [], "verify_classes": true },
+            "jvm_args": [], "verify_classes": true, "extract_natives": true },
   "game": { "version": "1.12.2-Forge_14.23.5.2864",
             "player": "CloudPlayer", "game_args": [] },
   "display": { "model": "windowed", "width": 0, "height": 0, "x": 0, "y": 0 },
@@ -53,6 +53,9 @@ classpath 走。** 第一次把 `gameDir` 挪到 `saves\default` 后，游戏只
   包装启动器）。见 §十。
 * `java.verify_classes`（默认 `true`）：启动前扫一遍 classpath 的 jar 中央目录，确认
   主类与 tweaker 真的在里面。关掉它回到"java 自己报错"的老路。
+* `java.extract_natives`（默认 `true`）：启动前按版本 json 的 `natives` 段把本地库解到
+  `runtime\natives\<版本>`。关掉只影响"用哪一份 dll"（退回客户端目录下的
+  `natives-tmp`），用于排障对比。见 §十一。
 * `display.width/height = 0` 表示**跟随串流分辨率**（`config.width/height`）。采集和
   游戏用同一对数，编码前不会多一次缩放。
 * `display.model`：`exclusive`（写 `options.txt: fullscreen:true`）或 `windowed`。
@@ -306,13 +309,98 @@ command
 坏文件，将来若某个 mod 用到 Scala 才会以"类找不到"的形式暴露。来源是整合包自带的
 `libraries`，本服务不做资源下载，所以这里只记录、不自动修。
 
-### 还没做（B / C / D）
+### 之后（B / C / D 已完成）
 
-- **B. 游戏参数模板化**：`minecraftArguments` / `arguments.game` 整体接管，加占位符
-  替换与 PCL 那套去重。做完之后 `--width` 就变成"追加进去让去重覆盖"。
-- **C. `arguments.jvm` 与 `inheritsFrom`**：官方 installer 生成的 Forge json 是
-  `inheritsFrom` 形式，`build_classpath` 只看单层会缺库。这台的实例是合并式 json
-  （61 库、无 `inheritsFrom`）才没炸 —— 是埋着的雷。
-- **D. natives 自动解压**：现在是"目录存在就用"，靠预先铺好的 `natives-tmp`。
+见 §十一 —— 参数整体模板化、继承链合并、natives 自动解压。
 
 
+## 十一、参数模板 / 继承链 / natives（B + C + D）
+
+上一轮（§十）只把主类与 tweaker 从 json 里取回来，参数还是硬编码。这一轮把三件事做完：
+**参数整体由版本 json 的模板生成**（B）、**读继承链并合并库**（C）、**按 json 解 natives**（D）。
+
+### B：参数来自模板，去重收口
+
+新增 `game/template.rs`，做四件事：
+
+| 职责 | 做法 |
+|---|---|
+| 占位符 | `${auth_player_name}`、`${game_directory}`、`${natives_directory}`、`${classpath}`、`${resolution_width}`… 二十余个；**不认识的直接报错**，绝不把 `${…}` 原样传给 java |
+| `rules` | `os.name`/`os.arch`/`features`；**最后一条命中的规则**说了算，一条没命中就排除。也接受"单个对象而不是数组"的写法（1.12.2 的 `lwjgl-platform:2.9.2` 就是这样少了一对方括号） |
+| 两种模板 | 旧式 `minecraftArguments` 按**引号感知**切分；新式 `arguments.game` 数组，元素可以是字符串或 `{rules, value}` |
+| 去重 | 同一个 `--flag` 只留**最后一次**出现的那一对（PCL2 的语义）；`${versionType}` 展开成空串时连键一起删 |
+
+拼接顺序固定为：**模板 → `--width/--height` → 实例的 `tweak_class` → 实例的 `game_args`**，
+然后统一去重。所以"改窗口尺寸"永远不用动模板 —— 模板里有 `--width` 也没关系，后面那对会顶掉它。
+
+`--print-game` 因此多了一行"覆盖掉了哪些键"：
+
+```
+# check : args: 9 个 jvm / 24 个 game token，模板=json，覆盖掉的键=--versiontype，残留占位符=0
+```
+
+`--versiontype` 出现在这里不是意外：1.12.2 的模板自己写了两次（`--versionType ${version_type}`
+与 `--versionType Forge`），去重让后者赢 —— 与旧实现硬编码 `release` 时得到的结果不同，
+但**这才是 json 的本意**。
+
+### C：继承链合并
+
+`load_version_chain()` 沿 `inheritsFrom` 向上读（上限 16 层，超过就是成环），然后父在前、
+子覆盖父地合并：
+
+* `libraries`：子层覆盖同名构件时**原地替换**（身份是 `group:artifact[:classifier]`，**不看版本**），
+  同一层里的重复**保留**；
+* `arguments.game` / `arguments.jvm`：数组拼接，父在前；
+* 其余字段（`mainClass`、`assetIndex`、`type`、`logging`）：子覆盖父；
+* `inheritsFrom` 合并后丢弃 —— 留着只会让下游以为还有一层。
+
+客户端 jar 沿链找**第一个存在的** `versions\<v>\<v>.jar`：`inheritsFrom` 式的 Forge 子层没有
+自己的 jar，原版那个在父层目录里。
+
+`arguments.jvm` 只作为**补充**：`-cp`、`-Djava.library.path`、`-Xmx/-Xms`、`-XX:ErrorFile`
+这些由我们自己算，json 里的同名项**连值一起丢**（`-cp` 的值是一个独立 token，只删键不删值的话
+它会变成主类前面多出来的位置参数，报错是 `Could not find or load main class <classpath 首项>`）。
+
+`# chain : test-chain → 1.12.2-base` 会出现在 `--print-game` 里 —— "官方 installer 装的 Forge"
+与"合并式 json"在参数上看不出区别，排查少库时这是第一个要确认的事实。
+
+### D：natives 自动解压
+
+`game/natives.rs` 按 `natives.windows` 找 classifier（`${arch}` 填 64），从
+`downloads.classifiers[cls].path`（缺则按 maven 布局推）拿到 jar，解到 **`runtime\natives\<版本>`**，
+`extract.exclude`（缺省 `META-INF/`）里的条目跳过，同尺寸的文件跳过不重写。
+
+`-Djava.library.path` 是**两个目录**：`runtime\natives\<版本>` 在前，旧的那个
+（`natives-tmp` 或版本目录）在后。多一个目录不多一分风险，少一套 dll 就是
+`UnsatisfiedLinkError: no lwjgl in java.library.path`。
+
+解压失败不致命：记一条 `# check : natives: …`，照旧用旧目录启动。
+
+### 实测（`.128`，2026-11-17 17:20）
+
+| 场景 | 结果 |
+|---|---|
+| 生产实例 `--print-game` | `模板=json`，24 个 game token 全部标 `json`，`--tweakClass` 来自模板，`--versionType` 去重后为 `Forge` |
+| natives | `3 个 jar，解出 11 个文件`；第二次跑 `0 解出 / 11 已是最新`（幂等） |
+| 合成继承链（`test-chain → 1.12.2-base`，子层用新式 `arguments.game` + `arguments.jvm`） | `# chain` 打出来；`-Dtest.jvm=1` 保留、`-cp`/`-Djava.library.path`/`-Xmx` 被丢（3 个 token）；子层的 `--demo` 出现；`--width/--height` 被实例的 1280×720 覆盖 |
+| classpath | 末尾是 `versions\1.12.2-base\1.12.2-base.jar` —— 父层 jar 找到了，这是继承链真正生效的证据 |
+| 真实启动（生产实例） | 202，pid 1264，窗口 `LWJGL 1936×1100 @0,0` |
+| **把 `natives-tmp` 改名后启动** | 仍然起得来、窗口正常 —— 说明 `runtime\natives` 那一份**够用**，不再依赖预先铺好的目录 |
+| 单测 | 495 通过（新增 15：占位符 / rules / 两种模板 / 去重 / 空值 / JVM 键归属 / 继承合并 / zip 中央目录） |
+
+### 合并过程中踩到的两个真问题
+
+1. **同一层里的重复库不能去重。** 第一版按构件身份对整份列表去重，`lwjgl-platform` 的
+   2.9.4 被 2.9.2 顶掉，而 dll 只在 2.9.4 的 natives jar 里 —— 解出来只有 jinput 与
+   text2speech 的 7 个文件。表现会是 `UnsatisfiedLinkError: no lwjgl`，与"合并库"看不出关系。
+   修法：只拿**父层**（本层开始之前的那些条目）比对。
+2. **`rules` 少一对方括号。** `lwjgl-platform:2.9.2` 写的是 `"rules": {"action":"allow","os":{"name":"osx"}}`。
+   把它当成"没有规则"会得到完全相反的结论（装到所有平台）。修法：单个对象也当一条规则。
+   修完之后 classpath 少了 osx-only 的 `java-objc-bridge` 等条目，"扫了几个 jar"从 55 降到 34。
+
+### 还剩
+
+* `javaVersion` 段（1.13+ 的 json 会写"这个版本要求 JRE 17"）目前不看，`java.path`
+  仍由实例指定。要自动挑 JRE 时再说 —— 那件事故意留给人。
+* 客户端目录仍在桌面（`Desktop\.minecraft`），迁到 `games\clients\` 会动 1.5 GB 用户数据，
+  等确认。

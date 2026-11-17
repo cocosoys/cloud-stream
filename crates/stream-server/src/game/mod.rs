@@ -40,12 +40,21 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::config::Config;
 
 pub mod host;
+mod natives;
+mod template;
+mod zipmin;
 
 pub use host::{GameHost, Status};
+
+use template::{
+    args_from_array, args_from_string, drop_empty_values, duplicate_flags, find_flag_value,
+    override_flags, rules_allow, Features, Placeholders,
+};
 
 /// 当前 Unix 秒。
 ///
@@ -195,6 +204,12 @@ pub struct JavaSpec {
     /// false，回到"java 自己报错"的老路。
     #[serde(default = "d_true")]
     pub verify_classes: bool,
+    /// 启动前按版本 json 的 `natives` 段把本地库解到 `runtime\natives\<版本>`。
+    ///
+    /// 默认开。关掉只影响"用哪一份 dll"：`-Djava.library.path` 会退回旧行为
+    /// （客户端目录下的 `natives-tmp` 或版本目录），用于排障时对比。
+    #[serde(default = "d_true")]
+    pub extract_natives: bool,
 }
 
 fn d_true() -> bool {
@@ -208,6 +223,7 @@ impl Default for JavaSpec {
             heap_mb: d_heap_mb(),
             jvm_args: Vec::new(),
             verify_classes: true,
+            extract_natives: true,
         }
     }
 }
@@ -467,6 +483,10 @@ pub struct LaunchPlan {
     /// classpath 里缺的 jar（相对 libraries 的路径）。非空不算失败：natives-only
     /// 的两个包本来就不在磁盘上，MC 也不需要它们进 classpath。
     pub missing: Vec<String>,
+    /// 版本 json 的继承链（子 → 父）。`--print-game` 会打出来：一个"官方 installer
+    /// 装的 Forge"和一个"合并式 json"在参数上看不出区别，但排查少库时这是第一个
+    /// 要确认的事实。
+    pub chain: Vec<String>,
     /// 启动前跑过的校验结论（一行一条，给 `--print-game` 与启动日志）。
     pub checks: Vec<String>,
 }
@@ -495,7 +515,7 @@ impl LaunchPlan {
     /// 带来源标注的分段视图（`--print-game`）。
     pub fn render_annotated(&self) -> String {
         let mut out = String::new();
-        let mut section = |title: &str, tokens: &[ArgToken], out: &mut String| {
+        let section = |title: &str, tokens: &[ArgToken], out: &mut String| {
             out.push_str(&format!("{title} ({} token)\n", tokens.len()));
             for t in tokens {
                 out.push_str(&format!("  {:<8} {}\n", t.origin.label(), t.text));
@@ -543,108 +563,6 @@ fn resolve_main_class(
     }
     Err("版本 json 里没有 mainClass，实例里也没写 game.main_class —— 两者至少要有一个"
         .to_owned())
-}
-
-/// tweaker：实例覆盖优先，否则从版本 json 的参数模板里取 `--tweakClass`。
-///
-/// 旧式模板（1.12 及以前）是 `minecraftArguments` 一整串；新式（1.13+）是
-/// `arguments.game` 数组。两种都读，因为 Forge 的安装器到现在仍在生成旧式的。
-fn resolve_tweak_class(
-    spec: &InstanceSpec,
-    json: &serde_json::Value,
-) -> Result<Option<(String, ArgOrigin)>, String> {
-    if let Some(v) = spec.game.tweak_class.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        return Ok(Some((v.to_owned(), ArgOrigin::Instance)));
-    }
-    if let Some(raw) = json.get("minecraftArguments").and_then(|v| v.as_str()) {
-        if let Some(v) = find_flag_value(&split_arguments(raw), "--tweakClass") {
-            return Ok(Some((v, ArgOrigin::Json)));
-        }
-    }
-    if let Some(arr) = json.pointer("/arguments/game").and_then(|v| v.as_array()) {
-        // 新式里参数元素可能是 `{rules, value}` 对象，这里只取纯字符串元素 ——
-        // 带 rules 的 tweaker 至今没出现过，真出现时交给 B 阶段的模板引擎。
-        let flat: Vec<String> =
-            arr.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect();
-        if let Some(v) = find_flag_value(&flat, "--tweakClass") {
-            return Ok(Some((v, ArgOrigin::Json)));
-        }
-    }
-    Ok(None)
-}
-
-/// 按空白切分参数串，**尊重双引号**。
-///
-/// 版本 json 的 `minecraftArguments` 是一整串文本：`split_whitespace` 会把
-/// `--gameDir "C:\Program Files\x"` 切成三段。PCL 为此写了 `SplitJavaArguments`
-/// 状态机，这里只做它最小的一件事 —— 引号内外切换、引号内的 `\"` 还原。
-fn split_arguments(raw: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut in_quotes = false;
-    let mut touched = false;
-    let mut chars = raw.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' if in_quotes && chars.peek() == Some(&'"') => {
-                cur.push('"');
-                chars.next();
-                touched = true;
-            }
-            '"' => {
-                in_quotes = !in_quotes;
-                touched = true;
-            }
-            c if c.is_whitespace() && !in_quotes => {
-                if touched {
-                    out.push(std::mem::take(&mut cur));
-                    touched = false;
-                }
-            }
-            c => {
-                cur.push(c);
-                touched = true;
-            }
-        }
-    }
-    if touched {
-        out.push(cur);
-    }
-    out
-}
-
-/// `["--tweakClass", "x.Foo", ...]` 里取 `x.Foo`。
-fn find_flag_value(tokens: &[String], flag: &str) -> Option<String> {
-    tokens
-        .iter()
-        .position(|t| t.eq_ignore_ascii_case(flag))
-        .and_then(|i| tokens.get(i + 1))
-        .cloned()
-}
-
-/// 游戏段里重复出现的 `--flag`。
-///
-/// 只查 `--` 开头的：`-Dfoo=1` 这类 JVM 属性重复是合法的（后者覆盖前者），
-/// 而 `--width`、`--uuid` 重复时 MC 通常只认第一个 —— 那正好是"改了却没生效"
-/// 的经典来源。PCL 的做法是拼接后统一去重（新值覆盖旧值），我们现阶段还没引入
-/// 模板拼接，所以先把"重复"这件事变成一条报错，等人决定以哪个为准。
-fn duplicate_flags(tokens: &[ArgToken]) -> Vec<String> {
-    let mut seen: Vec<&str> = Vec::new();
-    let mut dup: Vec<String> = Vec::new();
-    for t in tokens {
-        let s = t.text.as_str();
-        if !s.starts_with("--") {
-            continue;
-        }
-        if seen.iter().any(|x| x.eq_ignore_ascii_case(s)) {
-            if !dup.iter().any(|d| d.eq_ignore_ascii_case(s)) {
-                dup.push(s.to_owned());
-            }
-        } else {
-            seen.push(s);
-        }
-    }
-    dup
 }
 
 /// 类名 → jar 条目名：`a.b.C` → `a/b/C.class`。
@@ -703,81 +621,9 @@ fn short_list(items: &[String]) -> String {
     }
 }
 
-const EOCD_SIG: u32 = 0x0605_4b50;
-const CENTRAL_SIG: u32 = 0x0201_4b50;
-
-/// jar（zip）中央目录里的文件名列表。
+/// jar（zip）中央目录里的文件名列表。实现见 [`zipmin`]。
 fn jar_entry_names(path: &Path) -> Result<Vec<String>, String> {
-    use std::io::{Read, Seek, SeekFrom};
-
-    let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    let len = f.metadata().map_err(|e| e.to_string())?.len();
-    if len < 22 {
-        return Err("文件短于 EOCD".to_owned());
-    }
-    let tail_len = len.min(66_000) as usize; // EOCD + 最长 65535 字节注释
-    let tail_start = len - tail_len as u64;
-    let mut tail = vec![0u8; tail_len];
-    f.seek(SeekFrom::Start(tail_start)).map_err(|e| e.to_string())?;
-    f.read_exact(&mut tail).map_err(|e| e.to_string())?;
-
-    let mut eocd: Option<usize> = None;
-    for i in (0..=tail_len - 22).rev() {
-        let sig = u32::from_le_bytes([tail[i], tail[i + 1], tail[i + 2], tail[i + 3]]);
-        if sig != EOCD_SIG {
-            continue;
-        }
-        let comment = u16::from_le_bytes([tail[i + 20], tail[i + 21]]) as usize;
-        if i + 22 + comment == tail_len {
-            eocd = Some(i);
-            break;
-        }
-    }
-    let Some(i) = eocd else { return Err("找不到中央目录结尾（不是 zip？）".to_owned()) };
-
-    let cd_size = u32::from_le_bytes([tail[i + 12], tail[i + 13], tail[i + 14], tail[i + 15]]) as u64;
-    let cd_off = u32::from_le_bytes([tail[i + 16], tail[i + 17], tail[i + 18], tail[i + 19]]) as u64;
-    if cd_off == u32::MAX as u64 || cd_size == u32::MAX as u64 {
-        return Err("zip64 暂不支持".to_owned());
-    }
-    if cd_off + cd_size > len {
-        return Err("中央目录越界".to_owned());
-    }
-
-    let cd: Vec<u8> = if cd_off >= tail_start {
-        let s = (cd_off - tail_start) as usize;
-        let e = (s + cd_size as usize).min(tail_len);
-        tail[s..e].to_vec()
-    } else {
-        let mut buf = vec![0u8; cd_size as usize];
-        f.seek(SeekFrom::Start(cd_off)).map_err(|e| e.to_string())?;
-        f.read_exact(&mut buf).map_err(|e| e.to_string())?;
-        buf
-    };
-    Ok(central_dir_names(&cd))
-}
-
-/// 解析中央目录段，取出每个条目的文件名。格式见 PKWARE APPNOTE 4.3.12。
-fn central_dir_names(cd: &[u8]) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut p = 0usize;
-    while p + 46 <= cd.len() {
-        let sig = u32::from_le_bytes([cd[p], cd[p + 1], cd[p + 2], cd[p + 3]]);
-        if sig != CENTRAL_SIG {
-            break;
-        }
-        let name_len = u16::from_le_bytes([cd[p + 28], cd[p + 29]]) as usize;
-        let extra_len = u16::from_le_bytes([cd[p + 30], cd[p + 31]]) as usize;
-        let comment_len = u16::from_le_bytes([cd[p + 32], cd[p + 33]]) as usize;
-        let start = p + 46;
-        let end = start + name_len;
-        if end > cd.len() {
-            break;
-        }
-        names.push(String::from_utf8_lossy(&cd[start..end]).replace('\\', "/"));
-        p = end + extra_len + comment_len;
-    }
-    names
+    zipmin::names(path)
 }
 
 
@@ -795,77 +641,211 @@ fn read_version_json(client: &Path, version: &str) -> Result<(PathBuf, serde_jso
     Ok((vjson, json))
 }
 
-/// 从 `versions\<version>\<version>.json` 拼 classpath。
+// ---------------------------------------------------------------- 版本 json
+
+/// 一条继承链合并后的结果。
+///
+/// `inheritsFrom` 不是可选项：**官方 installer 装出来的 Forge 就是继承式的**
+/// （`1.12.2-forge-14.23.5.2864.json` 里只有 `inheritsFrom` 和自己的库，原版那
+/// 五十多个库在父层）。旧实现只看单层 json，遇到这种会少掉一半库，症状是
+/// `NoClassDefFoundError: net/minecraft/client/main/Main`。这台机器的 json 恰好
+/// 是合并式的（"导入到本地"生成的那种），所以一直没炸 —— 那是运气，不是设计。
+pub struct VersionJson {
+    /// 合并后的 json：父在前，子覆盖父。
+    pub merged: Value,
+    /// 从子到父的版本名，`chain[0]` 是实例里写的那个。
+    pub chain: Vec<String>,
+    /// 逐层原始 json，同样从子到父。参数模板要按"父先子后"拼。
+    pub layers: Vec<Value>,
+    /// 客户端 jar：沿链找第一个存在的 `versions\<v>\<v>.jar`。
+    pub client_jar: Option<PathBuf>,
+}
+
+/// 读一条继承链并合并。
+///
+/// 上限 16 层不是防"深"，是防环：`A → B → A` 这种手写错误会让循环永不结束，而
+/// 报错里带上整条链比"栈溢出"有用得多。
+fn load_version_chain(client: &Path, version: &str) -> Result<VersionJson, String> {
+    let mut chain: Vec<String> = Vec::new();
+    let mut layers: Vec<Value> = Vec::new();
+    let mut cur = version.to_owned();
+    let mut closed = false;
+    for _ in 0..16 {
+        if chain.iter().any(|v| *v == cur) {
+            return Err(format!(
+                "版本 json 的 inheritsFrom 成环：{} → {cur}",
+                chain.join(" → ")
+            ));
+        }
+        let (_path, json) = read_version_json(client, &cur)?;
+        let next = json
+            .get("inheritsFrom")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        chain.push(cur.clone());
+        layers.push(json);
+        match next {
+            Some(parent) => cur = parent,
+            None => {
+                closed = true;
+                break;
+            }
+        }
+    }
+    if !closed {
+        return Err(format!(
+            "版本 json 的继承链超过 16 层（{}），疑似成环",
+            chain.join(" → ")
+        ));
+    }
+
+    let mut merged = serde_json::Map::new();
+    for layer in layers.iter().rev() {
+        let Some(obj) = layer.as_object() else { continue };
+        for (key, value) in obj {
+            match key.as_str() {
+                // 合并完就没有"父"这个概念了，留着只会让后续代码以为还有一层。
+                "inheritsFrom" => {}
+                "libraries" => merge_libraries(&mut merged, value),
+                "arguments" => merge_arguments(&mut merged, value),
+                _ => {
+                    merged.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
+
+    let client_jar = chain
+        .iter()
+        .map(|v| client.join("versions").join(v).join(format!("{v}.jar")))
+        .find(|p| p.is_file());
+
+    Ok(VersionJson { merged: Value::Object(merged), chain, layers, client_jar })
+}
+
+/// 父库先、子库后；子层覆盖同名构件（`group:artifact[:classifier]`，**不看版本**）
+/// 时**原地替换**，位置不变。
+///
+/// 两条边界，都是踩过的：
+///
+/// * **同一层里的重复不去重。** 1.12.2 的 json 里 `lwjgl-platform` 有两个版本
+///   （2.9.4 与 2.9.2），vanilla 也两个都留着；按构件身份去重会干掉 2.9.4，而
+///   dll 恰恰只在它的 natives jar 里 —— 症状是 `UnsatisfiedLinkError: no lwjgl
+///   in java.library.path`，与"合并库"这件事看不出关系。
+/// * **覆盖要原地替换。** classpath 顺序对 Forge 有意义（`launchwrapper` 要在
+///   原版库之前），把子层覆盖的库挪到末尾会改掉这个顺序。
+fn merge_libraries(merged: &mut serde_json::Map<String, Value>, incoming: &Value) {
+    let Some(list) = incoming.as_array() else { return };
+    let target = merged
+        .entry("libraries".to_owned())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Some(arr) = target.as_array_mut() else { return };
+    // 本层开始的位置：只拿它前面的条目（父层）比对，本层内部互不干扰。
+    let inherited = arr.len();
+    for lib in list {
+        let key = lib.get("name").and_then(Value::as_str).and_then(lib_identity);
+        let pos = key.and_then(|k| {
+            arr[..inherited].iter().position(|x| {
+                x.get("name").and_then(Value::as_str).and_then(lib_identity).as_deref()
+                    == Some(k.as_str())
+            })
+        });
+        match pos {
+            Some(i) => arr[i] = lib.clone(),
+            None => arr.push(lib.clone()),
+        }
+    }
+}
+
+/// 库的身份：`group:artifact:version[:classifier]` → `group:artifact[:classifier]`。
+///
+/// 少于三段（不合 Maven 规范的自制库名）时原样返回 —— 这种情况按全名比对，
+/// 至少不会把两个不同的东西当成同一个。
+fn lib_identity(name: &str) -> Option<String> {
+    let parts: Vec<&str> = name.split(':').collect();
+    match parts.len() {
+        3 => Some(format!("{}:{}", parts[0], parts[1])),
+        4 => Some(format!("{}:{}:{}", parts[0], parts[1], parts[3])),
+        _ => Some(name.to_owned()),
+    }
+}
+
+/// `arguments.game` / `arguments.jvm` 都是数组：父的在前、子的在后。
+///
+/// 顺序就是优先级 —— 去重时"后面的赢"，所以子版本追加的 `--width` 会顶掉父层的。
+fn merge_arguments(merged: &mut serde_json::Map<String, Value>, incoming: &Value) {
+    let Some(obj) = incoming.as_object() else { return };
+    let target = merged
+        .entry("arguments".to_owned())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    let Some(dst) = target.as_object_mut() else { return };
+    for (key, value) in obj {
+        match (dst.get_mut(key).and_then(Value::as_array_mut), value.as_array()) {
+            (Some(existing), Some(list)) => existing.extend(list.iter().cloned()),
+            _ => {
+                dst.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+/// `rules` 过完一遍的库列表。classpath 与 natives 共用同一份判断 ——
+/// 分成两处写，早晚会出现"这个库进了 classpath 但没解 natives"。
+fn allowed_libraries<'a>(json: &'a Value, feat: Features) -> Vec<&'a Value> {
+    json.get("libraries")
+        .and_then(Value::as_array)
+        .map(|libs| {
+            libs.iter()
+                .filter(|lib| rules_allow(lib.get("rules"), feat))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 从合并后的库列表拼 classpath。
 ///
 /// 三条从脚本时代继承下来的规则，一条都不能省：
 /// 1. 路径取 `downloads.artifact.path`，它是**相对 libraries 根**的（不是相对
 ///    客户端根）—— 首版少 55 个 jar 就是这么来的；
 /// 2. 没有该字段时按 `group:artifact:version` 推导；
-/// 3. `rules` 有匹配项时看最后一条 `action`，没有匹配项就不进 classpath。
+/// 3. `rules` 不通过就不进（见 [`allowed_libraries`]）。
 fn build_classpath(
     client: &Path,
-    version: &str,
-    json: &serde_json::Value,
-) -> Result<(Vec<PathBuf>, Vec<String>), String> {
-    let vdir = client.join("versions").join(version);
-
+    vj: &VersionJson,
+    feat: Features,
+) -> (Vec<PathBuf>, Vec<String>) {
     let lib_root = client.join("libraries");
     let mut cp: Vec<PathBuf> = Vec::new();
     let mut missing: Vec<String> = Vec::new();
 
-    if let Some(libs) = json.get("libraries").and_then(|v| v.as_array()) {
-        for lib in libs {
-            // rules：空 = 进；有则最后一条匹配的说了算。1.12.2 只用得到 os.name。
-            let mut keep = true;
-            if let Some(rules) = lib.get("rules").and_then(|v| v.as_array()) {
-                keep = false;
-                for r in rules {
-                    let mut hit = true;
-                    if let Some(os) = r.get("os") {
-                        if let Some(name) = os.get("name").and_then(|v| v.as_str()) {
-                            if name != "windows" {
-                                hit = false;
-                            }
-                        }
-                        if let Some(arch) = os.get("arch").and_then(|v| v.as_str()) {
-                            if arch != "x86_64" {
-                                hit = false;
-                            }
-                        }
-                    }
-                    if hit {
-                        keep = r.get("action").and_then(|v| v.as_str()) == Some("allow");
-                    }
-                }
-            }
-            if !keep {
-                continue;
-            }
-
-            let rel = lib
-                .pointer("/downloads/artifact/path")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_owned())
-                .or_else(|| lib.get("name").and_then(|v| v.as_str()).and_then(name_to_path));
-            let Some(rel) = rel else { continue };
-
-            let full = lib_root.join(rel.replace('/', r"\"));
-            if full.is_file() {
+    for lib in allowed_libraries(&vj.merged, feat) {
+        let rel = lib
+            .pointer("/downloads/artifact/path")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| lib.get("name").and_then(Value::as_str).and_then(name_to_path));
+        let Some(rel) = rel else { continue };
+        let full = lib_root.join(rel.replace('/', r"\"));
+        if full.is_file() {
+            // 同一个 jar 在这份 json 里出现两次（`text2speech` 就是），完全相同的
+            // 路径进两次 classpath 没有语义，只会让 `-cp` 变长、让"扫了几个 jar"
+            // 这个计数失真。不同版本的同名构件不在这里去重 —— 那是 json 的意图
+            // （log4j 2.8.1 与 2.15.0 同时存在），由 JVM 的"先出现者胜"决定。
+            if !cp.contains(&full) {
                 cp.push(full);
-            } else {
-                missing.push(rel);
             }
+        } else {
+            missing.push(rel);
         }
     }
 
-    let client_jar = vdir.join(format!("{version}.jar"));
-    if client_jar.is_file() {
-        cp.push(client_jar);
-    } else {
-        missing.push(format!("{version}.jar"));
+    match &vj.client_jar {
+        Some(jar) => cp.push(jar.clone()),
+        None => missing.push(format!("{}.jar（继承链上各层都没有）", vj.chain[0])),
     }
-
-    Ok((cp, missing))
+    (cp, missing)
 }
 
 /// `group:artifact:version` → `group\artifact\version\artifact-version.jar`。
@@ -887,8 +867,11 @@ fn name_to_path(name: &str) -> Option<String> {
     ))
 }
 
-/// natives 目录：优先 `natives-tmp`，退回版本目录（与脚本一致）。
-fn natives_dir(client: &Path, version: &str) -> PathBuf {
+/// 旧行为那个 natives 目录：优先 `natives-tmp`，退回版本目录。
+///
+/// 只在两种情况下用到它：解 natives 全部失败时的兜底，以及
+/// `java.extract_natives = false` 的排障路径。新路径是 `runtime\natives\<版本>`。
+fn fallback_natives_dir(client: &Path, version: &str) -> PathBuf {
     let tmp = client.join("natives-tmp");
     if tmp.is_dir() {
         tmp
@@ -897,8 +880,153 @@ fn natives_dir(client: &Path, version: &str) -> PathBuf {
     }
 }
 
+// ------------------------------------------------------------- 参数模板接线
+
+/// 模板里的游戏参数。
+///
+/// 两种写法都会读，顺序是**旧式在前、新式在后**：
+///
+/// * 旧式（`minecraftArguments` 一整串）只有 1.12 及以前有，取**最近一层**的那个
+///   —— 子版本要换模板时直接写一份新的覆盖父层即可。
+/// * 新式（`arguments.game` 数组）从 1.13 起才有，父先子后。
+///
+/// 为什么不是"有 `arguments` 就不用 `minecraftArguments`"：继承式的版本里这两个
+/// 会同时出现 —— 父层是老版本的整串（`--gameDir` 之类的基础参数都在里面），子层
+/// 只追加了自己那几条。二选一会丢掉一半参数。拼接之后由去重收口：同一个键后面
+/// 的赢，与 vanilla 的合并效果一致。
+///
+/// 返回 `None` 表示这份 json 根本不给模板（自制版本、手写的最小版本 json）。
+fn template_game_args(
+    vj: &VersionJson,
+    ph: &Placeholders,
+    feat: Features,
+) -> Result<Option<Vec<ArgToken>>, String> {
+    let mut out: Vec<ArgToken> = Vec::new();
+    let mut found = false;
+
+    for layer in &vj.layers {
+        if let Some(raw) = layer.get("minecraftArguments").and_then(Value::as_str) {
+            if !raw.trim().is_empty() {
+                out.extend(args_from_string(raw, ph)?);
+                found = true;
+                break;
+            }
+        }
+    }
+
+    let mut appended = false;
+    for layer in vj.layers.iter().rev() {
+        if let Some(arr) = layer.pointer("/arguments/game") {
+            if arr.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+                appended = true;
+                out.extend(args_from_array(arr, ph, feat)?);
+            }
+        }
+    }
+
+    Ok(if found || appended { Some(out) } else { None })
+}
+
+/// json 没给模板时的底线参数。
+///
+/// 留着它不是因为"怕删"，而是因为模板缺失时唯一能做的事就是给一组 1.6~1.12 都
+/// 认的值；`--print-game` 输出一段空白比输出这组值更难排障。
+#[allow(clippy::too_many_arguments)]
+fn fallback_game_args(
+    spec: &InstanceSpec,
+    version: &str,
+    saves: &Path,
+    client: &Path,
+    asset_index: &str,
+    version_type: &str,
+) -> Vec<ArgToken> {
+    let mut game = vec![
+        ArgToken::builtin("--username"),
+        ArgToken::instance(spec.game.player.clone()),
+        ArgToken::builtin("--version"),
+        ArgToken::builtin(version.to_owned()),
+        ArgToken::builtin("--gameDir"),
+        ArgToken::instance(saves.to_string_lossy().into_owned()),
+        ArgToken::builtin("--assetsDir"),
+        ArgToken::builtin(client.join("assets").to_string_lossy().into_owned()),
+        ArgToken::builtin("--assetIndex"),
+        ArgToken::builtin(asset_index.to_owned()),
+        ArgToken::builtin("--uuid"),
+        ArgToken::builtin("00000000-0000-0000-0000-000000000000"),
+        ArgToken::builtin("--accessToken"),
+        ArgToken::builtin("0"),
+        ArgToken::builtin("--userType"),
+        ArgToken::builtin("legacy"),
+        ArgToken::builtin("--versionType"),
+        ArgToken::builtin(version_type.to_owned()),
+    ];
+    game.shrink_to_fit();
+    game
+}
+
+/// 版本 json 的 `arguments.jvm`（1.13+）。
+///
+/// 只作为**补充**：内存、GC、`-XX:ErrorFile`、`-Djava.library.path`、`-cp`
+/// 由我们自己算，所以这些键在 json 里的版本一律丢弃。
+///
+/// 丢弃时**连值一起丢**：`-cp` 在数组里是两个 token（`"-cp"` 与
+/// `"${classpath}"`），只删键不删值的话，那个 classpath 字符串会变成主类前面
+/// 多出来的位置参数 —— 报错是 `Could not find or load main class C:\...jar`，
+/// 与真正的原因隔着十万八千里。
+fn jvm_from_json(
+    vj: &VersionJson,
+    ph: &Placeholders,
+    feat: Features,
+) -> Result<(Vec<ArgToken>, usize), String> {
+    let mut raw: Vec<ArgToken> = Vec::new();
+    for layer in vj.layers.iter().rev() {
+        if let Some(arr) = layer.pointer("/arguments/jvm") {
+            raw.extend(args_from_array(arr, ph, feat)?);
+        }
+    }
+    let total = raw.len();
+    let mut out = Vec::with_capacity(total);
+    let mut i = 0usize;
+    while i < raw.len() {
+        let token = raw[i].clone();
+        if jvm_arg_is_ours(&token.text) {
+            let bare = matches!(token.text.as_str(), "-cp" | "-classpath");
+            i += 1;
+            if bare && i < raw.len() && !raw[i].text.starts_with('-') {
+                i += 1;
+            }
+            continue;
+        }
+        out.push(token);
+        i += 1;
+    }
+    let dropped = total - out.len();
+    Ok((out, dropped))
+}
+
+/// 这些 JVM 键由 [`InstanceSpec::plan`] 自己算，json 里的同名项一律丢弃。
+fn jvm_arg_is_ours(arg: &str) -> bool {
+    let key = arg.split('=').next().unwrap_or(arg);
+    if matches!(
+        key,
+        "-cp" | "-classpath" | "-Djava.library.path" | "-Dos.name" | "-Dos.version"
+    ) {
+        return true;
+    }
+    key.starts_with("-Xmx")
+        || key.starts_with("-Xms")
+        || key.starts_with("-Xss")
+        || key.starts_with("-XX:ErrorFile")
+        || key.starts_with("-XX:+HeapDumpOnOutOfMemoryError")
+        || key.starts_with("-Dminecraft.launcher.")
+}
+
 impl InstanceSpec {
-    /// 组装启动计划（不落盘、不起进程，纯计算）。
+    /// 组装启动计划（纯计算 + 一次 natives 解压）。
+    ///
+    /// 参数只有一个来源：版本 json 的模板。实例文件只负责"这台机器的事实"
+    /// （玩家名、存档目录、内存、覆盖值），不再自己拼参数 —— 那正是旧实现
+    /// "改一个参数就起不来"的根源。
     pub fn plan(&self, cfg: &Config, paths: &Paths) -> Result<LaunchPlan, String> {
         self.validate()?;
         let client = self.client_path(paths);
@@ -907,8 +1035,17 @@ impl InstanceSpec {
         let size = self.target_size(cfg);
         let version = &self.game.version;
 
-        let (_vjson_path, json) = read_version_json(&client, version)?;
-        let (cp, missing) = build_classpath(&client, version, &json)?;
+        let vj = load_version_chain(&client, version)?;
+        let merged = &vj.merged;
+        // 我们永远给得出两个分辨率的数，所以 `has_custom_resolution` 恒真 ——
+        // 它决定的正是 1.13+ 的 `--width/--height` 要不要出现在模板参数里。
+        let feat = Features {
+            demo_user: false,
+            custom_resolution: true,
+            quick_plays_support: false,
+        };
+
+        let (cp, missing) = build_classpath(&client, &vj, feat);
         if cp.is_empty() {
             return Err(format!(
                 "classpath 是空的（客户端 {} 下没有 versions\\{}\\）",
@@ -916,37 +1053,84 @@ impl InstanceSpec {
                 version
             ));
         }
-        let asset_index = json
+        let asset_index = merged
             .pointer("/assetIndex/id")
-            .and_then(|v| v.as_str())
+            .and_then(Value::as_str)
             .unwrap_or("1.12")
             .to_owned();
-        let version_type = json
+        let version_type = merged
             .get("type")
-            .and_then(|v| v.as_str())
+            .and_then(Value::as_str)
             .unwrap_or("release")
             .to_owned();
-
-        // 主类与 tweaker 一律"实例没写就从 json 取"。以前这两个都在实例里抄了一遍，
-        // 而 json 里本来就有 —— 一个字段改错，表现是 javaw 秒退 + 一行
-        // `Could not find or load main class`，与"哪里写错了"毫无线索关联。
-        let (main_text, main_origin) = resolve_main_class(self, &json)?;
-        let tweak = resolve_tweak_class(self, &json)?;
-
+        let (main_text, main_origin) = resolve_main_class(self, merged)?;
         let cp_joined = cp
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect::<Vec<_>>()
             .join(";");
 
+        // ---- natives：按 json 的 `natives` 段解到 runtime，客户端目录保持只读 ----
+        let lib_root = client.join("libraries");
+        let nat_dest = paths.runtime().join("natives").join(version);
+        let nat_fallback = fallback_natives_dir(&client, version);
+        let nat = if self.java.extract_natives {
+            natives::prepare(
+                &lib_root,
+                &allowed_libraries(merged, feat),
+                &nat_dest,
+                &nat_fallback,
+            )
+        } else {
+            let mut off = natives::Outcome::default();
+            if nat_fallback.is_dir() {
+                off.dirs.push(nat_fallback.clone());
+            }
+            off
+        };
+        // 一个目录都没有时退回旧路径：没有 `java.library.path` 的 lwjgl 启动即崩。
+        let library_path = if nat.dirs.is_empty() {
+            nat_fallback.to_string_lossy().into_owned()
+        } else {
+            nat.library_path()
+        };
+
+        // ---- 占位符：这里列的是 Mojang 的协议名，不是我们的口味 ----
+        let mut ph = Placeholders::new();
+        ph.set("auth_player_name", self.game.player.clone())
+            .set("version_name", version.clone())
+            .set("game_directory", saves.to_string_lossy().into_owned())
+            .set("assets_root", client.join("assets").to_string_lossy().into_owned())
+            .set("game_assets", client.join("assets").to_string_lossy().into_owned())
+            .set("assets_index_name", asset_index.clone())
+            .set("auth_uuid", "00000000-0000-0000-0000-000000000000")
+            .set("auth_access_token", "0")
+            .set("auth_session", "-")
+            .set("user_type", "legacy")
+            // MC 1.7 会把它当 JSON 解析；空串会让它当成"没有属性表"。
+            .set("user_properties", "{}")
+            .set("version_type", version_type.clone())
+            .set("natives_directory", library_path.clone())
+            .set("launcher_name", "stream-server")
+            .set("launcher_version", env!("CARGO_PKG_VERSION"))
+            .set("classpath", cp_joined.clone())
+            .set("classpath_separator", ";")
+            .set("library_directory", lib_root.to_string_lossy().into_owned())
+            .set(
+                "primary_jar",
+                vj.client_jar
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            )
+            .set("resolution_width", size.0.to_string())
+            .set("resolution_height", size.1.to_string());
+
         let mut jvm: Vec<ArgToken> = vec![
             ArgToken::builtin(format!("-Xmx{}M", self.java.heap_mb)),
             ArgToken::builtin("-Xms512M"),
             ArgToken::builtin("-XX:+UseG1GC"),
-            ArgToken::builtin(format!(
-                "-Djava.library.path={}",
-                natives_dir(&client, version).display()
-            )),
+            ArgToken::builtin(format!("-Djava.library.path={library_path}")),
             ArgToken::builtin("-Dfml.ignoreInvalidMinecraftCertificates=true"),
             ArgToken::builtin("-Dfml.ignorePatchDiscrepancies=true"),
             // JVM 自己的崩溃日志也进 runtime，与游戏的 crash-report 放在一起，
@@ -956,50 +1140,68 @@ impl InstanceSpec {
                 paths.runtime().join("hs_err_%p.log").display()
             )),
         ];
+        let (json_jvm, json_jvm_dropped) = jvm_from_json(&vj, &ph, feat)?;
+        jvm.extend(json_jvm);
+
+        // log4j2 的配置（1.12+）。给了它 `logs/latest.log` 才有正常格式；文件不在
+        // 就跳过 —— 这不该阻止启动，只是日志换成 log4j 默认样式。
+        let mut log_note: Option<String> = None;
+        if let Some(arg) = merged.pointer("/logging/client/argument").and_then(Value::as_str) {
+            let id = merged
+                .pointer("/logging/client/file/id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let cfg_file = client.join("assets").join("log_configs").join(id);
+            if !id.is_empty() && cfg_file.is_file() {
+                let mut lp = Placeholders::new();
+                lp.set("path", cfg_file.to_string_lossy().into_owned());
+                jvm.push(ArgToken::json(lp.expand(arg)?));
+            } else if !arg.trim().is_empty() {
+                log_note = Some(format!(
+                    "logging: assets\\log_configs\\{id} 不存在，本次用 log4j 默认配置"
+                ));
+            }
+        }
+
         jvm.extend(self.java.jvm_args.iter().cloned().map(ArgToken::instance));
         jvm.push(ArgToken::builtin("-cp"));
         // classpath 的内容来自版本 json 的 libraries，形状（`-cp` 与 `;`）是我们定的。
         jvm.push(ArgToken::json(cp_joined));
 
-        let mut game: Vec<ArgToken> = Vec::new();
-        game.push(ArgToken::builtin("--username"));
-        game.push(ArgToken::instance(self.game.player.clone()));
-        game.push(ArgToken::builtin("--version"));
-        game.push(ArgToken::json(version.clone()));
-        game.push(ArgToken::builtin("--gameDir"));
-        game.push(ArgToken::instance(saves.to_string_lossy().into_owned()));
-        game.push(ArgToken::builtin("--assetsDir"));
-        game.push(ArgToken::builtin(
-            client.join("assets").to_string_lossy().into_owned(),
-        ));
-        game.push(ArgToken::builtin("--assetIndex"));
-        game.push(ArgToken::json(asset_index));
-        game.push(ArgToken::builtin("--uuid"));
-        game.push(ArgToken::builtin("00000000-0000-0000-0000-000000000000"));
-        game.push(ArgToken::builtin("--accessToken"));
-        game.push(ArgToken::builtin("0"));
-        game.push(ArgToken::builtin("--userType"));
-        game.push(ArgToken::builtin("legacy"));
-        game.push(ArgToken::builtin("--versionType"));
-        game.push(ArgToken::json(version_type));
-        // 窗口尺寸走 MC 自己的参数（1.12.2 的 Main 认 --width/--height），
-        // 全屏则只能靠 options.txt，见 write_options。
+        // ---- 游戏段：模板 + 我们的覆盖值，最后统一去重 ----
+        let from_template = template_game_args(&vj, &ph, feat)?;
+        let used_template = from_template.is_some();
+        let mut game = from_template.unwrap_or_else(|| {
+            fallback_game_args(self, version, &saves, &client, &asset_index, &version_type)
+        });
+        // 尺寸：模板里已经有 `--width`（1.13+ 的写法）也没关系，去重时后面赢。
         game.push(ArgToken::builtin("--width"));
         game.push(ArgToken::builtin(size.0.to_string()));
         game.push(ArgToken::builtin("--height"));
         game.push(ArgToken::builtin(size.1.to_string()));
-        if let Some((text, origin)) = tweak.clone() {
+        // tweaker 覆盖：实例写了才追加，去重会顶掉模板里的那一个。
+        if let Some(tweak) = self.game.tweak_class.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        {
             game.push(ArgToken::builtin("--tweakClass"));
-            game.push(ArgToken { text, origin });
+            game.push(ArgToken::instance(tweak.to_owned()));
         }
         game.extend(self.game.game_args.iter().cloned().map(ArgToken::instance));
 
-        // ---- 启动前的三条校验 -------------------------------------------
+        // 空值先删（`--versionType ""` 这种），再去重（后者覆盖前者）。
+        let game = drop_empty_values(game);
+        let (game, overridden) = override_flags(game);
+        let texts: Vec<String> = game.iter().map(|t| t.text.clone()).collect();
+        let tweak = find_flag_value(&texts, "--tweakClass");
+
+        // ---- 启动前的校验 -----------------------------------------------
         // 都是"几分钟就能查、但错过了要花半小时"的错，所以宁可在这里拒绝启动。
         let mut checks: Vec<String> = Vec::new();
 
-        // 1) 占位符残留。我们没有模板引擎，参数里出现 `${...}` 说明有人把版本 json
-        //    的模板串直接写进了 game_args，或者将来模板化时漏了某一项。
+        if vj.chain.len() > 1 {
+            checks.push(format!("chain: {}", vj.chain.join(" → ")));
+        }
+        // 1) 占位符残留。json 里的模板串被抄进 game_args、或者将来新增的占位符
+        //    没人提供值时，都会在这里被拦住。
         for t in jvm.iter().chain(game.iter()) {
             if t.text.contains("${") {
                 return Err(format!(
@@ -1010,26 +1212,47 @@ impl InstanceSpec {
             }
         }
 
-        // 2) 游戏段重复的 `--flag`。MC 的 main 通常取第一个出现的值，于是"改了
-        //    却没生效"是这里最典型的症状（PCL 在拼接后专门做一遍去重，就是为这个）。
+        // 2) 去重之后仍然重复：说明去重逻辑漏了某个键（拆成了两组 token 之类）。
+        //    这是断言，不是策略 —— 正常路径上恒为空。
         let dups = duplicate_flags(&game);
         if !dups.is_empty() {
             return Err(format!(
-                "游戏参数里出现了重复的键：{}。MC 一般只认第一个，另一次会静默失效",
+                "去重之后游戏参数里还有重复的键：{}。这是参数拼接的 bug，请报出来",
                 dups.join("、")
             ));
         }
         checks.push(format!(
-            "args: {} 个 jvm / {} 个 game token，无重复键、无占位符残留",
+            "args: {} 个 jvm / {} 个 game token，模板={}，覆盖掉的键={}，残留占位符=0",
             jvm.len(),
-            game.len()
+            game.len(),
+            if used_template { "json" } else { "内置（json 没有模板）" },
+            if overridden.is_empty() { "-".to_owned() } else { overridden.join(",") }
         ));
+        if json_jvm_dropped > 0 {
+            checks.push(format!(
+                "jvm: json 的 arguments.jvm 里丢掉 {json_jvm_dropped} 个与我们重复的 token"
+            ));
+        }
+        if let Some(note) = log_note {
+            checks.push(note);
+        }
+        checks.push(nat.summary());
+        for note in &nat.notes {
+            checks.push(format!("natives: {note}"));
+        }
+        if !nat.failed.is_empty() {
+            checks.push(format!(
+                "natives: 解压失败 {} 个（{}），已退回旧目录",
+                nat.failed.len(),
+                short_list(&nat.failed)
+            ));
+        }
 
         // 3) 主类与 tweaker 必须真的在 classpath 里。
         if self.java.verify_classes {
             let mut wanted: Vec<&str> = vec![main_text.as_str()];
-            if let Some((text, _)) = tweak.as_ref() {
-                wanted.push(text.as_str());
+            if let Some(text) = tweak.as_deref() {
+                wanted.push(text);
             }
             let found = locate_classes(&cp, &wanted);
             if !found.missing.is_empty() {
@@ -1068,6 +1291,7 @@ impl InstanceSpec {
             size,
             model: self.display.model,
             missing,
+            chain: vj.chain,
             checks,
         })
     }
@@ -1183,6 +1407,9 @@ pub fn report(cfg: &Config) -> Result<String, String> {
         plan.size.0, plan.size.1, plan.model
     ));
     out.push_str(&format!("# main       : {}\n", plan.main_class.text));
+    if plan.chain.len() > 1 {
+        out.push_str(&format!("# chain      : {}\n", plan.chain.join(" → ")));
+    }
     for c in &plan.checks {
         out.push_str(&format!("# check      : {c}\n"));
     }
@@ -1199,6 +1426,7 @@ pub fn report(cfg: &Config) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    use super::template::split_arguments;
     use super::*;
 
     #[test]
@@ -1316,26 +1544,32 @@ mod tests {
         assert!(duplicate_flags(&ok).is_empty());
     }
 
-    #[test]
-    fn central_dir_reads_entry_names() {
-        fn entry(name: &str) -> Vec<u8> {
-            let mut v = vec![0u8; 46];
-            v[0..4].copy_from_slice(&CENTRAL_SIG.to_le_bytes());
-            v[28..30].copy_from_slice(&(name.len() as u16).to_le_bytes());
-            v.extend_from_slice(name.as_bytes());
-            v
+    /// 测试用的最小 `VersionJson`：只有 `layers` 对模板拼接有意义。
+    fn vj(layers: Vec<Value>) -> VersionJson {
+        let n = layers.len();
+        VersionJson {
+            merged: Value::Null,
+            chain: vec![String::new(); n],
+            layers,
+            client_jar: None,
         }
-        let mut cd = entry("net/minecraft/launchwrapper/Launch.class");
-        cd.extend(entry("META-INF/MANIFEST.MF"));
-        assert_eq!(
-            central_dir_names(&cd),
-            vec![
-                "net/minecraft/launchwrapper/Launch.class".to_owned(),
-                "META-INF/MANIFEST.MF".to_owned()
-            ]
-        );
-        assert!(central_dir_names(&[]).is_empty());
-        assert!(central_dir_names(&[0u8; 46]).is_empty(), "签名不对时不能瞎读");
+    }
+
+    fn ph() -> Placeholders {
+        let mut p = Placeholders::new();
+        p.set("auth_player_name", "CloudPlayer");
+        p.set("game_directory", r"C:\g\saves\default");
+        p.set("natives_directory", r"C:\g\runtime\natives");
+        p.set("classpath", r"C:\g\cp.jar");
+        p
+    }
+
+    fn texts(tokens: &[ArgToken]) -> Vec<&str> {
+        tokens.iter().map(|t| t.text.as_str()).collect()
+    }
+
+    fn owned_texts(tokens: &[ArgToken]) -> Vec<String> {
+        tokens.iter().map(|t| t.text.clone()).collect()
     }
 
     #[test]
@@ -1363,35 +1597,118 @@ mod tests {
 
     #[test]
     fn tweak_class_comes_from_the_template() {
-        let mut spec = example_instance("x");
         // 旧式：minecraftArguments 一整串
-        let old = serde_json::json!({
+        let old = vj(vec![serde_json::json!({
             "minecraftArguments": "--username ${auth_player_name} --tweakClass net.minecraftforge.fml.common.launcher.FMLTweaker --versionType Forge"
-        });
+        })]);
+        let args = template_game_args(&old, &ph(), Features::default())
+            .expect("应当能取到")
+            .expect("旧式模板应当有参数");
         assert_eq!(
-            resolve_tweak_class(&spec, &old).expect("应当能取到"),
-            Some((
-                "net.minecraftforge.fml.common.launcher.FMLTweaker".to_owned(),
-                ArgOrigin::Json
-            ))
+            find_flag_value(&owned_texts(&args), "--tweakClass").as_deref(),
+            Some("net.minecraftforge.fml.common.launcher.FMLTweaker")
         );
+        assert_eq!(texts(&args)[1], "CloudPlayer", "占位符要展开");
 
         // 新式：arguments.game 数组
-        let new = serde_json::json!({ "arguments": { "game": ["--tweakClass", "optifine.OptiFineTweaker"] } });
+        let new = vj(vec![serde_json::json!({
+            "arguments": { "game": ["--tweakClass", "optifine.OptiFineTweaker"] }
+        })]);
+        let args = template_game_args(&new, &ph(), Features::default())
+            .expect("应当能取到")
+            .expect("新式模板也应当有参数");
         assert_eq!(
-            resolve_tweak_class(&spec, &new).expect("应当能取到"),
-            Some(("optifine.OptiFineTweaker".to_owned(), ArgOrigin::Json))
+            find_flag_value(&owned_texts(&args), "--tweakClass").as_deref(),
+            Some("optifine.OptiFineTweaker")
         );
 
-        // 原版 json 没有 tweaker，应当返回 None 而不是报错。
-        assert_eq!(resolve_tweak_class(&spec, &serde_json::json!({})).expect("没有就是没有"), None);
+        // 原版 json / 自制 json 没有模板：返回 None，由调用方走内置底线参数。
+        assert!(template_game_args(&vj(vec![serde_json::json!({})]), &ph(), Features::default())
+            .expect("没有就是没有")
+            .is_none());
+    }
 
-        // 实例覆盖优先
-        spec.game.tweak_class = Some("my.Tweaker".to_owned());
-        assert_eq!(
-            resolve_tweak_class(&spec, &old).expect("覆盖"),
-            Some(("my.Tweaker".to_owned(), ArgOrigin::Instance))
+    #[test]
+    fn new_style_args_concatenate_parent_then_child() {
+        // layers 顺序是"子 → 父"，拼接顺序必须是"父 → 子"，否则子的覆盖值会先被
+        // 父值顶掉 —— 这是组合顺序最容易写反的一处。
+        let chain = vj(vec![
+            serde_json::json!({"arguments": {"game": ["--flag", "child"]}}),
+            serde_json::json!({"arguments": {"game": ["--flag", "parent"]}}),
+        ]);
+        let args = template_game_args(&chain, &ph(), Features::default()).unwrap().unwrap();
+        assert_eq!(texts(&args), vec!["--flag", "parent", "--flag", "child"]);
+        // 交给去重之后，后者（子）赢。
+        let (merged, over) = override_flags(args);
+        assert_eq!(texts(&merged), vec!["--flag", "child"]);
+        assert_eq!(over, vec!["--flag"]);
+    }
+
+    #[test]
+    fn old_and_new_style_coexist_in_an_inheritance_chain() {
+        // 继承式的真实形态：父层是老版本的整串（基础参数），子层只追加自己的几条。
+        // 二选一就会丢掉一半参数，所以两者都要读，顺序是旧式在前。
+        let chain = vj(vec![
+            serde_json::json!({"arguments": {"game": ["--child-flag", "1"]}}),
+            serde_json::json!({"minecraftArguments": "--gameDir ${game_directory}"}),
+        ]);
+        let args = template_game_args(&chain, &ph(), Features::default()).unwrap().unwrap();
+        assert_eq!(texts(&args), vec!["--gameDir", r"C:\g\saves\default", "--child-flag", "1"]);
+    }
+
+    #[test]
+    fn jvm_args_from_json_drop_the_keys_we_own() {
+        // `-cp` 在数组里是两个 token：只删键不删值，那个 classpath 会变成主类前面
+        // 多出来的位置参数。
+        let chain = vj(vec![serde_json::json!({
+            "arguments": {"jvm": [
+                "-Dtest.keep=1",
+                "-Djava.library.path=${natives_directory}",
+                "-cp", "${classpath}",
+                "-Xmx999M"
+            ]}
+        })]);
+        let (out, dropped) = jvm_from_json(&chain, &ph(), Features::default()).unwrap();
+        assert_eq!(texts(&out), vec!["-Dtest.keep=1"]);
+        assert_eq!(dropped, 4, "-Djava.library.path / -cp 与其值 / -Xmx999M");
+    }
+
+    #[test]
+    fn libraries_merge_by_name_in_place() {
+        let mut merged = serde_json::Map::new();
+        merge_libraries(
+            &mut merged,
+            &serde_json::json!([{"name": "a:b:1"}, {"name": "c:d:1"}, {"name": "a:b:0"}]),
         );
+        // 同一层里的重复**保留**：1.12.2 的 lwjgl-platform 就有两个版本，而 dll
+        // 只在其中一个的 natives jar 里。
+        let names: Vec<String> = merged["libraries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["name"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(names, vec!["a:b:1", "c:d:1", "a:b:0"]);
+
+        // 子层覆盖父层的构件：位置不变，内容替换。
+        merge_libraries(
+            &mut merged,
+            &serde_json::json!([{"name": "a:b:2"}, {"name": "e:f:1"}]),
+        );
+        let names: Vec<String> = merged["libraries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["name"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(names, vec!["a:b:2", "c:d:1", "a:b:0", "e:f:1"]);
+
+        // arguments 的子键是数组拼接，父在前。
+        let mut args = serde_json::Map::new();
+        merge_arguments(&mut args, &serde_json::json!({"game": ["--a"], "jvm": ["-Dx=1"]}));
+        merge_arguments(&mut args, &serde_json::json!({"game": ["--b"]}));
+        assert_eq!(args["arguments"]["game"], serde_json::json!(["--a", "--b"]));
+        assert_eq!(args["arguments"]["jvm"], serde_json::json!(["-Dx=1"]));
     }
 
     #[test]
