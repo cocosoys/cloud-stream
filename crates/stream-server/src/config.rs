@@ -317,6 +317,90 @@ pub struct Config {
     /// tuning helped" from "the machine was busier". Live encoders keep what
     /// they were opened with. See `pipeline::encoder::tuning`.
     pub tune: String,
+
+    /// 游戏托管：本进程要不要负责"把游戏客户端拉起来并看着它"。
+    ///
+    /// 关掉时所有游戏端点都答 404（不是 200 + 空状态）：一个没启用游戏托管的
+    /// 部署里，`POST /api/v1/control/game/start` 成功返回会让人以为游戏在起，
+    /// 而屏幕上什么都不会发生。见 [`crate::game`]。
+    pub game_enabled: bool,
+
+    /// 游戏托管：默认实例 id —— 对应 `<game_root>\instances\<id>.json`。
+    ///
+    /// 实例而不是路径：一台机器可以有多个客户端/多个存档，切换的动作应该是
+    /// "改一个字段"，不是"删了重配"。命令行 `--game-instance` 在单次启动里赢。
+    pub game_instance: String,
+
+    /// 游戏托管：`games` 根目录。
+    ///
+    /// **默认相对 exe 所在目录**（[`crate::run::root`]），不是相对工作目录 ——
+    /// 计划任务拉起时 cwd 由任务本身决定，谁也不能保证。`dist` 当初选相对
+    /// cwd 是因为它跟着包走；这里选了另一半：游戏目录里有存档，不能因为
+    /// 某人从别的目录敲了一次 exe 就"找不到世界了"。
+    pub game_root: Option<PathBuf>,
+
+    /// 游戏托管：服务起来时顺手把游戏也拉起来。
+    ///
+    /// 默认关。默认开会让"只想看串流、不想动桌面"的部署凭空多一个全屏窗口，
+    /// 而这个窗口正好盖住要串流的桌面 —— 那是一种很贵的惊喜。
+    pub game_autostart: bool,
+
+    /// 一次性动作：把生效的游戏实例与拼出来的启动命令行打到 stdout，然后退出。
+    ///
+    /// 与 `--print-config` 同一个理由：三十二个参数 + 一份实例 json 拼出来的
+    /// 那一条命令行，没人能凭记忆复述。运维要能"看一眼，然后复制到别处比对"。
+    /// 刻意不进 `--print-config` 的输出（那是配置本体），也不从文件读。
+    pub print_game: bool,
+
+    /// 输入锁定：把"从网页进来的输入"关在游戏里，不让它切走桌面。
+    ///
+    /// 默认关。理由和 `game_autostart` 一样是"别让默认配置改变一台机器的行为"：
+    /// 一个只想串流桌面的部署被默默锁上键盘，是运维最不想遇到的那种惊喜。
+    /// 但**只要开了游戏托管，它几乎总是该开**——全屏的 MC 一失去焦点就自己
+    /// 最小化，而串流采的是整屏。见 [`crate::kiosk`]。
+    pub kiosk: bool,
+
+    /// 游戏启动后自动上锁。
+    ///
+    /// 与 `kiosk` 分开是有意的：手工锁（面板上点一下）与自动锁的风险完全不同。
+    /// 自动锁意味着"玩家点开始游戏 → 桌面立刻被锁 → 只有口令或 SSH 能解"，
+    /// 这一步必须有人明确打开。
+    pub kiosk_autolock: bool,
+
+    /// 用注册表策略关掉 `Win` 组合与任务管理器（四档里的第 1 档）。
+    ///
+    /// 默认开。它只影响当前用户、改回来只要删一个值，而且是**唯一**能挡住
+    /// `Win+D` 这类"钩子看不见"的系统快捷键的一层。
+    pub kiosk_policy: bool,
+
+    /// 安装低级键盘钩子（第 2 档）。
+    ///
+    /// 默认开。留 `--no-kiosk-hook` 是为了排障：钩子出问题时表现是"键盘全没
+    /// 反应"，而关掉它就能一步区分"是钩子吃的"还是"注入端吃的"。
+    pub kiosk_hook: bool,
+
+    /// 网页解锁用的口令哈希（`sha256i:<轮数>:<盐>:<哈希>`）。
+    ///
+    /// 存哈希不存口令：运维拷一份 `stream-config.toml` 去排障、贴进聊天窗口，
+    /// 里面的字串不该等于口令。生成方式见 `--kiosk-hash`。
+    pub kiosk_password: Option<String>,
+
+    /// 一次性动作：算出口令哈希后退出。
+    ///
+    /// 明文从 `--kiosk-hash <口令>` 或 stdin（`echo 口令 | exe --kiosk-hash`）来。
+    /// 两条路都留着，因为它们的代价不同：参数会被 shell 历史记下，管道不会，
+    /// 但管道在 Windows 的 GUI 子系统下要绕一层重定向 —— 运维手边有什么就用
+    /// 什么，比"只提供一种正确姿势"更可能被照着做完。
+    pub kiosk_hash: bool,
+
+    /// `--kiosk-hash` 的明文。只在那一个一次性动作里有意义，不落盘、不打印。
+    pub kiosk_hash_plain: Option<String>,
+
+    /// 一次性动作：解除本机的输入锁定，然后退出。
+    ///
+    /// 这是"救命通道"：SSH 进去跑一条命令就能解锁。它不校验口令 —— 能在这台
+    /// 机器上执行任意命令的人本来就有更高权限，再要一次口令只是仪式。
+    pub unlock: bool,
 }
 
 impl Default for Config {
@@ -383,6 +467,21 @@ impl Default for Config {
             max_sessions: 8,
             mic_device: "auto".to_owned(),
             mic_default_device: "auto".to_owned(),
+            game_enabled: false,
+            game_instance: "default".to_owned(),
+            game_root: None,
+            game_autostart: false,
+            print_game: false,
+            // 锁定默认关，但"关"的是**行为**不是**能力**：策略与钩子两层的默认
+            // 值是开，`kiosk` 打开之后立刻是完整的 2 档锁定，不需要再记两个开关。
+            kiosk: false,
+            kiosk_autolock: false,
+            kiosk_policy: true,
+            kiosk_hook: true,
+            kiosk_password: None,
+            kiosk_hash: false,
+            kiosk_hash_plain: None,
+            unlock: false,
         }
     }
 }
@@ -753,6 +852,57 @@ impl Config {
                         }
                     }
                 }
+                // 游戏托管。四个开关都刻意做成"`--game` 开、`--no-game` 关"以外
+                // 的单值形式：游戏是一个**有状态**的对象（进程、窗口、存档），
+                // 拼错一个字母时"什么都没发生"比"起了一个不该起的窗口"好排查。
+                "--game" => cfg.game_enabled = true,
+                "--no-game" => cfg.game_enabled = false,
+                "--game-instance" => {
+                    if let Some(v) = iter.next() {
+                        if v.trim().is_empty() {
+                            log::warn!("--game-instance needs a non-empty id");
+                        } else {
+                            cfg.game_instance = v.trim().to_owned();
+                        }
+                    }
+                }
+                "--game-root" => {
+                    if let Some(v) = iter.next() {
+                        if v.is_empty() {
+                            cfg.game_root = None;
+                        } else {
+                            cfg.game_root = Some(PathBuf::from(v));
+                        }
+                    }
+                }
+                "--game-autostart" => cfg.game_autostart = true,
+                "--no-game-autostart" => cfg.game_autostart = false,
+                "--print-game" => cfg.print_game = true,
+                "--kiosk" => cfg.kiosk = true,
+                "--no-kiosk" => cfg.kiosk = false,
+                "--kiosk-autolock" => cfg.kiosk_autolock = true,
+                "--no-kiosk-autolock" => cfg.kiosk_autolock = false,
+                "--kiosk-policy" => cfg.kiosk_policy = true,
+                "--no-kiosk-policy" => cfg.kiosk_policy = false,
+                "--kiosk-hook" => cfg.kiosk_hook = true,
+                "--no-kiosk-hook" => cfg.kiosk_hook = false,
+                "--kiosk-password" => {
+                    if let Some(v) = iter.next() {
+                        let v = v.trim();
+                        cfg.kiosk_password = if v.is_empty() { None } else { Some(v.to_owned()) };
+                    }
+                }
+                "--kiosk-hash" => {
+                    cfg.kiosk_hash = true;
+                    // 可选值：下一个 token 不是开关就当作明文口令。
+                    if let Some(v) = iter.peek() {
+                        if !v.starts_with('-') {
+                            cfg.kiosk_hash_plain = Some((*v).clone());
+                            let _ = iter.next();
+                        }
+                    }
+                }
+                "--unlock" => cfg.unlock = true,
                 // 值已经在第一遍里读过并应用了，这里只是把它吞掉 —— 否则下面
                 // 的 `other` 分支会把 `--config` 报成未知参数，而它明明生效了。
                 "--config" => {

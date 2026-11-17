@@ -4013,6 +4013,7 @@ dependencies = [
  "scrap",
  "serde 1.0.228",
  "serde_json 1.0.118",
+ "sha2",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",

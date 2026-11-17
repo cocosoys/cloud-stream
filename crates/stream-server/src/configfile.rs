@@ -106,6 +106,28 @@ pub struct FileConfig {
     /// 文件里的列表**整体替换**命令行之前累积的列表，不追加。
     pub auth_grants: Option<Vec<String>>,
 
+    // ---- 游戏托管 ----
+    /// 要不要由本进程拉起并看着游戏客户端。
+    pub game: Option<bool>,
+    /// 默认实例 id（`<game_root>\instances\<id>.json`）。
+    pub game_instance: Option<String>,
+    /// `games` 根目录。空串 = 回到默认（exe 旁边的 `games`）。
+    pub game_root: Option<String>,
+    /// 服务起来时顺手把游戏也拉起来。
+    pub game_autostart: Option<bool>,
+
+    // ---- 输入锁定 ----
+    /// 是否启用输入锁定。
+    pub kiosk: Option<bool>,
+    /// 游戏启动后自动上锁。
+    pub kiosk_autolock: Option<bool>,
+    /// 注册表策略层（`NoWinKeys` / `DisableTaskMgr`）。
+    pub kiosk_policy: Option<bool>,
+    /// 低级键盘钩子层。
+    pub kiosk_hook: Option<bool>,
+    /// 网页解锁口令的哈希。空串 = 清除。
+    pub kiosk_password: Option<String>,
+
     // ---- 诊断 ----
     pub no_hdr: Option<bool>,
     pub dump_frame: Option<String>,
@@ -228,6 +250,49 @@ impl FileConfig {
             cfg.no_hdr = v;
         }
         cfg.dump_frame = opt_path(self.dump_frame);
+
+        if let Some(v) = self.game {
+            cfg.game_enabled = v;
+        }
+        if let Some(v) = self.game_instance {
+            if v.trim().is_empty() {
+                warnings.push("game_instance 不能为空，保留原值".to_owned());
+            } else {
+                cfg.game_instance = v.trim().to_owned();
+            }
+        }
+        cfg.game_root = opt_path(self.game_root);
+        if let Some(v) = self.game_autostart {
+            cfg.game_autostart = v;
+        }
+
+        if let Some(v) = self.kiosk {
+            cfg.kiosk = v;
+        }
+        if let Some(v) = self.kiosk_autolock {
+            cfg.kiosk_autolock = v;
+        }
+        if let Some(v) = self.kiosk_policy {
+            cfg.kiosk_policy = v;
+        }
+        if let Some(v) = self.kiosk_hook {
+            cfg.kiosk_hook = v;
+        }
+        if let Some(v) = self.kiosk_password.as_deref() {
+            let v = v.trim();
+            if v.is_empty() {
+                cfg.kiosk_password = None;
+            } else if !v.starts_with("sha256i:") {
+                // 明显不是哈希（比如运维把口令原文填进来了）。不能静默接受：
+                // 存明文既违背这个字段的用途，又会让网页解锁永远失败 —— 而失败
+                // 的样子是"口令不对"，没人会想到是格式问题。
+                warnings.push(
+                    "kiosk_password 看起来不是 --kiosk-hash 生成的哈希，已忽略".to_owned(),
+                );
+            } else {
+                cfg.kiosk_password = Some(v.to_owned());
+            }
+        }
     }
 
     /// 反向：把生效配置摊成可序列化的形态，供 `--print-config` 使用。
@@ -275,6 +340,15 @@ impl FileConfig {
             ),
             no_hdr: Some(cfg.no_hdr),
             dump_frame: Some(path_or_empty(cfg.dump_frame.as_deref())),
+            game: Some(cfg.game_enabled),
+            game_instance: Some(cfg.game_instance.clone()),
+            game_root: Some(path_or_empty(cfg.game_root.as_deref())),
+            game_autostart: Some(cfg.game_autostart),
+            kiosk: Some(cfg.kiosk),
+            kiosk_autolock: Some(cfg.kiosk_autolock),
+            kiosk_policy: Some(cfg.kiosk_policy),
+            kiosk_hook: Some(cfg.kiosk_hook),
+            kiosk_password: Some(cfg.kiosk_password.clone().unwrap_or_default()),
         }
     }
 }
@@ -507,6 +581,31 @@ pub fn render_toml(cfg: &Config) -> String {
         }
         out.push_str("]\n");
     }
+    out.push('\n');
+
+    out.push_str("# ---------- 游戏托管 ----------\n");
+    out.push_str("# game: 由本进程拉起并看着游戏客户端。关着时 /api/v1/control/game/* 一律 404。\n");
+    out.push_str(&kv_bool("game", cfg.game_enabled));
+    out.push_str("# game_instance: 默认实例 id，对应 <game_root>\\instances\\<id>.json。\n");
+    out.push_str(&kv_str("game_instance", &cfg.game_instance));
+    out.push_str("# game_root: games 根目录。空串 = exe 旁边的 games\\。\n");
+    out.push_str(&kv_opt_path("game_root", cfg.game_root.as_deref()));
+    out.push_str("# game_autostart: 服务起来时顺手拉起游戏（需要 game = true）。\n");
+    out.push_str(&kv_bool("game_autostart", cfg.game_autostart));
+    out.push('\n');
+
+    out.push_str("# ---------- 输入锁定（kiosk）----------\n");
+    out.push_str("# kiosk: 把网页进来的输入关在游戏里。开着时才会装钩子、写策略。\n");
+    out.push_str(&kv_bool("kiosk", cfg.kiosk));
+    out.push_str("# kiosk_autolock: 游戏启动成功后自动上锁（需要 kiosk = true）。\n");
+    out.push_str(&kv_bool("kiosk_autolock", cfg.kiosk_autolock));
+    out.push_str("# kiosk_policy: 用注册表关掉 Win 键组合与任务管理器（只影响当前用户）。\n");
+    out.push_str(&kv_bool("kiosk_policy", cfg.kiosk_policy));
+    out.push_str("# kiosk_hook: 低级键盘钩子。排障时可关掉，用来区分\"谁吃了按键\"。\n");
+    out.push_str(&kv_bool("kiosk_hook", cfg.kiosk_hook));
+    out.push_str("# kiosk_password: 网页解锁口令的哈希，用 `stream-server.exe --kiosk-hash` 生成。\n");
+    out.push_str("# 空串 = 不提供网页解锁，只能用 `--unlock` 或 Ctrl+Alt+Del。\n");
+    out.push_str(&kv_str("kiosk_password", cfg.kiosk_password.as_deref().unwrap_or("")));
     out.push('\n');
 
     out.push_str("# ---------- 诊断 ----------\n");

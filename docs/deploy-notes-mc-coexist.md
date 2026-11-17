@@ -63,3 +63,93 @@ C:\dev\jdk8\jdk8u504-b01\bin\java.exe -Xmx2G -Xms512M
 3. 进入游戏后验证：WASD 移动、视角、背包、聊天输入（含中文 IME）
 4. 退出 MC 复验串流回空桌面无异常
 5. 断开浏览器重连（重连已内置）验证画面恢复
+
+## 六、.150 复刻（2026-11-13）
+
+`.148` 之后的重装机器，形态和上面那份记录有不少出入，照抄会卡住。目标是云游戏链路
+的第一环：**游戏进程得先在看得见的桌面上跑起来**，串流才有画面可送。
+
+### 6.1 这台机器和 .148 的差别
+
+| 项 | .148 | .150（DESKTOP-0L2MMH3） |
+|---|---|---|
+| 用户 | `Administrator` | `Admin` |
+| mc 路径 | `C:\Users\Administrator\Desktop\.minecraft` | `C:\Users\Admin\Desktop\.minecraft` |
+| JDK | `C:\dev\jdk8\jdk8u504-b01`（jdk，含 javac） | **原无** → 新增 `C:\mc\jre8`（jre，1.8.0_512） |
+| 测试脚本落脚 | `C:\msi` | `C:\msi` **不存在**；`C:\mc` 是这次新建的 |
+| D 盘 | 数据盘 | **Windows 安装介质**（`boot\ / efi\ / sources\ / AutoUnattend.xml`），别往上写东西 |
+| 其它 | — | 装了 VMware Tools，`C:\rdpw` 是 RDP 包装 |
+
+`.minecraft` 内容本身一致：1369 个文件 220.6 MB，`1.12.2-Forge_14.23.5.2864`，
+`mods/` 里 `CustomNPCs_1.12.2-(05Jul20).jar` + `nashorn.jar`，启动后
+`5 mods loaded, 5 mods active`。`natives-tmp/` 里 lwjgl / jinput / OpenAL 的 DLL 齐全，
+所以 classpath 上那几个 `*-platform-*.jar` 缺着也不影响（它们只是 DLL 的容器）。
+
+### 6.2 JRE 8 从哪来
+
+GitHub 直连在这台机器上只有 **32–50 KB/s**（40 MB 要十几分钟，中途还会被掐），
+清华镜像 **9.6 MB/s**，4 秒下完：
+
+| 项 | 值 |
+|---|---|
+| 源 | `https://mirrors.tuna.tsinghua.edu.cn/Adoptium/8/jre/x64/windows/OpenJDK8U-jre_x64_windows_hotspot_8u512b09.zip` |
+| 大小 | 40,124,908 B |
+| 位置 | `C:\mc\jre8`（zip 解压即用，解出的顶层目录 `jdk8u512-b09-jre` 直接改名） |
+| 版本 | OpenJDK 1.8.0_512 |
+
+用 jre 而不是 jdk：这台只需要 `javaw.exe` 跑游戏，不需要编译。省一半体积。
+
+### 6.3 启动
+
+```cmd
+ssh mc-150 "powershell -NoProfile -ExecutionPolicy Bypass -File C:\mc\start-mc.ps1 -Deliver"
+```
+
+`-Deliver` 是这台机器上必须的（见 6.4 第 1 条）：脚本发现自己在 session 0 就会用
+`schtasks /IT` 建一个 `MCGame` 任务（和 `.148` 上同名），把自己重新投进 console 会话，
+然后在那边启动 `javaw.exe`。日志在 `%TEMP%\mc-launch.log`，游戏自己的日志在
+`.minecraft\logs\latest.log`。
+
+实测：投递到主菜单约 **55 秒**（含 Forge 的 tweak 链与 512×512 纹理图集），
+窗口 870×519 居中，工作集稳定后 ~1.2 GB。
+
+### 6.4 新踩的四个坑
+
+1. **ssh 落在 session 0，窗口不属于任何人看得见的桌面。** 症状极具误导性：进程活着、
+   `latest.log` 一路写到 `Narrator library for x64 successfully loaded`、CPU 也在动，
+   但屏幕上什么都没有。`query session` 能看到 `console  Admin  1  运行中`，
+   投递进 session 1 才看得见。这和卸载器那次 `--uninstall-step` 开隐藏窗口是同一类
+   问题——**进程存在 ≠ 人看得见**。
+2. **`Start-Process -WindowStyle Hidden` 会把 `SW_HIDE` 传染给第一个窗口。**
+   Minecraft 只有一个 LWJGL 窗口，于是它继承了这个设置：`EnumWindows` 能看到
+   `cls=LWJGL title=[Minecraft 1.12.2]` 但 `vis=False`、尺寸 1x1。游戏在后台完美运行，
+   就是没有画面。改用 `javaw.exe`（本身无控制台）后一切正常，别再加 Hidden。
+3. **`.ps1` 里有中文注释就必须带 UTF-8 BOM。** PS 5.1 读无 BOM 文件按 GBK 解，
+   中文注释的字节被错解后会吞掉换行，随后 `param(...)` 整块解析失败，报的错是
+   `第 24 行 意外的标记 ")"` —— 看起来像语法写错，其实是编码。带 BOM 后（`EF BB BF`）
+   PS 5.1 按 UTF-8 读，一次通过。
+4. **`schtasks /TR` 不解释 `>` 重定向**，也不接受超过 261 字符的命令行。要日志就让
+   脚本自己写文件，不要把重定向塞进 `/TR`。
+
+### 6.5 怎么确认"真的在屏幕上"
+
+跨会话截屏拿不到别会话的画面，所以把截屏脚本也投递进去：
+
+```cmd
+ssh mc-150 "powershell -File C:\mc\deliver.ps1 -Script C:\mc\shot.ps1 -TaskName MCSHOT"
+```
+
+`shot.ps1` 干三件事：先 `ShowWindow(GetConsoleWindow(), SW_HIDE)` 把自己的黑窗口藏掉
+（否则它会出现在截图里，还会正好挡住游戏——这个自指问题折腾了两轮），再
+`CopyFromScreen` 存 PNG，最后用 `EnumWindows` 把可见窗口列出来存档。
+`win:` 行里出现 `5768 | 870x519 | Minecraft 1.12.2` 就是成了。
+
+### 6.6 还没做
+
+- [ ] 全屏启动。现在 870×519 窗口化，云游戏该跟上串流端的分辨率（`options.txt` 的
+      `fullscreen` 或启动后 Alt+Enter），1080p 桌面下小窗看起来不像"云游戏"
+- [ ] 与 `stream-server` 的共存复测（`.148` 那份是 1080p@60 软编，主菜单空闲时
+      总 CPU 45–48%）
+- [ ] 退出游戏：现在只能 `Stop-Process javaw`，没有体面的收尾（存档、麦克风归还）
+- [ ] 把这条链收进 Rust：`CreateProcessAsUser` 投递 + 实例管理，替掉 PowerShell 与
+      schtasks 这层胶水
