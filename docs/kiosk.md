@@ -96,6 +96,27 @@ echo 我的口令 | stream-server.exe --kiosk-hash
 `password_set: false` 时 `kiosk/unlock` 答 403 并说明替代方案（`--unlock` 或
 `Ctrl+Alt+Del`）—— 面板据此把那个按钮画成禁用，而不是让人一遍遍试口令。
 
+### 网页侧
+
+前端在 `cloud-stream-web` 的 `addons/selkies-dashboard`，侧栏两个 section 分别对应
+S1–S3 的两块能力：**Game**（`GamePanel.jsx`）与 **Input lock**（`KioskPanel.jsx`），
+都默认折叠 —— 主机级操作不该让每个看画面的人都看得见。两者共用
+`src/lib/control-api.js`：它把状态码翻成 `kind`，文案留在 `translations.js`，
+所以同一个失败在面板上有可翻译的标题和一行服务端原文。
+
+`403` 在 `kiosk/unlock` 上承担两种语义，前端按响应体分流：
+
+| 响应体 `error` | 含义 | 面板行为 |
+|---|---|---|
+| `wrong password` | 口令错 | 清空输入框，提示"口令不正确" |
+| `kiosk_password is not configured` | 根本没配口令 | 换一条文案，指向 `--unlock` |
+
+两件事的下一步动作完全相反（重试 vs 别试了），只靠状态码分不开。
+
+前端还读两个字段来避免"看起来锁上了其实没锁"：`hook_installed=false`（钩子没装上，
+主机键盘照样能切窗口）和 `policy_pending=true`（策略写了但外壳还没重启），各给一行
+警告。
+
 ### 与游戏生命周期的联动
 
 | 事件 | 行为 |
@@ -160,6 +181,16 @@ UNLOCK signaled=true restored=2
 | `game/stop`（autolock 锁着） | 1.7 s（`killed-window-gone`），随后**自动解锁**，`armed=false policy_pending=false` |
 | 手工锁 + 停游戏 | 不解锁（`reason=web` 保持） |
 | 单测 | 473 通过（新增 23：判据 12、策略 4、口令 7） |
+
+**同日 15:20 复测（前端面板上线后，从 `.129` 远程调用）**
+
+| 项 | 结果 |
+|---|---|
+| `POST kiosk/lock` | 200，`armed=true reason=web`，`hook_installed=true`，`policy_pending=true` |
+| 注册表 | `NoWinKeys=0x1`、`DisableTaskMgr=0x1` 均已写入 |
+| `POST kiosk/unlock` 错口令 | 403 `{"error":"wrong password"}`（前端据此清空输入框） |
+| `POST kiosk/unlock` 对口令 | 200，`armed=false`；`reg query` 两条均"找不到"，值已删除 |
+| 远程可用性 | 控制面从 LAN 内另一台机器调得通（前端面板因此可用，不是只能本机操作） |
 
 未验证：
 

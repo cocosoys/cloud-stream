@@ -132,6 +132,20 @@ stream` 崩溃就是这么来的）。正确顺序是：游戏内先"保存并�
 * 崩溃自动重启（`restart_max` 目前是 0，代码走通但没造崩溃验证）；
 * 停止前自动"游戏内存档"—— 目前做不到，见 §6.1。
 
+### 前端面板上线后的复测（2026-11-17 15:20，从 `.129` 远程调用）
+
+| 调用 | 结果 |
+|---|---|
+| `POST control/game/start` | 202，`pid 3892`；10 s 后 `window = LWJGL 1936×1100 @0,0`，`kiosk.armed=true reason=autolock` |
+| 重复 `game/start` | 409，`error` 是中文说明，响应体**同时带完整的 `game` 段** —— 面板据此采纳服务端状态，不会出现"旧标签 + 红字" |
+| `POST control/game/restart` | 202，1.44 s，新 `pid 3496` |
+| `POST control/game/stop` | 200，`last_exit.reason=exited`；3 s 内 `kiosk.armed=false`（autolock 自动解锁） |
+| `GET /api/v1/health` | 匿名可读（`game` / `kiosk` 两段都在） |
+
+**结论：控制面从 LAN 内别的机器调得通**，不是只能本机 loopback —— 这是网页面板能成立的
+前提。当初按"只允许本机"设计的假设在这里被实测推翻，若后续要收紧，得先解决"面板从哪
+调"的问题，不能直接加 IP 限制。
+
 ## 八、输入锁定（S3，已完成）
 
 见 [kiosk.md](kiosk.md)。三层：注入端过滤、低级键盘钩子、注册表策略；四个解锁出口：
@@ -144,11 +158,57 @@ stream` 崩溃就是这么来的）。正确顺序是：游戏内先"保存并�
 2. **全屏（F11）能用，前提是焦点不被抢走** —— 这正是锁定提供的东西。所以 `exclusive`
    全屏在托管启动下变成可选项，不再依赖"人工按住这个窗口"。
 
-## 九、下一步（S4）
+## 九、S4：网页面板（已完成两块）
 
-1. **面板**：`stream-setting` 加"游戏"页（全字段可改、危险项二次确认）与"输入锁定"
-   页（锁定/解锁按钮、口令输入、三层开关）。
-2. `C:\mc` 下的 20 多个排障脚本归档到 `toolchain\probes\`。
-3. 已知待修：`toolchain\deploy.ps1` 的 `-RemoteBase` 参数被第 139 行的硬编码覆盖，
-   且它假定运行根是 `<base>\stream`，与安装器实际的 `C:\Program Files\cloud-stream`
-   不一致。这一轮的部署是手工做的（临时 `toolchain\serve-file.ps1` 用 HTTP 传二进制）。
+原计划把面板做进 `stream-setting`（桌面端工具箱）。实际做在了 web 前端
+`cloud-stream-web` 的 `addons/selkies-dashboard` 里，理由是：要锁的、要起停的东西都在
+被控机上，而唯一稳定可达被控机的界面就是串流页面本身 —— 桌面端工具箱还得先有人坐在
+那台机器前，那正好是 kiosk 之后做不到的事。
+
+| 页面 | 文件 | 内容 |
+|---|---|---|
+| Game | `src/components/GamePanel.jsx` | 起停/重启、5 s 轮询 `health.game`、运行时长与窗口尺寸、崩溃报告入口、停止即强杀的原话提示 |
+| Input lock | `src/components/KioskPanel.jsx` | 锁定/口令解锁、`hook_installed` 与 `policy_pending` 警告、`403` 双语义分流 |
+
+两者共用 `src/lib/control-api.js`（唯一出口，见 `kiosk.md` §4「网页侧」）。
+
+### 前端部署（这台机器上唯一走通的路）
+
+`C:\Program Files\cloud-stream\selkies-web` 是静态根，替换目录即可，不用重启服务
+（每次请求重读磁盘）。走的顺序：
+
+```powershell
+# 1. 本机打包（产物目录是 addons/selkies-dashboard/dist）
+Compress-Archive -Path <dist>\* -DestinationPath temp\selkies-web.zip -Force
+# 2. 本机起投递，被控机自己拉（scp 在这套策略下被拦）
+toolchain\serve-file.ps1 -Port 18080 -File temp\selkies-web.zip
+# 3. 被控机上解压到同盘临时目录，再交换
+ssh mc-150 'curl -sS -o C:\Users\Admin\sw.zip http://<本机>:18080/selkies-web.zip'
+ssh mc-150 'powershell -NoProfile -Command Expand-Archive -Path C:\Users\Admin\sw.zip -DestinationPath C:\PROGRA~1\cloud-stream\selkies-web-new -Force'
+ssh mc-150 'cd /d "C:\Program Files\cloud-stream" && ren selkies-web.bak selkies-web.bak.prev & ren selkies-web selkies-web.bak && ren selkies-web-new selkies-web'
+```
+
+先解压到 `-new` 再交换，是为了让"新目录不完整"的失败形态变成一个空目录，而不是一个
+半截的线上站点。上一个版本留在 `selkies-web.bak` 作回滚点。
+
+三个踩过的坑：
+
+1. **`Program Files` 的写入**：SSH 会话 `net session` 成功不代表能写安装目录；本次能写，
+   但第一次失联前 `echo > probe.txt` 静默失败过。部署前先 `echo` 一个探测文件验一下，
+   别在 `ren` 上才发现。
+2. **引号地狱**：远端默认 shell 是 cmd，`powershell -Command "..."` 里再套带空格的路径，
+   三层转义必错；`-EncodedCommand` 被本地安全策略拦。最后走通的是 8.3 短路径
+   （`C:\PROGRA~1\cloud-stream\...`）+ 单层双引号。
+3. **`tar -xf` 在这台机器上解不了 zip**（报"系统找不到指定的路径"），`Expand-Archive`
+   才是可用的那条。
+
+### 还剩下的
+
+1. `stream-setting` 桌面端工具箱——现在不是必需路径了，做不做看有没有"不串流也能运维"
+   的场景。
+2. `C:\mc` 下 20 多个排障脚本归档到 `toolchain\probes\`。
+3. `toolchain\deploy.ps1` 的 `-RemoteBase` 被第 139 行硬编码覆盖，且假定运行根是
+   `<base>\stream`，与安装器实际的 `C:\Program Files\cloud-stream` 不一致。这一轮的部署
+   是手工做的，这个脚本该修，否则下次还会绕开它。
+4. 客户端从桌面迁到 `games\clients\`（1.5 GB，动 `Desktop\.minecraft`，等用户确认）。
+
