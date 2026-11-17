@@ -71,3 +71,7 @@ __pycache__/
 # 契约的参考实现（docs/roadmap-future.md §1.2 就是围绕它写的），要入库。
 # 同一目录里的 *.txt 是提交信息草稿、抓取片段之类的中间物，不进。
 /temp/*.txt
+
+# 部署产物：前端 dist 打包出来的 zip（由 toolchain/serve-file.ps1 投递给被控机）。
+# 每次部署都重新生成，体积 1.2 MB，没有任何入库价值。
+/temp/*.zip
