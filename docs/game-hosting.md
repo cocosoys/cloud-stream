@@ -37,7 +37,7 @@ classpath 走。** 第一次把 `gameDir` 挪到 `saves\default` 后，游戏只
 {
   "schema": 1,
   "name": "Minecraft 1.12.2 Forge",
-  "client_dir": "C:\\Users\\Admin\\Desktop\\.minecraft",  // 绝对或相对 games 根
+  "client_dir": "clients\\1.12.2-forge",  // 绝对或相对 games 根
   "saves_dir": "saves\\default",
   "java": { "path": "", "major": 0, "heap_mb": 2048,
             "jvm_args": [], "verify_classes": true, "extract_natives": true },
@@ -224,8 +224,8 @@ ssh mc-150 'cd /d "C:\Program Files\cloud-stream" && ren selkies-web.bak selkies
 3. `toolchain\deploy.ps1` 的 `-RemoteBase` 被第 139 行硬编码覆盖，且假定运行根是
    `<base>\stream`，与安装器实际的 `C:\Program Files\cloud-stream` 不一致。这一轮的部署
    是手工做的，这个脚本该修，否则下次还会绕开它。
-4. 客户端从桌面迁到 `games\clients\`（1.5 GB，动 `Desktop\.minecraft`）。脚本已就绪
-   （`toolchain\migrate-client.ps1`，见 §十三），**未执行**：等 `.128` 在线 + 明确确认。
+4. ~~客户端从桌面迁到 `games\clients\`~~ → 已执行（`.128`，2026-11-18），见 §十三。
+   源目录 `Desktop\.minecraft` 按"复制不删源"的策略保留着，观察一段时间再决定。
 
 ## 十、参数来源与启动前校验（E + A）
 
@@ -487,6 +487,18 @@ JRE 的问题全发生在"服务起得来、游戏起不来"那一层，那时�
 实例写了 `java.path` 时**表里的选择与实际启动不一致** —— 一个查错用的输出偏偏不说真话，
 是最坏的一种。
 
+### 实测（`.128`，2026-11-18 11:10，新二进制已部署）
+
+这台机器上的 `1.12.2-Forge_14.23.5.2864.json` **带 `javaVersion: 8`**（合并式 json
+里保留了这一段），所以要求是明确的：
+
+| 场景 | 结果 |
+|---|---|
+| 实例仍写着 `java.path: C:\mc\jre8\bin\javaw.exe` | `# required : Java 8` / `# chosen : C:\mc\jre8\bin\javaw.exe（Java 8，实例 java.path）` |
+| 删掉 `java.path` 后重启服务 | `# found : 1 个 JRE（legacy Java 8 C:\mc\jre8）` → `# chosen : …（Java 8，来自 legacy）` —— **自动挑选接住了原来手写的那个路径** |
+| 同一实例 `--print-game` | 多出 `# java major : 8` 与首条 `# check : java: …`；classpath 34 个 jar、主类找到 |
+| 起游戏 | 202，pid 4460，31 s 后窗口 `LWJGL 1936×1100 @0,0`，`kiosk.armed=true reason=autolock` |
+
 ## 十三、客户端迁移（`toolchain\migrate-client.ps1`）
 
 把 `C:\Users\Admin\Desktop\.minecraft`（~1.5 GB）搬进 `games\clients\1.12.2-forge`。
@@ -513,7 +525,29 @@ JRE 的问题全发生在"服务起得来、游戏起不来"那一层，那时�
 8. 有 `stream-server.exe` 就顺手跑一次 `--print-game`，等于让人当场看到"还能不能起"。
 
 幂等：第二次运行会发现 `client_dir` 已经是目标值、junction 已指对，**不写任何文件**。
+先在假目录上验证过一遍（复制 → 校验 → 改 json → 换 junction → 再跑无写入）。
 
-已在假目录上跑通（复制 → 校验 → 改 json → 换 junction → 再跑一次无写入）。真机上
-**尚未执行**：`.128` 当前不可达，且这一步需要用户明确同意。
+### 实测（`.128`，2026-11-18 10:56）
+
+```text
+source : C:\Users\Admin\Desktop\.minecraft  files=1453 bytes=237,279,151
+free   : 54,848,045,056 bytes on C
+robocopy exit = 1 (0-7 = ok, 8+ = failure)
+verify : files 1453 -> 1453; bytes 237,279,151 -> 237,279,151
+client_dir: 'C:\\Users\\Admin\\Desktop\\.minecraft' -> 'clients\1.12.2-forge'
+instance rewritten: …\instances\mc-1.12.2.json  (backup mc-1.12.2.json.bak-20261118-105657)
+version json at new client: True
+junction removed/made: mods / config / resourcepacks
+```
+
+两件事要记下来：
+
+* **实际是 237 MB，不是 1.5 GB。** 那个数字来自更早的估算（可能算上了别的目录）。
+  核对方法只有一条：让脚本自己 `Measure-Object` 一遍，别信文档里的旧数字。
+* **三个 junction 都指过旧路径**，三个都被换掉了。如果漏了这一步，症状是"游戏起得来
+  但一个 mod 都不加载"，而且日志里不会有任何一句抱怨。
+
+迁移后立刻起游戏：pid 5296，窗口 `LWJGL 1936×1100 @0,0`；`saves\default\mods` 下能列出
+`CustomNPCs_1.12.2` 与 `nashorn.jar`（走的是新 junction）。源目录仍留在桌面，等真正的
+"跑一阵子没问题"之后再删。
 
