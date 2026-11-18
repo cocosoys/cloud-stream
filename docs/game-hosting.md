@@ -23,7 +23,7 @@
   clients\1.12.2-forge\          只读客户端（versions / libraries / assets）
   saves\default\                 --gameDir：存档、options.txt、logs、mods*
   instances\mc-1.12.2.json       实例描述
-  runtime\                       cmdline.txt、hs_err_%p.log
+  runtime\                       cmdline.txt、hs_err_%p.log、natives\<版本>\、jre\<任意名>\
 ```
 
 `*` **`mods/`、`config/`、`resourcepacks/` 在 1.12.2 里跟着 `--gameDir` 走，不跟着
@@ -39,7 +39,7 @@ classpath 走。** 第一次把 `gameDir` 挪到 `saves\default` 后，游戏只
   "name": "Minecraft 1.12.2 Forge",
   "client_dir": "C:\\Users\\Admin\\Desktop\\.minecraft",  // 绝对或相对 games 根
   "saves_dir": "saves\\default",
-  "java": { "path": "C:\\mc\\jre8\\bin\\javaw.exe", "heap_mb": 2048,
+  "java": { "path": "", "major": 0, "heap_mb": 2048,
             "jvm_args": [], "verify_classes": true, "extract_natives": true },
   "game": { "version": "1.12.2-Forge_14.23.5.2864",
             "player": "CloudPlayer", "game_args": [] },
@@ -51,6 +51,11 @@ classpath 走。** 第一次把 `gameDir` 挪到 `saves\default` 后，游戏只
 * `game.main_class` / `game.tweak_class` **不写是常态**：留空时分别从版本 json 的
   `mainClass` 与参数模板里的 `--tweakClass` 取。只在"确实要偏离 json"时才写（自定义
   包装启动器）。见 §十。
+* `java.path` **留空是常态**：留空时按版本 json 的 `javaVersion.majorVersion` 自动挑
+  JRE（见 §十二）。写了就永远优先，哪怕版本对不上 —— 那只警告、不拦，因为定制运行时
+  是有意的。
+* `java.major`（默认 `0` = 跟随 json）：钉死主版本。1.12 及以前的 json **没有**
+  `javaVersion` 段，而一台机器上同时装了 8 和 17 时，"1.12.2 该用哪个"需要有人说了算。
 * `java.verify_classes`（默认 `true`）：启动前扫一遍 classpath 的 jar 中央目录，确认
   主类与 tweaker 真的在里面。关掉它回到"java 自己报错"的老路。
 * `java.extract_natives`（默认 `true`）：启动前按版本 json 的 `natives` 段把本地库解到
@@ -74,7 +79,9 @@ game_autostart = false      # 服务起来时顺手拉起游戏
 ```
 
 `--game` / `--game-instance` / `--game-root` / `--game-autostart` 是命令行等价物；
-`--print-game` 打印生效实例与拼出来的那一条命令行（不含敏感值，可贴到别处比对）。
+`--print-game` 打印生效实例与拼出来的那一条命令行（不含敏感值，可贴到别处比对）；
+`--print-java` 打印这台机器上所有能找到的 JRE、各自的主版本、以及最终会选哪一个
+（实例文件读坏了也照样输出）。
 
 ## 五、接口
 
@@ -217,7 +224,8 @@ ssh mc-150 'cd /d "C:\Program Files\cloud-stream" && ren selkies-web.bak selkies
 3. `toolchain\deploy.ps1` 的 `-RemoteBase` 被第 139 行硬编码覆盖，且假定运行根是
    `<base>\stream`，与安装器实际的 `C:\Program Files\cloud-stream` 不一致。这一轮的部署
    是手工做的，这个脚本该修，否则下次还会绕开它。
-4. 客户端从桌面迁到 `games\clients\`（1.5 GB，动 `Desktop\.minecraft`，等用户确认）。
+4. 客户端从桌面迁到 `games\clients\`（1.5 GB，动 `Desktop\.minecraft`）。脚本已就绪
+   （`toolchain\migrate-client.ps1`，见 §十三），**未执行**：等 `.128` 在线 + 明确确认。
 
 ## 十、参数来源与启动前校验（E + A）
 
@@ -400,7 +408,112 @@ command
 
 ### 还剩
 
-* `javaVersion` 段（1.13+ 的 json 会写"这个版本要求 JRE 17"）目前不看，`java.path`
-  仍由实例指定。要自动挑 JRE 时再说 —— 那件事故意留给人。
-* 客户端目录仍在桌面（`Desktop\.minecraft`），迁到 `games\clients\` 会动 1.5 GB 用户数据，
-  等确认。
+* ~~`javaVersion` 段不看，JRE 靠实例手写 `java.path`~~ → 已做，见 §十二。
+* 客户端目录仍在桌面（`Desktop\.minecraft`），迁到 `games\clients\` 会动 1.5 GB 用户
+  数据 —— 脚本已就绪，未执行，见 §十三。
+
+## 十二、JRE 自动挑选（`javaVersion`）
+
+### 为什么以前不敢做
+
+版本 json 从 1.13 起写 `javaVersion.majorVersion`（1.17 写 16、1.20 写 17），官方启动器
+据此下载运行时。我们一直只看 `java.path` —— 一个手写的绝对路径。于是同一台机器上
+"1.12.2 要 8、1.20 要 17"这件事只能靠人记住并改配置，症状是两类，都很贵：
+
+* 用 17 起 1.12.2 Forge：`Unsupported class file major version 61`，或者 LaunchWrapper
+  的反射报错，字面上与"你选错了 java"毫无关系；
+* 用 8 起 1.20：同样的错，方向相反。
+
+### 怎么挑（`game/java.rs`）
+
+候选按来源排序，**同版本里排在前面的赢**：
+
+| 来源 | 位置 | 为什么在这个位置 |
+|---|---|---|
+| `runtime` | `games\runtime\jre\**`（递归三层，找 `bin\javaw.exe`） | 跟着部署走，换一台机器不该换结论 |
+| `JAVA_HOME` | 环境变量 | 人已经明确表达过偏好 |
+| `installed` | `%ProgramFiles%\{Java, Eclipse Adoptium, Microsoft, Zulu, BellSoft, Amazon Corretto, AdoptOpenJDK, Semeru}` 下的一级子目录 | 系统上正常装的那些 |
+| `client` | 客户端目录自带的 `runtime\`（官方启动器下载的那份） | 客户端换版本时跟着变 |
+| `legacy` | `C:\mc\jre8`、`C:\dev\jdk8\jdk8u504-b01` | 这台机器上的历史遗留，任何其它来源都能顶掉 |
+
+版本号**先读 `<jre>\release`**（`JAVA_VERSION="17.0.9"`），读不到才起一次
+`java -version`（带 `CREATE_NO_WINDOW`，否则玩家屏幕上会闪一个黑框）。探测要扫十几个
+目录，只有前者能接受。
+
+三条策略，每条都对应一种真会发生的部署：
+
+1. **有精确匹配就用它**；
+2. **没有精确匹配时向上取最小的那个** —— 1.17 的 json 写 16、机器上只有 17，是最正常
+   的漂移（`--release 16` 的字节码在 17 上跑得起来）；
+3. **全部低于要求时拒绝启动**。反过来是**必然**失败，没有"试一试"的余地 —— 与其让
+   `javaw` 打一行 `UnsupportedClassVersionError` 秒退，不如说清"要求 17，扫到的是 8"。
+
+两个例外：
+
+* 实例写了 `java.path` → **永远照用**，版本不符只记一条警告（定制运行时是有意的）；
+* json 没有 `javaVersion`（1.12 及以前）→ **优先 Java 8**，没有 8 才取最低可用版本，
+  并留一条"json 没写 javaVersion"的提示。
+
+### 怎么查（`--print-java`）
+
+JRE 的问题全发生在"服务起得来、游戏起不来"那一层，那时人通常只能隔着串流页面看一个
+黑屏。这个开关在任何一台机器上离线可跑，且实例文件读坏了也照样输出：
+
+```text
+# jre dir    : C:\Program Files\cloud-stream\games\runtime\jre
+# required   : Java 17
+# found      : 2 个 JRE
+  runtime   Java 17 C:\...\games\runtime\jre\jdk-17\bin\javaw.exe   <- C:\...\games\runtime\jre
+  JAVA_HOME Java 8  C:\dev\jdk8\bin\javaw.exe                      <- JAVA_HOME
+# chosen     : C:\...\runtime\jre\jdk-17\bin\javaw.exe（Java 17，来自 runtime）
+```
+
+`--print-game` 里则多了两行：`# java major : 8` 与一条排在最前的
+`# check : java: …（Java 8，来自 JAVA_HOME）` —— "要求 17、用的是 8"这类问题，命令行
+本身是看不出来的。
+
+### 实测（本机，无 `.128`）
+
+| 场景 | 结果 |
+|---|---|
+| 1.20.1 的 json（`javaVersion: 17`）+ 只有 Java 8 | 拒绝启动，错误里带"要求 Java 17 / 扫到 Java 8 / UnsupportedClassVersionError" |
+| 往 `runtime\jre\jdk-17` 放一个带 `release` 的 JRE | 立刻选中它（`runtime Java 17`），`--print-game` 通过 java 这一关 |
+| 1.12.2 的 json（没有 `javaVersion`） | 两台都有时选 **Java 8**，不选 17 |
+| 同一实例写 `java.major: 17` | 改选 17 —— 覆盖生效 |
+| 同一实例写 `java.path: C:\dev\jdk8\bin\javaw.exe`，json 要求 17 | 照用 8，`# warning` 说明"版本 json 要求 Java 17，按实例配置照用" |
+| 单测 | 506 通过（新增 11：`release` 解析 / `java -version` 解析 / 精确匹配 / 来源优先级 / 向上漂移 / 拒绝更旧 / 无要求优先 8 / 版本未知 / 路径回溯） |
+
+顺带修掉一个自己造成的 bug：`--print-java` 第一版直接调 `pick` 而不是 `select`，于是
+实例写了 `java.path` 时**表里的选择与实际启动不一致** —— 一个查错用的输出偏偏不说真话，
+是最坏的一种。
+
+## 十三、客户端迁移（`toolchain\migrate-client.ps1`）
+
+把 `C:\Users\Admin\Desktop\.minecraft`（~1.5 GB）搬进 `games\clients\1.12.2-forge`。
+**这是本项目唯一一处碰部署树之外的用户数据**，所以整个脚本的默认行为是
+**复制 + 校验 + 保留源目录**，删原件要同时给 `-PurgeSource` 和 `-Yes`。
+
+八步，每步失败都停在原地：
+
+1. 游戏在跑就拒绝（`javaw` 的 CommandLine 里含旧客户端路径）—— 它把大 jar 映射着，
+   robocopy 会报一堆像是磁盘故障的错；
+2. 空间检查：复制不是移动，目标卷要放得下第二份（多留 15%）；
+3. `robocopy /E /COPY:DAT /R:2 /W:2 /XJ`。`/XJ` 是关键：源里可能自己带 junction
+   （旧的 `saves\mods` 链接），跟着走会重复甚至成环；
+4. 校验：文件数 + 总字节数与源逐项相等，不等就把**每个一级子目录**的差异打出来然后
+   中止，什么都不切换；
+5. 改写 `instances\<id>.json` 的 `client_dir`：**只替换捕获到的那一段**（不用
+   `ConvertFrom-Json` 往返 —— 那会重排键、改转义、格式化数字），先备份成
+   `<id>.json.bak-<时间戳>`；
+6. 检查新客户端下 `versions\<version>\<version>.json` 在不在（classpath 是从它推出来的，
+   缺了就是"classpath 是空的"）；
+7. 修 `saves\<dir>\{mods,config,resourcepacks}` 三个 junction —— `seed-games.ps1` 造的，
+   搬完就悬空，症状是**游戏一个 mod 都不加载**。删链接用
+   `[IO.Directory]::Delete()`：`Remove-Item -Recurse` 会穿过重解析点删掉真文件；
+8. 有 `stream-server.exe` 就顺手跑一次 `--print-game`，等于让人当场看到"还能不能起"。
+
+幂等：第二次运行会发现 `client_dir` 已经是目标值、junction 已指对，**不写任何文件**。
+
+已在假目录上跑通（复制 → 校验 → 改 json → 换 junction → 再跑一次无写入）。真机上
+**尚未执行**：`.128` 当前不可达，且这一步需要用户明确同意。
+
