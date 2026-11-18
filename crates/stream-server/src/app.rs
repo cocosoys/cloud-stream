@@ -175,6 +175,19 @@ pub async fn run() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // 一次性动作：这台机器上有哪些 JRE、会选哪一个。与 `--print-game` 同一个位置、
+    // 同一个理由（输出给人和脚本读，此时日志还没初始化）。
+    if cfg.print_java {
+        match game::report_java(&cfg) {
+            Ok(text) => print!("{text}"),
+            Err(err) => {
+                eprintln!("game error: {err}");
+                std::process::exit(2);
+            }
+        }
+        return Ok(());
+    }
+
     // 一次性动作：从 stdin 读一行口令，打印哈希。
     //
     // 从 stdin 而不是参数，是这三处共同的考虑：shell 历史、进程列表（`ps`/

@@ -45,6 +45,7 @@ use serde_json::Value;
 use crate::config::Config;
 
 pub mod host;
+mod java;
 mod natives;
 mod template;
 mod zipmin;
@@ -186,8 +187,19 @@ fn d_stop_timeout() -> u64 {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct JavaSpec {
     /// `javaw.exe` 路径（相对 `games` 根或绝对）。为空则按常见位置探测。
+    ///
+    /// 非空时**永远优先**：它可能指向一个自编译的、带 agent 的定制运行时，那种
+    /// 情况任何"自动挑选"都会选错。此时版本与 json 要求不符只记一条警告，不拦。
     #[serde(default)]
     pub path: String,
+    /// 强制要求的主版本号（8 / 17 / 21）。`0` = 跟随版本 json 的
+    /// `javaVersion.majorVersion`。
+    ///
+    /// 存在的理由：1.12 及以前的 json **没有** `javaVersion` 段，而一台机器上
+    /// 同时装了 8 和 17 时，"1.12.2 该用哪个"是个真实的判断。默认策略是先找 8
+    /// （见 `java::pick`），但世界上总有 `--enable-preview` 之类需要钉死的情况。
+    #[serde(default)]
+    pub major: u32,
     #[serde(default = "d_heap_mb")]
     pub heap_mb: u32,
     /// 追加的 JVM 参数，排在默认参数之后。
@@ -220,6 +232,7 @@ impl Default for JavaSpec {
     fn default() -> Self {
         Self {
             path: String::new(),
+            major: 0,
             heap_mb: d_heap_mb(),
             jvm_args: Vec::new(),
             verify_classes: true,
@@ -377,33 +390,16 @@ impl InstanceSpec {
         Self::under_root(paths, &self.saves_dir)
     }
 
-    /// `javaw.exe` 的位置：显式配了就用，否则在几个常见位置里找。
-    ///
-    /// 探测顺序和 `toolchain\start-mc.ps1` 一致 —— 同一台机器上两条路径（脚本与
-    /// 服务）必须找到同一个 java，否则会出现"脚本能起、服务起不来"。
-    pub fn java_path(&self, paths: &Paths) -> Result<PathBuf, String> {
-        if !self.java.path.trim().is_empty() {
-            let p = Self::under_root(paths, &self.java.path);
-            if p.is_file() {
-                return Ok(p);
-            }
-            return Err(format!("java.path 指向的文件不存在：{}", p.display()));
+    /// 这个实例要求的 Java 主版本：实例覆盖优先，否则版本 json 的
+    /// `javaVersion.majorVersion`（1.13 起才有），都没有则 `None`。
+    fn required_java(&self, merged: &Value) -> Option<u32> {
+        if self.java.major > 0 {
+            return Some(self.java.major);
         }
-        let mut cands: Vec<PathBuf> = Vec::new();
-        if let Ok(p) = std::env::var("JAVA_HOME") {
-            cands.push(Path::new(&p).join("bin").join("javaw.exe"));
-        }
-        cands.push(PathBuf::from(r"C:\mc\jre8\bin\javaw.exe"));
-        cands.push(PathBuf::from(r"C:\dev\jdk8\jdk8u504-b01\bin\javaw.exe"));
-        for c in &cands {
-            if c.is_file() {
-                return Ok(c.clone());
-            }
-        }
-        Err(format!(
-            "找不到 javaw.exe；试过 {}。请在实例里写 java.path",
-            cands.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("、")
-        ))
+        merged
+            .pointer("/javaVersion/majorVersion")
+            .and_then(Value::as_u64)
+            .and_then(|n| if n <= u32::MAX as u64 { Some(n as u32) } else { None })
     }
 
     /// 目标窗口尺寸：0 = 跟随串流分辨率。
@@ -465,6 +461,9 @@ impl ArgToken {
 #[derive(Debug, Clone)]
 pub struct LaunchPlan {
     pub java: PathBuf,
+    /// 选中那个 JRE 的主版本（读不出来时 `None`）。`--print-game` 打出来 ——
+    /// 「要求 17、用的是 8」这类问题，命令行里看是看不出来的。
+    pub java_major: Option<u32>,
     pub cwd: PathBuf,
     /// JVM 段，含 `-cp` 与 classpath。
     ///
@@ -1031,12 +1030,20 @@ impl InstanceSpec {
         self.validate()?;
         let client = self.client_path(paths);
         let saves = self.saves_path(paths);
-        let java = self.java_path(paths)?;
         let size = self.target_size(cfg);
         let version = &self.game.version;
 
         let vj = load_version_chain(&client, version)?;
         let merged = &vj.merged;
+
+        // ---- JRE：json 说"这个版本要 Java N"，那就按 N 去挑 ----
+        //
+        // 顺序是「先读 json，再找 java」，与"先找到 java 再说"的直觉相反：要哪个
+        // 版本是 json 的事（1.13 起每个 json 都写了），机器上有哪几个才是探测器
+        // 的事。反过来的话，1.12.2 与 1.20 在同一台机器上就只能靠人肉改配置。
+        let required = self.required_java(merged);
+        let choice = java::select(&self.java, paths, &client, required)?;
+        let java = choice.java.clone();
         // 我们永远给得出两个分辨率的数，所以 `has_custom_resolution` 恒真 ——
         // 它决定的正是 1.13+ 的 `--width/--height` 要不要出现在模板参数里。
         let feat = Features {
@@ -1197,6 +1204,13 @@ impl InstanceSpec {
         // 都是"几分钟就能查、但错过了要花半小时"的错，所以宁可在这里拒绝启动。
         let mut checks: Vec<String> = Vec::new();
 
+        // 0) 选了哪个 JRE。排在最前是因为后面每一条校验（尤其"类在哪"）都建立在
+        //    "这个 JVM 能加载这个字节码"之上。
+        checks.push(format!("java: {}", choice.note));
+        if let Some(w) = &choice.warning {
+            checks.push(format!("java: {w}"));
+        }
+
         if vj.chain.len() > 1 {
             checks.push(format!("chain: {}", vj.chain.join(" → ")));
         }
@@ -1284,6 +1298,7 @@ impl InstanceSpec {
 
         Ok(LaunchPlan {
             java,
+            java_major: choice.major,
             cwd: client,
             jvm,
             main_class: ArgToken { text: main_text, origin: main_origin },
@@ -1403,6 +1418,10 @@ pub fn report(cfg: &Config) -> Result<String, String> {
     out.push_str(&format!("# saves      : {}\n", spec.saves_path(&paths).display()));
     out.push_str(&format!("# java       : {}\n", plan.java.display()));
     out.push_str(&format!(
+        "# java major : {}\n",
+        plan.java_major.map(|m| m.to_string()).unwrap_or_else(|| "?".to_owned())
+    ));
+    out.push_str(&format!(
         "# display    : {}x{} {:?}\n",
         plan.size.0, plan.size.1, plan.model
     ));
@@ -1421,6 +1440,81 @@ pub fn report(cfg: &Config) -> Result<String, String> {
     out.push_str("\ncommand\n");
     out.push_str(&plan.render());
     out.push('\n');
+    Ok(out)
+}
+
+/// `--print-java` 的正文：这台机器上所有能找到的 JRE、它们的主版本、以及最终会
+/// 选哪一个。
+///
+/// 为什么值得单独一个开关：JRE 的问题全都发生在「服务起得来、游戏起不来」这一层，
+/// 而那时人只能隔着串流页面看一个黑屏。这个开关可以在任何一台机器上离线跑，
+/// 输出足够回答三个问题 —— 机器上有哪几个 Java、json 要求几、会选哪一个。
+///
+/// **实例读不到也照样输出**：实例文件写坏时，最需要知道的正是"机器上有哪些
+/// Java"，而不是一句"实例读不到"。
+pub fn report_java(cfg: &Config) -> Result<String, String> {
+    let paths = Paths::resolve(cfg)?;
+    let mut out = String::new();
+    out.push_str(&format!("# games root : {}\n", paths.root.display()));
+    out.push_str(&format!("# jre dir    : {}\n", paths.runtime().join("jre").display()));
+
+    let loaded = InstanceSpec::load(&paths, &cfg.game_instance);
+    let mut spec_java = JavaSpec::default();
+    let (client, required) = match &loaded {
+        Ok(spec) => {
+            let client = spec.client_path(&paths);
+            let req = load_version_chain(&client, &spec.game.version)
+                .ok()
+                .and_then(|vj| spec.required_java(&vj.merged));
+            out.push_str(&format!(
+                "# instance   : {} ({})\n",
+                cfg.game_instance,
+                if spec.name.is_empty() { "-" } else { &spec.name }
+            ));
+            spec_java = spec.java.clone();
+            (client, req)
+        }
+        Err(err) => {
+            out.push_str(&format!("# instance   : 读不到（{err}）\n"));
+            (paths.clients(), None)
+        }
+    };
+    out.push_str(&format!("# client     : {}\n", client.display()));
+    out.push_str(&format!(
+        "# required   : {}\n",
+        match required {
+            Some(n) => format!("Java {n}"),
+            None => "无（json 没写 javaVersion，也没设 java.major）".to_owned(),
+        }
+    ));
+    if !spec_java.path.trim().is_empty() {
+        out.push_str(&format!("# pin        : java.path = {}\n", spec_java.path));
+    }
+
+    // 表里列的是"机器上有哪些"，`chosen` 走的是 `select` —— 与真正启动时**同一个
+    // 函数**。这里曾经直接调 `pick`，于是实例写了 `java.path` 时表里的选择与实际
+    // 启动不一致：一个查错用的输出偏偏不说真话，是最坏的一种。
+    let cands = java::discover(&paths, &client);
+    out.push_str(&format!("# found      : {} 个 JRE\n", cands.len()));
+    for c in &cands {
+        out.push_str(&format!(
+            "  {:<9} {:<7} {}   <- {}\n",
+            c.origin.label(),
+            c.major.map(|m| format!("Java {m}")).unwrap_or_else(|| "?".to_owned()),
+            c.java.display(),
+            c.source
+        ));
+    }
+
+    match java::select(&spec_java, &paths, &client, required) {
+        Ok(ch) => {
+            out.push_str(&format!("# chosen     : {}\n", ch.note));
+            if let Some(w) = ch.warning {
+                out.push_str(&format!("# warning    : {w}\n"));
+            }
+        }
+        Err(err) => out.push_str(&format!("# chosen     : 无 —— {err}\n")),
+    }
     Ok(out)
 }
 

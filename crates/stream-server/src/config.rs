@@ -352,6 +352,14 @@ pub struct Config {
     /// 刻意不进 `--print-config` 的输出（那是配置本体），也不从文件读。
     pub print_game: bool,
 
+    /// 一次性动作：把「这台机器上有哪些 JRE、版本各是几、会选哪一个」打到 stdout。
+    ///
+    /// 与 `--print-game` 分开，是因为它回答的是**另一个**问题：`--print-game` 说的是
+    /// "要跑什么"，这个说的是"拿什么跑"。JRE 的问题全发生在"服务起得来、游戏起不来"
+    /// 那一层，那时候人通常只能在串流页面外看一个黑屏 —— 这个开关能在任何一台机器
+    /// 上离线跑，且**实例文件坏了也照样输出**。
+    pub print_java: bool,
+
     /// 输入锁定：把"从网页进来的输入"关在游戏里，不让它切走桌面。
     ///
     /// 默认关。理由和 `game_autostart` 一样是"别让默认配置改变一台机器的行为"：
@@ -472,6 +480,7 @@ impl Default for Config {
             game_root: None,
             game_autostart: false,
             print_game: false,
+            print_java: false,
             // 锁定默认关，但"关"的是**行为**不是**能力**：策略与钩子两层的默认
             // 值是开，`kiosk` 打开之后立刻是完整的 2 档锁定，不需要再记两个开关。
             kiosk: false,
@@ -878,6 +887,7 @@ impl Config {
                 "--game-autostart" => cfg.game_autostart = true,
                 "--no-game-autostart" => cfg.game_autostart = false,
                 "--print-game" => cfg.print_game = true,
+                "--print-java" => cfg.print_java = true,
                 "--kiosk" => cfg.kiosk = true,
                 "--no-kiosk" => cfg.kiosk = false,
                 "--kiosk-autolock" => cfg.kiosk_autolock = true,
