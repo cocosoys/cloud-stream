@@ -115,6 +115,18 @@ game_autostart = false      # 服务起来时顺手拉起游戏
 `last_exit.reason` 三种值：`exited`（自己退的）、`killed-window-gone`（窗口没了进程
 还挂着 —— 就是上面这条）、`killed`（宽限期到了窗口还在）。
 
+**但这三个值描述不了"是谁的意思"。** `stop` 在这台机器上恒走 `killed-window-gone`
++ `code=1`，一次真崩溃也是 `exited` + 非 0，两者从 JSON 上看不出区别。所以
+`last_exit` 还带一个 `requested`：
+
+| `requested` | `code` | 含义 | 面板文案 |
+|---|---|---|---|
+| `true` | 任意 | 有人调了 `POST control/game/stop` | 已按请求停止 |
+| `false` | `0` | 玩家在游戏里选"保存并退出" | 客户端正常退出 |
+| `false` | 非 0 / `null` | 崩了 | 异常退出（code N），查看崩溃报告 |
+
+`requested` 缺失（0.4.0 及更早）时前端退回旧文案，不猜。
+
 **代价必须写进运维手册：停止 = 强杀。** 玩家在游戏里没退出世界就点停止，等于
 `taskkill /F`，可能留下半写的区块文件（本机那个 `Unexpected end of ZLIB input
 stream` 崩溃就是这么来的）。正确顺序是：游戏内先"保存并退出"，再从页面停止。
@@ -141,10 +153,33 @@ stream` 崩溃就是这么来的）。正确顺序是：游戏内先"保存并�
 
 未验证：
 
-* `game_autostart = true` 的冷启动（现在配的是 false，手工走接口更可控）；
-* `exclusive` 全屏模式下由托管启动的稳定性（依赖 S3 的输入锁定，否则失焦即最小化）；
-* 崩溃自动重启（`restart_max` 目前是 0，代码走通但没造崩溃验证）；
 * 停止前自动"游戏内存档"—— 目前做不到，见 §6.1。
+
+### 第四轮（2026-11-19，0.4.0 → 0.4.1）
+
+这一轮的目的是把"代码走通"的三项变成"机器上走通"，顺带查清了 `last_exit` 的
+不确定性问题。
+
+| 场景 | 结果 |
+|---|---|
+| `game/stop` 连续 4 次（windowed ×3、exclusive ×1） | 全部 `reason=killed-window-gone` + `code=1` —— **确定性**，不是偶发；这就是加 `requested` 的理由 |
+| `display.model=exclusive` | 窗口 `1920×1080 @0,0`；windowed 是 `1936×1100 @0,0`，多出的 16×20 就是边框 |
+| `game_autostart=true` + 重启计划任务 | 7 s 后自动 start，200 s 出窗口，`kiosk.armed=true reason=autolock` |
+| `restart_max=2`，强杀 javaw 两次 | 两次都自愈：`restarts` 1→2，pid 4400→5280→5424 |
+| 第 3 次强杀 | 不再重启，`state=stopped`，`restarts` 停在 2 |
+| 主动 `game/stop`（配额未用尽） | `requested=true`；25 s 后仍 `stopped`、`restarts=0` —— 自愈没有误触发 |
+| 冷启动耗时 | 130–200 s（5 个 mod + CustomNPCs 的 Markov 字典）。面板的"启动中…"要能撑住这么久 |
+
+仍未验证（都需要人在串流页面或 VMware 控制台里做）：
+
+* **物理键盘**在锁定态是否真按不动（`Alt+Tab`/`Win`）。脚本发的键都是 `INJECTED`，
+  按设计会被放行，自动化测不出来 —— 见 `kiosk.md` 的同一项。
+* **F11 运行时切全屏**。这一项卡在一个更基础的事实上：SSH 会话在 Session 0，
+  而游戏窗口在 Session 1，`FindWindow`/`GetWindowRect` 在 Session 0 里全是空 ——
+  测不了，不是没测。`exclusive` 的启动即全屏已经把"托管下能全屏"这件事证明了，
+  F11 只剩"锁定后焦点不被抢"这一半。
+* 停止前自动存档（同上，做不到）。
+
 
 ### 前端面板上线后的复测（2026-11-17 15:20，从 `.129` 远程调用）
 
@@ -409,8 +444,8 @@ command
 ### 还剩
 
 * ~~`javaVersion` 段不看，JRE 靠实例手写 `java.path`~~ → 已做，见 §十二。
-* 客户端目录仍在桌面（`Desktop\.minecraft`），迁到 `games\clients\` 会动 1.5 GB 用户
-  数据 —— 脚本已就绪，未执行，见 §十三。
+* ~~客户端目录仍在桌面（`Desktop\.minecraft`），迁到 `games\clients\` 会动 1.5 GB 用户
+  数据~~ → 已执行（实际 237 MB），见 §十三。
 
 ## 十二、JRE 自动挑选（`javaVersion`）
 
@@ -551,3 +586,68 @@ junction removed/made: mods / config / resourcepacks
 `CustomNPCs_1.12.2` 与 `nashorn.jar`（走的是新 junction）。源目录仍留在桌面，等真正的
 "跑一阵子没问题"之后再删。
 
+## 十四、崩溃自愈与退出归因（0.4.1）
+
+### 一维不够
+
+`last_exit.reason` 回答的是"进程怎么没的"，不是"谁让它没的"。本机 1.12.2 的表现
+是恒定的：`WM_CLOSE` 之后窗口销毁、javaw 不退出、1 秒后被 `TerminateProcess`——
+于是**主动停止**永远是 `killed-window-gone` + `code=1`，与一次真崩溃从 JSON 上
+看不出区别。第四轮连测 4 次，4 次一样，所以这不是偶发而是形态。
+
+加了 `requested: bool` 之后，两个问题各有答案：
+
+| 场景 | `requested` | `code` |
+|---|---|---|
+| `POST control/game/stop` | `true` | 1（强杀） |
+| 玩家在游戏里"保存并退出" | `false` | 0 |
+| 崩溃 / 被外部杀掉 | `false` | 非 0 或 `null` |
+
+前端据此分三档措辞（`GamePanel.jsx` 的 `exitTone`）：已按请求停止 / 正常退出 /
+异常退出（提示看崩溃报告）。字段缺失（≤0.4.0）时退回旧文案，不猜。
+
+### 判据：什么该救
+
+`should_restart()` 是一条纯函数，四条与关系：
+
+```
+max > 0 && !requested && code != Some(0) && restarts < max
+```
+
+* **`max = 0` 不救**：默认值，等于这个功能不存在。
+* **主动停止不救**：人点了停止，重启它等于跟人对着干。
+* **`code = 0` 不救**：那是玩家自己退出游戏，救回来等于把人拽回主菜单，
+  还顺手盖掉他刚写的存档。
+* **到上限不救**：坏客户端 / 坏驱动会让每次启动都崩在同一处，无限重启只会
+  占满 CPU 并把 `logs` 刷爆。
+
+监督循环每 2 秒看一次 `status()`，用 `last_exit.at_unix` 去重（否则同一次退出
+会被反复重启）。重启成功后补一次 `kiosk::autolock` —— 停游戏会自动解锁，
+这条路不补就会留下"游戏在跑、桌面没锁"。
+
+### 实测（`.128`，2026-11-19）
+
+`restart_max=2`，`restart_backoff_sec=5`：
+
+| 动作 | 结果 |
+|---|---|
+| 强杀 javaw（pid 4400） | 20 s 内新 pid 5280，`restarts=1` |
+| 再强杀（5280） | 新 pid 5424，`restarts=2` |
+| 第三次强杀 | `state=stopped`，`restarts` 停在 2，日志一条"已自愈 2 次（上限 2）" |
+| 手动 start 后 stop | `requested=true`，25 s 后仍 stopped、`restarts=0` |
+
+单测 512（新增 6：非主动非零救 / 主动不救 / 零码不救 / 上限 / max=0 / code 缺失）。
+
+### 踩到的：回滚配置会换掉访问口令
+
+`configfile::ensure_auth_token` 是既有行为：**配置里 `auth_token` 为空时，服务启动
+会生成一个随机口令写回配置文件**（它是 `/api/` 的 Bearer，也是 MC 上报的
+`X-Cloud-Key`）。所以：
+
+* 用备份覆盖 `stream-config.toml`（本文档 §九 那种"回滚"），重启后**会换一个新口令**，
+  已经带旧口令打开的页面全部 401；
+* 反过来，只要不动那个文件，重启多少次口令都不变。
+
+这一轮就是被它绊了一次：用 `.bak-s4` 恢复配置 → 令牌丢掉 → 重启生成新的 →
+我的 `curl` 全部 401。之后的验证都带着 `?token=<口令>`。**回滚配置的人要知道
+"回滚也会回滚口令"**；不想换就把 `auth_token` 那一行先抄下来。

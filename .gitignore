@@ -75,3 +75,7 @@ __pycache__/
 # 部署产物：前端 dist 打包出来的 zip（由 toolchain/serve-file.ps1 投递给被控机）。
 # 每次部署都重新生成，体积 1.2 MB，没有任何入库价值。
 /temp/*.zip
+
+# 跑 toolchain\build.ps1 -Task test 时把输出重定向到这里再筛（直接管道会被
+# PowerShell 的编码搞坏）。纯中间物。
+/temp/*.log

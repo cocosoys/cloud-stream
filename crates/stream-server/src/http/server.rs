@@ -918,6 +918,10 @@ pub async fn serve(cfg: Arc<Config>) -> Result<()> {
             });
         }
     }
+    // 崩溃自愈：`restart_max = 0` 时它自己什么都不做，所以无条件挂上。
+    if let Some(host) = game.as_ref() {
+        host.spawn_supervisor(cfg.clone());
+    }
     // #102: how many sessions may hold the stream at once. One shared encoder
     // means "one more viewer" is not free — it costs a packetizer pass and a
     // full copy of the bitrate — so the bound exists to protect the people

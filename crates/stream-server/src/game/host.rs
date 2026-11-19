@@ -33,6 +33,14 @@ pub struct Exit {
     pub code: Option<i32>,
     /// "exited"（自己退的）或 "killed"（宽限期到了被结束）。
     pub reason: &'static str,
+    /// 这次退出是不是**我们**让它退的。
+    ///
+    /// 加这一维是因为 `reason` 只描述"进程怎么没的"，不描述"谁的意思"。主动点
+    /// 停止时，1.12.2 的表现恒为"窗口先销毁、javaw 不退出、1 秒后被杀"，于是
+    /// `reason` 永远是 `killed-window-gone`、`code` 永远是 1 —— 与一次真崩溃
+    /// 长得一模一样。面板上把玩家自己点停的那次显示成"游戏异常退出"，是会让
+    /// 人去翻不存在的问题的。
+    pub requested: bool,
     pub at_unix: u64,
 }
 
@@ -119,6 +127,11 @@ impl GameHost {
     /// 会同时写 `session.lock`，第二个的表现是"进游戏立刻被踢回主菜单"，而原因
     /// 藏在日志最后一行。
     pub async fn start(&self, cfg: &Config) -> Result<Status, String> {
+        self.start_inner(cfg, true).await
+    }
+
+    /// `reset_restarts`：手动起 = 新的一轮，自愈配额归零；自愈重启 = 继续消耗配额。
+    async fn start_inner(&self, cfg: &Config, reset_restarts: bool) -> Result<Status, String> {
         let mut guard = self.inner.lock().await;
         if let Some(child) = guard.child.as_mut() {
             if let Ok(None) = child.try_wait() {
@@ -178,6 +191,11 @@ impl GameHost {
         guard.started_at = Some(Instant::now());
         guard.last_exit = None;
         guard.size = plan.size;
+        if reset_restarts {
+            guard.restarts = 0;
+        } else {
+            guard.restarts = guard.restarts.saturating_add(1);
+        }
         drop(guard);
         Ok(self.status().await)
     }
@@ -229,6 +247,7 @@ impl GameHost {
                     exit = Some(Exit {
                         code: status.code(),
                         reason: "exited",
+                        requested: true,
                         at_unix: now_unix(),
                     });
                     break;
@@ -264,6 +283,7 @@ impl GameHost {
             exit = Some(Exit {
                 code: status.and_then(|s| s.code()),
                 reason,
+                requested: true,
                 at_unix: now_unix(),
             });
         }
@@ -284,6 +304,78 @@ impl GameHost {
         self.start(cfg).await
     }
 
+    /// 崩溃自愈：非主动退出且退出码非 0 时，等 `restart_backoff_sec` 再起，
+    /// 最多 `restart_max` 次。
+    ///
+    /// 三条判据都是拿代价换来的：
+    ///
+    /// * **主动 stop 不救**。人点了停止，重启它等于跟人对着干；而且本机的停止
+    ///   恒走 kill（见 [`Self::stop`]），退出码非 0 本来就是必然的。
+    /// * **退出码 0 不救**。玩家在游戏里点"退出游戏"就是 0，救回来等于把人拽回
+    ///   主菜单，还顺手盖掉他刚写的存档。
+    /// * **到上限就停**。坏客户端 / 坏驱动会让每次启动都在同一处崩，无限重启
+    ///   只会占满 CPU 并把 `logs` 刷爆。
+    ///
+    /// 重启成功后补一次 autolock：停游戏会自动解锁（见 `http/health.rs` 的
+    /// `disarm_if_autolock`），自愈这条路不补，就会留下"游戏在跑、桌面没锁"。
+    pub fn spawn_supervisor(self: &Arc<Self>, cfg: Arc<Config>) {
+        let max = self.spec.lifecycle.restart_max;
+        let backoff = Duration::from_secs(self.spec.lifecycle.restart_backoff_sec.max(1));
+        if max == 0 {
+            return;
+        }
+        log::info!(
+            "game: 崩溃自愈已启用（最多 {max} 次，退避 {}s）",
+            backoff.as_secs()
+        );
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            // 记住"已经处理过的那次退出"，否则同一个 `last_exit` 会被反复重启。
+            let mut handled: Option<u64> = None;
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let st = this.status().await;
+                if st.state == "running" {
+                    continue;
+                }
+                let Some(exit) = st.last_exit.clone() else { continue };
+                if handled == Some(exit.at_unix) {
+                    continue;
+                }
+                handled = Some(exit.at_unix);
+                if !should_restart(&exit, st.restarts, max) {
+                    // 主动停止与正常退出是日常，不吵；只有"想救但救不动了"才值得一条警告。
+                    if !exit.requested && exit.code != Some(0) {
+                        log::warn!(
+                            "game: 已自愈 {} 次（上限 {max}），这次不重启 —— code={:?}",
+                            st.restarts,
+                            exit.code
+                        );
+                    }
+                    continue;
+                }
+                log::warn!(
+                    "game: 非正常退出（code={:?}），{}s 后第 {} 次自愈重启",
+                    exit.code,
+                    backoff.as_secs(),
+                    st.restarts + 1
+                );
+                tokio::time::sleep(backoff).await;
+                match this.start_inner(&cfg, false).await {
+                    Ok(s) => {
+                        log::info!("game: 自愈重启成功 pid={:?}", s.pid);
+                        if crate::kiosk::autolock(&cfg) {
+                            if let Err(err) = crate::kiosk::engage("autorestart") {
+                                log::warn!("kiosk: 自愈后 autolock 失败：{err}");
+                            }
+                        }
+                    }
+                    Err(err) => log::warn!("game: 自愈重启失败：{err}"),
+                }
+            }
+        });
+    }
+
     async fn is_running(&self) -> bool {
         let mut guard = self.inner.lock().await;
         match guard.child.as_mut() {
@@ -302,6 +394,8 @@ impl GameHost {
                 guard.last_exit = Some(Exit {
                     code: status.code(),
                     reason: "exited",
+                    // 没人叫它退 —— 这一条正是崩溃自愈要认的那一类。
+                    requested: false,
                     at_unix: now_unix(),
                 });
                 guard.child = None;
@@ -344,6 +438,14 @@ impl GameHost {
         }
     }
 
+}
+
+/// 一次退出该不该救。
+///
+/// 抽成纯函数是因为循环里那四个 `continue` 的条件就是这段逻辑的全部，
+/// 而循环本身在测试里跑不动（要有真进程）。
+fn should_restart(exit: &Exit, restarts: u32, max: u32) -> bool {
+    max > 0 && !exit.requested && exit.code != Some(0) && restarts < max
 }
 
 fn now_unix() -> u64 {
@@ -506,5 +608,51 @@ mod tests {
         std::fs::write(dir.join("crash-reports").join("b.log"), "x").unwrap();
         assert_eq!(count_crash_reports(&dir), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------------------------------------------------- 崩溃自愈判据
+
+    fn exit_at(code: Option<i32>, requested: bool) -> Exit {
+        Exit {
+            code,
+            reason: "exited",
+            requested,
+            at_unix: 0,
+        }
+    }
+
+    #[test]
+    fn autorestart_rescues_unrequested_nonzero_exit() {
+        assert!(should_restart(&exit_at(Some(1), false), 0, 3));
+    }
+
+    #[test]
+    fn autorestart_ignores_requested_stop() {
+        // 本机的 stop 恒为 killed-window-gone + code 1，与真崩溃同形，
+        // 只能靠 requested 区分 —— 这也是加这个字段的全部理由。
+        assert!(!should_restart(&exit_at(Some(1), true), 0, 3));
+    }
+
+    #[test]
+    fn autorestart_ignores_clean_quit() {
+        // 玩家在游戏里点"退出游戏"。
+        assert!(!should_restart(&exit_at(Some(0), false), 0, 3));
+    }
+
+    #[test]
+    fn autorestart_stops_at_limit() {
+        assert!(!should_restart(&exit_at(Some(1), false), 3, 3));
+        assert!(should_restart(&exit_at(Some(1), false), 2, 3));
+    }
+
+    #[test]
+    fn autorestart_is_disabled_when_max_is_zero() {
+        assert!(!should_restart(&exit_at(Some(1), false), 0, 0));
+    }
+
+    #[test]
+    fn autorestart_treats_missing_code_as_crash() {
+        // 被外部 TerminateProcess 杀掉时 code 可能是 None，那不是玩家正常退出。
+        assert!(should_restart(&exit_at(None, false), 0, 3));
     }
 }
