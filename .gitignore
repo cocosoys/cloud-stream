@@ -79,3 +79,5 @@ __pycache__/
 # 跑 toolchain\build.ps1 -Task test 时把输出重定向到这里再筛（直接管道会被
 # PowerShell 的编码搞坏）。纯中间物。
 /temp/*.log
+# ---- 本机部署/排障临时目录（含自签证书与私钥，绝不入库）----
+/temp/
