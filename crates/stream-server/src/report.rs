@@ -55,26 +55,30 @@ pub fn spawn(cfg: &Config) {
         .mc_report_ip
         .clone()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(local_ipv4);
+        .unwrap_or_else(|| local_ipv4(&url));
     let port = cfg.port;
     let version = env!("CARGO_PKG_VERSION").to_owned();
     let name = host_name();
+    // 配了证书就告诉服务端"我这边是 https"：ERP 的入口地址和心跳探针都据此选协议。
+    let tls = cfg.tls_cert.is_some() && cfg.tls_key.is_some();
 
     let spawned = std::thread::Builder::new()
         .name("mc-report".to_owned())
-        .spawn(move || run(&url, &key, &name, &ip, port, &version));
+        .spawn(move || run(&url, &key, &name, &ip, port, &version, tls));
     if let Err(err) = spawned {
         log::warn!("启动上报线程起不来：{err}");
     }
 }
 
-fn run(url: &str, key: &str, name: &str, ip: &str, port: u16, version: &str) {
+fn run(url: &str, key: &str, name: &str, ip: &str, port: u16, version: &str, tls: bool) {
+    // 不带 mcVersion：那个字段在服务端是"这台机器承载的 Minecraft 版本"，
+    // 由管理员填；客户端只知道自己的版本号，拿它去覆盖会把 ERP 的版本列写脏。
     let body = serde_json::json!({
         "name": name,
         "ip": ip,
         "port": port,
         "version": version,
-        "mcVersion": env!("CARGO_PKG_VERSION"),
+        "tls": tls,
         "client": "cloud-stream",
     })
     .to_string();
@@ -167,12 +171,28 @@ fn host_name() -> String {
 /// 监听 `0.0.0.0` 时 `cfg.host` 不是可连地址，而"随便挑一块网卡"在多网卡机器上
 /// 经常挑到 VPN。这里用一次不发包的 UDP `connect`：由系统按路由表选出口网卡，
 /// 拿到的就是"从本机发出去时用的那个地址"，通常也正是 MC 那侧能连回来的那个。
-fn local_ipv4() -> String {
+///
+/// 目标选**上报地址里的主机**（也就是 MC 服务器），不是 `127.0.0.1`：连回环地址
+/// 时系统必然选回环网卡，探出来永远是 `127.0.0.1` —— 那个地址报给 MC 之后既不能
+/// 代表这台机器，心跳也永远打不通。
+fn local_ipv4(url: &str) -> String {
+    let fallback = "127.0.0.1".to_owned();
+    let authority = match url.strip_prefix("http://").and_then(|rest| rest.split('/').next()) {
+        Some(a) if !a.is_empty() => a,
+        _ => return fallback,
+    };
+    // 去掉端口；IPv6 的 `[::1]:8080` 这里不展开（上报地址按运维惯例写 IPv4/域名）。
+    let host = match authority.rsplit_once(':') {
+        Some((h, _)) if !authority.starts_with('[') => h,
+        _ => authority,
+    };
+    let probe_host = if host.is_empty() { "127.0.0.1" } else { host };
     std::net::UdpSocket::bind("0.0.0.0:0")
         .and_then(|sock| {
-            sock.connect("127.0.0.1:9")?;
+            // 端口 9（discard）不需要有服务在听：UDP 的 connect 只查路由，不发包。
+            sock.connect((probe_host, 9))?;
             sock.local_addr()
         })
         .map(|addr| addr.ip().to_string())
-        .unwrap_or_else(|_| "127.0.0.1".to_owned())
+        .unwrap_or(fallback)
 }
