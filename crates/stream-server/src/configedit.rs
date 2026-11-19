@@ -190,6 +190,32 @@ pub const KEYS: &[Key] = &[
         label: "访问口令（留空 = 局域网不鉴权；改完要重启任务）",
         brief: "访问口令",
     },
+    // MC 云客户端登记：客户端启动后向 Minecraft 服务端上报「我在线」。
+    // 地址/密钥留空即不上报；服务端 90s 心跳不依赖这几项。
+    Key {
+        name: "mc_report",
+        kind: Kind::Bool,
+        label: "启动后向 MC 服务器上报（true/false）",
+        brief: "上报开关",
+    },
+    Key {
+        name: "mc_report_url",
+        kind: Kind::Text,
+        label: "MC 上报地址（http://主机:25574/api/plugins/WebGame/cloud/report）",
+        brief: "上报地址",
+    },
+    Key {
+        name: "mc_report_key",
+        kind: Kind::Text,
+        label: "MC 上报密钥（X-Cloud-Key；留空 = 用上面的访问口令）",
+        brief: "上报密钥",
+    },
+    Key {
+        name: "mc_report_ip",
+        kind: Kind::Text,
+        label: "上报给 MC 的本机地址（留空 = 自动探测局域网 IPv4）",
+        brief: "上报地址 IP",
+    },
 ];
 
 pub fn find(name: &str) -> Option<&'static Key> {

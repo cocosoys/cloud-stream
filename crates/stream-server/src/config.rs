@@ -253,6 +253,22 @@ pub struct Config {
     /// 老部署只写 `--auth-token` 时行为不变，多租户部署改用若干条
     /// `--auth-grant tenant:role:token`。
     pub auth_grants: Vec<crate::security::token::GrantSpec>,
+    /// MC 云客户端登记：启动后是否向 Minecraft 服务器上报"我在线"。
+    ///
+    /// 开着的时候本进程在监听就绪后 `POST {mc_report_url}`，把
+    /// `name / ip / port / version` 写进服务端 `cloud-clients.yml`。失败不致命：
+    /// 重试几次就放弃，Minecraft 侧还有 90s 心跳可以自己把状态拉起来。
+    pub mc_report: bool,
+    /// 上报目标，完整 URL，例如
+    /// `http://127.0.0.1:25574/api/plugins/WebGame/cloud/report`。为空则不上报。
+    pub mc_report_url: Option<String>,
+    /// 上报用的共享密钥，走 `X-Cloud-Key`。与服务端登记的首报值做 TOFU 比对，
+    /// 同一台设备的后续上报必须一致。**与 [`Self::auth_token`] 默认同值**：
+    /// 首次生成时用它填好，两者分开存只是为了让运维能单独换掉上报密钥。
+    pub mc_report_key: Option<String>,
+    /// 上报给 MC 的本机地址。留空则自动探测（第一个非回环 IPv4）。
+    /// 监听 `0.0.0.0` 时不能拿 `host` 当地址用，那是"本机所有网卡"不是可连地址。
+    pub mc_report_ip: Option<String>,
     /// #95: which encoder backend to use — `auto` (default), `software`, or one
     /// of `nvenc` / `amf` / `qsv` to demand a specific one.
     ///
@@ -468,6 +484,10 @@ impl Default for Config {
             policy: "auto".to_owned(),
             auth_token: None,
             auth_grants: Vec::new(),
+            mc_report: false,
+            mc_report_url: None,
+            mc_report_key: None,
+            mc_report_ip: None,
             display: 0,
             encoder: "auto".to_owned(),
             tune: "tuned".to_owned(),

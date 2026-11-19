@@ -52,6 +52,7 @@ pub mod ops;
 pub mod pipeline;
 pub mod platform;
 pub mod run;
+pub mod report;
 pub mod security;
 pub mod signaling;
 pub mod update;

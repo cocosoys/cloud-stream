@@ -122,7 +122,7 @@ pub async fn run() -> anyhow::Result<()> {
     // 区分开：前者的唯一办法是人改文件，看门狗把机器重启一万次也不会好；后者
     // 值得重试。此刻日志还没初始化，所以只能用 eprintln —— 而这句就是用户能
     // 看到的全部，它必须自己说清是哪一份文件、哪一行。
-    let cfg = match config::Config::parse(argv) {
+    let mut cfg = match config::Config::parse(argv) {
         Ok(cfg) => Arc::new(cfg),
         Err(err) => {
             // GUI 子系统下 stderr 指向 NUL（见 `boot` 模块），所以这句话通常会
@@ -594,8 +594,18 @@ pub async fn run() -> anyhow::Result<()> {
         },
     );
 
+    // 云游戏客户端接入（首次启动）：配置里 `auth_token` 还是空的时候补一个随机口令
+    // 并写回配置文件 —— 它同时是 MC 服务端 90s 心跳的 Bearer 令牌和客户端上报的
+    // `X-Cloud-Key`。`--print-config` / `--ops` 这些一次性动作已经在上面 exit 了，
+    // 所以这里写盘只发生在真正要跑服务的时候。`Arc::get_mut` 为 None 说明别处
+    // 已经克隆过（那时说明运行期早就起来了），不覆盖。
+    if let Some(cfg_mut) = Arc::get_mut(&mut cfg) {
+        configfile::ensure_auth_token(cfg_mut);
+    }
+
     // #36 starts the capture loop after Connected notices are sent; the WS
     // listener, media session and DC hook run from this point on.
+    crate::report::spawn(&cfg);
     let serve = http::serve(cfg);
     let outcome = tokio::select! {
         result = serve => result,

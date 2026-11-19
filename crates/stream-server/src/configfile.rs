@@ -105,6 +105,14 @@ pub struct FileConfig {
     /// `["tenant:role:token", ...]`，与 `--auth-grant` 可重复同义。
     /// 文件里的列表**整体替换**命令行之前累积的列表，不追加。
     pub auth_grants: Option<Vec<String>>,
+    /// MC 云客户端登记：启动后向 Minecraft 服务端上报「我在线」。
+    pub mc_report: Option<bool>,
+    /// 上报目标完整 URL（`http://host:port/api/plugins/WebGame/cloud/report`）。
+    pub mc_report_url: Option<String>,
+    /// 上报共享密钥，走 `X-Cloud-Key` 请求头。
+    pub mc_report_key: Option<String>,
+    /// 上报给 MC 的本机地址；空 = 自动探测局域网 IPv4。
+    pub mc_report_ip: Option<String>,
 
     // ---- 游戏托管 ----
     /// 要不要由本进程拉起并看着游戏客户端。
@@ -245,6 +253,18 @@ impl FileConfig {
                 }
             }
         }
+        if let Some(v) = self.mc_report {
+            cfg.mc_report = v;
+        }
+        if let Some(v) = self.mc_report_url {
+            cfg.mc_report_url = if v.trim().is_empty() { None } else { Some(v.trim().to_owned()) };
+        }
+        if let Some(v) = self.mc_report_key {
+            cfg.mc_report_key = if v.trim().is_empty() { None } else { Some(v.trim().to_owned()) };
+        }
+        if let Some(v) = self.mc_report_ip {
+            cfg.mc_report_ip = if v.trim().is_empty() { None } else { Some(v.trim().to_owned()) };
+        }
 
         if let Some(v) = self.no_hdr {
             cfg.no_hdr = v;
@@ -338,6 +358,10 @@ impl FileConfig {
                     .map(|g| format!("{}:{}:{}", g.tenant.as_str(), g.role.as_str(), g.token))
                     .collect(),
             ),
+            mc_report: Some(cfg.mc_report),
+            mc_report_url: Some(cfg.mc_report_url.clone().unwrap_or_default()),
+            mc_report_key: Some(cfg.mc_report_key.clone().unwrap_or_default()),
+            mc_report_ip: Some(cfg.mc_report_ip.clone().unwrap_or_default()),
             no_hdr: Some(cfg.no_hdr),
             dump_frame: Some(path_or_empty(cfg.dump_frame.as_deref())),
             game: Some(cfg.game_enabled),
@@ -434,6 +458,88 @@ pub fn resolve(explicit: Option<&Path>) -> Option<PathBuf> {
 /// 老位置的口令文件（`auth-token.txt`）。
 ///
 /// 2026-11 之前口令**只能**放在这里：`set-password.cmd` 写它，`--run` 读出来
+/// 首次安装/首次启动时补一个访问口令，并落回配置文件。
+///
+/// # 为什么需要这一步
+///
+/// 默认配置里 `auth_token` 是空串 —— "局域网不鉴权"。云游戏客户端接入之后，
+/// 这条空串就变成了一个洞：`/api/v1/health` 不带令牌也能读，而客户端上报
+/// `X-Cloud-Key` 也失去了唯一来源（密钥得先有个值才能发出去）。
+///
+/// 所以在**有配置文件**、且里面的 `auth_token` 还是空的这种情况下，生成一个
+/// 32 字符口令写回去。之后：
+/// - 服务端每个 `/api/` 请求都要出示它（含 90s 心跳）；
+/// - `stream-setting` 的“访问口令”一栏会读出它（它是 `Kind::Secret`）；
+/// - 客户端上报默认拿它当 `X-Cloud-Key`（[`Config::mc_report_key`] 留空时）。
+///
+/// 只在**键存在但为空**时改写，或键整个不存在时**插在文件开头**（TOML 里
+/// 顶层键必须出现在任何 `[section]` 之前，追加到文件尾会被算进最后一张表）。
+pub fn ensure_auth_token(cfg: &mut Config) {
+    if cfg
+        .auth_token
+        .as_deref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let token = generate_token();
+    cfg.auth_token = Some(token.clone());
+    if cfg.mc_report && cfg.mc_report_key.is_none() {
+        cfg.mc_report_key = Some(token.clone());
+    }
+
+    let Some(path) = cfg.config_source.clone() else {
+        log::info!("没有配置文件（默认值启动），口令只在本次进程内有效。");
+        return;
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(err) => {
+            log::warn!("读不出 {}，口令只在本次进程内有效：{err}", path.display());
+            return;
+        }
+    };
+
+    // 找形如 `auth_token = ...` 的行；找到就整行替换，保留其余内容与注释。
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_owned()).collect();
+    let mut replaced = false;
+    for line in &mut lines {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("auth_token") && trimmed.contains('=') && !trimmed.starts_with("auth_grants")
+        {
+            *line = format!("auth_token = \"{token}\"");
+            replaced = true;
+            break;
+        }
+    }
+    if !replaced {
+        lines.insert(0, format!("auth_token = \"{token}\""));
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    match std::fs::write(&path, out) {
+        Ok(()) => log::info!(
+            "首次启动：已生成访问口令并写入 {}（stream-setting 的“访问口令”一栏可见）。",
+            path.display()
+        ),
+        Err(err) => log::warn!("口令写回 {} 失败：{err}（本次进程内仍然生效）", path.display()),
+    }
+}
+
+/// 32 字符口令，去掉容易看错的 `0/O/1/l/I`，方便管理员手抄。
+///
+/// 随机源走 `hbb_common` 重导出的 `rand`：本项目没有把 `rand` 列为直接依赖，
+/// 而 hbb_common 的指纹/口令模块本来就在用它，重导出避免多一份版本。
+fn generate_token() -> String {
+    use hbb_common::rand::Rng;
+    const ALPHABET: &[u8] = b"abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let mut rng = hbb_common::rand::thread_rng();
+    (0..32)
+        .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
+        .collect()
+}
+
 /// 转成 `--auth-token` 传给服务。现在正式位置是配置里的 `auth_token`（能进
 /// 表单、能进 `--ops` 的备份与回滚、能写非 ASCII），这个文件只剩一个作用：
 /// 让老机器升级上来时不用重新设一遍口令。
@@ -581,6 +687,19 @@ pub fn render_toml(cfg: &Config) -> String {
         }
         out.push_str("]\n");
     }
+    out.push('\n');
+
+    out.push_str("# ---------- MC 云客户端登记 ----------\n");
+    out.push_str("# mc_report: 启动后（监听就绪时）向 Minecraft 服务器 POST 一条「我在线」。\n");
+    out.push_str("# 关掉时状态只能靠服务端的 90s 心跳拉取来发现。\n");
+    out.push_str(&kv_bool("mc_report", cfg.mc_report));
+    out.push_str("# mc_report_url: 完整地址，例如 http://127.0.0.1:25574/api/plugins/WebGame/cloud/report\n");
+    out.push_str(&kv_str("mc_report_url", cfg.mc_report_url.as_deref().unwrap_or("")));
+    out.push_str("# mc_report_key: 上报密钥，走 X-Cloud-Key；留空则不上报。\n");
+    out.push_str("# 与 auth_token 默认同值，服务端按 TOFU 记住首报值。\n");
+    out.push_str(&kv_str("mc_report_key", cfg.mc_report_key.as_deref().unwrap_or("")));
+    out.push_str("# mc_report_ip: 上报给 MC 的本机地址；留空 = 自动探测局域网 IPv4。\n");
+    out.push_str(&kv_str("mc_report_ip", cfg.mc_report_ip.as_deref().unwrap_or("")));
     out.push('\n');
 
     out.push_str("# ---------- 游戏托管 ----------\n");

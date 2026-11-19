@@ -89,7 +89,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::{CreateFontW, DeleteObject};
+use windows_sys::Win32::Graphics::Gdi::{CreateFontW, DeleteObject, InvalidateRect};
 use windows_sys::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
@@ -98,7 +98,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetWindowTextW, LoadIconW,
     LoadCursorW, MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassW,
     SendMessageW, SetForegroundWindow, SetWindowTextW, SetWindowPos, ShowWindow, TranslateMessage,
-    BS_PUSHBUTTON, CW_USEDEFAULT, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_PASSWORD,
+    BS_PUSHBUTTON, BS_AUTOCHECKBOX, CW_USEDEFAULT, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_PASSWORD,
     ES_READONLY,
     MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO, MSG, SWP_NOACTIVATE, SWP_NOZORDER,
     SW_SHOWNORMAL, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_SETFONT,
@@ -536,6 +536,17 @@ const CFG_BUTTONS: &[(&str, i32, i32, i32)] = &[
     ("打开原文", BTN_CFG_RAW, 232, 100),
 ];
 
+/// 「显示口令」复选框。原来的口令格是打码的（这块屏幕常被别人远程看着），
+/// 但首次安装时管理员要把这串口令抄到 MC 服务端/另一台机器上，所以得有一个
+/// **临时**揭开的手段：勾上就明文，关掉窗口再打开又回到打码。
+const ID_SHOW_SECRET: i32 = 1020;
+/// Win32 里 `EM_SETPASSWORDCHAR`（windows-sys 没导出，值见 winuser.h）。
+const EM_SETPASSWORDCHAR: u32 = 0x00CC;
+/// `BM_GETCHECK`：返回复选框当前状态。
+const BM_GETCHECK: u32 = 0x00F0;
+/// `BST_CHECKED`。
+const BST_CHECKED: isize = 1;
+
 static FIELDS: Mutex<Vec<Field>> = Mutex::new(Vec::new());
 
 /// 表单窗口。0 = 还没建过。关闭时只隐藏不销毁：重建十八个控件比 `ShowWindow`
@@ -778,6 +789,33 @@ fn apply_config_layout(hwnd: HWND) {
             SendMessageW(child, WM_SETFONT, font as usize, 1);
         }
     }
+    // 复选框放在第二列那侧（第一列的按钮只排到 332，COL_X[1] = 360）。
+    unsafe {
+        let child = GetDlgItem(hwnd, ID_SHOW_SECRET);
+        if child != 0 {
+            MoveWindow(child, scaled(COL_X[1], dpi), y, scaled(FIELD_W, dpi), scaled(24, dpi), 1);
+            SendMessageW(child, WM_SETFONT, font as usize, 1);
+        }
+    }
+}
+
+/// 勾上「显示口令（临时）」→ 所有 secret 格临时明文；取消 → 回到打码。
+fn toggle_secret_fields(hwnd: HWND) {
+    let fields = FIELDS.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe {
+        let box_hwnd = GetDlgItem(hwnd, ID_SHOW_SECRET);
+        let revealed = box_hwnd != 0
+            && SendMessageW(box_hwnd, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        for field in fields.iter() {
+            if !field.secret || field.hwnd == 0 {
+                continue;
+            }
+            // 0 = 不设密码字符（明文）；0x25CF = ● 回填。
+            let ch = if revealed { 0usize } else { 0x25CFusize };
+            SendMessageW(field.hwnd, EM_SETPASSWORDCHAR, ch, 0);
+            InvalidateRect(field.hwnd, std::ptr::null(), 1);
+        }
+    }
 }
 
 /// 把 `FIELDS` 里的原值重新摆到控件上（打开窗口时、保存之后各一次）。
@@ -996,14 +1034,33 @@ unsafe extern "system" fn config_wndproc(
                     std::ptr::null(),
                 );
             }
+            // 口令是打码显示的；给个复选框临时揭开，方便首次安装时抄到别处。
+            let c = wide("BUTTON");
+            let t = wide("显示口令（临时）");
+            CreateWindowExW(
+                0,
+                c.as_ptr(),
+                t.as_ptr(),
+                (BS_AUTOCHECKBOX as u32) | WS_CHILD | WS_VISIBLE,
+                0,
+                0,
+                0,
+                0,
+                hwnd,
+                ID_SHOW_SECRET as isize,
+                instance,
+                std::ptr::null(),
+            );
             // 位置与字体统一在这里定，按窗口所在屏的 DPI。
-            apply_config_layout(hwnd);
-            0
+            apply_config_layout(hwnd);            0
         }
         WM_COMMAND => {
             let id = (wparam & 0xffff) as i32;
             let main = *MAIN_HWND.lock().unwrap_or_else(|e| e.into_inner()) as HWND;
             match id {
+                ID_SHOW_SECRET => {
+                    toggle_secret_fields(hwnd);
+                }
                 BTN_CFG_SAVE => {
                     // 写文件是毫秒级的（改一份小文本 + 复制一份留底），不复用
                     // spawn_job：那会把"保存成功没有"推到日志末尾，而人此刻
